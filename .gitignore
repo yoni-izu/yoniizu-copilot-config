@@ -1,0 +1,22 @@
+# Runtime / session data — never commit
+logs/
+session-state/
+ide/
+session-store.db
+session-store.db-shm
+session-store.db-wal
+command-history-state.json
+vscode.session.metadata.cache.json
+
+# Auto-managed by the Copilot client (experiment IDs, cache)
+config.json
+
+# Python build artifacts
+__pycache__/
+*.pyc
+
+# Editor / backup noise
+*.bak
+.DS_Store
+*.swp
+*~

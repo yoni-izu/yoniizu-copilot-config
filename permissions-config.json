@@ -1,0 +1,131 @@
+{
+  "locations": {
+    "/home/yoniizu": {
+      "tool_approvals": [
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "xargs"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "python3"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "pip show",
+            "npm list"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "npx mcp-remote",
+            "npx --yes"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "mkdir"
+          ]
+        },
+        {
+          "kind": "write"
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "sed"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "git -C"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "elmcli"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "gh api"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "jq"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "copilot"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "printf"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "python"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "curl"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "node"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "sleep"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "env"
+          ]
+        }
+      ]
+    },
+    "/home/yoniizu/projects/iridium/two": {
+      "tool_approvals": [
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "jq"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "python3"
+          ]
+        }
+      ]
+    }
+  }
+}

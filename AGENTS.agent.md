@@ -1,0 +1,2 @@
+# AI Personas with tool constraints
+# This document describes how to create custom agents with specific tool constraints and handoffs. Custom agents can be designed to perform specific tasks while adhering to defined limitations on the tools they can use. This allows for more controlled and focused interactions, ensuring that the agent operates within the desired parameters.

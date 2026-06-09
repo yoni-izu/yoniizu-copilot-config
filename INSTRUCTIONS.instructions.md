@@ -1,0 +1,1 @@
+# Conditional rules per file type
