@@ -131,9 +131,7 @@ Sanitized. The same page that was created in prep is **updated in place**. Visib
 - <decision>
 
 ## Action items
-| # | Action | Owner | Due | Jira |
-|---|---|---|---|---|
-| 1 | <text> | <name> | YYYY-MM-DD | <KEY or "—"> |
+- <text> — <owner mention> (<due if any>, <Jira key if any>)
 
 ## Readiness toward MS<N>
 - On track: <list>
@@ -142,9 +140,6 @@ Sanitized. The same page that was created in prep is **updated in place**. Visib
 
 ## Next weekly
 <auto-computed date>
-
----
-*Published <today> — visibility: anyone in the organization (lifted on `start team weekly`)*
 ```
 
 **Sanitization rules** (excluded from the published page):

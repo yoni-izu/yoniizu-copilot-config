@@ -436,7 +436,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps(tasks, indent=2))
         return 0
 
-    rows = [("ID", "Title", "Cat", "Pri", "Status", "Cx", "Est", "Age", "WS")]
+    rows = [("ID", "Title", "Feature", "Cat", "Pri", "Status", "Cx", "Est", "Age", "WS")]
     for t in tasks:
         title = t["title"]
         if len(title) > 50:
@@ -444,6 +444,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         rows.append((
             t["id"],
             title,
+            feature_blurb(t),
             t["category"][:4],
             t["priority"][:4],
             t["status"][:11],
@@ -469,7 +470,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_list_reviews(args: argparse.Namespace) -> int:
     d = load()
-    rows = [("ID", "PRs", "Repos", "Authors", "Status", "Files", "+/-", "Age")]
+    rows = [("ID", "PRs", "Repos", "Authors", "Status", "Files", "+/-", "Age", "Feature")]
     n = 0
     for t in d["tasks"]:
         if t.get("category") != "code-review":
@@ -489,6 +490,7 @@ def cmd_list_reviews(args: argparse.Namespace) -> int:
         rows.append((
             t["id"], pr_nums, repos, authors, t["status"],
             str(files), f"+{add}/-{dele}", f"{days_since(t.get('created', TODAY))}d",
+            feature_blurb(t),
         ))
     if n == 0:
         print("no active review tasks")
@@ -505,6 +507,26 @@ def _print_table(rows: list[tuple]) -> None:
         print(line)
         if idx == 0:
             print(sep)
+
+
+def feature_blurb(t: dict, maxlen: int = 70) -> str:
+    """Short human-readable feature label for a task.
+
+    Prefers the description's first sentence; falls back to the title stripped
+    of any leading "Review: " prefix. Returns "" if nothing useful is found.
+    """
+    desc = (t.get("description") or "").strip()
+    if desc:
+        # First sentence: split on ". " but keep terse
+        first = desc.split(". ", 1)[0]
+        # Collapse newlines / repeated whitespace
+        first = re.sub(r"\s+", " ", first).strip()
+    else:
+        title = (t.get("title") or "").strip()
+        first = re.sub(r"^Review:\s*", "", title, flags=re.IGNORECASE)
+    if len(first) > maxlen:
+        first = first[: maxlen - 1].rstrip() + "…"
+    return first
 
 
 # ----------------------------------------------------------------------------

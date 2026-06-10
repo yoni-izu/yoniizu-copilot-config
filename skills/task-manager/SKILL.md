@@ -15,8 +15,8 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 |------------|---------|-------|
 | `add <title> [-c CAT] [-p PRI] [--complexity X] [--cost N] [--jira K] [--context S] [--workspace W] [--no-workspace] [--backlog] [--cwd PATH]` | Add a non-review task | Auto-detects workspace from cwd unless `--no-workspace`. Reports if workspace is occupied. |
 | `add-review <url> [<url>...] [-t TITLE] [-d DESC] [-p PRI] [--complexity X] [--cost N] [--jira K]` | Create a code-review task from one or more PR URLs | Fetches PR title, author, branch, stats via `gh` and `git ls-remote`. Auto-estimates complexity from file/line counts. Auto-extracts Jira key from `[XXX-123]` titles. Multiple URLs → one task with multiple `reviews[]` entries. |
-| `list [--status S] [--category C] [--priority P] [--json]` | List tasks | Default hides `done`/`cancelled`. Sorts by priority then category. Prints summary + workspace map. |
-| `list-reviews` | List active review tasks | Hides done/cancelled and tasks where every PR is merged. |
+| `list [--status S] [--category C] [--priority P] [--json]` | List tasks | Default hides `done`/`cancelled`. Sorts by priority then category. Shows a "Feature" column (first sentence of `description`, falls back to title with leading `Review:` stripped). Prints summary + workspace map. |
+| `list-reviews` | List active review tasks | Hides done/cancelled and tasks where every PR is merged. Shows a "Feature" column derived from the task description. |
 | `workspaces [--project NAME]` | Show workspace occupancy | Default project: `iridium`. |
 | `update <id> <status> [-n NOTE]` | Set arbitrary status | `id` matches `T-NNN` or unique title substring. |
 | `done <id> [-n NOTE]` / `block <id>` / `cancel <id>` | Status shortcuts | `done`/`cancel` auto-clear workspace and set `completed`. |
