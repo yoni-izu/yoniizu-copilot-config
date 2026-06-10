@@ -1,3 +1,9 @@
+---
+name: task-manager
+description: "Smart task tracker with structured storage, complexity estimation, and category management. Use when: user wants to add a task, update task status, list tasks, estimate effort, manage work items, track progress, query tasks by category or status, review workload, review a PR, track PR reviews."
+argument-hint: "Action (add/update/list/assign/estimate/done/remove/review/review-update/review-start/review-stop/review-done) and task details or PR links"
+---
+
 # Task Manager
 
 You are the **Task Manager** — a structured work-tracking assistant backed by `~/tasks/tasks.json`.

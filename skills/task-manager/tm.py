@@ -818,6 +818,145 @@ def cmd_review_msg(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Subcommand: re-review
+# ----------------------------------------------------------------------------
+
+def cmd_re_review(args: argparse.Namespace) -> int:
+    """Given one or more PR URLs:
+    - Find existing review task(s) that own those PRs.
+    - Add any untracked PRs to the matching task (fetching details from GitHub).
+    - Transition each affected task to waiting-for-re-review.
+    Reports an error for any URL whose task cannot be identified.
+    """
+    if not args.urls:
+        print("[tm] re-review needs at least one PR URL", file=sys.stderr)
+        return 2
+
+    d = load()
+
+    # Build lookup: (owner, repo, pr_number) → task
+    pr_to_task: dict[tuple, dict] = {}
+    for t in d["tasks"]:
+        if t.get("category") != "code-review":
+            continue
+        for p in pr_entries(t):
+            key = (p["owner"].lower(), p["repo"].lower(), int(p["pr_number"]))
+            pr_to_task[key] = t
+
+    # Classify each input URL
+    task_to_new_urls: dict[str, list[str]] = {}   # task_id → new PR URLs to add
+    task_objs: dict[str, dict] = {}
+    unmatched: list[str] = []
+
+    for url in args.urls:
+        try:
+            owner, repo, num = parse_pr_url(url)
+        except ValueError as e:
+            print(f"[tm] {e}", file=sys.stderr)
+            return 2
+
+        key = (owner.lower(), repo.lower(), num)
+        task = pr_to_task.get(key)
+
+        if task:
+            # Already tracked — just flag the task
+            task_objs[task["id"]] = task
+            task_to_new_urls.setdefault(task["id"], [])
+        else:
+            # Not tracked — try to infer which task it belongs to by repo+owner
+            candidates = [
+                t for t in d["tasks"]
+                if t.get("category") == "code-review"
+                and t.get("status") not in ("done", "cancelled")
+                and any(
+                    p["owner"].lower() == owner.lower() or p["repo"].lower() == repo.lower()
+                    for p in pr_entries(t)
+                )
+            ]
+            # Prefer a task that shares the same author (fetch quick author info)
+            if len(candidates) == 1:
+                task = candidates[0]
+                task_objs[task["id"]] = task
+                task_to_new_urls.setdefault(task["id"], []).append(url)
+            elif len(candidates) > 1:
+                # Narrow by JIRA key in PR title if possible
+                try:
+                    info = fetch_pr_details(url)
+                    jira_m = re.match(r"\s*\[([A-Z][A-Z0-9]+-\d+)\]", info.get("title") or "")
+                    jira_key = jira_m.group(1) if jira_m else None
+                except Exception:
+                    jira_key = None
+                matched = (
+                    [c for c in candidates if c.get("jira") == jira_key]
+                    if jira_key else []
+                )
+                if len(matched) == 1:
+                    task = matched[0]
+                    task_objs[task["id"]] = task
+                    task_to_new_urls.setdefault(task["id"], []).append(url)
+                else:
+                    ids = ", ".join(c["id"] for c in candidates)
+                    print(f"[tm] {owner}/{repo}#{num}: ambiguous — matches tasks {ids}; "
+                          f"add manually with 'add-review' or specify task ID",
+                          file=sys.stderr)
+                    unmatched.append(url)
+            else:
+                print(f"[tm] {owner}/{repo}#{num}: not found in any review task — "
+                      f"use 'add-review' to create a new task", file=sys.stderr)
+                unmatched.append(url)
+
+    if unmatched and not task_objs:
+        return 1
+
+    rc = 0
+    for tid, task in task_objs.items():
+        prs = pr_entries(task)
+
+        # Add any new PRs
+        new_urls = task_to_new_urls.get(tid, [])
+        for url in new_urls:
+            try:
+                info = fetch_pr_details(url)
+            except Exception as e:
+                print(f"[tm] failed to fetch {url}: {e}", file=sys.stderr)
+                rc = 1
+                continue
+            entry = {
+                "pr_url": url,
+                "owner": info["owner"],
+                "repo": info["repo"],
+                "pr_number": info["pr_number"],
+                "author": info["author"],
+                "branch": info["branch"],
+                "files_changed": info["files_changed"],
+                "additions": info["additions"],
+                "deletions": info["deletions"],
+                "review_status": "waiting-for-re-review",
+                "submitted_at": None,
+                "merged": info.get("merged", False),
+            }
+            if "reviews" not in task:
+                task["reviews"] = prs if prs else []
+            task["reviews"].append(entry)
+            append_note(task, f"re-review: added {info['repo']}#{info['pr_number']}")
+            print(f"  added {info['repo']}#{info['pr_number']} "
+                  f"({info['files_changed']} files +{info['additions']}/-{info['deletions']})")
+
+        # Transition all PR entries to waiting-for-re-review
+        for p in pr_entries(task):
+            p["review_status"] = "waiting-for-re-review"
+        task["status"] = "todo"
+        task["workspace"] = None
+        task["updated"] = TODAY
+        append_note(task, "re-review: waiting-for-re-review on all PRs")
+        print(f"{tid} status=todo review_status=waiting-for-re-review "
+              f"({len(pr_entries(task))} PR(s))")
+
+    save(d)
+    return rc
+
+
+# ----------------------------------------------------------------------------
 # Argparse wiring
 # ----------------------------------------------------------------------------
 
@@ -919,6 +1058,14 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("review-msg", help="print a review-request message for a task")
     a.add_argument("id")
     a.set_defaults(func=cmd_review_msg)
+
+    # re-review
+    a = sub.add_parser(
+        "re-review",
+        help="mark PRs for re-review: find their task, add any new PRs, set waiting-for-re-review",
+    )
+    a.add_argument("urls", nargs="+", metavar="PR_URL")
+    a.set_defaults(func=cmd_re_review)
 
     return p
 
