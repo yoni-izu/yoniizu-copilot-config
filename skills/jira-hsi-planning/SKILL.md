@@ -22,9 +22,11 @@ argument-hint: "Describe what you want: milestone analysis, sprint report, find 
 |---|---|---|
 | 2012 | FW HSI MS6 Sprint 1 | May 19 – Jun 2 |
 | 2013 | FW HSI MS6 Sprint 2 | Jun 2 – Jun 16 |
-| 2014 | FW HSI MS6.5 Sprint 1 | Jun 9 – Jun 28 |
-| 2015 | FW HSI MS6.5 Sprint 2 | Jun 28 – Jul 14 |
+| 2014 | FW HSI MS6.5 Sprint 1 *(now MS6 Sprint 3 — MS6.5 discontinued, see below)* | Jun 9 – Jun 28 |
+| 2015 | FW HSI MS6.5 Sprint 2 *(now MS6 Sprint 4 — MS6.5 discontinued, see below)* | Jun 28 – Jul 14 |
 | 2016 | FW HSI MS7 Sprint 1 | Jul 15 – Jul 29 |
+
+> **⚠️ MS6.5 discontinued (RAID I-002, closed 2026-06-08):** Karin Shteingaus confirmed MS6.5 is retired. Sprints 2014 and 2015 retain their Jira names ("MS6.5 Sprint 1/2") but now fall **within the MS6.0 window**. All work previously labelled `iridium-system-sw-6.5` was bulk-restored to `iridium-system-sw-6.0` (35 tickets, 2026-06-08). When scheduling stories/epics, treat sprints 2012–2015 as MS6 sprints and sprint 2016+ as MS7.
 
 ### Jira Projects
 
@@ -434,7 +436,16 @@ Fetch the current list from Confluence when needed:
 ```
 Page: https://elementlabs.atlassian.net/wiki/spaces/RPI/pages/284524644/Iridium+System+Software+milestones
 ```
-> ⚠️ Due dates on this page may be outdated. Use milestone names authoritatively, but verify dates with the user or from active sprint/milestone data in Jira.
+
+**Confirmed milestone dates (RAID I-002, 2026-06-08):**
+
+| Milestone | Jira value | End date | Notes |
+|---|---|---|---|
+| MS6.0 | `iridium-system-sw-6.0` | **2026-07-21** | Pre-power-on. Covers sprints 2012–2015. |
+| MS6.5 | *(retired)* | — | Discontinued 2026-06-02 by automation; confirmed by Karin 2026-06-08. Do **not** assign tickets to this milestone. |
+| MS7.0 | `iridium-system-sw-7.0` | **2026-09-01** | Post-power-on. Starts sprint 2016+. |
+
+> **Rule:** Pre-power-on work → MS6.0. Post-power-on work → MS7.0. If unsure, default to MS6.0 and flag for per-ticket review.
 
 The `SW Internal Milestone` custom field in Jira is the source of truth for milestone assignment.
 
