@@ -23,7 +23,7 @@ next query on the same subject is fast and does not require re-reading the sourc
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
-| _(none yet)_ | | | | |
+| Iridium per-die D2D instance counts (hD2D vs vD2D) | `iridium-d2d-instance-counts.md` | iridium, hd2d, vd2d, horizontal, vertical, instance count, topology, lanes, bandwidth, routing, cce | Verified from RTL/address-map + spec | 2026-06-12 |
 
 ## Topic File Template
 
