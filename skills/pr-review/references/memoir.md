@@ -1,0 +1,177 @@
+# Review Memoir
+
+Personal notes on code review style, conventions, and design approaches.
+Grows with each review — captures what I look for, recurring patterns, and lessons learned.
+
+---
+
+## Review Philosophy
+
+- **Correctness first, style second.** Only flag style if it actively hurts readability or maintainability.
+- **Actionable comments.** Every comment should say *what* to change and *why*. No drive-by "hmm" comments.
+- **Pick battles.** 3 well-reasoned blockers > 15 nits. Author energy is finite.
+- **Respect the author's design.** Don't redesign in review unless there's a clear defect or scaling problem.
+- **Verify claims.** When a comment says "this is safe because X" — verify X. Read the actual code path.
+
+## What I Always Check
+
+### Concurrency & Synchronization
+- Mutex scope: is the critical section minimal? Does it cover both read and write of shared state?
+- Semaphore semantics: binary vs counting, take/give balance, timeout handling.
+- Monotonic state flags read outside mutex: safe only if transition is one-way (false→true).
+- Memory ordering: on multi-core shared memory, look for barriers/volatile.
+
+### Error Handling
+- All error paths must release held resources (mutex, allocated memory, semaphore).
+- Error codes should be meaningful — propagate specific errno, don't collapse to -1.
+- Validate at system boundaries (public API), trust within internal helpers.
+
+### Hardware Programming
+- Write-only registers need shadow state for readback/debug.
+- Register field widths: mask values before writing; BUILD_ASSERT field sizes match spec.
+- Multi-register sequences: does ordering matter? Are they atomic from HW perspective?
+- Stale HW state on reconfiguration: must zero/invalidate entries beyond new table size.
+
+### API Design
+- Public headers expose minimum necessary. Internal types stay in .c files or internal headers.
+- Function naming: consistent prefix scheme (module_verb_noun).
+- Parameter validation: at the public API boundary, not deep in internals.
+- Forward-compatibility: unused parameters with ARG_UNUSED are OK if documented (e.g., per-die shadow planned).
+- When a PR claims "vendor-agnostic" / "pluggable" / "drop-in", grep for the second consumer. If it doesn't exist, the API shape is speculation — push to land only what has a real caller today.
+- Identify independent variation axes (e.g. vendor vs integration glue) before approving a single vtable that mixes them. Mixed axes inside one driver defeat the stated reuse goal.
+
+### DTS / Device Tree
+- Required vs optional properties: does the binding match actual usage?
+- Phandle ownership: which node logically "owns" a reference? (SE owns topology, not individual C2C ports.)
+- Table size assertions: BUILD_ASSERT that DTS arrays don't exceed HW limits.
+- Properties on a binding must describe *that device*. Integration glue (wrapper hardware, sibling-block regs) belongs in its own binding with a phandle, not as add-on properties on the vendor device node.
+
+### Code-Move / Refactor PRs
+- Hash-compare the moved blobs (pre-move source vs post-move destination) — byte-identical is the gold standard, not visual diff. Use the cleanup-commit's parent in the source repo, not its main tip (which still has the files).
+- Pull the canonical commit list from `gh pr view --json commits` — `git log origin/main..HEAD` may include sibling PRs' commits queued behind this one.
+- For "unreferenced" deletion claims, filter grep results for three recurring false-positive classes: (a) peer files in the same bundle referencing each other, (b) built-artifact snapshots that self-reference, (c) commented-out blocks in build files.
+- Anchor or word-boundary substring greps (`expect_sc` matches `expect_scan`; `dirty_check` matches commented cmake) — otherwise you re-investigate non-issues.
+- **Always re-read the final PR diff right before posting.** Squash/force-push or revert during the review window can erase code your findings target. Snapshot once with `gh pr diff <N>` and audit each parked finding against that snapshot.
+
+## Recurring Patterns (Firmware)
+
+### Shadow + Program pattern
+- Shadow tables hold the source of truth for write-only HW registers.
+- `seed()` populates shadow under mutex; `program()` writes to HW under mutex.
+- Single-entry writes (`write_npa_entry`) update shadow AND program HW if already programmed.
+- Thread-safe: all shadow access protected by the same mutex.
+
+### Init Thread with MW Handshake
+- Dedicated thread waits for middleware signal (semaphore).
+- Timeout → DTS fallback. No timeout → wait forever (production flow).
+- After seed (either MW or DTS), program HW and signal "done".
+- Callers (e.g., link-up path) use `wait_ready()` to block until LUT is programmed.
+
+### Validation-then-mutate
+- Validate ALL inputs before modifying any state.
+- Return error early if invalid — no partial state corruption.
+- Use bitmask tracking (seen_mask) to detect duplicates and gaps in table indices.
+
+## Design Approaches I Approve Of
+
+- **Enum duplication with BUILD_ASSERT:** Public enum (el_se.h) mirrors internal enum (c2c_lut.h) with compile-time assertion that values match. Avoids exposing internal header to external consumers.
+- **DT_INST_FOREACH pattern for device arrays:** Builds static const device pointer arrays at compile time. Clean and zero-cost at runtime.
+- **Topology presets from DTS:** Compile-time struct array initialized from DTS node labels. No runtime parsing, no dynamic allocation.
+- **`c2c_lut_wait_ready()` take-then-give:** Allows multiple callers to "pass through" a one-shot semaphore. First caller blocks until signal; subsequent callers immediately succeed because the sem is given back.
+
+## Anti-patterns I Flag
+
+- **`#if 0` blocks in production code.** Use Kconfig or remove entirely. Dead code rots.
+- **Static `bool table_logged` to suppress repeated logs.** Hides bugs. Use LOG_DBG with Kconfig level control instead.
+- **Per-instance data that's actually global.** If all ports share the same LUT tables, model it as global state (like this PR correctly does) not per-device config.
+- **Casting between structurally-identical but separately-defined structs** (`el_se_chip_info*` → `c2c_chip_info*`). Safe only if layout is guaranteed identical. Prefer BUILD_ASSERT on sizeof and offsetof, or use a single definition.
+
+
+## Lessons Learned
+
+Consolidated by theme. Each bullet is a distilled, reusable rule; review-specific
+provenance is dropped in favor of the principle.
+
+### Snapshot Discipline (before you post)
+- **Always re-pull the final PR diff right before drafting and again before posting.** Subagent file-stat estimates and early `gh pr view --json files` snapshots include intermediate-commit churn that later gets squashed, reverted, or force-pushed away. Findings die silently when they target code that isn't in the final diff. Snapshot once with `gh pr diff <N>` and audit each parked finding against that snapshot.
+- **Pull the canonical commit list from `gh pr view --json commits`.** `git log origin/main..HEAD` may include sibling PRs' commits queued behind this branch (dependency chains, merge queue). Size the diff and scan history from the canonical list.
+- **`grep BUILD_ASSERT` (and existing assertions) across the PR's files before flagging a missing one.** Compile-time coverage for struct layout, field offsets, and enum values is often already present.
+
+### Pick Battles & Scope
+- **3 well-reasoned blockers beat 15 nits.** A representative outcome: 10 findings, 4 posted, 6 dropped/acknowledged. Only substantive issues should reach the PR — author energy is finite.
+- **Distinguish PR-introduced from pre-existing issues.** When a PR refreshes one row of a doc table or touches one function, scope review to that change. Pre-existing errors elsewhere belong in their own PR; flagging them here dilutes signal.
+- **Defer findings to the PR that introduced the code.** Issues uncovered while reading *moved* code (e.g. a `static const` in a header creating one copy per TU) belong on the introducing PR, not the move PR. The move preserves behavior; the introduction made the design choice. Note it for the right author and PR.
+
+### Working With the Author and Other Reviewers
+- **Read the author's own pending draft thread first.** Before drafting, fetch the author's pending review comments (GraphQL `pullRequest.reviews(states: PENDING)` returns the user's own drafts). High chance some findings are already drafted in their words — focus on the gaps.
+- **Read other reviewers' posted comments and threads before drafting.** Avoid duplicating signal; build on or defer to existing threads.
+- **Let the author post their own comments where it fits.** For some findings, the author phrasing them in their own words gives better ownership and tone.
+- **Author redirect dropping a finding is a green flag, not a loss.** "I've already drafted that" or "I disagree, here's why" — if the reasoning holds, drop the planned comment without re-litigating. Signal-to-noise of the posted review matters more than coverage.
+- **"Author tested it" can close a correctness pushback.** When the concern was correctness (not style) and the author runs the code and confirms behavior, that's a valid resolution even without a code change. Reserve insistence for shape/readability issues where testing doesn't address the concern.
+- **Cross-link identical constants across sibling PRs rather than re-litigate.** When the same magic number (timeout, register value, retry count) appears in two PRs from the same author, post the substantive comment on one and a one-line cross-link on the other. One Kconfig hoist resolves both; review doesn't fragment.
+
+### Re-Review After Force-Push / Rebase
+- **Diff the prior reviewed SHA against the new head and triage per file.** Comment-addressing fixes get scrutinized; unrelated rebase artifacts (path repaths from sibling-repo splits, CI config additions) get a glance and a pass. Don't re-review files that didn't change since the last pass.
+- **Don't assume a rebase is clean.** Commit content dates can stay the same while committer dates change. Check for silent changes and for JIRA ticket renumbering in commit messages — renumbering can signal scope changes.
+- **Amended-commit re-reviews are fast.** `git diff <old-sha>..<new-sha>` gives exactly the incremental change; no need to re-read the whole PR.
+- **Verify replaced cross-repo dependencies independently.** When an author swaps a dependency PR in another repo (e.g. infra PR closed, replaced by proj_infra PR), re-verify the new dependency — it may be trivial (a DTS alias) or introduce subtle changes.
+
+### Code-Move & Multi-Repo Refactors
+- **Hash-compare moved blobs, don't eyeball them.** `sha256` of each blob — pre-move source vs post-move destination — collapses correctness to "did the bytes change in transit?". Read moved files only if hashes diverge or the move is paired with intentional edits.
+- **Compare against the cleanup commit's parent, not the source repo's main tip.** Use `<deletion-commit>^` in the source repo; comparing against source `main` HEAD returns empty-file hashes because the files are already gone there.
+- **Verify the deletion set equals the addition set.** For large deletion PRs (tens of thousands of lines), line-by-line review is meaningless. Cross-check: `diff <(git diff --stat | sort) <(git -C ../other diff --stat | sort)`.
+- **Build-system repath changes are the high-signal part.** File moves are mechanical; the cmake/Makefile/starfile/`module.yaml` changes that update include paths are where bugs hide. A wrong root prefix (`ip/infra/` vs `infra/`) silently compiles against the old location while the old branch still has the files. Verify root variables (`MODULE_INFRA_ROOT`/`INFRA_ROOT`) match what consumers reference.
+- **Consumer PRs prove the split.** In a multi-repo split, source and destination define the split; the consumer PRs (tools, proj_infra, fla_rom) prove it works by updating every include path. Review them carefully even when they look trivial — any missed path is a build failure.
+- **Filter three recurring false-positives when validating "unreferenced" deletion claims:** (a) peer files in the same script bundle referencing each other, (b) build-artifact snapshots that re-publish and self-reference the tree, (c) commented-out cmake/build blocks.
+- **Anchor or word-boundary substring greps.** Bare substrings generate noise (`expect_sc` matches `expect_scan`; `dirty_check` matches commented build lines). Use word-boundary regex or eyeball each hit's context before reacting.
+- **Board overlays belong in the application directory.** Zephyr convention is `<app>/boards/<board>.conf` + `<board>.overlay`. A `projects/<product>/<app>/boards/` indirection adds cmake complexity (`BOARD_OVERLAY_SEARCH_DIRS`, product-selection vars) for no gain — the build already searches `<app>/boards/`.
+- **Eliminate single-valued indirection variables early.** A `TOOLS_PROJECT`/product cmake variable that defaults to the only valid value and threads through starfiles, cmake, and paths is complexity debt. Add multi-product plumbing when the second product actually arrives.
+- **`add_subdirectory_ifdef` ordering is rarely a review point.** Driver-list ordering in cmake is seldom strictly alphabetical; don't flag it unless the file enforces it.
+
+### Abstraction & the "Second Consumer" Test
+- **Grep for the second consumer before approving any "vendor-agnostic / pluggable / drop-in" API.** If it doesn't exist, the API shape is speculation — push to land only what has a real caller today.
+- **Identify independent variation axes before approving a single vtable.** Two reuse axes (e.g. swap vendor vs swap integration glue) need two composing device classes, each with its own DT node and driver, linked by phandle — not one vtable inside the vendor driver. Mixing axes defeats the stated reuse: the vendor driver carries integration code, and integration paths share nothing.
+- **Renaming leaf calls is not abstraction.** If both consumers still own the same multi-step sequence (enable → load → unhalt → poll) and only per-step names changed, the reuse is cosmetic. Promote the *orchestration* into an op so consumers share the call, not just the leaf names.
+- **A "future-proofing" enum value or branch with no consumer is dead code in disguise.** Push to drop it; let the consumer-introducing PR shape it correctly.
+- **Offset-as-parameter leaks driver arithmetic into the API.** A `mem_addr_t die_offset` (or `stride * idx`) passed by every consumer forces caller-side stride math and bakes an unchecked "same stride for all bases" assumption. Prefer an opaque per-die id / handle / device instance so the driver owns the arithmetic.
+- **Accept phasing, but each phase must stand on its own consumers.** "This is phase 1" doesn't excuse shipping dead branches or untested abstractions inside phase 1.
+- **A "compatibility wrapper" needs a named external consumer.** If a migration turns the old symbol into a one-line forward and grep shows zero in-repo callers, ask which downstream repo needs the old name. If none, it's dead code with a flattering label — delete or document the consumer.
+- **Superseding PRs: verify the overlap explicitly.** Diff commit messages and content; don't take the author's word that a new PR fully covers the old one.
+
+### Hardware / Register Correctness
+- **Pull the vendor manual before drafting a "why is this here" comment.** Invoke the relevant per-IP doc skill (EP-PHY vs SU/C2C, etc.) and read the register-field description first — it can flip the conclusion entirely ("why is SE doing this weird thing" → "SE is doing the right thing; the other side is latently broken").
+- **Be ready to flip your finding mid-review.** Once the docs are in, re-derive the conclusion from scratch and post the correct framing, not the original hypothesis with a hedge.
+- **Default/auto register paths are bring-up traps.** Vendor HW often exposes an "auto" trigger tied to a clock or reset edge (for power-gating exit). Using it during bring-up couples FW timing to something unrelated (e.g. `ref_clk_en`). Prefer the explicit-control override for first-bring-up; the auto path can stay for runtime PM.
+- **Implicit timing dependencies on integration signals are latent bugs.** Code that "works today" only because an unrelated subsystem asserts a signal at the right moment is temporal coupling waiting to break. Flag it even without a failing test, and ask for the assumption to be documented in the wrapper header.
+- **Diff what each instance writes when two driver instances share a vtable over the same HW.** Asymmetric register writes through a shared API — same in-arg, same physical PHY, different bits — are a contract violation: a latent bug on one side or an undocumented integration delta on the other. Surface before merge.
+- **Two HW paths to the same effect → prefer the one already in the existing driver's footprint.** If a SW-control outcome can be reached via a wrapper-block register or a PHY-core register, and the PHY driver already writes neighboring bits in the core register on init, propose the core-register path: symmetric across wrappers, no per-integration replication.
+- **One-way trapdoor bits deserve a dedicated comment.** A CSR that gates the very access path the host must use to clear it warrants explicit header-level documentation and ideally an asymmetric API split (`unsafe_enable` vs `safe_disable`). Verify in RTL where the gate physically sits — that determines which other CSRs go dark when set.
+- **Inline comment reads inverted → the comment is the bug.** When prose doesn't match the manual's field semantics, fix the comment. Readers trust prose over re-reading the manual; an inverted comment misleads long after the author is gone.
+- **Write-only registers need shadow state** for readback/debug; mask field values before writing; `BUILD_ASSERT` field widths against spec; zero/invalidate stale entries beyond a new table size on reconfigure.
+- **Word-alignment of DT-derived sizes.** Passing a DT reg size to an API expecting a word count (`bytes / sizeof(uint32_t)`) silently truncates if the size isn't word-multiple. Prefer a `BUILD_ASSERT` at the binding/macro layer over a runtime check at the consumer.
+- **Document the *why* of non-trivial HW magic constants** (tail_drop, credit count, enhanced mode). "Empirical knee", "HW capacity ceiling", "minimum to keep pipeline full" — a bare `CREDITS = 2` invites future tuning regressions.
+
+### Concurrency, Caching & Observability
+- **Check observability before flagging a race.** If the suspected bad window produces a `LOG_WRN`, a rejection, and an error return to the caller, the failure is visible and recoverable — it may be the caller's fault, not a defect. Drop the finding.
+- **Evaluate caching tradeoffs against the fast path, not the slow path.** A small atomic cache that guards a hot MMIO path (~10–50ns/access) earns its keep across config sequences of hundreds of writes, even if it looks like overhead in isolation.
+- **Correctness obligations scale with indirection.** A cache introduces a contract (every gate owner must invalidate on close). When the tradeoff is justified, document the obligation at the registration macro (e.g. `EL_DIE_GATE_DEFINE`), not just at the invalidation function.
+- **`STRUCT_SECTION_ITERABLE` + linker fragments is the clean extension pattern** for composable cross-component subsystems — compile-time registration, no runtime tables owned by a single driver. Prefer over vtable dispatch for cross-component coordination.
+- **Hardcoded die ID 0 as "local" is a latent bug.** Transport wrappers comparing extracted die ID against literal 0 break on non-primary dies. Use a runtime-resolved "self" die ID (DTS or global config).
+
+### API Design & Validation
+- **Validate at the boundary, pick one discipline per layer.** Asymmetric validation (upper thunk does `device_is_ready()` on its own device but only NULL-checks the device it forwards to) yields ambiguous error logs and hides which layer failed. Either both layers fully validate with distinct messages, or only the boundary validates and the inner trusts.
+- **Identical log strings across stacked layers are a debug-time tax.** Two layers logging the same string for different conditions guarantees future misattribution. Distinct prefixes or device names cost nothing at write time.
+- **API struct fields shouldn't be conditionally compiled.** A function pointer behind `#ifdef` in the struct means consumers can't safely NULL-check it. Always declare the field, assign only when the impl exists, return `-ENOSYS` at the call site when NULL.
+- **Macro-result member access is a code smell.** Initializer macros ending in `,` then "chained" with `.field = ...` only compile because the comma lives inside the macro body — a fragile inversion of "the call site owns separators". Push back even when it compiles; the fix (move the comma to the call site → `MACRO(x), .field = ...`) is cheap. Validated end-to-end in practice.
+- **`CALL_IF_ENABLED` / `IF_ENABLED` collapse `#if defined(CONFIG_X)` islands** around single conditional calls — equivalent at preprocess, removes ifdef noise. Worth propagating.
+- **Casting between structurally-identical, separately-defined structs** is safe only with `BUILD_ASSERT` on sizeof and every offset — or a single definition.
+
+### Specialized PR Types
+- **Vendor SDK drops are not feature PRs.** Don't review tens of thousands of lines of vendor code line-by-line. Check: right directory? build integration (CMakeLists, Kconfig) correct? version/license header present? Is the tree pristine vs the vendor tarball (local patches belong in a separate overlay, not mixed in)? Is the version captured somewhere auditable for clean future diffs?
+- **Pure data-table PRs: verify cross-repo consistency and spec cross-check.** When the same lookup table is duplicated across repos in different formats (Python dict, shell `case`, Starlark dict), diff entries against each other *and* against the hardware spec/header. The code pattern is trivially correct; the values are where bugs hide.
+- **Design reviews: evaluate each pillar independently.** A multi-part proposal can be 2/3 right. Don't let disagreement on one part color the whole review. Ground every architecture argument in actual code (read the candidate files and prove generalizability or its absence with concrete evidence).
+- **Repo boundary > directory convention for enforcement at scale.** With many devs, a repo boundary creates natural friction (separate CI, CODEOWNERS, release tags); subdirectory conventions rely on review discipline that degrades. When code is misplaced across a boundary, *sharpen the boundary* (move the misplaced code) rather than remove it. Heuristic: a driver that `#include`s an IP register header belongs in the corresponding `ip.` repo; otherwise it's SW infrastructure. Consider scaling (a consolidated repo grows with every product) and CI blast radius (product changes should trigger product CI).
+- **Driver functional-domain file splits.** Name files after the HW concept, not borrowed SW abstractions (`bar_map`/`addr_xlat`, not `mmap`, for BAR→SoC translation). Give each domain file its own Kconfig guard; the init function calls into each via `#if defined(CONFIG_...)`. Avoid `__maybe_unused` — fix variable scoping during the split. Don't add empty `// todo` files (structure without substance). Every `#endif` in nested driver-init macros and internal headers needs a `/* CONFIG_... */` comment. Wrap always-together low-level call sequences (poison mask + MSI-X DBI + security level + response manip) into a single named helper — the name becomes documentation.
+- **Defensive guards inside internal statics — keep or drop is taste.** Note redundancy when a helper's only caller already enforces a guard, but don't insist on removal; depth-in-defense has value if the helper grows new callers.
+- **Avoid naming one specific transport in shared documentation.** When a subsystem can reach remote dies via more than one indirect interface (SPI-GW or side-band), comments and docs must describe the generic mechanism ("indirect interface"), not the platform's current choice. Flag every such mention.
+- **Compile-coverage check on DT-instance macros.** Init macros gated by `DT_INST_FOREACH_STATUS_OKAY` only compile if some CI config enables that instance. When raising shape concerns about such a macro, also ask whether any CI build actually instantiates it.
