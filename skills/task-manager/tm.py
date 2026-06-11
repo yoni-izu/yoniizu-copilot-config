@@ -1727,24 +1727,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return self._send(200, json.dumps({"ok": True, "message": msg, "tasks": tasks},
                                               ensure_ascii=False))
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    class Server(ThreadingHTTPServer):
+        # Avoid "Address already in use" on quick restarts (TIME_WAIT sockets).
+        allow_reuse_address = True
+        daemon_threads = True
+
+    httpd = Server(("127.0.0.1", args.port), Handler)
     PID_FILE.write_text(str(os.getpid()))
 
-    def _cleanup(*_):
-        PID_FILE.unlink(missing_ok=True)
-        try:
-            httpd.shutdown()
-        except Exception:
-            pass
+    # Run the request loop in a background thread so the main thread can call
+    # httpd.shutdown() safely (shutdown() deadlocks if invoked from the same
+    # thread as serve_forever()).
+    stop = threading.Event()
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
 
-    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     print(f"[tm] serving editable dashboard at http://127.0.0.1:{args.port} (Ctrl-C to stop)")
     try:
-        httpd.serve_forever()
+        stop.wait()
     except KeyboardInterrupt:
         pass
     finally:
-        _cleanup()
+        httpd.shutdown()
+        httpd.server_close()
+        PID_FILE.unlink(missing_ok=True)
     return 0
 
 

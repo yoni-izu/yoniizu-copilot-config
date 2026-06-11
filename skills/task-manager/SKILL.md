@@ -93,6 +93,23 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
 
 Only `category: "code-review"` tasks may have `review` / `reviews`; other categories must not.
 
+## Dashboard server (`serve`) — operational notes
+
+The `serve` subcommand backs the **editable** HTML dashboard. The static
+`dashboard` output is read-only; editing only activates when the page is loaded
+from the running server (it probes `/health` and `/api/tasks`).
+
+- **Open the served URL, not the file.** Editing is enabled only at
+  `http://127.0.0.1:8787` (the served page). Opening `~/tasks/dashboard.html`
+  directly (or any `file://` path) shows a **read-only** badge by design.
+- **Port already in use.** If a leftover server holds the port, the systemd unit
+  (`task-dashboard.service`) fails with `Address already in use` and auto-restarts
+  in a loop. Run `python3 ~/.copilot/skills/task-manager/tm.py serve --stop`
+  (or kill the bound PID) before starting the unit.
+- **Survive a full logout.** The systemd user service starts at login. To keep it
+  running with no active session, run `sudo loginctl enable-linger $USER` once
+  (needs polkit/sudo, so it is not done automatically).
+
 ## When to use the LLM instead of the CLI
 
 The CLI is dumb on purpose. For these branches, fall back to direct file edits:
