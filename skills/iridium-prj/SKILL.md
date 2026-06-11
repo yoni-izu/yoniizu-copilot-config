@@ -87,6 +87,7 @@ workspace/variant checkout. A typical workspace contains:
 | `fw/tools/fw_host_streaming_boot/` | Host-side streaming/flashless boot tooling |
 | `kmd/` | Kernel-mode driver(s) for the Iridium Linux stack |
 | `sim/`, `experiments/`, `evidence/`, `logs/` | Simulation, experiment runs, captured evidence |
+| `<repo>/.github/` | Per-repo skills / AI resources. **Every** repo in the workspace carries its own `.github/` with additional skills and AI context — consult them alongside this skill. |
 
 **Local-first strategy** (this skill is global / user-level — the workspace may or may not
 contain the source):
@@ -95,6 +96,9 @@ contain the source):
    (`project.iridium.sw.fw.infra.star` and other `.star`/`elmcli` manifests).
 3. If a needed repo is not local, use the GitHub search tools against the relevant
    `Elmnt-Internal/ip.<ip>.*` repos (see the IP skills for exact repo URLs).
+4. The workspace is multi-repo, with its repo set and layout defined by the `elmcli` manifest.
+   Each repo has a `.github/` directory containing additional skills / AI resources — check
+   the relevant repo's `.github/` for project- or IP-specific guidance before/while researching.
 
 ### Build / Workspace Conventions
 
