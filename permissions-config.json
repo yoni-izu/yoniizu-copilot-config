@@ -108,6 +108,26 @@
           "commandIdentifiers": [
             "env"
           ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "git add",
+            "git commit",
+            "git push"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "gh extension"
+          ]
+        },
+        {
+          "kind": "commands",
+          "commandIdentifiers": [
+            "git config"
+          ]
         }
       ]
     },
