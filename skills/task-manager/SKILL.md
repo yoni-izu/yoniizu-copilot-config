@@ -166,9 +166,9 @@ Combined `review-stop` + status update for the review pass.
    - Outcome was `in-progress` (just stopping without submitting) → keep `in-progress`, clear `workspace`.
 4. Always: `updated = today`, append a note describing the outcome.
 5. Easiest path: do steps 2-4 by calling `tm.py review-update <id> <review_status>` (it handles the derivation). Then update notes / `workspace` directly if needed.
-6. **Memoir update.** Append a lessons-learned entry to `~/review_memoir.md`:
+6. **Memoir update.** Append a lessons-learned entry to the review memoir at `~/.copilot/skills/pr-review/references/memoir.md` (owned by the `pr-review` skill):
    - Read the current memoir first to avoid duplicates and respect existing section names.
-   - Under `## Lessons Learned`, add `### From <feature/topic> Review`.
+   - **Consolidate intelligently:** fold each lesson under the right existing theme heading and merge true duplicates — do not append a per-review log section.
    - Capture: key findings (posted and dropped), new patterns/anti-patterns, reasoning behind drops, process insights.
    - **Strip specifics** — no PR numbers, commit hashes, branch names, line numbers, task IDs, or author names. Make entries reusable.
    - If a finding reinforces an existing guideline, reference it briefly rather than restate it.
