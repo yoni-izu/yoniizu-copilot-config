@@ -24,6 +24,24 @@ argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM contro
 - **C2C Protocol**: Element's internal chip-to-chip protocol running over the PCIe DM controller
 - **Use Case**: High-bandwidth scale-up links between SoCs (e.g., SU ↔ SU peer-to-peer)
 
+## Boot Flow Responsibilities
+
+Reference: [Boot flow](https://elementlabs.atlassian.net/wiki/spaces/SWENG/pages/598671382/Boot+flow) (SWENG space).
+
+FW boots through staged, chained-authenticated images (root of trust starts at FLA.ROM). The MuC-resident runtime stages are **FLA.RT → PRIMEBOOT → MANAGEMENT**; **POWER & THERMAL** runs on the PTuC. Drivers are split into **INIT** (one-time bring-up) and **RUNTIME** (interrupt/operational) components.
+
+Scale Up (SU / C2C) responsibilities by stage (per the proposed driver-functionality split):
+
+| Driver / Module | FLA.RT | PRIMEBOOT | MANAGEMENT | POWER & THERMAL |
+|-----------------|--------|-----------|------------|-----------------|
+| EL C2C          | —      | —         | FULL       | —               |
+| EL SE           | —      | —         | FULL       | —               |
+
+- SU is brought up **entirely in MANAGEMENT** (FULL) — both the C2C protocol driver (`EL C2C`) and the Scale Up engine (`EL SE`, repo `ip.se.sw.fw`). It is **not** active in FLA.RT, PRIMEBOOT, or POWER & THERMAL.
+- The boot-flow page enumerates **PCIe PHY FW** (for the EP, loaded by FLA.RT) and **UCIe PHY FW** (for D2D, loaded by PRIMEBOOT) image loads, but does **not** separately call out an SU PHY FW load — the SU reuses the **same PCIe6 PHY** as the EP.
+
+> The Init-vs-Runtime split is still evolving: after tape-out (TO) some functionality may shift between stages. Treat this as the current plan, not a frozen contract.
+
 ## Document Catalog
 
 ### DM Controller Documents (`~/docs/C2C/`)

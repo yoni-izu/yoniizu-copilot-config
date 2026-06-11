@@ -28,6 +28,25 @@ argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or contr
 - **PCS Wrapper**: Thin layer — CDC + reorder only. MAC does encode/decode/scramble.
 - **PIPE Interface**: PHY ↔ Controller communication. In SerDes arch, raw data crosses PIPE (no 8b/10b or 128b/130b at PIPE boundary).
 
+## Boot Flow Responsibilities
+
+Reference: [Boot flow](https://elementlabs.atlassian.net/wiki/spaces/SWENG/pages/598671382/Boot+flow) (SWENG space).
+
+FW boots through staged, chained-authenticated images (root of trust starts at FLA.ROM). The MuC-resident runtime stages are **FLA.RT → PRIMEBOOT → MANAGEMENT**; **POWER & THERMAL** runs on the PTuC. Drivers are split into **INIT** (one-time bring-up) and **RUNTIME** (interrupt/operational) components.
+
+PCIe EP responsibilities by stage (per the proposed driver-functionality split):
+
+| Driver / Module | FLA.RT | PRIMEBOOT | MANAGEMENT | POWER & THERMAL |
+|-----------------|--------|-----------|------------|-----------------|
+| EL PCIE EP      | INIT   | RUNTIME   | RUNTIME    | —               |
+| EL PIW          | INIT   | —         | RUNTIME    | —               |
+
+- **FLA.RT** (runs on the MuC, executes from SPSRAM) is **primarily responsible for PCIe bring-up**. It loads/authenticates the **PCIe PHY FW ICCM and DCCM** images and copies them into the PHY memories (cold reset only), and runs the PCIe EP / PIW **INIT** path so the host PCIe link can be established — required before the host can stream any further images (the 100 ms PCIe-link target favors early bring-up).
+- **PRIMEBOOT** and **MANAGEMENT** run the PCIe EP **RUNTIME** path; PIW **RUNTIME** lives in MANAGEMENT.
+- Caveat from the page: PCIe init is **currently part of PRIMEBOOT**; depending on timing requirements it may be moved to FLA.RT. Treat the table as the current plan, not a frozen contract.
+
+> The Init-vs-Runtime split is still evolving: after tape-out (TO) some HW init may shift between stages.
+
 ## Document Catalog
 
 ### Top-Level Documents (`~/docs/PCIe EP/`)

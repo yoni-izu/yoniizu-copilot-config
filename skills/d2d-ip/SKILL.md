@@ -22,6 +22,27 @@ argument-hint: 'Ask a question about D2D IP design, protocol, or integration'
 - **UCIe**: Universal Chiplet Interconnect Express — open industry standard for die-to-die and chiplet interconnect, reference for protocol, PHY, and interoperability
 - **Purpose**: High-bandwidth, low-latency communication between dies within the same package; UCIe context for cross-vendor compatibility and industry alignment
 
+## Boot Flow Responsibilities
+
+Reference: [Boot flow](https://elementlabs.atlassian.net/wiki/spaces/SWENG/pages/598671382/Boot+flow) (SWENG space).
+
+FW boots through staged, chained-authenticated images (root of trust starts at FLA.ROM). The MuC-resident runtime stages are **FLA.RT → PRIMEBOOT → MANAGEMENT**; **POWER & THERMAL** runs on the PTuC. Drivers are split into **INIT** (one-time bring-up) and **RUNTIME** (interrupt/operational) components so they can work seamlessly across stages.
+
+D2D responsibilities by stage (per the proposed driver-functionality split):
+
+| Driver / Module | FLA.RT | PRIMEBOOT | MANAGEMENT | POWER & THERMAL |
+|-----------------|--------|-----------|------------|-----------------|
+| EL D2D          | —      | FULL      | FULL       | —               |
+| EL D2D MGR      | —      | FULL      | FULL       | —               |
+| EL D2D WRAPPER  | —      | FULL      | FULL       | —               |
+| EL AW D2D       | —      | FULL      | FULL       | —               |
+
+- **PRIMEBOOT** is the primary stage for D2D: it initializes the D2D HW IP and **brings up the D2D link**, and loads/authenticates the **UCIe PHY FW** image into the PHY memories (cold reset only). Per the page, "the D2D driver will bring up the D2D link as part of PRIMEBOOT."
+- **MANAGEMENT** handles D2D **runtime/interrupts** (D2D interrupts are serviced in both PRIMEBOOT & MANAGEMENT). D2D init code may **also be required in MANAGEMENT** if D2D is reset in a reset where the FW boot flow does not restart.
+- D2D is **not** active in FLA.RT or POWER & THERMAL.
+
+> The Init-vs-Runtime split is still evolving: after tape-out (TO) some HW init currently done in PRIMEBOOT may move to MANAGEMENT or POWER & THERMAL. Treat this as the current plan, not a frozen contract.
+
 ## Document Catalog
 
 ### D2D & UCIe Documents (`~/docs/D2D/`)
