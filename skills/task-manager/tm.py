@@ -45,6 +45,10 @@ REVIEW_STATUSES = {
     "merged",
 }
 TODAY = date.today().isoformat()
+# Timestamp for note prefixes: date + time (notes are stored as
+# ``YYYY-MM-DD HH:MM: msg``). Date-only fields (created/updated/completed)
+# keep using TODAY.
+NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def load() -> dict:
@@ -92,14 +96,15 @@ def last_worked(t: dict) -> str | None:
     """ISO date the task was most recently worked on.
 
     Uses the latest of the ``updated`` field and the most recent note's date
-    prefix (notes are stored as ``YYYY-MM-DD: msg``). Returns None if unknown.
+    prefix (notes are stored as ``YYYY-MM-DD HH:MM: msg``; legacy notes use
+    ``YYYY-MM-DD: msg``). Returns None if unknown.
     """
     candidates: list[str] = []
     upd = t.get("updated")
     if upd:
         candidates.append(upd)
     for note in t.get("notes", []):
-        m = re.match(r"(\d{4}-\d{2}-\d{2}):", note)
+        m = re.match(r"(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)?:", note)
         if m:
             candidates.append(m.group(1))
     valid = []
@@ -145,7 +150,7 @@ def workspace_holder(d: dict, ws: str) -> dict | None:
 
 
 def append_note(t: dict, msg: str) -> None:
-    t.setdefault("notes", []).append(f"{TODAY}: {msg}")
+    t.setdefault("notes", []).append(f"{NOW}: {msg}")
 
 
 def pr_entries(t: dict) -> list[dict]:
@@ -280,7 +285,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     # Workspace auto-assignment
     ws_name = args.workspace or (None if args.no_workspace else detect_workspace(args.cwd))
     status = "todo"
-    notes = [f"{TODAY}: initial submission"]
+    notes = [f"{NOW}: initial submission"]
     assigned_ws = None
     skip_reason = None
 
@@ -291,7 +296,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         holder = workspace_holder(d, ws_name)
         if holder is None:
             assigned_ws = ws_name
-            notes.append(f"{TODAY}: auto-assigned to workspace {ws_name}")
+            notes.append(f"{NOW}: auto-assigned to workspace {ws_name}")
         else:
             status = "backlog"
             skip_reason = f"workspace '{ws_name}' occupied by {holder['id']} ({holder['title']})"
@@ -421,7 +426,7 @@ def cmd_add_review(args: argparse.Namespace) -> int:
         "updated": today,
         "completed": None,
         "workspace": None,
-        "notes": [f"{today}: initial submission" +
+        "notes": [f"{NOW}: initial submission" +
                   (f" ({len(reviews)} PRs)" if len(reviews) > 1 else "")],
         "reviews": reviews,
     }
@@ -1234,7 +1239,7 @@ function daysSince(iso){ if(!iso) return null;
   return Math.floor((Date.now()-d)/(864e5)); }
 function lastWorked(t){
   const cands=[]; if(t.updated) cands.push(t.updated);
-  (t.notes||[]).forEach(n=>{ const m=/^(\d{4}-\d{2}-\d{2}):/.exec(n); if(m) cands.push(m[1]); });
+  (t.notes||[]).forEach(n=>{ const m=/^(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)?:/.exec(n); if(m) cands.push(m[1]); });
   if(!cands.length) return null;
   return cands.sort().slice(-1)[0];
 }
