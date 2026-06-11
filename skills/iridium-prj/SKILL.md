@@ -51,6 +51,7 @@ argument-hint: 'Ask a question about the Iridium project — architecture, PRM/N
 |------|------|---------|
 | `Iridium PRM.docx` | ~2.7MB | Product Reference Manual — the master project spec. 3287 paras, 40 tables. Covers FIU, binning, memory scrubbing, reset flow, trace (ETR/BMON/STM/SPMU), security (SL/SG, CfgR, RR, PB, RAC/WAC, Boot ROM), GPIO/straps, eFuse, D2D, C2C, ECC, interrupts/PLIC, I-cache, MMU, VCore, PCIe, scheduler, VME, manageability, RAS, power/thermal loop, PSOC, logical BIST, CCE, margin tools, run-time FW security, boot-time estimation |
 | `Iridium NoC Specification.docx` | ~7.1MB | NoC / fabric spec. 1662 paras, 18 tables. Covers address map (memory regions, device/host/management/control/debug address spaces, NPA), redundancy (inner-die & platform), device coordinates, scale-up connectivity & routing, device routing, MEM fabric (planes, mRTR/pRTR, virtual channels, data merging, E2E credits), VME & datapaths |
+| `Iridium SoC spec.docx` | — | SoC architecture spec. 487 paras, 11 tables. Covers Architectural Design (**Reset Domains** — authoritative **Table 4-2** reset-domain matrix, *not* in the PRM; **Software Reset Flow**), MMU/PMMU (TLB, PTW, layers), Virtualization (PF/VF: PCIe BMU/iATU/CfgR/MSI-X/TEE, PSOC mailbox/FLR, MMU ASID/gateways, NoC), and PCIe EP capability/RAS support tables. Authority for the reset-domain matrix and SoC-level architecture. |
 
 ### Related Project Data (`~/docs/`)
 

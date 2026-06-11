@@ -24,7 +24,7 @@ the source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
-| _(none yet)_ | | | | |
+| Reset Domains (component × reset type) | [reset-domains.md](reset-domains.md) | reset, reset domains, warm, por, wdt, flr, hot, piw, pcie ep, psoc, muc | Verified from spec | 2026-06-11 |
 
 ## Topic File Template
 
