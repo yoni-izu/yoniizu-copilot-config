@@ -81,7 +81,38 @@ argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or contr
 2. If found locally — read directly from the workspace (fastest, no network)
 3. If NOT found locally — use GitHub search tools to query the remote repos above
 
+## Knowledge Base (Expert Memory)
+
+This skill keeps an **expert memory** of everything it has already researched and verified, so
+repeat questions on the same subject are answered fast without re-reading the (very large)
+controller/PHY docs, EP spec, PIW docs, or RTL.
+
+- **Location:** `~/.copilot/skills/pcie-ep-ip/knowledge/`
+- **Index:** `~/.copilot/skills/pcie-ep-ip/knowledge/INDEX.md` — catalog of recorded topics
+- Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
+  (seeded with `ds-term.md` and `phy-reset.md`, both verified from RTL)
+
+The knowledge base is **always consulted first** (Step 0) and **always updated after**
+non-trivial research (final step). This is what makes the skill grow into a true PCIe EP expert
+over time.
+
 ## Procedure
+
+### Step 0: Consult the Knowledge Base (do this first)
+
+1. Read `~/.copilot/skills/pcie-ep-ip/knowledge/INDEX.md` and scan the topic table.
+2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
+   `knowledge/` directory for the question's keywords:
+   ```python
+   import os, glob
+   kb = os.path.expanduser("~/.copilot/skills/pcie-ep-ip/knowledge")
+   for f in glob.glob(os.path.join(kb, "*.md")):
+       txt = open(f, encoding="utf-8").read()
+       if "<keyword>" in txt.lower():
+           print(f"== {os.path.basename(f)} ==")
+   ```
+3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
+   **narrow** the search before diving into the docs/RTL.
 
 ### Step 1: Classify the Question
 
@@ -142,6 +173,20 @@ for i, para in enumerate(doc.paragraphs):
 4. Always cite the source document and page number in your answer
 5. If the docs don't cover it, check RTL via GitHub search tools
 
+### Step 4: Record Verified Findings (do this last)
+
+After answering a non-trivial question, persist what you verified so the skill remembers it:
+
+1. Create or update `~/.copilot/skills/pcie-ep-ip/knowledge/<topic-slug>.md` using the template
+   in `INDEX.md`. Keep it concise, durable, and reusable.
+2. Add or refresh the topic's row in `INDEX.md` (newest at top) with tags, status, and date.
+3. Always include citations (doc + page, RTL repo + file + symbol) so the finding can be
+   re-verified and trusted.
+4. If new research contradicts a prior entry, **correct** that entry rather than leaving stale
+   information.
+
+Skip recording only for trivial lookups already fully covered by an existing entry.
+
 ### Search Strategy Tips
 
 - **Register by name**: Search reference PDF for the exact register name (e.g., `PORT_LINK_CTRL_OFF`, `TST_CFG_0`)
@@ -161,68 +206,16 @@ for i, para in enumerate(doc.paragraphs):
 | `GEN_CTRL` | varies | PHY ref | General PHY control |
 | `PEP_CTRL_AUX_DS_TERM_CTRL` | PEP_AUX + 0x34 (PF), VF mirrors at 0x10..0x80 | Element EP | Downstream termination control. Reset=0x55. Bits: PF_UNCERR_MSTR_TERM_MASK(0x1), PF_SW_MSTR_TERM(0x2), PF_UNCERR_ELBI_TERM_MASK(0x4), PF_SW_ELBI_TERM(0x8). |
 
-## Downstream Termination (DS_TERM) Datapath (Verified from RTL)
+## Deep-Dive Findings (in the Knowledge Base)
 
-`PEP_CTRL_AUX_DS_TERM_CTRL` controls two independent gates inside the DWC IIP at the **AXI master output stage** — i.e. the controller boundary toward SoC LBW fabric. Source: `Elmnt-Internal/ip.pcie.rtl` → `pep_macro/rtl/pep_axi_mstr.v`:
+Detailed, RTL-verified deep dives have been recorded in the knowledge base — read these files
+before re-researching the same topics:
 
-```verilog
-assign pcil_pf_mstr_ds_term[i] = pcil_pf_mstr_req_vld &
-    ((pcil_cfg_pf_sw_mstr_term[i]) | (pcil_rasdp_err_mode & !pcil_cfg_pf_uncerr_mstr_term_mask[i]));
-assign muxd_aux_g_pf_elbi_ds_term[i] = muxd_aux_g_pf_elbi_req_vld[i] &
-    ((muxd_aux_g_cfg_pf_sw_elbi_term[i]) | (muxd_aux_g_rasdp_err_mode & !muxd_aux_g_cfg_pf_uncerr_elbi_term_mask[i]));
-```
-
-Two trigger sources per gate:
-- `PF_SW_*_TERM` — software/CSR force
-- `rasdp_err_mode & !PF_UNCERR_*_TERM_MASK` — automatic on RASDP uncorrectable error (mask=1 disables this; reset state 0x55 has both masks set, so auto-termination is disabled by default)
-
-### What gets gated by each bit (host → device direction):
-
-| Bit | Gate location | Blocks (host‑initiated) | Survives |
-|-----|--------------|-------------------------|----------|
-| `PF_SW_MSTR_TERM` | DWC IIP MSTR master output | BAR / iATU‑routed MEM TLPs to SoC | Config TLPs (handled inside controller); ELBI path; embedded EP CPU |
-| `PF_SW_ELBI_TERM` | DWC IIP ELBI master output | **All host CSR access via ELBI** — PIW regs, PEP_CTRL_AUX (incl. `DS_TERM_CTRL` itself), PEP_CTRL_CORE, rest of SoC | Config TLPs; MSTR path; embedded EP CPU; sideband (JTAG/BMC) |
-
-### Notification:
-- ELBI gate firing raises `intr_sei_ds_term_elbi_pulse_intr` (signal `muxd_aux_g_elbi_term` in `pep_macro/rtl/pcie_iip_device_wrap.v`)
-- FW SEI bit: `IIP_AUX_SEI_BIT_DS_TERM_ELBI` (`fw/ip/pcie/include/el_piw_sei_bits.h`); handler bound in `fw/ip/pcie/drivers/el_piw/el_piw_sei_tree.c`
-
-### Host‑side one‑way trapdoor:
-- `el_pcie_safe_write32` traverses ELBI when `CONFIG_EL_PCIE_IF_ELBI=y` (`fw/ip/pcie/include/el_pcie.h`)
-- "Safe" in cluster architecture (`fw/ip/pcie/docs/pcie-cluster-architecture.md`) means resilient to transaction‑level disruption (FLR, BAR remap) — **NOT** ELBI termination
-- Once host sets `PF_SW_ELBI_TERM=1` via ELBI, the clear write cannot land — the gate sits in front of `PEP_CTRL_AUX`. Recovery requires the embedded EP CPU (local LBW access, unaffected) or a sideband path
-- Host self‑test (`drivers/snps_ep_ctl/tests/host_tests_sv.c`) uses `wait_for_user_to_disable_elbi_termination(...)` as the manual recovery workaround
-- API: `dwc_ep_ctl_set_downstream_termination(dev, enable)` toggles both `PF_SW_MSTR_TERM` and `PF_SW_ELBI_TERM` together
-
-### Unrelated mechanism — don't confuse:
-- `PIW_RR_MAIN_CFG_ELBI_MNG_SEC_TERM_*`, `PIW_*_CFG_TEE_TERM_*`, `PIW_MNG_CFG_{SEC,EMPTY_STRB,NARROW_BURST,MSI_WR,MSIX_WR}_TERM_*` are **separate AXI security/range filters in PIW**, downstream of the DWC DS_TERM gate. Different blocks, different schema (`AXI_TERMINATION{,_CFG}.yml`).
-
-## PHY Reset Signal Chain (Verified from RTL)
-
-Two distinct PHY reset signals, both generated by Synopsys `DWC_pcie_clkrst.v` inside `pep_wrap.v`:
-
-### Inputs to controller reset block (from PSOC via `pcie_ep_cls.v`):
-- `perst_n` ← `async_psoc2pep_perst_n` — PERST from PSOC reset manager (or external GPIO pad)
-- `power_up_rst_n` / `button_rst_n` ← `async_pep_rst_n` — cold/power-on reset from PSOC
-
-### Outputs from controller to PPW:
-| Signal | Asserted on | Drives in PPW |
-|--------|------------|---------------|
-| `phy_perst_n` | Cold reset, Warm reset, **PERST** | `phy_reset` (= `~phy_perst_n`), APB `presetn`, JTAG `trstn`, SRAM `rst_n` |
-| `phy_rst_n` | Cold reset, Warm reset, **PERST**, **Hot reset** | Per-lane `pipe_laneX_reset_n` |
-
-### Key facts:
-- **PERST asserts both `phy_perst_n` and `phy_rst_n`** — full PHY reset including FW SRAM wipe
-- **Hot reset only asserts `phy_rst_n`** — PIPE lane reset only, no PHY core/FW/SRAM impact
-- FLR, platform, WD, hard, soft, debug resets do NOT reach the PHY at all
-- After PERST, PIW `fw_sram_copy_handler` automatically re-copies FW from PIW SRAM → PHY SRAM (FSM in `piw_macro/rtl/fw_sram_copy_handler.v`)
-
-### PSOC reset manager mapping (from `ip.psoc.rtl`):
-- PSOC has 9 reset types → 129 unit reset outputs
-- PCIe units = `async_pcie_rst_n[1:0]` (unit indices 16-17)
-- `async_prstn` (PERST output) can be sourced from either unit_rst[16] or external GPIO pad (CSR selectable)
-- Only **POR** and **warm reset** types assert PCIe unit resets by default
-- Hot/FLR flow goes FROM PCIe TO PSOC (`async_pcie2psoc_hot_rst_n`, `async_pcie2psoc_flr_rst_n`), not the other way
+- **Downstream Termination (DS_TERM) datapath** — `knowledge/ds-term.md`
+  (what each `PEP_CTRL_AUX_DS_TERM_CTRL` bit gates, SW vs RASDP triggers, ELBI one-way trapdoor,
+  SEI notification, and the unrelated PIW AXI filters)
+- **PHY reset signal chain** — `knowledge/phy-reset.md`
+  (`phy_perst_n` vs `phy_rst_n`, PERST vs Hot reset, FW SRAM re-copy, PSOC reset-manager mapping)
 
 ## Important Notes
 

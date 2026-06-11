@@ -45,7 +45,37 @@ argument-hint: 'Ask a question about D2D IP design, protocol, or integration'
 2. If found locally — read directly from the workspace (fastest, no network)
 3. If NOT found locally — use GitHub search tools to query the remote repos above
 
+## Knowledge Base (Expert Memory)
+
+This skill keeps an **expert memory** of everything it has already researched and verified, so
+repeat questions on the same subject are answered fast without re-reading the spec or RTL.
+
+- **Location:** `~/.copilot/skills/d2d-ip/knowledge/`
+- **Index:** `~/.copilot/skills/d2d-ip/knowledge/INDEX.md` — catalog of recorded topics
+- Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
+
+The knowledge base is **always consulted first** (Step 0) and **always updated after**
+non-trivial research (final step). This is what makes the skill grow into a true D2D expert
+over time.
+
 ## Procedure
+
+### Step 0: Consult the Knowledge Base (do this first)
+
+1. Read `~/.copilot/skills/d2d-ip/knowledge/INDEX.md` and scan the topic table.
+2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
+   `knowledge/` directory for the question's keywords:
+   ```python
+   import os, glob
+   kb = os.path.expanduser("~/.copilot/skills/d2d-ip/knowledge")
+   for f in glob.glob(os.path.join(kb, "*.md")):
+       txt = open(f, encoding="utf-8").read()
+       if "<keyword>" in txt.lower():
+           print(f"== {os.path.basename(f)} ==")
+   ```
+3. If a recorded finding fully answers the question, use it (cite it) and skip to verifying it
+   is still current only if there's reason to doubt it. Otherwise, use it to **narrow** the
+   search before diving into the spec/RTL.
 
 ### Step 1: Search the Specification
 
@@ -88,6 +118,20 @@ for t_idx, table in enumerate(doc.tables):
 4. The docx may have images/diagrams — mention when a diagram would be helpful but cannot be rendered
 5. Always cite the paragraph number or table index in your answer
 6. If the spec doesn't cover it, check RTL via GitHub search tools
+
+### Step 3: Record Verified Findings (do this last)
+
+After answering a non-trivial question, persist what you verified so the skill remembers it:
+
+1. Create or update `~/.copilot/skills/d2d-ip/knowledge/<topic-slug>.md` using the template in
+   `INDEX.md`. Keep it concise, durable, and reusable.
+2. Add or refresh the topic's row in `INDEX.md` (newest at top) with tags, status, and date.
+3. Always include citations (spec paragraph/table, RTL repo + file + symbol) so the finding can
+   be re-verified and trusted.
+4. If new research contradicts a prior entry, **correct** that entry rather than leaving stale
+   information.
+
+Skip recording only for trivial lookups already fully covered by an existing entry.
 
 ### Search Strategy Tips
 

@@ -81,7 +81,38 @@ The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are sh
 | Use case | SU ↔ SU links, can act as RC or EP | Host-facing endpoint |
 | PHY | Identical PCIe6 PHY | Identical PCIe6 PHY |
 
+## Knowledge Base (Expert Memory)
+
+This skill keeps an **expert memory** of everything it has already researched and verified, so
+repeat questions on the same subject are answered fast without re-reading the (very large) DM
+controller docs, PHY docs, C2C spec, or RTL.
+
+- **Location:** `~/.copilot/skills/su-ip/knowledge/`
+- **Index:** `~/.copilot/skills/su-ip/knowledge/INDEX.md` — catalog of recorded topics
+- Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
+
+The knowledge base is **always consulted first** (Step 0) and **always updated after**
+non-trivial research (final step). This is what makes the skill grow into a true Scale Up
+expert over time. (PHY facts equally true for the EP can also be recorded in the `pcie-ep-ip`
+knowledge base — the PHY is identical.)
+
 ## Procedure
+
+### Step 0: Consult the Knowledge Base (do this first)
+
+1. Read `~/.copilot/skills/su-ip/knowledge/INDEX.md` and scan the topic table.
+2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
+   `knowledge/` directory for the question's keywords:
+   ```python
+   import os, glob
+   kb = os.path.expanduser("~/.copilot/skills/su-ip/knowledge")
+   for f in glob.glob(os.path.join(kb, "*.md")):
+       txt = open(f, encoding="utf-8").read()
+       if "<keyword>" in txt.lower():
+           print(f"== {os.path.basename(f)} ==")
+   ```
+3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
+   **narrow** the search before diving into the docs/RTL.
 
 ### Step 1: Classify the Question
 
@@ -154,6 +185,20 @@ for t_idx, table in enumerate(doc.tables):
 4. For PHY questions: use the same PHY docs as PCIe EP (located under `~/docs/PCIe EP/phy/`)
 5. Always cite the source document and page number in your answer
 6. If the docs don't cover it, check RTL via GitHub search tools
+
+### Step 4: Record Verified Findings (do this last)
+
+After answering a non-trivial question, persist what you verified so the skill remembers it:
+
+1. Create or update `~/.copilot/skills/su-ip/knowledge/<topic-slug>.md` using the template in
+   `INDEX.md`. Keep it concise, durable, and reusable.
+2. Add or refresh the topic's row in `INDEX.md` (newest at top) with tags, status, and date.
+3. Always include citations (doc + page, RTL repo + file + symbol) so the finding can be
+   re-verified and trusted.
+4. If new research contradicts a prior entry, **correct** that entry rather than leaving stale
+   information.
+
+Skip recording only for trivial lookups already fully covered by an existing entry.
 
 ### Search Strategy Tips
 
