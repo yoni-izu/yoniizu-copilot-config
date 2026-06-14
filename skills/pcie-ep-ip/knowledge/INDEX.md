@@ -24,6 +24,7 @@ re-reading the (very large) source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| PCIe6 PHY instance count per die (Iridium) | [phy-instance-count.md](phy-instance-count.md) | phy instances, per die, pcie ep, scale up, se, c2c, count | Verified from project DTS | 2026-06-14 |
 | Downstream Termination (DS_TERM) datapath | [ds-term.md](ds-term.md) | ds_term, pep_ctrl_aux, elbi, mstr, rasdp, termination, host trapdoor | Verified from RTL | 2026-06-11 |
 | PHY reset signal chain | [phy-reset.md](phy-reset.md) | phy reset, perst, hot reset, phy_perst_n, phy_rst_n, psoc reset, fw sram copy | Verified from RTL | 2026-06-11 |
 
