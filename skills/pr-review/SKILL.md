@@ -45,9 +45,18 @@ Read [references/memoir.md](./references/memoir.md) in full. Note which "Always 
 **Local workspace mode:** see [Local Workspace Mode](#local-workspace-mode) below for diff acquisition, then continue with Step 2 unchanged.
 
 ### Step 2 — Read existing review state first
+
+**Always inventory every pre-existing comment before forming new findings — never review a PR as if it were untouched.** Existing threads are first-class review inputs: each one is either resolved, still-open, or stale, and that disposition shapes the verdict.
+
 1. **Author's own pending drafts:** fetch via GraphQL `pullRequest.reviews(states: PENDING)` (or `gh api graphql`). Many findings may already be drafted in the author's words — focus on the gaps.
-2. **Other reviewers' posted comments and threads:** read them so you don't duplicate signal; build on or defer to existing threads.
-3. **Existing pending review by the user:** inspect it; never clobber it.
+2. **All prior review comments and threads** (yours, other reviewers', and bots like Copilot/CI): pull the full set with `gh pr view <N> --json reviews,comments` and the review-thread resolution state via GraphQL (`pullRequest.reviewThreads` → `isResolved`, `comments`). Read every thread so you don't duplicate signal and so you can build on or defer to it.
+3. **For each existing comment/thread, determine whether the author attended to it.** This is mandatory, not optional:
+   - **Map the thread to its code anchor** and check the *current* diff snapshot (from Step 1) for a change that addresses it. A resolved/outdated thread whose target lines changed is likely handled; an unresolved thread on still-unchanged code is likely open.
+   - **Cross-check the commit history** (`gh pr view <N> --json commits`, `git log`) for a fix commit referencing the comment, and read the author's reply on the thread.
+   - Classify each prior thread as: **Addressed** (code changed or convincingly answered), **Partially addressed** (some but not all of the ask), **Unaddressed** (no change, no reply, still valid), **Acknowledged-won't-fix** (author declined with rationale), or **Stale/moot** (target code removed).
+   - For **Unaddressed** or **Partially addressed** threads that you still agree with, carry them forward as findings (re-anchored to current lines) so they aren't silently lost. For ones you now disagree with, note them in the Dropped/considered section with the reason.
+   - **Decide if anything should be added** to an existing thread: a follow-up nudge, a clarification, or a note that a fix is incomplete. Prefer replying on the existing thread over opening a duplicate.
+4. **Existing pending review by the user:** inspect it; never clobber it.
 
 ### Step 3 — Analyze and form findings
 Apply the memoir's checklists plus independent reasoning. For each candidate finding:
@@ -60,7 +69,7 @@ Apply the memoir's checklists plus independent reasoning. For each candidate fin
 Write a draft to [drafts/](./drafts/) using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
 
 ### Step 5 — Present for approval
-Show the user the full draft: findings grouped by severity, a **recommended verdict** (approve / comment / request-changes) with one-line justification, and the dropped list. Ask which comments to post and whether to submit the verdict. Do nothing on GitHub yet.
+Show the user the full draft: a **Prior comments** disposition table (each existing thread marked Addressed / Partially / Unaddressed / Won't-fix / Stale, with what the author did and any follow-up to add), findings grouped by severity, a **recommended verdict** (approve / comment / request-changes) with one-line justification, and the dropped list. Call out any unaddressed prior comments explicitly — they often gate the verdict. Ask which comments to post and whether to submit the verdict. Do nothing on GitHub yet.
 
 ### Step 6 — Submit only what's approved
 On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set into [drafts/](./drafts/) (e.g. `pr-<N>-submitted-<timestamp>.md`).
@@ -92,15 +101,16 @@ For each review repo:
 
 ### Continue with the standard flow
 - Step 2 (existing review state) and Step 6 (submission) still hit **GitHub** — the author's pending drafts, other reviewers' threads, and posted comments live there. Use the `owner`/`repo`/`pr_number` from the store/`gh` to target the right PR.
-- Draft to [drafts/](./drafts/) as usual; record the local head SHA reviewed.
-- When done, prefer `task-manager review-done <id> <outcome>` so the review task status and the memoir update flow through the task-manager lifecycle.
+- Draft to [drafts/](./drafts/) as usual; record the local head SHA reviewed (one per repo in a multi-repo set).
+- When done, prefer `task-manager review-done <id> <outcome>` so the review task status and the memoir update flow through the task-manager lifecycle. **Record the reviewed head SHA(s) in the task notes** (e.g. `reviewed @ <repo>:<sha>`), so the next re-review can diff `that-sha .. new-head` without re-deriving the baseline. This is the authoritative re-review baseline when no prior draft exists.
 
 ## Re-Review (force-push / rebase)
 When invoked with `re-review` or when the PR changed since the last pass:
-1. Find the previously reviewed SHA (from the prior draft in [drafts/](./drafts/)).
-2. `git diff <old-sha>..<new-sha>` (or `gh pr diff`) and triage per file: scrutinize comment-addressing fixes; glance-and-pass unrelated rebase artifacts (path repaths, CI config). Don't re-review unchanged files.
-3. Check for silent changes and JIRA ticket renumbering in commit messages (can signal scope change).
-4. Re-audit each parked finding against the fresh diff snapshot — drop any whose target code no longer exists.
+1. **Find the last actually-reviewed SHA** — the head from the *previous review pass*, not the head you just recomputed this session. Resolve it in priority order: (a) the `Head SHA reviewed` line in the most recent prior draft in [drafts/](./drafts/); (b) the `reviewed @ <sha>` recorded in the task-manager task notes (see `review-done`); (c) the `commit.oid` GitHub attaches to your last submitted review (`gh pr view <N> --json reviews` / GraphQL `reviews.nodes.commit.oid`). **Never diff a SHA against itself** — if old and new heads match, retrieve the older one from (a)/(b)/(c) before concluding "no new code".
+2. **Fetch the old SHA even if it was force-pushed away** (`git fetch origin <old-sha>`; rebases orphan it but it stays fetchable by hash). Then `git diff <old-sha>..<new-sha>` (or `gh pr diff`) and triage per file: scrutinize comment-addressing fixes; glance-and-pass unrelated rebase artifacts (path repaths, CI config, base advances). Don't re-review unchanged files.
+3. **Confirm "no new code" by diff, never by head-equality alone.** A rebase changes the head SHA even when your session's recomputed head already matches the PR head; the real question is `old-reviewed-SHA .. current-head`. New files (e.g. a driver split) hide here — list `git diff --name-status <old>..<new>` before claiming nothing changed.
+4. Check for silent changes and JIRA ticket renumbering in commit messages (can signal scope change).
+5. Re-audit each parked finding against the fresh diff snapshot — drop any whose target code no longer exists.
 
 ## Draft Template
 
@@ -113,6 +123,9 @@ When invoked with `re-review` or when the PR changed since the last pass:
 
 ## Recommended verdict: <approve | comment | request-changes>
 <one-line justification>
+
+## Prior comments (existing threads)
+- [<Addressed | Partially | Unaddressed | Won't-fix | Stale>] <file>:<line> — <commenter>: <one-line gist> — <how the author attended to it / what's still missing / follow-up to add>
 
 ## Findings
 ### [BLOCKER] <file>:<line>
