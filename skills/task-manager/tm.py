@@ -1054,6 +1054,34 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   }
   .chip input { accent-color:var(--accent); margin:0; }
   .chip.on { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+  .dd { position:relative; }
+  .dd-btn {
+    display:inline-flex; align-items:center; justify-content:space-between; gap:8px;
+    min-width:160px; padding:7px 10px; border:1px solid var(--border); border-radius:8px;
+    background:var(--bg); color:var(--text); cursor:pointer; font:inherit; user-select:none;
+  }
+  .dd-btn:hover { border-color:var(--accent); }
+  .dd.open .dd-btn { border-color:var(--accent); }
+  .dd-btn .dd-label { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .dd-btn.has-sel .dd-label { color:var(--accent); font-weight:600; }
+  .dd-caret { font-size:10px; opacity:.7; }
+  .dd-panel {
+    display:none; position:absolute; z-index:20; top:calc(100% + 4px); left:0;
+    min-width:100%; max-height:280px; overflow:auto; padding:6px;
+    background:var(--panel); border:1px solid var(--border); border-radius:10px; box-shadow:var(--shadow);
+  }
+  .dd.open .dd-panel { display:block; }
+  .dd-opt {
+    display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:7px;
+    cursor:pointer; font-size:13px; white-space:nowrap;
+  }
+  .dd-opt:hover { background:var(--accent-soft); }
+  .dd-opt input { accent-color:var(--accent); margin:0; }
+  .dd-clear {
+    width:100%; margin-top:4px; padding:5px 8px; border:none; border-top:1px solid var(--border);
+    background:none; color:var(--muted); cursor:pointer; font:inherit; font-size:12px; text-align:left;
+  }
+  .dd-clear:hover { color:var(--accent); }
   input[type=search], select, input[type=text], input[type=number], textarea {
     font:inherit; padding:7px 10px; border:1px solid var(--border); border-radius:8px;
     background:var(--bg); color:var(--text); min-width:160px;
@@ -1070,6 +1098,18 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   button.primary { background:var(--accent); border:1px solid var(--accent); color:#fff; cursor:pointer;
     padding:6px 12px; border-radius:8px; font:inherit; }
   button.primary:hover { filter:brightness(1.05); }
+  .header-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  button.refresh {
+    display:inline-flex; align-items:center; gap:6px; background:var(--panel); color:var(--text);
+    border:1px solid var(--border); border-radius:8px; padding:7px 12px; cursor:pointer; font:inherit;
+    box-shadow:var(--shadow);
+  }
+  button.refresh:hover { border-color:var(--accent); color:var(--accent); }
+  button.refresh:disabled { opacity:.6; cursor:default; }
+  button.refresh .ico { display:inline-block; font-size:14px; line-height:1; }
+  button.refresh.spinning .ico { animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .refresh-note { font-size:11px; color:var(--muted); margin-top:4px; text-align:right; }
   table { width:100%; border-collapse:collapse; background:var(--panel);
           border:1px solid var(--border); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
   th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--border); vertical-align:top; }
@@ -1094,6 +1134,22 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     .s-backlog{background:#4c1d9544;color:#c4b5fd;} .s-cancelled,.p-low{background:#37415133;color:#9ca3af;}
   }
   .cat { font-size:11px; color:var(--muted); }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; margin:16px 0 0; border-bottom:1px solid var(--border); }
+  .tab { padding:8px 16px; border:1px solid transparent; border-bottom:none; border-radius:8px 8px 0 0;
+         cursor:pointer; font:inherit; font-size:13px; font-weight:600; color:var(--muted); background:none; }
+  .tab:hover { color:var(--accent); }
+  .tab.on { color:var(--accent); background:var(--panel); border-color:var(--border); margin-bottom:-1px; }
+  .tab .badge-count { font-size:11px; font-weight:500; color:var(--muted); margin-left:7px; }
+  .tab.on .badge-count { color:var(--accent); }
+  .rv-pending{background:#e5e7eb;color:#6b7280;} .rv-in-progress{background:#fef3c7;color:#92400e;}
+  .rv-commented{background:#e0edff;color:#1d4ed8;} .rv-changes-requested{background:#fee2e2;color:#b91c1c;}
+  .rv-waiting-for-re-review{background:#ede9fe;color:#6d28d9;} .rv-approved{background:#dcfce7;color:#15803d;}
+  .rv-merged{background:#dcfce7;color:#15803d;}
+  @media (prefers-color-scheme: dark){
+    .rv-pending{background:#37415133;color:#9ca3af;} .rv-in-progress{background:#78350f44;color:#fcd34d;}
+    .rv-commented{background:#1e3a8a33;color:#93c5fd;} .rv-changes-requested{background:#7f1d1d44;color:#fca5a5;}
+    .rv-waiting-for-re-review{background:#4c1d9544;color:#c4b5fd;} .rv-approved,.rv-merged{background:#14532d44;color:#86efac;}
+  }
   .detail td { background:var(--bg); }
   .detail-box { display:grid; gap:10px; padding:6px 2px; }
   .detail-box h4 { margin:0 0 4px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
@@ -1119,10 +1175,19 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Task Dashboard <span id="modebadge" class="mode ro">read-only</span></h1>
-  <div class="sub">Generated __GENERATED__ · <span id="total"></span></div>
+  <div class="header-top">
+    <div>
+      <h1>Task Dashboard <span id="modebadge" class="mode ro">read-only</span></h1>
+      <div class="sub">Generated __GENERATED__ · <span id="total"></span></div>
+    </div>
+    <div>
+      <button class="refresh" id="refresh" title="Reload entry values without losing filters, tab, or sort"><span class="ico">↻</span> Refresh</button>
+      <div class="refresh-note" id="refresh-note"></div>
+    </div>
+  </div>
 </header>
 <div class="wrap">
+  <nav class="tabs" id="tabs"></nav>
   <div class="stats" id="stats"></div>
 
   <div class="controls">
@@ -1133,25 +1198,40 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="grp">
         <span class="lbl">Status</span>
-        <div class="chips" id="f-status"></div>
+        <div class="dd" id="dd-status">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-status"></div>
+        </div>
       </div>
-      <div class="grp">
+      <div class="grp" id="grp-category">
         <span class="lbl">Category</span>
-        <div class="chips" id="f-category"></div>
+        <div class="dd" id="dd-category">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-category"></div>
+        </div>
       </div>
       <div class="grp">
         <span class="lbl">Priority</span>
-        <div class="chips" id="f-priority"></div>
+        <div class="dd" id="dd-priority">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-priority"></div>
+        </div>
       </div>
     </div>
     <div class="row" style="margin-top:12px;">
       <div class="grp">
         <span class="lbl">Complexity</span>
-        <select id="f-complexity"><option value="">All</option></select>
+        <div class="dd" id="dd-complexity">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-complexity"></div>
+        </div>
       </div>
       <div class="grp">
         <span class="lbl">Workspace</span>
-        <select id="f-workspace"><option value="">All</option></select>
+        <div class="dd" id="dd-workspace">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-workspace"></div>
+        </div>
       </div>
       <div class="grp">
         <span class="lbl">Sort by</span>
@@ -1175,8 +1255,13 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="toolbar">
-      <span class="lbl" style="color:var(--muted);font-size:11px;">Columns:</span>
-      <div class="chips" id="cols"></div>
+      <div class="grp" style="flex-direction:row; align-items:center; gap:8px;">
+        <span class="lbl" style="color:var(--muted);font-size:11px;">Columns</span>
+        <div class="dd" id="dd-cols">
+          <button type="button" class="dd-btn"><span class="dd-label">Columns</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="cols"></div>
+        </div>
+      </div>
       <button class="link" id="reset" style="margin-left:auto;">Reset filters</button>
     </div>
   </div>
@@ -1203,6 +1288,9 @@ const COLUMNS = [
   {key:"category",label:"Category",  on:true},
   {key:"priority",label:"Priority",  on:true},
   {key:"status",  label:"Status",    on:true},
+  {key:"reviewstatus",label:"Review", on:false},
+  {key:"prs",     label:"PRs",       on:false},
+  {key:"author",  label:"Author",    on:false},
   {key:"complexity",label:"Cx",      on:false},
   {key:"cost",    label:"Est",       on:true},
   {key:"jira",    label:"Jira",      on:true},
@@ -1210,6 +1298,17 @@ const COLUMNS = [
   {key:"age",     label:"Age",       on:true},
   {key:"worked",  label:"Worked",    on:true},
 ];
+
+// Per-tab column presets (smart category views). Order follows COLUMNS.
+const TAB_DEFS = {
+  "all":         {cols:["id","title","category","priority","status","cost","jira","age","worked"]},
+  "development": {cols:["id","title","priority","status","complexity","cost","workspace","age","worked"]},
+  "code-review": {cols:["id","title","priority","status","reviewstatus","prs","author","age"]},
+  "planning":    {cols:["id","title","priority","status","jira","age","worked"]},
+  "testing":     {cols:["id","title","priority","status","complexity","cost","age"]},
+  "misc":        {cols:["id","title","priority","status","age","worked"]},
+};
+let activeTab = "all";
 
 // Column key -> how to extract a comparable value
 function sortVal(t,key){
@@ -1226,6 +1325,9 @@ function sortVal(t,key){
     case "age": return t.created||"";        // ascending = oldest first
     case "created": return t.created||"";
     case "worked": return lastWorked(t)||"";
+    case "reviewstatus": { const p=prs(t); return p.length?(p.map(r=>r.review_status||"").sort()[0]||""):"~"; }
+    case "prs": { const p=prs(t); return p.length?(p[0].repo+"#"+p[0].pr_number):"~"; }
+    case "author": { const p=prs(t); return p.length?(p[0].author||""):"~"; }
   }
   return "";
 }
@@ -1254,69 +1356,74 @@ function feature(t){
   return f.length>90 ? f.slice(0,89)+"…" : f;
 }
 
-// ---- build filter chips ----
+// ---- build filter dropdowns ----
 function uniq(arr){ return [...new Set(arr)]; }
-function chip(container, value, label, group){
-  const lab=document.createElement("label"); lab.className="chip";
+const DD_GROUPS = ["status","category","priority","complexity","workspace"];
+function ddItem(container, value, label, group){
+  const lab=document.createElement("label"); lab.className="dd-opt";
   lab.innerHTML=`<input type="checkbox" data-group="${group}" value="${esc(value)}"> ${esc(label)}`;
   const cb=lab.querySelector("input");
-  cb.addEventListener("change",()=>{ lab.classList.toggle("on",cb.checked); render(); });
+  cb.addEventListener("change",()=>{ updateDdLabel(group); render(); });
   container.appendChild(lab);
 }
-function buildFilters(){
-  document.getElementById("f-status").innerHTML="";
-  document.getElementById("f-category").innerHTML="";
-  document.getElementById("f-priority").innerHTML="";
-  STATUS_ORDER.filter(s=>TASKS.some(t=>t.status===s))
-    .forEach(s=>chip(document.getElementById("f-status"),s,s,"status"));
-  uniq(TASKS.map(t=>t.category)).sort()
-    .forEach(c=>chip(document.getElementById("f-category"),c,c,"category"));
-  PRI_ORDER.filter(p=>TASKS.some(t=>t.priority===p))
-    .forEach(p=>chip(document.getElementById("f-priority"),p,p,"priority"));
-
-  const cpxSel=document.getElementById("f-complexity");
-  cpxSel.innerHTML='<option value="">All</option>';
-  CPX_ORDER.filter(c=>TASKS.some(t=>t.complexity===c))
-    .forEach(c=>{ const o=document.createElement("option"); o.value=c; o.textContent=c; cpxSel.appendChild(o); });
-  const wsSel=document.getElementById("f-workspace");
-  wsSel.innerHTML='<option value="">All</option>';
-  uniq(TASKS.map(t=>t.workspace).filter(Boolean)).sort()
-    .forEach(w=>{ const o=document.createElement("option"); o.value=w; o.textContent=w; wsSel.appendChild(o); });
+function updateDdLabel(group){
+  const dd=document.getElementById("dd-"+group); if(!dd) return;
+  const btn=dd.querySelector(".dd-btn"); const lbl=btn.querySelector(".dd-label");
+  const vals=checkedVals(group);
+  btn.classList.toggle("has-sel", vals.length>0);
+  lbl.textContent = vals.length===0 ? "All" : (vals.length===1 ? vals[0] : vals.length+" selected");
 }
-
-// ---- column toggles ----
-const colsBox=document.getElementById("cols");
-COLUMNS.forEach(c=>{
-  const lab=document.createElement("label"); lab.className="chip"+(c.on?" on":"");
-  lab.innerHTML=`<input type="checkbox" ${c.on?"checked":""}> ${esc(c.label)}`;
-  const cb=lab.querySelector("input");
-  cb.addEventListener("change",()=>{ c.on=cb.checked; lab.classList.toggle("on",cb.checked); render(); });
-  colsBox.appendChild(lab);
-});
+function buildFilters(){
+  ["status","category","priority","complexity","workspace"].forEach(g=>{
+    document.getElementById("f-"+g).innerHTML="";
+  });
+  STATUS_ORDER.filter(s=>TASKS.some(t=>t.status===s))
+    .forEach(s=>ddItem(document.getElementById("f-status"),s,s,"status"));
+  uniq(TASKS.map(t=>t.category)).sort()
+    .forEach(c=>ddItem(document.getElementById("f-category"),c,c,"category"));
+  PRI_ORDER.filter(p=>TASKS.some(t=>t.priority===p))
+    .forEach(p=>ddItem(document.getElementById("f-priority"),p,p,"priority"));
+  CPX_ORDER.filter(c=>TASKS.some(t=>t.complexity===c))
+    .forEach(c=>ddItem(document.getElementById("f-complexity"),c,c,"complexity"));
+  uniq(TASKS.map(t=>t.workspace).filter(Boolean)).sort()
+    .forEach(w=>ddItem(document.getElementById("f-workspace"),w,w,"workspace"));
+  DD_GROUPS.forEach(updateDdLabel);
+}
 
 function checkedVals(group){
   return [...document.querySelectorAll(`input[data-group="${group}"]:checked`)].map(c=>c.value);
 }
-const cpxSel=document.getElementById("f-complexity");
-const wsSel=document.getElementById("f-workspace");
+
+// ---- dropdown open/close ----
+document.querySelectorAll(".dd").forEach(dd=>{
+  dd.querySelector(".dd-btn").addEventListener("click",e=>{
+    e.stopPropagation();
+    const wasOpen=dd.classList.contains("open");
+    document.querySelectorAll(".dd.open").forEach(o=>o.classList.remove("open"));
+    if(!wasOpen) dd.classList.add("open");
+  });
+  dd.querySelector(".dd-panel").addEventListener("click",e=>e.stopPropagation());
+});
+document.addEventListener("click",()=>document.querySelectorAll(".dd.open").forEach(o=>o.classList.remove("open")));
 
 // ---- filtering ----
 function applyFilters(){
   const q=document.getElementById("q").value.trim().toLowerCase();
   const st=checkedVals("status"), cat=checkedVals("category"), pri=checkedVals("priority");
-  const cpx=cpxSel.value, ws=wsSel.value;
+  const cpx=checkedVals("complexity"), ws=checkedVals("workspace");
   const hideDone=document.getElementById("o-hidedone").checked;
   const needJira=document.getElementById("o-jira").checked;
   const needWs=document.getElementById("o-ws").checked;
   const reviewOnly=document.getElementById("o-review").checked;
 
   return TASKS.filter(t=>{
+    if(activeTab!=="all" && t.category!==activeTab) return false;
     if(hideDone && (t.status==="done"||t.status==="cancelled")) return false;
     if(st.length && !st.includes(t.status)) return false;
     if(cat.length && !cat.includes(t.category)) return false;
     if(pri.length && !pri.includes(t.priority)) return false;
-    if(cpx && t.complexity!==cpx) return false;
-    if(ws && t.workspace!==ws) return false;
+    if(cpx.length && !cpx.includes(t.complexity)) return false;
+    if(ws.length && !ws.includes(t.workspace)) return false;
     if(needJira && !t.jira) return false;
     if(needWs && !t.workspace) return false;
     if(reviewOnly && t.category!=="code-review") return false;
@@ -1357,6 +1464,13 @@ function cellFor(t,key){
     case "workspace": return `<td>${esc(t.workspace||"—")}</td>`;
     case "age": { const n=daysSince(t.created); return `<td>${n==null?"—":n+"d"}</td>`; }
     case "worked": return `<td>${esc(workedLabel(t))}</td>`;
+    case "reviewstatus": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
+      const ss=[...new Set(p.map(r=>r.review_status||"pending"))];
+      return `<td>${ss.map(s=>`<span class="badge rv-${esc(s)}">${esc(s)}</span>`).join(" ")}</td>`; }
+    case "prs": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
+      return `<td>${p.map(r=>`<a href="${esc(r.pr_url)}" target="_blank" onclick="event.stopPropagation()">${esc(r.repo)}#${esc(r.pr_number)}</a>${r.merged?" \u2713":""}`).join("<br>")}</td>`; }
+    case "author": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
+      return `<td>${esc([...new Set(p.map(r=>r.author||"?"))].join(", "))}</td>`; }
   }
   return "<td></td>";
 }
@@ -1428,7 +1542,7 @@ function wireEditor(detEl,t){
         method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
       const data=await res.json();
       if(!res.ok){ msg.textContent="Error: "+(data.error||res.status); btn.disabled=false; return; }
-      TASKS=data.tasks; buildFilters(); render();
+      TASKS=data.tasks; buildFilters(); buildTabs(); render();
       msg.textContent="Saved.";
     }catch(err){ msg.textContent="Network error: "+err; btn.disabled=false; }
   });
@@ -1475,16 +1589,72 @@ function render(){
   renderStats();
 }
 
+// ---- tabs (category views) ----
+function tabCount(cat){
+  return TASKS.filter(t=>(cat==="all"||t.category===cat) && !(["done","cancelled"].includes(t.status))).length;
+}
+function buildTabs(){
+  const present=CATEGORIES.filter(c=>TASKS.some(t=>t.category===c));
+  const tabs=[["all","All"], ...present.map(c=>[c,c])];
+  const box=document.getElementById("tabs");
+  box.innerHTML=tabs.map(([k,l])=>
+    `<button class="tab${k===activeTab?" on":""}" data-tab="${esc(k)}">${esc(l)}<span class="badge-count">${tabCount(k)}</span></button>`).join("");
+  box.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>selectTab(b.dataset.tab)));
+}
+function applyTabPreset(tab){
+  const preset=(TAB_DEFS[tab]||TAB_DEFS.all).cols;
+  COLUMNS.forEach(c=>{ c.on=preset.includes(c.key); });
+  buildColumns();
+}
+function selectTab(tab){
+  activeTab=tab;
+  document.querySelectorAll("#tabs .tab").forEach(b=>b.classList.toggle("on",b.dataset.tab===tab));
+  // category filter is redundant inside a category tab: clear + hide it
+  const gc=document.getElementById("grp-category");
+  if(gc) gc.style.display = tab==="all" ? "" : "none";
+  if(tab!=="all"){
+    document.querySelectorAll('input[data-group="category"]').forEach(cb=>{ cb.checked=false; });
+    updateDdLabel("category");
+  }
+  applyTabPreset(tab);
+  render();
+}
+
+// ---- column toggles ----
+function buildColumns(){
+  const colsBox=document.getElementById("cols");
+  colsBox.innerHTML="";
+  COLUMNS.forEach(c=>{
+    const lab=document.createElement("label"); lab.className="dd-opt";
+    lab.innerHTML=`<input type="checkbox" ${c.on?"checked":""}> ${esc(c.label)}`;
+    const cb=lab.querySelector("input");
+    cb.addEventListener("change",()=>{ c.on=cb.checked; render(); });
+    colsBox.appendChild(lab);
+  });
+}
+
 function renderStats(){
-  const c={}; TASKS.forEach(t=>c[t.status]=(c[t.status]||0)+1);
-  const open=TASKS.filter(t=>!["done","cancelled"].includes(t.status));
+  const scope = activeTab==="all" ? TASKS : TASKS.filter(t=>t.category===activeTab);
+  const c={}; scope.forEach(t=>c[t.status]=(c[t.status]||0)+1);
+  const open=scope.filter(t=>!["done","cancelled"].includes(t.status));
   const est=open.reduce((s,t)=>s+(t.cost_hours||0),0);
   const cards=[
-    ["Total",TASKS.length],["Open",open.length],
+    ["Total",scope.length],["Open",open.length],
     ["In&nbsp;progress",c["in-progress"]||0],["Blocked",c["blocked"]||0],
     ["Todo",c["todo"]||0],["Done",c["done"]||0],
     ["Est&nbsp;remaining",est+"h"],
   ];
+  if(activeTab==="development"){
+    const ws=new Set(open.map(t=>t.workspace).filter(Boolean));
+    cards.push(["Workspaces&nbsp;busy",ws.size]);
+  } else if(activeTab==="code-review"){
+    const allPrs=scope.flatMap(t=>prs(t));
+    const awaiting=allPrs.filter(r=>["pending","in-progress"].includes(r.review_status)).length;
+    const changes=allPrs.filter(r=>r.review_status==="changes-requested").length;
+    cards.push(["PRs",allPrs.length],["Awaiting",awaiting],["Changes&nbsp;req",changes]);
+  } else if(activeTab==="planning"){
+    cards.push(["With&nbsp;Jira",scope.filter(t=>t.jira).length]);
+  }
   document.getElementById("stats").innerHTML=cards.map(([l,n])=>
     `<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
 }
@@ -1496,19 +1666,60 @@ document.getElementById("sort").addEventListener("change",e=>{
   sortState.dir = (e.target.value==="created"||e.target.value==="worked"||e.target.value==="cost")?-1:1;
   render();
 });
-["f-complexity","f-workspace","o-hidedone","o-jira","o-ws","o-review"]
+["o-hidedone","o-jira","o-ws","o-review"]
   .forEach(id=>document.getElementById(id).addEventListener("change",render));
 document.querySelectorAll("#o-jira,#o-ws,#o-review,#o-hidedone").forEach(cb=>
   cb.addEventListener("change",()=>cb.closest(".chip").classList.toggle("on",cb.checked)));
 document.getElementById("reset").addEventListener("click",()=>{
   document.getElementById("q").value="";
-  document.querySelectorAll('.chips input[data-group]').forEach(cb=>{cb.checked=false; cb.closest(".chip").classList.remove("on");});
-  cpxSel.value=""; wsSel.value="";
+  document.querySelectorAll('.dd-panel input[data-group]').forEach(cb=>{cb.checked=false;});
+  DD_GROUPS.forEach(updateDdLabel);
+  document.querySelectorAll(".dd.open").forEach(o=>o.classList.remove("open"));
   sortState.key="priority"; sortState.dir=1; document.getElementById("sort").value="priority";
   const hd=document.getElementById("o-hidedone"); hd.checked=true; hd.closest(".chip").classList.add("on");
   ["o-jira","o-ws","o-review"].forEach(id=>{const cb=document.getElementById(id); cb.checked=false; cb.closest(".chip").classList.remove("on");});
   render();
 });
+
+// ---- refresh: reload entry values in place, keeping filters/tab/sort/columns ----
+function captureFilterState(){
+  const s={}; DD_GROUPS.forEach(g=>{ s[g]=checkedVals(g); }); return s;
+}
+function restoreFilterState(s){
+  DD_GROUPS.forEach(g=>{
+    document.querySelectorAll(`input[data-group="${g}"]`).forEach(cb=>{
+      cb.checked = !!(s[g] && s[g].includes(cb.value));
+    });
+    updateDdLabel(g);
+  });
+}
+async function refreshData(){
+  const btn=document.getElementById("refresh");
+  const note=document.getElementById("refresh-note");
+  if(btn){ btn.disabled=true; btn.classList.add("spinning"); }
+  try{
+    if(SERVED){
+      const r=await fetch("/api/tasks",{cache:"no-store"});
+      if(r.ok){ TASKS=await r.json(); }
+    }
+    const fstate=captureFilterState();   // preserve active filter selections
+    buildFilters();                       // rebuild options (may include new values)
+    restoreFilterState(fstate);           // re-apply selections that still exist
+    buildTabs();                          // refresh tab counts, keep activeTab
+    document.getElementById("total").textContent=`${TASKS.length} tasks`;
+    render();                             // sort/columns/options state untouched
+    if(note){
+      const now=new Date();
+      const hh=String(now.getHours()).padStart(2,"0"), mm=String(now.getMinutes()).padStart(2,"0"), ss=String(now.getSeconds()).padStart(2,"0");
+      note.textContent = (SERVED ? "Updated " : "Re-rendered ") + `${hh}:${mm}:${ss}`;
+    }
+  }catch(e){
+    if(note){ note.textContent="Refresh failed"; }
+  }finally{
+    if(btn){ btn.disabled=false; btn.classList.remove("spinning"); }
+  }
+}
+document.getElementById("refresh").addEventListener("click",refreshData);
 
 // ---- served-mode detection: enables editing + live data ----
 async function init(){
@@ -1524,6 +1735,8 @@ async function init(){
   }catch(e){ /* file:// — stay read-only with embedded data */ }
   document.getElementById("total").textContent=`${TASKS.length} tasks`;
   buildFilters();
+  buildTabs();
+  applyTabPreset(activeTab);
   render();
 }
 init();
