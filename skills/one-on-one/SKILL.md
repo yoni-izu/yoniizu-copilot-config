@@ -86,9 +86,9 @@ Per-meeting child pages live in each member's **personal Confluence space**, und
 
 | Phase | Page state | Visibility |
 |---|---|---|
-| Prep | Draft | **Restricted to Yoni only** (page restrictions API) |
-| Live (on `start 1:1`) | Live | **Still restricted to Yoni only** — restrictions are NOT lifted on start. Yoni shares his screen or reads relevant items aloud during the meeting. |
-| Published (on `end 1:1` approval of drafts) | Final | **Default: anyone in the organization** (restrictions removed entirely — this is the only stage that lifts restrictions) |
+| Prep | Draft | **Visible to Yoni + the member** — read restricted to `[Yoni, member]`, edit restricted to Yoni only. The member can read the agenda ahead of the meeting but cannot edit it. |
+| Live (on `start 1:1`) | Live | **Still `[Yoni, member]` read / Yoni-only edit** — restrictions are NOT changed on start. The member already has read access from prep; the org-wide lift happens only at publish. |
+| Published (on `end 1:1` approval of drafts) | Final | **Default: anyone in the organization** (restrictions removed entirely — this is the only stage that lifts restrictions org-wide) |
 
 **First-use bootstrap:** If a member has no `Confluence personal space (1:1 host)` field in their member file, ask Yoni for the space URL and folder name, then write them into the member file before continuing.
 
@@ -115,7 +115,16 @@ printf 'machine elementlabs.atlassian.net\n  login <yoni-email>\n  password %s\n
 chmod 600 ~/.netrc
 ```
 
-**Set page to Yoni-only** (prep phase — adds `read` and `update` restrictions for Yoni's account):
+**Set page to Yoni + member** (prep phase default — `read` allowed for both Yoni and the member, `update` restricted to Yoni only so the member can view but not edit):
+
+```bash
+curl -sS -n -X PUT -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  "https://elementlabs.atlassian.net/wiki/rest/api/content/<PAGE_ID>/restriction" \
+  -d '[{"operation":"read","restrictions":{"user":[{"type":"known","accountId":"<YONI_ACCOUNT_ID>"},{"type":"known","accountId":"<MEMBER_ACCOUNT_ID>"}]}},
+       {"operation":"update","restrictions":{"user":[{"type":"known","accountId":"<YONI_ACCOUNT_ID>"}]}}]'
+```
+
+**Set page to Yoni-only** (use only if Yoni explicitly wants a private prep page — read and update both restricted to Yoni's account):
 
 ```bash
 curl -sS -n -X PUT -H 'Content-Type: application/json' -H 'Accept: application/json' \
@@ -147,7 +156,7 @@ Account IDs come from `mcp_atlassian-mcp_atlassianUserInfo` (Yoni) or `mcp_atlas
 | Read Jira / RAID / member files / task-manager / GitHub PRs | Auto |
 | Compute next 1:1 date | Auto |
 | Write `_next.md`, rotate to `_last.md`, write archive (after approval) | Auto |
-| Create Confluence draft page with Yoni-only restrictions | Auto (after URL captured) |
+| Create Confluence draft page with Yoni + member read restrictions (default) | Auto (after URL captured) |
 | Update Confluence draft during prep | Auto |
 | Edit Confluence page during live | **Confirm per push** (default: off, Yoni edits manually) |
 | Publish final page → remove restrictions (org-wide) | **Confirm** (only after Yoni approves the drafts at `end 1:1`) |
@@ -175,18 +184,19 @@ Also accepts: `prep 1:1 with <name> on YYYY-MM-DD` (override date).
    - **Member file** sections: Goals, 1:1 Topics queue, recent Notes, Wins queue.
    - **Wins auto-surface** (last 7 days): merged PRs they authored, tickets transitioned to Done with `resolution=Done` and ≥2d effort, code reviews they delivered. Draft 1-2 specific win talking points citing the artifact.
 4. **Write local `_next.md`** (verbose, private) using the [prep template](./references/prep-template.md#local-next-md).
-5. **Create Confluence draft page** with restrictions **Yoni-only**:
+5. **Create Confluence draft page** with restrictions **Yoni + member** (read allowed for both Yoni and the member; edit restricted to Yoni only). This is the default so the member can review the agenda before the meeting. Use Yoni-only restrictions only if Yoni explicitly asks for a private prep page.
    - Parent: `Yoni:<Name>` folder in the member's personal space.
    - Title: `Yoni:<Name> - <next-date>`
    - Body: sanitized agenda using the [prep template](./references/prep-template.md#confluence-draft-page).
+   - Member account ID comes from the member file (`Jira Account ID` / cached `Confluence accountId`).
 6. **Show Yoni** both outputs: the local prep doc and a summary of the Confluence draft (with page URL). Yoni can edit before live mode.
 
 ### 2. Live — `start 1:1 with <name>`
 
 **On entry:**
 
-1. **Do not touch Confluence restrictions.** The page stays restricted to Yoni only throughout the live meeting. Restrictions are lifted only at publish time (after Yoni approves the drafts at `end 1:1`).
-2. Enter live mode bound to that member. State this in a one-line acknowledgement: *"Live 1:1 with `<Name>` started. Chat inputs will be captured to `_next.md` live section. Confluence page remains Yoni-only — share your screen or read items aloud as needed."*
+1. **Do not touch Confluence restrictions.** The page keeps its prep-phase restrictions (read `[Yoni, member]`, edit Yoni-only) throughout the live meeting. The org-wide lift happens only at publish time (after Yoni approves the drafts at `end 1:1`).
+2. Enter live mode bound to that member. State this in a one-line acknowledgement: *"Live 1:1 with `<Name>` started. Chat inputs will be captured to `_next.md` live section. Confluence page is visible to you and `<Name>` (edit restricted to you) — share your screen or read items aloud as needed."*
 
 **Input handling during live mode:**
 

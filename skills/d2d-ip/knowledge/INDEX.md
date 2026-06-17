@@ -23,6 +23,7 @@ next query on the same subject is fast and does not require re-reading the sourc
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| UCIe error notification / reporting mechanism | `ucie-error-notification.md` | ucie, error, notification, reporting, escalation, errmsg, sideband, linkerror, rdi, fdi, viral, dvsec, correctable, non-fatal, fatal, uie | Verified from spec | 2026-06-16 |
 | Iridium per-die D2D instance counts (hD2D vs vD2D) | `iridium-d2d-instance-counts.md` | iridium, hd2d, vd2d, horizontal, vertical, instance count, topology, lanes, bandwidth, routing, cce | Verified from RTL/address-map + spec | 2026-06-12 |
 
 ## Topic File Template

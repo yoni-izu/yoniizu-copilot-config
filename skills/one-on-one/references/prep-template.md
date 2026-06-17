@@ -80,7 +80,7 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 
 ## Confluence draft page
 
-Sanitized, member-facing. Created in the member's personal space, in folder `Yoni:<Name>`, with title `Yoni:<Name> - <next-date>`. **Restrictions: Yoni only** during prep.
+Sanitized, member-facing. Created in the member's personal space, in folder `Yoni:<Name>`, with title `Yoni:<Name> - <next-date>`. **Restrictions: Yoni + member** during prep — the member can read the agenda but only Yoni can edit it (use Yoni-only restrictions only if Yoni explicitly asks for a private prep page).
 
 **Voice rules** (apply to every line on this page):
 - **Objective tone, third-person or imperative.** Never write from Yoni's perspective. No "I will", "I'll personally", "I'd like to". Use "transition X", "confirm Y", "agree Z" or "<Name> to do X".
@@ -109,7 +109,7 @@ Sanitized, member-facing. Created in the member's personal space, in folder `Yon
 - <proposed agenda bullet>
 
 ---
-*Prepared <today> — restricted until meeting starts*
+*Prepared <today> — shared with <Name> for review ahead of the meeting*
 ```
 
 **Sanitization rules** (what goes into the Confluence page from `_next.md`):
