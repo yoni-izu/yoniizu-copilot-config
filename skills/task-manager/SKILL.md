@@ -30,8 +30,8 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `done <id> [-n NOTE]` / `block <id>` / `cancel <id>` | Status shortcuts | `done`/`cancel` auto-clear workspace and set `completed`. |
 | `assign <id> <workspace> [--force]` | Assign task to a workspace slot | Refuses if slot is occupied unless `--force`; promotes `todo`→`in-progress`. |
 | `remove <id> --yes` | Permanently delete | Prefer `cancel` unless this is a duplicate/mistake. |
-| `review-update <id> <review_status> [--pr N]` | Manual review status update | Applies to all PR entries unless `--pr` is given. Auto-derives task status (`commented`/`changes-requested` → `blocked`, `waiting-for-re-review` → `todo`, `approved` → `done` when all PRs approved/merged). Auto-purges when all PRs merged. |
-| `review-check` | Poll GitHub, mark merged PRs, purge fully-merged review tasks | |
+| `review-update <id> <review_status> [--pr N]` | Manual review status update | Applies to all PR entries unless `--pr` is given. Auto-derives task status (`commented`/`changes-requested` → `blocked`, `waiting-for-re-review` → `todo`, `approved` → `done` when all PRs approved/merged). Auto-purges when all PRs are resolved (merged **or** closed without merge). |
+| `review-check` | Poll GitHub, mark merged/closed PRs, purge review tasks where all PRs are resolved (merged or closed). Skips `done`/`cancelled` tasks. | |
 | `review-msg <id>` | Print a templated review-request message for a task | |
 
 Valid values:
@@ -86,7 +86,8 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
     "deletions": 45,
     "review_status": "pending",
     "submitted_at": null,
-    "merged": false
+    "merged": false,
+    "closed": false
   }
 ]
 ```
@@ -185,7 +186,7 @@ Combined `review-stop` + status update for the review pass.
 7. If the store file is missing, the CLI creates `{"next_id": 1, "tasks": []}`.
 8. `jira` is optional — populate when the user mentions one or when `add-review` extracts it from a PR title.
 9. **Review-only fields:** Only `category: "code-review"` tasks have `review` / `reviews`.
-10. **Review auto-purge:** When every PR in a review task is merged, the task is deleted. CLI does this in `review-update` and `review-check`.
+10. **Review auto-purge:** When every PR in a review task is *resolved* — i.e. **merged or closed without merge** — the task is deleted (a closed PR needs no review). CLI does this in `review-update` and `review-check`. Each PR entry carries both a `merged` and a `closed` flag; `review-check` sets them by polling GitHub (`mergedAt` ⇒ merged, `closed` ⇒ closed).
 11. **Branch capture on review logging:** Every PR entry must persist a resolved `branch`. `add-review` retries via `git ls-remote` if `gh` doesn't return one; report failure rather than storing `unknown`.
 12. **Multi-PR support:** Feature-level review tasks use `reviews[]` with one entry per PR. Pass multiple URLs to `add-review`.
 13. **Workspace uniqueness:** At most one non-done/non-cancelled task per workspace slot. CLI enforces this on `assign` (refuses unless `--force`) and on `add` (defaults to `backlog` if the slot is occupied).

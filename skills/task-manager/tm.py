@@ -162,6 +162,11 @@ def pr_entries(t: dict) -> list[dict]:
     return []
 
 
+def pr_resolved(p: dict) -> bool:
+    """A PR no longer needs review once it is merged or closed-without-merge."""
+    return bool(p.get("merged") or p.get("closed"))
+
+
 # ----------------------------------------------------------------------------
 # GitHub / git helpers (use gh CLI + git ls-remote, no API keys needed)
 # ----------------------------------------------------------------------------
@@ -369,6 +374,7 @@ def cmd_add_review(args: argparse.Namespace) -> int:
             "review_status": "pending",
             "submitted_at": None,
             "merged": info.get("merged", False),
+            "closed": info.get("closed", False),
         })
         if info.get("title"):
             titles.append(info["title"])
@@ -518,7 +524,7 @@ def cmd_list_reviews(args: argparse.Namespace) -> int:
         if t.get("status") in ("done", "cancelled"):
             continue
         prs = pr_entries(t)
-        if all(p.get("merged") for p in prs):
+        if all(pr_resolved(p) for p in prs):
             continue
         n += 1
         repos = ",".join(sorted({p["repo"] for p in prs}))
@@ -769,11 +775,12 @@ def cmd_review_update(args: argparse.Namespace) -> int:
     t["updated"] = TODAY
     append_note(t, f"review-update: {args.status}" + (f" on #{args.pr}" if args.pr else " on all PRs"))
 
-    # Auto-purge if all merged
-    if all(p.get("merged") for p in prs):
+    # Auto-purge if all PRs are resolved (merged or closed without merge)
+    if all(pr_resolved(p) for p in prs):
         d["tasks"] = [x for x in d["tasks"] if x["id"] != t["id"]]
         save(d)
-        print(f"{t['id']} all PRs merged → purged")
+        reason = "merged" if all(p.get("merged") for p in prs) else "merged/closed"
+        print(f"{t['id']} all PRs {reason} → purged")
         return 0
 
     save(d)
@@ -794,29 +801,34 @@ def cmd_review_check(args: argparse.Namespace) -> int:
         if t.get("category") != "code-review":
             keep.append(t)
             continue
+        if t.get("status") in ("done", "cancelled"):
+            keep.append(t)
+            continue
         prs = pr_entries(t)
         changed = False
         for p in prs:
-            if p.get("merged"):
+            if pr_resolved(p):
                 continue
             try:
-                info = gh_pr_json(p["owner"], p["repo"], p["pr_number"], "state,merged,closed")
+                info = gh_pr_json(p["owner"], p["repo"], p["pr_number"], "state,mergedAt,closed")
             except Exception as e:
                 updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: fetch failed ({e})")
                 continue
-            if info.get("merged"):
+            merged = bool(info.get("mergedAt"))
+            closed = bool(info.get("closed"))
+            if merged:
                 p["merged"] = True
                 p["review_status"] = "merged"
                 changed = True
                 updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: merged")
-            elif info.get("closed") and not info.get("merged"):
-                p["review_status"] = "merged"  # legacy: 'merged' status doubles as 'closed' per skill
+            elif closed:
+                p["closed"] = True
                 append_note(t, f"{p['repo']}#{p['pr_number']}: closed without merge")
                 changed = True
                 updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: closed")
         if changed:
             t["updated"] = TODAY
-        if prs and all(p.get("merged") for p in prs):
+        if prs and all(pr_resolved(p) for p in prs):
             purged.append(t["id"])
             continue
         keep.append(t)
