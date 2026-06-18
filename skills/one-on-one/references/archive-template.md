@@ -96,6 +96,7 @@ Sanitized. The same page that was created in prep is **updated in place**. On pu
 ```
 
 **Single-home rule (no duplication across sections — strict):**
+- **Status-first, self-contained, work-focused phrasing.** Each storefront bullet = plain-language description of the work (understandable without opening the ticket) + an explicit status word (**not started / work-in-progress / blocked / in review / merged / tested / done**); ticket/PR keys are trailing references only. Do **not** describe planning mechanics (sprint/milestone moves, re-estimation, "needs a commit/sequencing call", capacity math) — the storefront is about the work and its state, not how it is planned.
 - Each fact, commitment, or item appears **exactly once** on the page. Before finalizing, scan every section and remove any topic that appears twice.
 - **No `Action items` section on the storefront.** Member-owned commitments → **Looking Ahead** (with `owner` + `due`). Yoni-owned actions → **local archive only**, never on the storefront. The local archive keeps the full `Action items` table for both Yoni and the member.
 - Strategic direction or deferrals without an owner → **Looking Ahead** as well (single forward-looking section).
