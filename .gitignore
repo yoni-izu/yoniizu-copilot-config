@@ -20,3 +20,6 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# PR review drafts — local working notes, never commit
+skills/pr-review/drafts/
