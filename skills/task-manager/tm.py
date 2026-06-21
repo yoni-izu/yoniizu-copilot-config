@@ -871,6 +871,152 @@ def cmd_review_msg(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Subcommand: scan-reviews (discover PRs that request my review)
+# ----------------------------------------------------------------------------
+
+# Repo families excluded from the review queue regardless of mode.
+SCAN_EXCLUDE_REPOS = {"ip.infra.sw.manifests"}
+# Jira-key prefixes (families) to drop from the scan, e.g. SDK noise.
+SCAN_EXCLUDE_JIRA_PREFIXES = ("MODINFSDKSW",)
+# Allowlist files (maintained by the review-mgr skill).
+REVIEW_MGR_REFS = Path(os.path.expanduser("~/.copilot/skills/review-mgr/references"))
+HSI_REPOS_FILE = REVIEW_MGR_REFS / "hsi-repos.txt"
+FW_REPOS_FILE = REVIEW_MGR_REFS / "fw-repos.txt"
+
+
+def jira_key_from_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    m = re.match(r"\s*\[([A-Z][A-Z0-9]+-\d+)\]", title)
+    return m.group(1) if m else None
+
+
+def load_repo_allowlist(path: Path) -> set[str]:
+    """Read owner/repo entries from an allowlist file (empty set if missing)."""
+    repos: set[str] = set()
+    if not path.exists():
+        return repos
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        repos.add(line)
+    return repos
+
+
+def gh_me() -> str | None:
+    out = subprocess.run(["gh", "api", "user", "--jq", ".login"],
+                         capture_output=True, text=True, check=False)
+    return out.stdout.strip() or None if out.returncode == 0 else None
+
+
+def tracked_pr_index(d: dict) -> dict[tuple[str, str, int], str]:
+    """Map (owner, repo, pr_number) -> task id for every PR already in the store."""
+    idx: dict[tuple[str, str, int], str] = {}
+    for t in d["tasks"]:
+        for p in pr_entries(t):
+            key = (p.get("owner"), p.get("repo"), p.get("pr_number"))
+            if all(k is not None for k in key):
+                idx[key] = t["id"]
+    return idx
+
+
+def cmd_scan_reviews(args: argparse.Namespace) -> int:
+    """Discover open PRs that request the user's review and emit a candidate list.
+
+    Mechanical only: queries GitHub, filters noise, dedups against the store,
+    and groups by Jira key. The review-mgr skill drives the checkbox selection
+    and calls add-review on the chosen entries.
+    """
+    me = gh_me()
+    cmd = ["gh", "search", "prs", "--review-requested=@me", "--state=open",
+           "--json", "repository,number,title,author,url", "--limit", str(args.limit)]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        print(f"[tm] gh search failed: {out.stderr.strip()}", file=sys.stderr)
+        return 1
+    try:
+        raw = json.loads(out.stdout or "[]")
+    except json.JSONDecodeError as e:
+        print(f"[tm] could not parse gh output: {e}", file=sys.stderr)
+        return 1
+
+    # Scope: hsi (default) < fw < all. --all wins, then --fw, else hsi.
+    if args.all:
+        scope, allow = "all", None
+    elif args.fw:
+        scope, allow = "fw", load_repo_allowlist(FW_REPOS_FILE)
+    else:
+        scope, allow = "hsi", load_repo_allowlist(HSI_REPOS_FILE)
+    if allow is not None and not allow:
+        afile = FW_REPOS_FILE if scope == "fw" else HSI_REPOS_FILE
+        print(f"[tm] {scope} allowlist empty/missing; pass --all to scan every repo "
+              f"or populate {afile}", file=sys.stderr)
+        return 1
+
+    d = load()
+    tracked = tracked_pr_index(d)
+
+    candidates = []
+    for pr in raw:
+        repo_full = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        repo_name = (pr.get("repository") or {}).get("name") or ""
+        owner = repo_full.split("/")[0] if "/" in repo_full else None
+        author = (pr.get("author") or {}).get("login")
+        title = pr.get("title")
+        num = pr.get("number")
+        jira = jira_key_from_title(title)
+
+        # Filters
+        if me and author == me:
+            continue
+        if repo_name in SCAN_EXCLUDE_REPOS:
+            continue
+        if jira and jira.split("-")[0] in SCAN_EXCLUDE_JIRA_PREFIXES:
+            continue
+        if allow is not None and repo_full not in allow:
+            continue
+
+        candidates.append({
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": num,
+            "url": pr.get("url"),
+            "title": title,
+            "author": author,
+            "jira": jira,
+            "tracked": tracked.get((owner, repo_name, num)),
+        })
+
+    # Group by Jira key (None keys stay standalone)
+    groups: dict[str, list[dict]] = {}
+    for c in candidates:
+        key = c["jira"] or f"__solo__{c['repo']}#{c['pr_number']}"
+        groups.setdefault(key, []).append(c)
+    for c in candidates:
+        gkey = c["jira"] or ""
+        c["group"] = gkey if (gkey and len(groups.get(gkey, [])) > 1) else None
+
+    if args.json:
+        print(json.dumps({"me": me, "mode": scope,
+                          "candidates": candidates}, indent=2))
+        return 0
+
+    # Human table
+    mode = {"all": "all repos", "fw": "fw repos", "hsi": "HSI repos"}[scope]
+    new_n = sum(1 for c in candidates if not c["tracked"])
+    print(f"# scan-reviews ({mode}) — {len(candidates)} requesting review, "
+          f"{new_n} new")
+    for c in candidates:
+        mark = f"[tracked {c['tracked']}]" if c["tracked"] else "[new]"
+        grp = f" {{{c['group']}}}" if c["group"] else ""
+        print(f"  {mark} {c['repo']}#{c['pr_number']} by {c['author']}{grp}")
+        print(f"        {c['title']}")
+        print(f"        {c['url']}")
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # Subcommand: re-review
 # ----------------------------------------------------------------------------
 
@@ -2099,6 +2245,20 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("review-msg", help="print a review-request message for a task")
     a.add_argument("id")
     a.set_defaults(func=cmd_review_msg)
+
+    # scan-reviews
+    a = sub.add_parser(
+        "scan-reviews",
+        help="discover open PRs requesting your review (HSI repos by default)",
+    )
+    a.add_argument("--fw", action="store_true",
+                   help="scan the broader FW team repo allowlist instead of HSI only")
+    a.add_argument("--all", action="store_true",
+                   help="scan every repo, not just an allowlist")
+    a.add_argument("--limit", type=int, default=100,
+                   help="max PRs to fetch from GitHub (default 100)")
+    a.add_argument("--json", action="store_true", help="emit JSON for the skill to consume")
+    a.set_defaults(func=cmd_scan_reviews)
 
     # re-review
     a = sub.add_parser(
