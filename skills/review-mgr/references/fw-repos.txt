@@ -1,0 +1,27 @@
+# FW team repository allowlist (owner/repo, one per line).
+# Used by `tm.py scan-reviews --fw` to restrict the review-requested scan to the
+# team's firmware repos (broader than HSI, narrower than --all).
+# Lines starting with '#' and blanks are ignored.
+
+Elmnt-Internal/ip.infra.sw.fw
+Elmnt-Internal/ip.armcpu.sw.fw
+Elmnt-Internal/ip.cce.sw.fw
+Elmnt-Internal/ip.d2d.sw.fw
+Elmnt-Internal/ip.dma.sw.fw
+Elmnt-Internal/ip.mmu.sw.fw
+Elmnt-Internal/ip.mng.sw.fw
+Elmnt-Internal/ip.noc.sw.fw
+Elmnt-Internal/ip.pcie.sw.fw.ep
+Elmnt-Internal/ip.psoc.sw.fw
+Elmnt-Internal/ip.schd.sw.fw
+Elmnt-Internal/ip.se.sw.fw
+Elmnt-Internal/ip.tnd.sw.fw
+Elmnt-Internal/ip.vcore.sw.fw
+Elmnt-Internal/ip.vme.sw.fw
+Elmnt-Internal/module.infra.sw.fw
+Elmnt-Internal/module.infra.sw.fw.zephyr
+Elmnt-Internal/project.iridium.sw.fw.infra
+Elmnt-Internal/project.iridium.sw.fw.psoc_primeboot
+Elmnt-Internal/project.iridium.sw.fw.psoc_mng
+Elmnt-Internal/project.iridium.sw.fw.fla_runtime
+Elmnt-Internal/project.iridium.sw.fw.psoc_power_thermal

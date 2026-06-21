@@ -1,0 +1,10 @@
+# HSI FW repository allowlist (owner/repo, one per line).
+# Used by `tm.py scan-reviews` HSI mode to restrict the review-requested scan
+# to the HSI IP firmware repos. Lines starting with '#' and blanks are ignored.
+# `scan-reviews --all` ignores this list and scans every repo that requests your review.
+#
+# HSI IPs: D2D, PCIe (EP), SE.
+
+Elmnt-Internal/ip.d2d.sw.fw
+Elmnt-Internal/ip.pcie.sw.fw.ep
+Elmnt-Internal/ip.se.sw.fw
