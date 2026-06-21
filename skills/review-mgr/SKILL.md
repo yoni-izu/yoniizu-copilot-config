@@ -43,8 +43,9 @@ Find new review requests and let the user tick which to add.
 1. Run `tm.py scan-reviews --json` (HSI IPs: D2D/PCIe/SE) by default. Because you sit in a wide reviewers group, GitHub flags many PRs that are noise to you — so widen deliberately: `--fw` for the broader FW team allowlist, or `--all` for every repo GitHub flags. The CLI already excludes self-authored PRs, `ip.infra.sw.manifests`, and `MODINFSDKSW-*`, and annotates each candidate as new/tracked plus a Jira `group`.
 2. Present the candidates as a **multi-select checkbox list** (use the ask-questions tool, `multiSelect: true`). For each candidate show: `repo#num — title (author)`. Already-tracked PRs (`tracked: T-NNN`) must be shown but clearly annotated and **left unticked by default**; new ones are the focus.
 3. **Surface Jira groups as a suggestion, not a mandate.** When several ticked PRs share a `group` (Jira key), point it out and ask, per group, whether to add them as **one multi-PR review task** or as **separate tasks**. Standalone PRs (no group) become their own task.
-4. For each chosen group/PR, call `tm.py add-review <url> [<url>...]` — pass all URLs of a group in one call to create a single multi-PR task; pass single URLs for standalone tasks. Let `add-review` fetch details and estimate complexity. Skip anything already tracked.
-5. Report what was added (task ids + PR counts) and what was skipped (already tracked).
+4. **Enforce one PR per repo per task.** Before creating any multi-PR task, verify that no two PRs in the group target the same repo. If they do, **split them into separate tasks** — one task per conflicting repo. Reason: `review-start` checks out one branch per repo; two PRs in the same repo means one can never be checked out, making local review impossible and causing confusion about which code is live.
+5. For each chosen group/PR, call `tm.py add-review <url> [<url>...]` — pass all URLs of a group in one call to create a single multi-PR task; pass single URLs for standalone tasks. Let `add-review` fetch details and estimate complexity. Skip anything already tracked.
+6. Report what was added (task ids + PR counts) and what was skipped (already tracked).
 
 Do **not** auto-add without the tick step — discovery is assistive, the user curates.
 
@@ -111,4 +112,5 @@ For `blocked` review tasks, check whether the author acted (CLI does **not** do 
 4. **Never destructive git.** No resets; skip and report dirty repos.
 5. **Done gating:** a review task is `done` only when every PR is approved/merged. Submitting comments/changes-requested → `blocked`.
 6. **Auto-purge:** when every PR in a task is resolved (merged or closed-without-merge) the task is deleted — `review-update` / `review-check` handle this.
-7. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
+7. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo — a second PR in the same repo is unreachable locally, causes confusion about which code is under review, and forces the reviewer to context-switch branches mid-review. When adding PRs (via `scan` or `add-review`), split any same-repo collisions into separate tasks. When inheriting a task that already violates this, split it before `start`.
+8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
