@@ -66,6 +66,8 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
 
    Use the **Title** from the memory file cache; only fetch PR state, CI, and review data from GitHub.
 
+   The **PR#** column must be rendered as a clickable markdown link to the PR on GitHub, using the format `[#<number>](https://github.com/<Owner>/<Repo>/pull/<number>)`.
+
 6. Flag any items needing attention (CI failures, review comments, rebase needed).
 7. If **all PRs** in a feature are `merged`, notify the user and offer to remove the entry.
 
