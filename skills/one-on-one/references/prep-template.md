@@ -37,14 +37,16 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 1. **<one-line win>** — cite: <PR URL / Jira KEY / review URL>
    - *Why this matters:* <Yoni's private context, e.g. "first major refactor they shipped solo">
 
-## Review of last week (page-bound — sanitized recap)
-- <what shipped, closed, transitioned in the last 7 days — broader than Wins>
-- <e.g.: "3 segregation child PRs merged, IPPCIESW-490 host-FW bug fix landed">
+## Done (page-bound — completed this cycle, mirrors the page's Done section)
+- <what shipped/closed/delivered in the last 7 days — merged/tested/closed — incl. approved wins>
+- <e.g.: "Warm-reset callback handling — merged [ep#248]">
 
-## Looking Ahead (page-bound)
-- <top 2-3 priorities for the next 1-2 sprints>
-- <near-term carry to next sprint / next milestone>
-- <items being deferred (one line)>
+## In progress (page-bound — mirrors the page's In progress section)
+- <work actively underway — WIP / in review / blocked (blocker inline) — incl. member-owned commitments>
+
+## Planned / not started (page-bound — mirrors the page's Planned section)
+- <committed for current/next sprint, not started>
+- <forward strategic direction / deferral (one line)>
 
 ## Owed by me (from task-manager) (PRIVATE)
 - [ ] T-XXX: Review PR <repo>#<num> — <title> — pending <N>d
@@ -94,29 +96,38 @@ Sanitized, member-facing. Created in the member's personal space, in folder `Yon
 ```markdown
 # 1:1 with <Name> — <next-meeting-date>
 
-## Carry-over from <prev-date>
-- [ ] <open action> — owner: <Yoni/Name>
+## Done
+- <completed-this-cycle work — what it is + merged/tested/closed/delivered — link to PR / Jira KEY> *(approved wins are the highlight-worthy Done items; no separate Wins section)*
 
-## Wins
-- <one-line win cite — link to PR / Jira KEY> *(only items Yoni approved)*
+## In progress
+- <work actively underway — what it is + work-in-progress / in review / blocked (state the blocker inline) — refs>
 
-## Review of last week
-- <what was done: merged PRs, closed tickets, status changes, decisions delivered — one line each>
+## Planned (not started)
+- <work committed for the current/next sprint, status not started — what it is + "not started" — refs>
+- <forward strategic direction / deferral — one line>
 
-## Looking Ahead
-- <top in-flight items and what's coming next — one line each>
+## Decisions
+- <decision reached in the meeting — one-line context> *(omit the whole section if none)*
 
 ## Meeting notes
-- <proposed agenda bullet — edited live during the meeting>
-- <proposed agenda bullet>
+- <discussion-only topic with a concrete trigger — edited live> *(omit the whole section if empty)*
 ```
 
+**Routing rule — every work item maps by its status word to exactly one of the three work-state sections:**
+
+| Status word | Section |
+|---|---|
+| done / merged / tested / closed / delivered | **Done** |
+| work-in-progress / in review / blocked | **In progress** |
+| not started | **Planned (not started)** |
+
 **Sanitization rules** (what goes into the Confluence page from `_next.md`):
-- Carry-over actions → **Carry-over** ✓ (member-owned items only; Yoni-owned actions stay in the local archive)
-- Approved wins only → **Wins** (one line + artifact link; rationale stays local)
-- Recent activity (merged PRs, closed tickets, status changes since last 1:1) → **Review of last week**
-- Current work + plan + sprint goal **and member-owned commitments with `owner` + `due`** → **Looking Ahead** (one line per item, no RAG flags, no spent/remaining, no Yoni-private spillover/capacity decisions). There is **no separate Action items section on the storefront** — Looking Ahead is the single forward-looking section, mixing strategic direction with dated member commitments.
-- Talking points → **Meeting notes** (proposed bullets, edited live; drop filler/habit prompts, keep only items with a concrete trigger)
-- **Avoid overlap between Looking Ahead and Meeting notes.** If a meeting bullet is a forward commitment, move it to Looking Ahead and drop it from Meeting notes. Meeting notes is for discussion topics (questions, context, things that didn't become commitments)
-- RAID items → one-line member-facing heads-up inside the relevant section, never the full row
-- **Excluded:** "Risks / things to flag", "Private notes", win rationale, RAID detail, spillover/capacity/reassignment decisions, reviewer-bandwidth prompts, "Anything from you"-style filler, T-IDs from `task-manager`, **PTO / upcoming day-off entries** (kept in the day-off log only), **Yoni-owned action items** (anything where `owner: Yoni` — kept in the local archive only), **sprint / milestone mechanics irrelevant to the member** (sprint renames, milestone retirements by automation, planning-tool quirks — only surface when they directly affect the member's owned work).
+- Completed-this-cycle work (merged PRs, closed tickets, delivered reviews) **and approved wins** → **Done** (one line + artifact link; win rationale stays local). There is no separate `Wins` or `Review of last week` section.
+- In-flight work (WIP / in review / blocked), including member-owned commitments → **In progress** (owner allowed inline, **no due date on the storefront**, no RAG flags, no spent/remaining).
+- Committed-but-not-started work + forward strategic direction / deferrals → **Planned (not started)**.
+- A carried action from the previous 1:1 → reclassify by its **current** status into Done / In progress / Planned. There is no `Carry-over` section on the storefront.
+- Decisions reached in the meeting → **Decisions** (one line each). Do not also restate as a work bullet.
+- Discussion-only topics with a concrete trigger → **Meeting notes** (edited live; drop filler/habit prompts). Omit the section if empty.
+- **No overlap:** every Jira key / PR link / epic appears **at most once** across the whole page. If an item could fit two sections, its status word decides — it has exactly one.
+- RAID items → one-line member-facing heads-up inside the relevant work-state section, never the full row.
+- **Excluded:** "Risks / things to flag", "Private notes", win rationale, RAID detail, spillover/capacity/reassignment decisions, reviewer-bandwidth prompts, "Anything from you"-style filler, T-IDs from `task-manager`, **PTO / upcoming day-off entries** (kept in the day-off log only; a forward PTO heads-up affecting sprint capacity → **Planned (not started)**), **Yoni-owned action items** (anything where `owner: Yoni` — kept in the local archive only), **sprint / milestone mechanics irrelevant to the member** (sprint renames, milestone retirements by automation, planning-tool quirks — only surface when they directly affect the member's owned work).
