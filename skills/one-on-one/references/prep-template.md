@@ -89,6 +89,7 @@ Sanitized, member-facing. Created in the member's personal space, in folder `Yon
 - **No filler topics.** Do not add habitual prompts like "Anything from you?", "Reviewer bandwidth — is the review pile the blocker?", "How are you feeling?". The member will raise what they need. Only include topics with a concrete trigger.
 - **RAID items: orient toward the member.** Do not paste full RAID descriptions or scoring. Translate into one line of what changed for *them* (e.g. "MS6.5 no longer exists — treat scope as MS6 + MS7") and omit the internal mechanics (escalation paths, P/I scores, owners, due dates). Those stay in `_next.md`.
 - **No Yoni-private considerations.** Spillover decisions, capacity calculus, reassignment plans, and reviewer logistics stay local. The page should only contain what the member needs to walk in informed.
+- **No editorial / meta notes on the page.** The storefront contains only headings and content bullets — never section-purpose annotations (e.g. "*(populated live during the meeting — discussion topics only…)*"), authoring placeholders, status hints about how a section is filled, or prep/publish footers (e.g. "*Prepared `<today>` — shared with `<Name>`…*"). Lifecycle state (prep vs. live vs. published) is conveyed by Confluence permissions and page history, not by text on the page. Any `*(…)*` parenthetical in these templates is authoring guidance for you — do **not** copy it onto the page.
 
 ```markdown
 # 1:1 with <Name> — <next-meeting-date>
@@ -106,12 +107,8 @@ Sanitized, member-facing. Created in the member's personal space, in folder `Yon
 - <top in-flight items and what's coming next — one line each>
 
 ## Meeting notes
-*(populated live during the meeting — discussion topics only; forward commitments land in Looking Ahead)*
 - <proposed agenda bullet — edited live during the meeting>
 - <proposed agenda bullet>
-
----
-*Prepared <today> — shared with <Name> for review ahead of the meeting*
 ```
 
 **Sanitization rules** (what goes into the Confluence page from `_next.md`):

@@ -63,13 +63,13 @@ Verbose, includes private notes. Lives at `~/team-planner/members/<name>/1on1/YY
 
 ## Confluence published page
 
-Sanitized. The same page that was created in prep is **updated in place**. On publish, page restrictions are removed (default org-wide visibility). Sections mirror the prep-template structure. The published page is for the team and the org — it must not duplicate information across sections, and it must not include private working state (carry-overs to the next 1:1, publish-status footers, "for-Yoni" reminders).
+Sanitized. The same page that was created in prep is **updated in place**. On publish, page restrictions are removed (default org-wide visibility). Sections mirror the prep-template structure. The published page is for the team and the org — it must not duplicate information across sections, and it must not include private working state (carry-overs to the next 1:1, publish-status footers, "for-Yoni" reminders). It must **not** carry editorial / meta notes either — section-purpose annotations, authoring placeholders, or prep/publish footers. Any `<!-- ... -->` or `*(...)*` note in the block below is authoring guidance for you; the page itself holds only headings and content bullets.
 
 ```markdown
 # 1:1 with <Name> — YYYY-MM-DD
 
 ## Carry-over from <prev-date>
-*(Omit this section entirely on the first 1:1 with this member, or whenever there is no prior 1:1 to carry from.)*
+<!-- Omit this section entirely on the first 1:1 with this member, or whenever there is no prior 1:1 to carry from. -->
 - [x] <closed action> — outcome
 - [ ] <still-open action> — owner, due
 
@@ -83,12 +83,12 @@ Sanitized. The same page that was created in prep is **updated in place**. On pu
 - <decision> — <one-line context>
 
 ## Looking Ahead
-*(Single forward-looking section on the storefront. Includes the **member's** owned-and-dated commitments — each as a bullet with owner + due — alongside strategic direction and deferrals. There is **no separate Action items table** on the published page. **Yoni's own action items never appear on the storefront** — they live only in the local archive's Action items table.)*
+<!-- Single forward-looking section on the storefront. Includes the member's owned-and-dated commitments — each as a bullet with owner + due — alongside strategic direction and deferrals. There is no separate Action items table on the published page. Yoni's own action items never appear on the storefront — they live only in the local archive's Action items table. -->
 - <Mateusz-owned commitment with `owner` + `due YYYY-MM-DD`>
 - <strategic direction / deferral, no owner needed>
 
 ## Meeting notes
-*(discussion-only — context, questions, topics raised that did not become commitments; omit entirely if all live capture was forward-looking and folded into Looking Ahead.)*
+<!-- discussion-only — context, questions, topics raised that did not become commitments; omit entirely if all live capture was forward-looking and folded into Looking Ahead. -->
 - <bullet captured live — paraphrase, no he-said/I-said>
 
 ## Next 1:1
@@ -111,6 +111,7 @@ Sanitized. The same page that was created in prep is **updated in place**. On pu
 - "Private notes" section (entirely private).
 - "Carry-over to next 1:1" — that is local-archive-only. The published page is not a working tool for the next cycle.
 - Publish-status footers (e.g. `*Published <date> — visibility: anyone in the organization*`). Visibility is conveyed by Confluence permissions, not page text.
+- **Editorial / meta notes of any kind** — section-purpose annotations (e.g. `*(populated live during the meeting…)*`, `*(discussion-only…)*`), authoring placeholders, "edited live" hints, and prep footers (e.g. `*Prepared <date> — shared with <Name>…*`). The page carries only headings and content bullets.
 - Risk text — only mentioned if promoted to RAID, with a one-line summary.
 - Live `private:`-tagged entries — never reach the page.
 - Task IDs from `task-manager`.
