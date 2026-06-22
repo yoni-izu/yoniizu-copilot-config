@@ -63,48 +63,52 @@ Verbose, includes private notes. Lives at `~/team-planner/members/<name>/1on1/YY
 
 ## Confluence published page
 
-Sanitized. The same page that was created in prep is **updated in place**. On publish, page restrictions are removed (default org-wide visibility). Sections mirror the prep-template structure. The published page is for the team and the org — it must not duplicate information across sections, and it must not include private working state (carry-overs to the next 1:1, publish-status footers, "for-Yoni" reminders). It must **not** carry editorial / meta notes either — section-purpose annotations, authoring placeholders, or prep/publish footers. Any `<!-- ... -->` or `*(...)*` note in the block below is authoring guidance for you; the page itself holds only headings and content bullets.
+Sanitized. The same page that was created in prep is **updated in place**. On publish, page restrictions are removed (default org-wide visibility). Sections mirror the prep-template structure. The published page is for the team and the org — it is organized by **work state** so each item has exactly one home, it must not duplicate information across sections, and it must not include private working state (carry-overs to the next 1:1, publish-status footers, "for-Yoni" reminders). It must **not** carry editorial / meta notes either — section-purpose annotations, authoring placeholders, or prep/publish footers. Any `<!-- ... -->` note in the block below is authoring guidance for you; the page itself holds only headings and content bullets.
 
 ```markdown
 # 1:1 with <Name> — YYYY-MM-DD
 
-## Carry-over from <prev-date>
-<!-- Omit this section entirely on the first 1:1 with this member, or whenever there is no prior 1:1 to carry from. -->
-- [x] <closed action> — outcome
-- [ ] <still-open action> — owner, due
+## Done
+<!-- Work completed this cycle: merged / tested / closed / delivered. Approved wins are the highlight-worthy Done items — no separate Wins or Review section. -->
+- <what it is + merged/tested/closed/delivered> (link: <PR / Jira>)
 
-## Wins
-- <one-line win> (link: <PR / Jira>)
+## In progress
+<!-- Work actively underway: work-in-progress / in review / blocked. A blocked item is still in-progress work — state the blocker inline. Includes member-owned commitments (owner inline, no due date). -->
+- <what it is + WIP / in review / blocked (blocker inline)> — <owner if a member commitment>
 
-## Review of last week
-- <what shipped, closed, transitioned — one line each>
-
-## Decisions
-- <decision> — <one-line context>
-
-## Looking Ahead
-<!-- Single forward-looking section on the storefront. Includes the member's owned-and-dated commitments — each as a bullet with owner + due — alongside strategic direction and deferrals. There is no separate Action items table on the published page. Yoni's own action items never appear on the storefront — they live only in the local archive's Action items table. -->
-- <Mateusz-owned commitment with `owner` + `due YYYY-MM-DD`>
+## Planned (not started)
+<!-- Work committed for the current/next sprint whose status is not started, plus forward strategic direction and deferrals. Yoni's own action items never appear here — local archive only. -->
+- <what it is + not started>
 - <strategic direction / deferral, no owner needed>
 
+## Decisions
+<!-- Decisions reached in the meeting. A decision is not a work item. Omit the whole section if there were none. -->
+- <decision> — <one-line context>
+
 ## Meeting notes
-<!-- discussion-only — context, questions, topics raised that did not become commitments; omit entirely if all live capture was forward-looking and folded into Looking Ahead. -->
+<!-- Discussion-only narrative with no work-state home — risk discussion, design rationale, cross-cutting concerns. Omit entirely if empty; never an empty stub. -->
 - <bullet captured live — paraphrase, no he-said/I-said>
 
 ## Next 1:1
 <auto-computed date>
 ```
 
-**Single-home rule (no duplication across sections — strict):**
-- **Status-first, self-contained, work-focused phrasing.** Each storefront bullet = plain-language description of the work (understandable without opening the ticket) + an explicit status word (**not started / work-in-progress / blocked / in review / merged / tested / done**); ticket/PR keys are trailing references only. Do **not** describe planning mechanics (sprint/milestone moves, re-estimation, "needs a commit/sequencing call", capacity math) — the storefront is about the work and its state, not how it is planned.
-- Each fact, commitment, or item appears **exactly once** on the page. Before finalizing, scan every section and remove any topic that appears twice.
-- **No `Action items` section on the storefront.** Member-owned commitments → **Looking Ahead** (with `owner` + `due`). Yoni-owned actions → **local archive only**, never on the storefront. The local archive keeps the full `Action items` table for both Yoni and the member.
-- Strategic direction or deferrals without an owner → **Looking Ahead** as well (single forward-looking section).
-- Closed work that landed during the cycle → **Wins** (with artifact link) **or** **Review of last week** (one-line summary), not both. If a single item naturally fits both, keep the artifact-linked Wins entry and drop the Review echo.
-- Decisions captured in the meeting → **Decisions** only. Do not paraphrase the same decision under Looking Ahead or as a separate Meeting-notes bullet.
-- **Meeting notes is for narrative that has no home elsewhere** — risk discussion, design rationale, cross-cutting concerns. If a Meeting-notes bullet duplicates a Decision or a Looking Ahead item, delete it. After all other sections are drafted, Meeting notes is the **last** section to fill — keep only what is genuinely unique.
-- **Consolidate related sub-topics.** When two bullets share the same root (e.g., "reset pre/post handling" and "reset state machine proposal"), merge them into a single entry in the single correct section. Never split one topic across two bullets to "give it more weight".
-- Carry-over from the previous 1:1 → **Carry-over from `<prev-date>`** only (and omit entirely on a first 1:1).
+**Single-home rule (no duplication across sections — strict, keyed off work state):**
+- **The three work-state sections are mutually exclusive.** A piece of work has exactly one current status, so it lands in exactly one of **Done** / **In progress** / **Planned (not started)**. Map the item's status word to its section:
+
+  | Status word | Section |
+  |---|---|
+  | done / merged / tested / closed / delivered | **Done** |
+  | work-in-progress / in review / blocked | **In progress** |
+  | not started | **Planned (not started)** |
+
+- **Status-first, self-contained, work-focused phrasing.** Each bullet = plain-language description of the work (understandable without opening the ticket) + its status word; ticket/PR keys are trailing references only. Do **not** describe planning mechanics (sprint/milestone moves, re-estimation, "needs a commit/sequencing call", capacity math).
+- Each fact, commitment, or item appears **exactly once** on the page. Before finalizing, walk every section and remove any topic that appears twice; then walk again at the **ticket-key level** — every Jira key / PR link / epic appears at most once.
+- **No `Carry-over` section.** A carried action from the previous 1:1 is reclassified by its **current** status into Done / In progress / Planned. Loop-closing across cycles lives in the local archive only.
+- **No `Action items` section.** Member-owned commitments are work items — they live under **In progress** or **Planned (not started)** per their status (owner inline, no due date). Yoni-owned actions → **local archive only**, never on the storefront.
+- **Decisions captured in the meeting → `Decisions` only.** Do not also restate the decision as a work bullet. If the decision changed a work item's state, the work item carries its own state bullet and the decision row references it by key without re-describing the work.
+- **Meeting notes is for narrative that has no work-state home** — risk discussion, design rationale, cross-cutting concerns. If a Meeting-notes bullet duplicates a work-state bullet or a Decision, delete it. Meeting notes is the **last** section to fill — keep only what is genuinely unique. Omit if empty.
+- **Consolidate related sub-topics.** When two bullets share the same root (e.g., "reset pre/post handling" and "reset state machine"), merge them into a single entry in the single correct section, classified by the thread's overall state. Never split one topic across two bullets to "give it more weight".
 
 **Sanitization rules** (what is excluded from the published Confluence page):
 - "Feedback" section (entirely private).
@@ -117,8 +121,8 @@ Sanitized. The same page that was created in prep is **updated in place**. On pu
 - Task IDs from `task-manager`.
 - Win rationale (only the one-line win + artifact link).
 - Spillover/capacity/reassignment decisions, reviewer-bandwidth musings, "Anything from you"-style filler.
-- **PTO / day-off entries** — kept only in the day-off log and (if relevant) the local archive. Never on the storefront.
-- **Yoni's own action items** (anything where `owner: Yoni`) — kept only in the local archive. Storefront `Looking Ahead` shows member-owned items only.
+- **PTO / day-off entries** — kept only in the day-off log and (if relevant) the local archive. Never on the storefront (a forward PTO heads-up affecting sprint capacity may appear under **Planned (not started)**).
+- **Yoni's own action items** (anything where `owner: Yoni`) — kept only in the local archive. The storefront's work-state sections show member-owned items only.
 - **Sprint / milestone mechanics that are irrelevant to the member** — e.g., sprint renames, milestone retirements by automation, planning-tool quirks, sprint-board hygiene. These belong in the team-planner snapshot, not on a member's 1:1 page. Only mention milestone/sprint context when it directly affects the member's owned work (a due date, a scope change, a blocker).
 
 ---
