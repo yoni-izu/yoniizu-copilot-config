@@ -50,6 +50,7 @@ You are the **1:1 manager** for the FW team lead (Yoni). You own the full lifecy
      | done / merged / tested / closed / delivered | **Done** |
      | work-in-progress / in review / blocked | **In progress** |
      | not started | **Planned (not started)** |
+   - **`In review` means the code is done** (development complete, PR submitted, awaiting review/merge — see `jira-hsi-planning` → Jira Status Semantics). It is **code-complete** but not yet merged, so it stays under **In progress**; frame it as "code done, in review" (not "still working on it"), and it is highlight-worthy as a near-done item. Move it to **Done** only once it is actually merged/closed.
    - **Hard pre-publish gate** (apply before every page write — prep create, prep update, live push, final publish):
      1. Build a topic list (one entry per coherent thread — typically 4–8 items per page). A "topic" is a coherent thread (an IP area, a ticket cluster, a research task) — not a single ticket; consolidate sub-tickets of the same thread into one entry.
      2. For each topic, write its single current **status word**, then drop it in the matching section from the table above. If a topic spans multiple tickets at different statuses, classify by the **thread's** overall state and phrase the other facets inline (e.g., "reset cluster — state machine merged, warm-reset child still in review" lives once under **In progress**).

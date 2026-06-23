@@ -62,6 +62,16 @@ When querying HSI tickets across all projects, use the team field filter (see be
 | Mateusz Michalak | `712020:2ba0db16-45ee-4938-a78c-b5b987ed630f` | `mateusz-michalak-el` | Engineer | |
 | Vasyl Gomonovych | `712020:d4010729-0c48-4f5a-9dd3-4af6197589b9` | `vgomonovych` | Engineer | Ramping up — ~10d in first milestone, full 20d after. |
 
+### Jira Status Semantics
+
+**`In Review` means the code is done.** When a story is in `In Review` status, development/implementation is complete — the PR is submitted and the work is awaiting code review / merge. Treat `In Review` as **code-complete**:
+
+- It counts toward **development-done** for progress %, wins, and milestone-landing projections — the engineering effort is finished even though the ticket is not yet `Done`.
+- It is **not** fully `Done` (not merged/closed, evidence/DoD not yet signed off). Keep it distinct from `Done` in status tables; do not silently roll it into the Done bucket.
+- When grouping by status, surface `In Review` (code-complete) as its own line, between `In Progress` (still being written) and `Done` (merged/closed).
+
+This distinction is shared by the `one-on-one`, `team-planner`, `manager-brief`, and `team-weekly` skills — apply it consistently wherever status is interpreted.
+
 ## Guiding Principles
 
 ### Epic Structuring Rule
@@ -110,10 +120,11 @@ When querying HSI tickets across all projects, use the team field filter (see be
 **Procedure:**
 1. Fetch the Confluence milestone page to get the list of milestone names and any dates.
 2. Use MCP to search Jira for HSI tickets with `"SW Internal Milestone" = "<MS Name>"`.
-3. Group tickets by status (To Do / In Progress / Done / Blocked).
+3. Group tickets by status (To Do / In Progress / In Review / Done / Blocked). Keep `In Review` (code-complete — see [Jira Status Semantics](#jira-status-semantics)) distinct from `Done`.
 4. Calculate:
    - Total story points per status group
    - % complete (Done points / Total points)
+   - % code-complete ((Done + In Review) points / Total points) — development-done view
    - Blocked ticket count and list
    - Tickets still unestimated
 5. Present a summary table:
@@ -122,10 +133,12 @@ When querying HSI tickets across all projects, use the team field filter (see be
 Milestone: <name>
 ───────────────────────────────────────
 ✅ Done        : X tickets  (Y pts)
+🧪 In Review   : X tickets  (Y pts)   ← code done, awaiting merge
 🔄 In Progress : X tickets  (Y pts)
 🔴 Blocked     : X tickets  (Y pts)
 ⬜ To Do       : X tickets  (Y pts)
-📊 Completion  : Z%
+📊 Completion     : Z%   (Done only)
+🛠️ Code-complete : Z%   (Done + In Review)
 ⚠️ Unestimated : X tickets
 ```
 
