@@ -9,6 +9,7 @@ For each active milestone, gather:
 1. **Remaining scope (effort-days)** — via `jira-hsi-planning`:
    - JQL: `project = <proj> AND fixVersion = "<milestone>" AND status != Done`
    - Sum `timeoriginalestimate` (seconds) ÷ 28800 → effort-days. Use individual `getJiraIssue` calls per ticket since `searchJiraIssuesUsingJql` strips the estimate field (see team-planner's snapshot note).
+   - **`In Review` tickets are code-complete** (development done, awaiting merge — see `jira-hsi-planning` → Jira Status Semantics). They are not `Done`, so they appear in this query, but their **remaining engineering effort is ~0**. Track their effort-days separately and exclude (or heavily discount) them from `remaining_scope` for the burn computation — counting them as full remaining work understates how close the milestone is. Report `In Review` effort-days as a distinct "code-complete, awaiting merge" line.
    - Separate **unestimated tickets** count — these are a risk indicator on their own.
 
 2. **Velocity (effort-days per working day, team-wide)** — three sources, used together:

@@ -16,16 +16,17 @@ Weekly snapshots capture milestone state for trend analysis. Stored in `~/team-p
     "total": 0,
     "by_status": {
       "done": 0,
+      "in_review": 0,
       "in_progress": 0,
       "to_do": 0,
       "blocked": 0
     },
     "by_subsystem": {
-      "pcie_ep": { "done": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
-      "se": { "done": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
-      "d2d": { "done": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
-      "infra": { "done": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
-      "other": { "done": 0, "in_progress": 0, "to_do": 0, "blocked": 0 }
+      "pcie_ep": { "done": 0, "in_review": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
+      "se": { "done": 0, "in_review": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
+      "d2d": { "done": 0, "in_review": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
+      "infra": { "done": 0, "in_review": 0, "in_progress": 0, "to_do": 0, "blocked": 0 },
+      "other": { "done": 0, "in_review": 0, "in_progress": 0, "to_do": 0, "blocked": 0 }
     }
   },
 
@@ -37,11 +38,13 @@ Weekly snapshots capture milestone state for trend analysis. Stored in `~/team-p
     "done_wont_do": 0,
     "done_duplicate": 0,
     "done_other": 0,
+    "in_review": 0,
     "in_progress": 0,
     "to_do": 0,
     "blocked": 0,
     "unestimated_tickets": 0,
-    "completion_pct": 0.0
+    "completion_pct": 0.0,
+    "code_complete_pct": 0.0
   },
 
   "capacity": {
@@ -73,6 +76,7 @@ Weekly snapshots capture milestone state for trend analysis. Stored in `~/team-p
       "name": "",
       "in_progress_count": 0,
       "in_progress_days": 0,
+      "in_review_count": 0,
       "blocked_count": 0,
       "to_do_count": 0,
       "done_count": 0
@@ -98,6 +102,8 @@ Weekly snapshots capture milestone state for trend analysis. Stored in `~/team-p
 
 - `effort` uses `timeoriginalestimate` from Jira (seconds ÷ 28800 = days). This team does not use story points (`customfield_10016`).
 - `completion_pct` = `done (resolution=Done only) / total` by effort-days. Falls back to ticket count when estimates are missing.
+- `code_complete_pct` = `(done + in_review) / total` by effort-days. `In Review` means the code is done (development complete, awaiting merge — see `jira-hsi-planning` → Jira Status Semantics), so this is the development-done view of progress. Keep it distinct from `completion_pct`.
+- `in_review` (status + effort) tracks code-complete work that is not yet merged/closed. Never fold it into `done`.
 - `done_wont_do` / `done_duplicate` / `done_other` track non-Done resolutions in effort-days for planning-churn visibility.
 - `blocked_external_days` is cumulative for the snapshot period (typically since last snapshot).
 - `confidence` is the lead's 1-10 assessment, with a one-line justification.

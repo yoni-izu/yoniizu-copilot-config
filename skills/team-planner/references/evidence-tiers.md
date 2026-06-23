@@ -31,6 +31,12 @@ Use evidence tiers instead of a flat "Done = merged" rule. Each story should dec
 - Errata, workaround, feature flag, release note, or host-driver dependency documented.
 - Failure modes and recovery behavior tested or explicitly deferred.
 
+## Jira Status vs. Evidence Tier
+
+- **`In Review` status = code is done** (development complete, PR submitted, awaiting review/merge). This is a **code-complete** signal, equivalent to the implementation portion of the target tier being finished.
+- Code-complete is **not** the same as the tier being met: `In Review` does not by itself satisfy L1–L4 evidence (contract sign-off, lab/silicon runs, validation acceptance). A story stays short of "Done" until both it is merged/closed **and** its target tier evidence exists.
+- For forecasting and capacity, treat `In Review` work as development-done; for Definition of Done, hold it to the tier rule below.
+
 ## Usage Rules
 
 - Every story must declare its **target evidence tier** at sprint planning.
