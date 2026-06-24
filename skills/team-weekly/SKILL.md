@@ -40,6 +40,7 @@ You are the **Team Weekly manager** for the HSI FW team lead (Yoni). You own the
 6. **Discussion is a first-class agenda item.** Always leave a sized "Open floor" block. If you skip it, note why.
 7. **Confluence is the storefront.** Yoni drives Confluence edits in the browser during the meeting. The assistant only pushes to the page on explicit request.
 8. **Never invent.** Cite a Jira issue, PR, RAID row, snapshot, archive, or staff-meeting page for every factual claim.
+8a. **Never report the same completion twice across weeks.** Always diff the **Done & completed** section against the previous weekly archive before finalizing (see Prep step 3a). An item shipped is reported in exactly one weekly. Progressions (in-progress→done) are fine; re-reporting an already-announced done item is not. Verify each "Done" against Jira `resolution` — `Won't Do`/`Duplicate` are churn, not wins.
 9. **High-level metrics, not exact numbers.** Planning metrics (effort, utilization, completion %) are for Yoni's private prep. In the team-facing content use qualitative framing ("heavily loaded", "~4x over capacity", "confidence is low") — not raw effort-day figures or utilization percentages.
 10. **No PTO on the agenda by default.** Team PTO is omitted from the Confluence page and team-facing sections unless Yoni explicitly requests it.
 11. **Yoni's personal staff-meeting action items are private.** Items where Yoni is the sole owner (e.g., "add attributes for PCIe resets") stay in `_next.md` private notes only. They do not appear on the team agenda or Confluence page. Only items that require team awareness or team action are surfaced.
@@ -108,7 +109,7 @@ Also accepts: `prep team weekly on YYYY-MM-DD` (override date).
 1. **Compute next-meeting date.** Default = next **Tuesday** (the standing slot), snapped forward over team-wide holidays. Override if Yoni provided a date.
 2. **Verify Confluence target.** Confirm the SWENG folder `695369790` is reachable. No index-page bootstrap is needed — pages are created directly under the folder.
 3. **Gather inputs:**
-   - **Previous archive** (`archive/<latest>.md`) → carry-over actions, parking-lot topics, things still open.
+   - **Previous archive** (`archive/<latest>.md`) → carry-over actions, parking-lot topics, things still open. **Also load it as the de-dup baseline (see step 3a).**
    - **Jira via `jira-hsi-planning`:**
      - Active sprint tickets across the team (status, owner, effort, remaining, blocked).
      - Tickets transitioned in the last 7 days (Done with `resolution=Done`, moved to Blocked, reopened).
@@ -119,6 +120,11 @@ Also accepts: `prep team weekly on YYYY-MM-DD` (override date).
    - **Staff updates** (`staff-updates.md` + capability 5): items pulled but not yet relayed.
    - **Manager-brief state** (`~/team-planner/manager-brief/`): read `commitments.md` (open + recently closed), `decisions.md` (taken only — skip `needed`), `standing-topics.md`, and the most recent `briefs/*.md` for milestone goals and projections. **Treat every item as private by default** (principle 13). Land them in `_next.md` private notes under a `### From manager brief (private — Yoni-only)` block, each with a `surface?: ask` flag. During prep review, ask Yoni per item: *"Surface to team? [y / sanitized: <text> / no]"*. Default is `no`. Never copy items into the Confluence draft until explicitly approved.
    - **Day-off log** (member files): upcoming approved PTO in the next 2 weeks. *(used for Yoni's private capacity notes only — not surfaced to the team unless Yoni requests it.)*
+3a. **De-dup against the previous weekly (MANDATORY).** Before finalizing the **Done & completed** section, diff every candidate item against the previous archive's Past/Done content (grep the prior `archive/<latest>.md` for the ticket keys, PR numbers, and feature names). Apply these rules:
+   - **Already reported done last week → drop it.** A completed item is reported exactly once. Do not re-list it.
+   - **Was "in progress / next / pulled into sprint" last week and is now actually done → keep it.** That is a legitimate progression, not a duplicate. (Verify it really flipped to `resolution=Done`.)
+   - **Standing infra/framework that was already announced as merged but the team still needs to act on → do NOT re-list as a Done win.** Convert it to an Announcement nudge / call-to-action instead (e.g. "IRQ-tree is available — wire your causes via a PR").
+   - **Verify every "Done" claim against Jira `resolution`.** Only `resolution = Done` counts. Items resolved `Won't Do` / `Duplicate` / `Declined` are scope churn, NOT completions — never list them as Done, and prefer citing the merged PR over a mis-attributed/aborted ticket key. (1:1 notes sometimes cite the wrong key — trust Jira over the note.)
 4. **Build per-IP wins/gaps** using the [IP scoreboard rules](./references/ip-scoreboard.md).
 5. **Build past/present/future block** for weekly + sprint + milestone clocks.
 6. **Write local `_next.md`** (verbose, private) using the [prep template](./references/prep-template.md#local-next-md).
