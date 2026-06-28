@@ -24,7 +24,7 @@ STORE = Path(os.path.expanduser("~/tasks/tasks.json"))
 PROJECTS_ROOT = Path(os.path.expanduser("~/projects"))
 DEFAULT_PROJECT = "iridium"
 
-CATEGORIES = {"development", "code-review", "planning", "testing", "misc"}
+CATEGORIES = {"development", "code-review", "planning", "testing", "track", "misc"}
 PRIORITIES = ["critical", "high", "medium", "low"]
 STATUSES = {"backlog", "todo", "in-progress", "blocked", "done", "cancelled"}
 COMPLEXITIES = ["trivial", "small", "medium", "large", "epic"]
@@ -1438,7 +1438,7 @@ const JIRA_BASE = "https://elementlabs.atlassian.net/browse/";
 const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled"];
 const PRI_ORDER = ["critical","high","medium","low"];
 const CPX_ORDER = ["trivial","small","medium","large","epic"];
-const CATEGORIES = ["development","code-review","planning","testing","misc"];
+const CATEGORIES = ["development","code-review","planning","testing","track","misc"];
 
 const COLUMNS = [
   {key:"id",      label:"ID",        on:true},
@@ -1464,6 +1464,7 @@ const TAB_DEFS = {
   "code-review": {cols:["id","title","priority","status","reviewstatus","prs","author","age"]},
   "planning":    {cols:["id","title","priority","status","jira","age","worked"]},
   "testing":     {cols:["id","title","priority","status","complexity","cost","age"]},
+  "track":       {cols:["id","title","priority","status","jira","age","worked"]},
   "misc":        {cols:["id","title","priority","status","age","worked"]},
 };
 let activeTab = "all";
