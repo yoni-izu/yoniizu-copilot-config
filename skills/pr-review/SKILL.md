@@ -1,7 +1,7 @@
 ---
 name: pr-review
-description: "Review a GitHub pull request end-to-end with the reviewer's own style and memoir. Use when: reviewing a PR, drafting review comments, doing a code review, reviewing PRs checked out locally in the workspace (e.g. after review-mgr start), re-reviewing after a force-push/rebase, checking a PR before approving, requesting changes, auditing a code-move/refactor PR, reviewing HW/register/driver code, deciding an approve/comment/request-changes verdict."
-argument-hint: "PR URL or owner/repo#number, OR 'local' to review checked-out workspace branches; optionally: re-review, draft-only, submit"
+description: "Review a GitHub pull request end-to-end with the reviewer's own style and memoir. Use when: reviewing a PR, drafting review comments, doing a code review, reviewing PRs checked out locally in the workspace (e.g. after review-mgr start), re-reviewing after a force-push/rebase, checking a PR before approving, requesting changes, auditing a code-move/refactor PR, reviewing HW/register/driver code, walking through drafted findings one by one to adjust/polish/reject them, deciding an approve/comment/request-changes verdict."
+argument-hint: "PR URL or owner/repo#number, OR 'local' to review checked-out workspace branches; optionally: re-review, walkthrough, draft-only, submit"
 ---
 
 # PR Review
@@ -78,6 +78,8 @@ Lead with an **Executive summary of the changes** (see below), then show the use
 - **Verdict at a glance:** the recommended verdict and the single biggest reason for it.
 This is a summary of the *changes*, separate from and preceding the findings — it orients the reader before the detailed review.
 
+**Interactive option:** if the user wants to refine findings one at a time before seeing the consolidated draft, run the [Walkthrough](#walkthrough) first — it lets them adjust, question, polish, reclassify, or reject each finding. It's the natural next step after a local review is drafted.
+
 ### Step 6 — Submit only what's approved
 On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set into [drafts/](./drafts/) (e.g. `pr-<N>-submitted-<timestamp>.md`).
 
@@ -118,6 +120,40 @@ When invoked with `re-review` or when the PR changed since the last pass:
 3. **Confirm "no new code" by diff, never by head-equality alone.** A rebase changes the head SHA even when your session's recomputed head already matches the PR head; the real question is `old-reviewed-SHA .. current-head`. New files (e.g. a driver split) hide here — list `git diff --name-status <old>..<new>` before claiming nothing changed.
 4. Check for silent changes and JIRA ticket renumbering in commit messages (can signal scope change).
 5. Re-audit each parked finding against the fresh diff snapshot — drop any whose target code no longer exists.
+
+## Walkthrough
+
+An optional interactive pass that refines a drafted review **one finding at a time** before anything is presented for submission. Trigger it when the user says "walkthrough", "walk me through the findings", "go finding by finding", or after a local review is drafted and the user wants to adjust, question, polish, reclassify, or reject findings. It sits between Step 4 (draft) and Step 5 (present) and is the natural next step once a local review is done. It is **purely local refinement of the draft** — it never touches GitHub, and all Hard Rules still hold.
+
+### Entering the walkthrough
+1. **Locate the draft.** Use the most recent draft(s) in [drafts/](./drafts/) for this PR/workspace (`pr-<N>-<repo>-<timestamp>.md`). If no draft exists yet, run Steps 0–4 first, then enter the walkthrough. For a multi-repo set, confirm the order and walk one repo's draft at a time.
+2. **State the lay of the land.** Up front, announce the totals and order, e.g. "12 findings — 3 blockers, 5 suggestions, 3 nits, 1 question. Walking blockers first." Default order is by severity (blockers → suggestions → nits → questions/praise); honor a different order if asked. Carry-forward prior-comment items (from Step 2) are part of the walk.
+
+### Per-finding loop
+For each finding, present a compact card and then **wait for the user's decision — never auto-advance past a finding without an explicit choice.**
+
+**Card (keep it to what fits on screen):**
+- `[<n>/<total>] [<SEVERITY>] <file>:<line>`
+- the comment body as currently drafted
+- the one-line *why* / code anchor
+- offer to expand on request: the surrounding diff hunk or the full function
+
+**Actions offered each time (the user may combine these or free-type):**
+- **keep** — accept as-is; advance.
+- **polish / edit** — rewrite the body (tighter, more actionable, better tone). Show the revised text and confirm before saving.
+- **reclassify** — change severity (e.g. blocker→suggestion, suggestion→nit, nit→drop).
+- **question** — answer it by going back to the *actual code path*: the diff snapshot, the full file, second-consumer greps, or the vendor manual via the relevant IP skill (`pcie-ep-ip`, `su-ip`, `d2d-ip`, `ras-manageability`, …). Re-present the (possibly unchanged) card afterward. Answering a question never silently mutates the finding — any change is a separate, explicit edit.
+- **reject / drop** — remove it from Findings and move it to **Dropped / considered** with the user's reason (preserve the reasoning; it feeds the memoir).
+- **defer / split** — keep but mark it pre-existing / "post later", or split one finding into two.
+- **skip** — park it and revisit at the end.
+
+### Persist as you go
+**Write each decision back to the draft file immediately — do not batch.** Edit, reclassify, move-to-dropped, or delete in place so a mid-walkthrough interruption loses nothing. Keep the Findings and Dropped/considered sections consistent after every change.
+
+### Closing the walkthrough
+1. Resolve any **skipped** findings.
+2. **Recompute the recommended verdict** from the survivors (no blockers left → likely approve; an open blocker → request-changes) and refresh the executive summary and counts.
+3. Hand off to **Step 5 (present)** with the refined draft, then **Step 6 (submit)** only what the user approves. The walkthrough refines findings; it does not approve or submit on its own.
 
 ## Draft Template
 
