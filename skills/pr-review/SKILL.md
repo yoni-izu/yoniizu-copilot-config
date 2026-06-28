@@ -66,7 +66,7 @@ Apply the memoir's checklists plus independent reasoning. For each candidate fin
 - Pick battles: drop nits that don't hurt readability or maintainability. Distinguish PR-introduced from pre-existing issues; defer the latter to their own PR.
 
 ### Step 4 — Draft locally
-Write a draft to [drafts/](./drafts/) using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
+Write a draft to [drafts/](./drafts/) using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
 
 ### Step 5 — Present for approval
 Lead with an **Executive summary of the changes** (see below), then show the user the full draft: a **Prior comments** disposition table (each existing thread marked Addressed / Partially / Unaddressed / Won't-fix / Stale, with what the author did and any follow-up to add), findings grouped by severity, a **recommended verdict** (approve / comment / request-changes) with one-line justification, and the dropped list. Call out any unaddressed prior comments explicitly — they often gate the verdict. Ask which comments to post and whether to submit the verdict. Do nothing on GitHub yet.
@@ -140,7 +140,7 @@ For each finding, present a compact card and then **wait for the user's decision
 
 **Actions offered each time (the user may combine these or free-type):**
 - **keep** — accept as-is; advance.
-- **polish / edit** — rewrite the body (tighter, more actionable, better tone). Show the revised text and confirm before saving.
+- **polish / edit** — rewrite the body per [Comment Phrasing](#comment-phrasing) (tighter, more actionable, better tone). Show the revised text and confirm before saving.
 - **reclassify** — change severity (e.g. blocker→suggestion, suggestion→nit, nit→drop).
 - **question** — answer it by going back to the *actual code path*: the diff snapshot, the full file, second-consumer greps, or the vendor manual via the relevant IP skill (`pcie-ep-ip`, `su-ip`, `d2d-ip`, `ras-manageability`, …). Re-present the (possibly unchanged) card afterward. Answering a question never silently mutates the finding — any change is a separate, explicit edit.
 - **reject / drop** — remove it from Findings and move it to **Dropped / considered** with the user's reason (preserve the reasoning; it feeds the memoir).
@@ -154,6 +154,17 @@ For each finding, present a compact card and then **wait for the user's decision
 1. Resolve any **skipped** findings.
 2. **Recompute the recommended verdict** from the survivors (no blockers left → likely approve; an open blocker → request-changes) and refresh the executive summary and counts.
 3. Hand off to **Step 5 (present)** with the refined draft, then **Step 6 (submit)** only what the user approves. The walkthrough refines findings; it does not approve or submit on its own.
+
+## Comment Phrasing
+
+How every comment body should read — the reviewer's voice. Applies when drafting (Step 4), polishing in the walkthrough, and anything posted at Step 6. Optimize for a busy author who'll act on a short, sharp comment and ignore a wall of text.
+
+- **Casual but unambiguous.** Write like a colleague at the next desk, not a formal report — but never trade away precision for tone. The reader must know exactly which code and which change is meant.
+- **Technically correct and concrete.** Name the exact symbol / line / condition. A short correct sentence beats a hedged paragraph.
+- **Assume a competent author.** Skip background they already know and don't re-explain how their own subsystem works — go straight to the point that needs attention.
+- **Short.** No one reads long comments. Aim for 1–3 sentences per finding; cut throat-clearing, restated context, and filler.
+- **First-person human voice.** These are the reviewer's own comments. Never frame them as AI- or assistant-written, and don't hedge with "it seems the model thinks…"-style framing.
+- **Own the knowledge.** When a finding leans on RTL, a vendor manual, another skill, the memoir, or any reference, state the conclusion flatly as your own — never cite the source or imply it was looked up. Write "this is tied to `'0` in this rev, so it never fires", not "the RTL / knowledge base shows…".
 
 ## Draft Template
 
