@@ -69,7 +69,7 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
    The **PR#** column must be rendered as a clickable markdown link to the PR on GitHub, using the format `[#<number>](https://github.com/<Owner>/<Repo>/pull/<number>)`.
 
 6. Flag any items needing attention (CI failures, review comments, rebase needed).
-7. If **all PRs** in a feature are `merged`, notify the user and offer to remove the entry.
+7. If **all PRs** in a feature are `merged`, the feature is complete — automatically remove it from tracking (no confirmation needed) and notify the user it was dropped.
 
 ### 3. Analyze a CI Failure (`analyze`)
 
@@ -190,8 +190,8 @@ Thanks
 ### 9. Auto-Cleanup
 
 During any `status`/`check` operation:
-- If all PRs in a feature are `merged`, ask the user: "All PRs for **<feature>** are merged. Remove from tracking?"
-- On confirmation, remove the feature entry from memory.
+- If all PRs in a feature are `merged`, the batch is done — automatically remove the feature entry from memory without asking.
+- Notify the user: "All PRs for **<feature>** are merged — removed from tracking."
 
 ## Parsing PR References
 
@@ -216,7 +216,7 @@ When multiple conditions apply, report the highest-priority status:
 ## Rules
 
 - Always use the memory tool to read/write `/memories/pr-monitor-features.md`.
-- Never delete a feature entry without user confirmation.
+- Never delete a feature entry without user confirmation, **except** fully-merged batches, which are auto-removed during `status`/`check`.
 - When checking status, fetch all PRs even if some have cached status — always get fresh data.
 - Use `gh` CLI as fallback if the GitHub tools don't return sufficient detail (e.g., for failure logs).
 - Present results as markdown tables for readability.
