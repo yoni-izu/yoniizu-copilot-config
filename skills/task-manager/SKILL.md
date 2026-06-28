@@ -32,7 +32,7 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 > **Code-review subcommands** (`scan-reviews`, `add-review`, `list-reviews`, `review-update`, `review-check`, `review-msg`) also live in `tm.py`, but the review queue lifecycle is owned by the **review-mgr** skill. See `~/.copilot/skills/review-mgr/SKILL.md`.
 
 Valid values:
-- categories: `development`, `code-review`, `planning`, `testing`, `misc`
+- categories: `development`, `code-review`, `planning`, `testing`, `track`, `misc`
 - priorities: `critical`, `high`, `medium`, `low`
 - statuses: `backlog`, `todo`, `in-progress`, `blocked`, `done`, `cancelled`
 - complexities: `trivial`, `small`, `medium`, `large`, `epic`
@@ -90,6 +90,17 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
 ```
 
 Only `category: "code-review"` tasks may have `review` / `reviews`; other categories must not.
+
+### `track` tasks
+
+Use `category: "track"` for work you are **monitoring rather than executing** — a topic
+or activity owned by a team member, a bug being worked by someone else, an external
+dependency, or any thread you want to keep an eye on without owning the hands-on work.
+They behave like ordinary tasks (status, priority, notes, `jira`) and get their own
+dashboard tab. Put the person/thing being tracked and the reason in `context`, and use
+append-only `notes` to log progress updates you observe. A `track` task is typically not
+assigned to a workspace slot (you are not the one coding it), so prefer `--no-workspace`
+when adding one.
 
 ## Dashboard server (`serve`) — operational notes
 
