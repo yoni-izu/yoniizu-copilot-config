@@ -107,6 +107,7 @@ For each review repo:
    ```
    Cross-check the local head against the PR head SHA (`gh pr view <N> --json headRefOid`) so you're reviewing what's actually on the PR. If they differ, the local branch is stale — `git pull` or warn before proceeding.
 3. **Exploit local context:** read full files, `grep`/build/run tests as needed. This is the main advantage over remote mode — use it for second-consumer greps, `BUILD_ASSERT` checks, and verifying claims against the real code path.
+4. **For HSI repos, consult the matching `*-ip` skill for code correctness.** When the repo under review is an HSI IP (PCIe EP, PCIe PHY, SE, D2D, …), read the relevant skill (`pcie-ep-ip`, `su-ip`, `d2d-ip`, `ras-manageability`, …) and validate register fields, sequences, and reset/value semantics against its spec/RTL before flagging — the field semantics can flip a finding.
 
 ### Continue with the standard flow
 - Step 2 (existing review state) and Step 6 (submission) still hit **GitHub** — the author's pending drafts, other reviewers' threads, and posted comments live there. Use the `owner`/`repo`/`pr_number` from the store/`gh` to target the right PR.
