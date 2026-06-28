@@ -66,6 +66,19 @@ Detection → Logging → Containment → Communication → Recovery
 - **Communication**: Interrupts → FW → BMC/Host (via PLDM or GPIO)
 - **Recovery**: Device reset, row remapping, page offlining, RMA
 
+### C2C / Scale-Up link errors → tray reset (FW vs BMC split)
+
+Spec-owner directive (Maxim, via Akshay, 2026-06-23) for C2C **drop mode** / link-error recovery:
+
+- **FW only reports the link-error event.** No FW-driven routing-table invalidation, no FW
+  cross-die "device lost" propagation (viral is no longer a valid flow).
+- **The BMC owns recovery and resets the *entire tray*** — even a **single link error triggers
+  a full tray reset**.
+- On the BMC-issued **"scale up reset"** request, FW must **configure the reset mask and enable
+  c2c reset *before* issuing the reset**. Nothing more is required for drop mode.
+- Impl references: `ip.psoc.sw.fw`#390, `module.infra.sw.fw`#118. Full C2C-side detail in the
+  `su-ip` knowledge base (`drop-mode-error-containment.md`).
+
 ### Poison vs Viral
 
 - **Poison**: Data-associated error. Set on AWUSER/RUSER bus. Consumer can handle it.
