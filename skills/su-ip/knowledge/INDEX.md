@@ -27,7 +27,7 @@ re-reading the (very large) source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
-| _(none yet)_ | | | | |
+| C2C Drop Mode & Isolation Mode (error containment, FW responsibility) | `drop-mode-error-containment.md` | drop mode, isolation mode, viral, error containment, ras, link down, watchdog, completion timeout, fw responsibility, tray reset, scale up reset, reset mask, c2c reset, bmc, isolation drain, isolation drop, drain enable, drain arming | Verified from doc + spec-owner directive + RTL | 2026-06-28 |
 
 ## Topic File Template
 
