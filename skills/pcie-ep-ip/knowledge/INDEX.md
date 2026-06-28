@@ -24,6 +24,7 @@ re-reading the (very large) source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| EP PHY IDDQ / test_powerdown control (per-die) | [ep-phy-iddq-test-powerdown.md](ep-phy-iddq-test-powerdown.md) | iddq, test_powerdown, ppw_ctrl, phy_ctrl, reset default, die2, die3, firmware ownership | Verified from RTL + generated register headers | 2026-06-24 |
 | PIW transaction drain (inbound only) | [piw-drain.md](piw-drain.md) | drain, piw, inbound, host-to-device, axi master, ruser, buser, sei, timeout, ctrl mng main, upstream termination | Verified from FW + doc | 2026-06-15 |
 | PCIe6 PHY instance count per die (Iridium) | [phy-instance-count.md](phy-instance-count.md) | phy instances, per die, pcie ep, scale up, se, c2c, count | Verified from project DTS | 2026-06-14 |
 | Downstream Termination (DS_TERM) datapath | [ds-term.md](ds-term.md) | ds_term, pep_ctrl_aux, elbi, mstr, rasdp, termination, host trapdoor | Verified from RTL | 2026-06-11 |
