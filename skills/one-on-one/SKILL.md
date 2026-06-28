@@ -75,11 +75,14 @@ You are the **1:1 manager** for the FW team lead (Yoni). You own the full lifecy
 ├── <name>.md                       # team-planner owns; this skill appends to "## 1:1 History" section
 │                                   # team-planner records "Confluence personal space (1:1 host)" URL in header
 └── <name>/                         # this skill owns
+    ├── running.md                  # rolling between-meetings log; appended via `log 1:1`, consumed + cleared at prep
     ├── _next.md                    # active prep + live private notes
     ├── _last.md                    # previous cycle (safety net, overwritten each cycle)
     └── 1on1/
         └── YYYY-MM-DD.md           # finalized archive (verbose, private)
 ```
+
+**Running record (`running.md`).** A per-member rolling log Yoni updates throughout the week — drop-in observations, things to raise, wins spotted, follow-ups — captured between meetings via `log 1:1 with <name>: <text>`. It is the primary source of fresh, week-of context at prep time. Entries persist across days (it is **not** overwritten weekly like `_last.md`); at prep they are folded into `_next.md`, reach the permanent archive at `end 1:1`, and the running record is then reset to an empty, date-stamped header so it is clean for the next week. It is Yoni-private and never reaches Confluence.
 
 ## Confluence Topology
 
@@ -167,6 +170,8 @@ Account IDs come from `mcp_atlassian-mcp_atlassianUserInfo` (Yoni) or `mcp_atlas
 |---|---|
 | Read Jira / RAID / member files / task-manager / GitHub PRs | Auto |
 | Compute next 1:1 date | Auto |
+| Append an entry to a member's `running.md` running record (`log 1:1`) | Auto |
+| Consume + reset `running.md` at prep (entries are preserved in `_next.md`) | Auto |
 | Write `_next.md`, rotate to `_last.md`, write archive (after approval) | Auto |
 | Create Confluence draft page with Yoni + member read+edit restrictions (default) | Auto (after URL captured) |
 | Update Confluence draft during prep | Auto |
@@ -179,6 +184,20 @@ Account IDs come from `mcp_atlassian-mcp_atlassianUserInfo` (Yoni) or `mcp_atlas
 
 ## Capabilities
 
+### 0. Log — `log 1:1 with <name>: <text>`
+
+The always-on, between-meetings capability. Use it any time during the week to drop a quick note into the member's running record so nothing is lost before the next 1:1.
+
+Also accepts the same tagged grammar as live mode (optional): `log 1:1 with <name> topic: <text>`, `... win: <text>`, `... action: <text>`, `... followup: <text>`, `... private: <text>`, `... note: <text>`. Untagged text defaults to `note:`.
+
+**Procedure:**
+
+1. **Resolve member** → `members/<name>/`. If `running.md` does not exist, create it from the [running-record template](./references/prep-template.md#running-record-running-md) with a fresh header.
+2. **Append a timestamped entry** to the `## Entries` section: `- YYYY-MM-DD — [<tag>] <text>` (omit the `[<tag>]` bracket for a plain note). Never rewrite or reorder existing entries.
+3. **Acknowledge in one line** (e.g. *"Logged to Igal's running record (topic). 4 entries pending for next prep."*). No other output — this is a quick-capture action, not a report.
+
+The running record is consumed and cleared at the next `prep 1:1 with <name>` (see capability 1, step 5).
+
 ### 1. Prep — `prep 1:1 with <name>`
 
 Also accepts: `prep 1:1 with <name> on YYYY-MM-DD` (override date).
@@ -188,6 +207,7 @@ Also accepts: `prep 1:1 with <name> on YYYY-MM-DD` (override date).
 1. **Resolve member.** Read `~/team-planner/members/<name>.md`. If `Confluence personal space (1:1 host)` field is missing, prompt Yoni for it and write it to the file before continuing.
 2. **Compute next-meeting date.** Default = last archive date + 7 days, snapped forward over weekends and approved PTO from the member's day-off log. Override if Yoni provided a date.
 3. **Gather inputs:**
+   - **Running record** (`members/<name>/running.md`) → every entry logged since the last prep. This is the primary source of fresh, week-of context. Route each entry by its tag (or best-guess for untagged): topics → agenda, wins → Wins (verify resolution before promoting), actions → owed/commitments, followups → Owed-by-me, private → Private notes.
    - **Previous archive** (`members/<name>/1on1/<latest>.md`) → carry-over actions, unresolved topics, things Yoni said he would follow up on.
    - **Jira** (via `jira-hsi-planning`): current sprint tickets assigned to them, MS6/MS6.5 work, blocked, reopened, recently transitioned (last 7d). Include status, effort estimate, remaining, parent epic.
    - **RAID** (`~/team-planner/raid.md`): rows where the member is FW Owner or named.
@@ -195,13 +215,14 @@ Also accepts: `prep 1:1 with <name> on YYYY-MM-DD` (override date).
    - **Day-off log**: upcoming approved PTO for the member.
    - **Member file** sections: Goals, 1:1 Topics queue, recent Notes, Wins queue.
    - **Wins auto-surface** (last 7 days): merged PRs they authored, tickets transitioned to Done with `resolution=Done` and ≥2d effort, code reviews they delivered. Draft 1-2 specific win talking points citing the artifact.
-4. **Write local `_next.md`** (verbose, private) using the [prep template](./references/prep-template.md#local-next-md).
-5. **Create Confluence draft page** with restrictions **Yoni + member** (both read and edit allowed for Yoni **and** the member — both can view and edit the page). This is the default so the member can review and edit the agenda before the meeting. Use Yoni-only restrictions only if Yoni explicitly asks for a private prep page.
+4. **Write local `_next.md`** (verbose, private) using the [prep template](./references/prep-template.md#local-next-md). Fold the running-record entries into the relevant sections (its source items appear under `## From running record`).
+5. **Consume + reset the running record.** Once its entries are folded into `_next.md`, reset `members/<name>/running.md` to an empty, date-stamped header (`Consumed <prep-date>`). The entries are not lost — they live in `_next.md` and reach the permanent archive at `end 1:1`. This keeps the running record clean for the next week's notes. Do this only after `_next.md` is written.
+6. **Create Confluence draft page** with restrictions **Yoni + member** (both read and edit allowed for Yoni **and** the member — both can view and edit the page). This is the default so the member can review and edit the agenda before the meeting. Use Yoni-only restrictions only if Yoni explicitly asks for a private prep page.
    - Parent: `Yoni:<Name>` folder in the member's personal space.
    - Title: `Yoni:<Name> - <next-date>`
    - Body: sanitized agenda using the [prep template](./references/prep-template.md#confluence-draft-page).
    - Member account ID comes from the member file (`Jira Account ID` / cached `Confluence accountId`).
-6. **Show Yoni** both outputs: the local prep doc and a summary of the Confluence draft (with page URL). Yoni can edit before live mode.
+7. **Show Yoni** both outputs: the local prep doc and a summary of the Confluence draft (with page URL). Yoni can edit before live mode.
 
 ### 2. Live — `start 1:1 with <name>`
 

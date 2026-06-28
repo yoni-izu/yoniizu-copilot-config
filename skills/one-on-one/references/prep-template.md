@@ -1,6 +1,42 @@
 # Prep Templates
 
-Used by capability 1 (Prep) of the `one-on-one` skill. Two outputs per prep: a verbose local doc (`_next.md`) and a sanitized Confluence draft page.
+Used by capability 1 (Prep) of the `one-on-one` skill. Two outputs per prep: a verbose local doc (`_next.md`) and a sanitized Confluence draft page. A third file, the per-member running record (`running.md`), is maintained continuously between meetings (capability 0) and consumed at prep.
+
+---
+
+## Running record (`running.md`)
+
+Per-member rolling log Yoni updates throughout the week via `log 1:1 with <name>: <text>`. Yoni-private; never reaches Confluence. Appended to continuously; consumed and reset at each prep. Lives at `~/team-planner/members/<name>/running.md`.
+
+```markdown
+# Running record — <Name>
+
+Quick notes logged between 1:1s via `log 1:1 with <name>: <text>`.
+Consumed into the agenda and reset at each prep. Yoni-private.
+
+_Last consumed: <prep-date or "never">_
+
+## Entries
+- YYYY-MM-DD — [topic] <text>
+- YYYY-MM-DD — [win] <text + artifact ref>
+- YYYY-MM-DD — [action] <text>
+- YYYY-MM-DD — [followup] <text>
+- YYYY-MM-DD — [private] <text>
+- YYYY-MM-DD — <untagged note>
+```
+
+**Reset form** (written at prep, after entries are folded into `_next.md`):
+
+```markdown
+# Running record — <Name>
+
+Quick notes logged between 1:1s via `log 1:1 with <name>: <text>`.
+Consumed into the agenda and reset at each prep. Yoni-private.
+
+_Last consumed: <prep-date>_
+
+## Entries
+```
 
 ---
 
@@ -19,6 +55,13 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 - [ ] <open action item> — owner: <Yoni/Name> — due: <date>
 - [ ] <carry-over topic>
 - [ ] <thing Yoni said he would follow up on>
+
+## From running record (logged since <prev-date>)
+*(raw entries consumed from `running.md` this prep — routed into the sections below; kept here for traceability)*
+- <YYYY-MM-DD> [topic] <text> → agenda
+- <YYYY-MM-DD> [win] <text> → Wins (verify resolution before promoting)
+- <YYYY-MM-DD> [action] <text> → Owed by me / commitment
+- <YYYY-MM-DD> [private] <text> → Private notes
 
 ## Big picture (PRIVATE)
 - **Milestone:** MS<N> — <X> days remaining, their load <Y>d remaining, RAG <color>
