@@ -79,6 +79,25 @@ The knowledge base is **always consulted first** (Step 0) and **always updated a
 non-trivial research (final step). This is what makes the skill grow into a true D2D expert
 over time.
 
+> **Recording trigger — read this twice.** Record a finding whenever you **verify** a
+> non-trivial IP fact during this turn, regardless of *why* you were invoked. The
+> trigger is the verification, not the question shape. This fires when:
+> - the user asked you directly (the obvious case);
+> - another skill (e.g. `pr-review`, `iridium-prj`, `ras-manageability`) consulted you;
+> - you read FW driver code, generated register headers, or RTL during a code review
+>   and locked in a durable register/protocol/sequence/erratum fact;
+> - you reconciled two sources (spec vs RTL, doc vs FW) and resolved which is current.
+>
+> **"Non-trivial IP fact"** = anything a future query could re-ask: a register's
+> reset/behaviour, a field/bit semantic, a bring-up or training sequencing rule, a
+> protocol nuance, a controller/PHY quirk, a cross-IP interaction, a HW–FW contract.
+> If in doubt, **record**. A too-detailed knowledge base costs milliseconds; a missing
+> entry costs the next query a full re-read of a multi-thousand-page source.
+>
+> Skip only: pure code-style nits, project-specific FW architecture (belongs in
+> `iridium-prj`), tooling/CI/Python issues, and re-statements of facts already fully
+> covered by an existing entry.
+
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base (do this first)
