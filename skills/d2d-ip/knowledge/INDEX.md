@@ -23,6 +23,8 @@ next query on the same subject is fast and does not require re-reading the sourc
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| Pre-FIU transport reachability — SPI-GW reaches horizontal links MMIO can't | `pre-fiu-transport-reachability.md` | spi gateway, spi-gw, mmio transport, fiu, transport switch, dup broadcast, horizontal links, d2-d3, primeboot, sbinit, re-bring-up, verification reads | Verified from FW driver | 2026-06-30 |
+| SBINIT-done probe (spare bit vs intr summary) | `sbinit-done-probe.md` | sbinit, sideband init, cmn_top_int2, spare_cfg0, cmn_top_int1, intr1_summary, rom marker, boot probe, link bring-up | Verified from spec + reg header | 2026-06-29 |
 | D2D link health monitoring | `health-monitoring.md` | health monitor, link health, eye monitoring, running parity, runtime link testing, ber, slm, per-lane, retrain, autonomous bw, pll lock, ointerrupt_0, ointerrupt_1 | Verified from spec | 2026-06-23 |
 | D2D / UCIe error injection mechanisms | `error-injection.md` | error injection, inject, crc, ecc, parity, prbs, link test, d2d_err_link_test_ctl, imp_mb_config6, imp_mb_config7, ber, runtime link testing, testability | Verified from spec | 2026-06-23 |
 | UCIe error notification / reporting mechanism | `ucie-error-notification.md` | ucie, error, notification, reporting, escalation, errmsg, sideband, linkerror, rdi, fdi, viral, dvsec, correctable, non-fatal, fatal, uie | Verified from spec | 2026-06-16 |
