@@ -68,16 +68,25 @@ Detection → Logging → Containment → Communication → Recovery
 
 ### C2C / Scale-Up link errors → tray reset (FW vs BMC split)
 
-Spec-owner directive (Maxim, via Akshay, 2026-06-23) for C2C **drop mode** / link-error recovery:
+Headline: **FW reports the link-error event; BMC resets the entire tray on any link error.**
+On the BMC-issued "scale up reset" request, FW must configure the reset mask and enable c2c
+reset before issuing the reset — nothing more for drop mode. Full detail (spec-owner directive,
+FW PR refs, superseded spec paragraphs) in [`knowledge/c2c-link-error-tray-reset.md`](knowledge/c2c-link-error-tray-reset.md).
+C2C-side / RTL detail (drain payload vs drop arming, `int_isolation('0)` tie-off) in the
+`su-ip` knowledge base (`drop-mode-error-containment.md`).
 
-- **FW only reports the link-error event.** No FW-driven routing-table invalidation, no FW
-  cross-die "device lost" propagation (viral is no longer a valid flow).
-- **The BMC owns recovery and resets the *entire tray*** — even a **single link error triggers
-  a full tray reset**.
-- On the BMC-issued **"scale up reset"** request, FW must **configure the reset mask and enable
-  c2c reset *before* issuing the reset**. Nothing more is required for drop mode.
-- Impl references: `ip.psoc.sw.fw`#390, `module.infra.sw.fw`#118. Full C2C-side detail in the
-  `su-ip` knowledge base (`drop-mode-error-containment.md`).
+### PIW SEI host-notify path — execution-context safety + plugin registration
+
+Two non-obvious operational constraints on the PCIe EP error-handling chain (PIW SEI → host):
+
+1. **HOST_NOTIFY can block — bind via the poll-thread (`EL_IRQ_TREE_ROOT_IRQ_MON_REGISTER`),
+   never hard ISR.** EQ-mailbox allocation/retry can block.
+2. **Plugin registration is the liveness gate.** Until the matching `pcie_sei` plugin (under
+   `ip/mng/subsystems/el_error_handler/plugins/`) calls `el_piw_sei_register_err_handler`,
+   the whole HOST_NOTIFY chain is silently inert — no host notifications, no log.
+
+Full detail (capture-surface contract, hardening recommendations, FW citations) in
+[`knowledge/piw-sei-host-notify.md`](knowledge/piw-sei-host-notify.md).
 
 ### Poison vs Viral
 
@@ -177,7 +186,60 @@ MC ←→ SPI Physical ←→ Mailbox Transport ←→ PLDM/MCTP Protocol ←→
 | Margin Tools | Execute margin measurements, expose results via PLDM |
 | Platform | Module Alert# handling, MC reboot recovery |
 
+## Knowledge Base (Expert Memory)
+
+This skill keeps an **expert memory** of everything it has already researched and verified, so
+repeat questions on the same subject are answered fast without re-reading the (very large) RAS
+and Device Manageability specs.
+
+- **Location:** `~/.copilot/skills/ras-manageability/knowledge/`
+- **Index:** `~/.copilot/skills/ras-manageability/knowledge/INDEX.md` — catalog of recorded topics
+- Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
+
+The knowledge base is **always consulted first** (Step 0) and **always updated after**
+non-trivial research (final step). This is what makes the skill grow into a true RAS &
+manageability expert over time. RAS findings that are equally relevant to one specific IP
+(PCIe, SE/C2C, D2D) should also be mirrored or cross-linked in that IP's knowledge base.
+
+> **Recording trigger — read this twice.** Record a finding whenever you **verify** a
+> non-trivial RAS/manageability fact during this turn, regardless of *why* you were invoked.
+> The trigger is the verification, not the question shape. This fires when:
+> - the user asked you directly (the obvious case);
+> - another skill (e.g. `pr-review`, `iridium-prj`, `pcie-ep-ip`, `su-ip`, `d2d-ip`) consulted you;
+> - you read FW driver code, IRQ-tree wiring, PLDM/MCTP handlers, or design docs during a
+>   code review and locked in a durable contract/sequence/erratum fact;
+> - you reconciled two sources (RAS spec vs FW, manageability spec vs PLDM handler, spec-owner
+>   directive vs older spec text) and resolved which is current.
+>
+> **"Non-trivial RAS/manageability fact"** = anything a future query could re-ask: an error
+> classification/containment rule, an execution-context contract (ISR vs thread), a PLDM/MCTP
+> command shape or quirk, a telemetry-attribute semantic, a power/thermal-loop rule, a
+> spec-owner directive that supersedes earlier text, a HW–FW–BMC responsibility split, an
+> integration contract (e.g. plugin-registration liveness gates).
+> If in doubt, **record**. A too-detailed knowledge base costs milliseconds; a missing entry
+> costs the next query a full re-read of a multi-hundred-page spec.
+>
+> Skip only: pure code-style nits, project-specific FW architecture (belongs in
+> `iridium-prj`), tooling/CI/Python issues, and re-statements of facts already fully covered
+> by an existing entry.
+
 ## Procedure
+
+### Step 0: Consult the Knowledge Base (do this first)
+
+1. Read `~/.copilot/skills/ras-manageability/knowledge/INDEX.md` and scan the topic table.
+2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
+   `knowledge/` directory for the question's keywords:
+   ```python
+   import os, glob
+   kb = os.path.expanduser("~/.copilot/skills/ras-manageability/knowledge")
+   for f in glob.glob(os.path.join(kb, "*.md")):
+       txt = open(f, encoding="utf-8").read()
+       if "<keyword>" in txt.lower():
+           print(f"== {os.path.basename(f)} ==")
+   ```
+3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
+   **narrow** the search before diving into the spec / FW code.
 
 ### Step 1: Search the Specifications
 
@@ -252,6 +314,23 @@ for t_idx, table in enumerate(doc.tables):
    - Infra FW: `module.infra.sw.fw.zephyr`
    - PCIe EP FW: `ip.pcie.sw.fw.ep`
    - SE FW: `ip.se.sw.csr`
+
+### Step 4: Record Verified Findings (do this last)
+
+After answering a non-trivial question, persist what you verified so the skill remembers it:
+
+1. Create or update `~/.copilot/skills/ras-manageability/knowledge/<topic-slug>.md` using the
+   template in `INDEX.md`. Keep it concise, durable, and reusable.
+2. Add or refresh the topic's row in `INDEX.md` (newest at top) with tags, status, and date.
+3. Always include citations (doc + paragraph/table/page, RTL/FW repo + file + symbol) so the
+   finding can be re-verified and trusted.
+4. If new research contradicts a prior entry, **correct** that entry rather than leaving stale
+   information.
+5. If the finding is equally relevant to one specific IP, also mirror or cross-link it from
+   that IP's knowledge base (`pcie-ep-ip`, `su-ip`, `d2d-ip`).
+
+Skip recording only for trivial lookups already fully covered by an existing entry. See the
+"Recording trigger" block above for what counts as non-trivial.
 
 ### Search Strategy Tips
 
