@@ -1017,6 +1017,238 @@ def cmd_scan_reviews(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Subcommand: blocked-scan (check whether the ball has come back on my blocked reviews)
+# ----------------------------------------------------------------------------
+
+# Heuristic markers in author replies to a review comment.
+_PUSHBACK_MARKERS = (
+    "won't fix", "wont fix", "wontfix", "by design", "as-is", " as is",
+    "intentional", "not applicable", "disagree", "next step", "future work",
+    "out of scope",
+)
+_ADDRESSED_MARKERS = (
+    "done", "fixed", "addressed", "applied", "updated", "resolved",
+)
+
+
+def _reply_pushback(body: str) -> bool:
+    b = body.lower()
+    return any(m in b for m in _PUSHBACK_MARKERS)
+
+
+def _reply_addressed(body: str) -> bool:
+    b = body.lower().strip()
+    # Short "done"/"fixed" tokens are the strongest signal.
+    if b in {"done", "done.", "fixed", "fixed."}:
+        return True
+    return any(m in b.split() for m in _ADDRESSED_MARKERS)
+
+
+def _gh_api(path: str) -> Any:
+    """gh api <path> --paginate → parsed JSON (list or dict). Returns [] on failure."""
+    out = subprocess.run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json", "--paginate", path],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        return []
+    text = out.stdout.strip()
+    if not text:
+        return []
+    # --paginate concatenates JSON arrays as ][ — normalize.
+    text = text.replace("][", ",")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+
+def _classify_pr(state: str, merged: bool, new_commits: int, threads_replied: int) -> str:
+    if merged:
+        return "merged"
+    if state and state.upper() == "CLOSED":
+        return "closed"
+    if new_commits > 0:
+        return "needs_re_review"
+    if threads_replied > 0:
+        return "replies_only"
+    return "no_activity"
+
+
+def _scan_one_pr(me: str, owner: str, repo: str, num: int, submitted_at: str) -> dict:
+    """Return the compact per-PR summary used by blocked-scan."""
+    result: dict[str, Any] = {
+        "repo": repo, "pr": num,
+        "url": f"https://github.com/{owner}/{repo}/pull/{num}",
+        "submitted_at": submitted_at,
+        "state": None, "mergeable": None, "head": None,
+        "new_commits": 0, "recent_commits": [],
+        "my_threads": 0, "threads_with_reply": 0, "replies": [],
+        "classification": "unknown", "transitioned": None,
+    }
+    try:
+        pr = gh_pr_json(owner, repo, num,
+                        "state,mergeable,isDraft,updatedAt,headRefOid,mergedAt,closed,commits")
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+    result["state"] = pr.get("state")
+    result["mergeable"] = pr.get("mergeable")
+    result["head"] = (pr.get("headRefOid") or "")[:8]
+    merged = bool(pr.get("mergedAt"))
+    commits = pr.get("commits") or []
+    new = [c for c in commits if (c.get("committedDate") or "")[:10] > (submitted_at or "")]
+    result["new_commits"] = len(new)
+    result["recent_commits"] = [
+        {"date": (c.get("committedDate") or "")[:10],
+         "sha": (c.get("oid") or "")[:8],
+         "msg": (c.get("messageHeadline") or "")[:80]}
+        for c in commits[-3:]
+    ]
+
+    # Thread replies
+    comments = _gh_api(f"/repos/{owner}/{repo}/pulls/{num}/comments?per_page=100")
+    if isinstance(comments, list):
+        threads: dict[int, list[dict]] = {}
+        for c in comments:
+            rid = c.get("in_reply_to_id") or c.get("id")
+            threads.setdefault(rid, []).append(c)
+        for _, msgs in threads.items():
+            msgs.sort(key=lambda m: m.get("created_at", ""))
+            head = msgs[0]
+            if (head.get("user") or {}).get("login") != me:
+                continue
+            result["my_threads"] += 1
+            later = [m for m in msgs[1:]
+                     if (m.get("user") or {}).get("login") != me]
+            if later:
+                result["threads_with_reply"] += 1
+                last = later[-1]
+                body = (last.get("body") or "").replace("\r", " ").replace("\n", " ")
+                head_body = (head.get("body") or "").replace("\r", " ").replace("\n", " ")
+                result["replies"].append({
+                    "path": head.get("path"),
+                    "line": head.get("line") or head.get("original_line"),
+                    "by": (last.get("user") or {}).get("login"),
+                    "date": (last.get("created_at") or "")[:10],
+                    "snippet": body[:140],
+                    "my_snippet": head_body[:100],
+                    "pushback": _reply_pushback(body),
+                    "addressed": _reply_addressed(body),
+                })
+
+    result["classification"] = _classify_pr(
+        result["state"] or "", merged, result["new_commits"], result["threads_with_reply"])
+    return result
+
+
+def cmd_blocked_scan(args: argparse.Namespace) -> int:
+    """For every blocked code-review task, check GitHub for author activity.
+
+    Compact output (~1–3 KB) that the review-mgr skill consumes instead of
+    fetching PRs one-by-one. Optional --update auto-transitions PRs with new
+    commits since submission to `waiting-for-re-review`.
+    """
+    d = load()
+    me = gh_me()
+    if not me:
+        print("[tm] could not determine gh login (gh auth status?)", file=sys.stderr)
+        return 1
+    tasks = [t for t in d["tasks"]
+             if t.get("category") == "code-review" and t.get("status") == "blocked"]
+    report: list[dict] = []
+    for t in tasks:
+        entry = {
+            "id": t["id"],
+            "title": t.get("title", ""),
+            "blocked_days": days_since(t.get("updated") or t.get("created") or TODAY),
+            "prs": [],
+        }
+        for p in pr_entries(t):
+            if pr_resolved(p):
+                continue
+            summary = _scan_one_pr(
+                me, p.get("owner", ""), p.get("repo", ""),
+                int(p.get("pr_number") or 0), p.get("submitted_at") or "",
+            )
+            entry["prs"].append(summary)
+        report.append(entry)
+
+    # Apply --update transitions (per-PR to avoid touching quiet PRs on multi-PR tasks)
+    if args.update:
+        d = load()  # reload for a clean write path
+        transitioned: list[tuple[str, str, int]] = []
+        for entry in report:
+            t = find_task(d, entry["id"])
+            if not t:
+                continue
+            for pr_sum in entry["prs"]:
+                if pr_sum["classification"] != "needs_re_review":
+                    continue
+                for p in pr_entries(t):
+                    if p.get("repo") == pr_sum["repo"] and p.get("pr_number") == pr_sum["pr"]:
+                        p["review_status"] = "waiting-for-re-review"
+                        pr_sum["transitioned"] = "waiting-for-re-review"
+                        transitioned.append((t["id"], pr_sum["repo"], pr_sum["pr"]))
+            # Derive task status: any non-resolved, non-blocked-still means it's back with reviewer.
+            prs = pr_entries(t)
+            if any(pp.get("review_status") == "waiting-for-re-review" for pp in prs) \
+                    and t.get("status") == "blocked":
+                t["status"] = "todo"
+                t["updated"] = TODAY
+                append_note(t, "blocked-scan: bounced back → waiting-for-re-review")
+        save(d)
+
+    if args.json:
+        print(json.dumps({"generated_at": NOW, "me": me, "tasks": report}, indent=2))
+        return 0
+
+    # Markdown (compact)
+    buckets = {"needs_re_review": [], "replies_only": [],
+               "no_activity": [], "merged": [], "closed": []}
+    for entry in report:
+        for pr_sum in entry["prs"]:
+            buckets.setdefault(pr_sum["classification"], []).append((entry, pr_sum))
+
+    print(f"# blocked-scan — {TODAY} ({len(report)} blocked task(s), "
+          f"{sum(len(e['prs']) for e in report)} PR(s))")
+
+    def _emit(header: str, items: list[tuple[dict, dict]], icon: str,
+              show_replies: bool = True) -> None:
+        if not items:
+            return
+        print(f"\n## {icon} {header} ({len(items)})")
+        for entry, pr_sum in items:
+            tag = ""
+            if pr_sum.get("transitioned"):
+                tag = f"  → **{pr_sum['transitioned']}**"
+            mergeable = pr_sum.get("mergeable")
+            m = f" [{mergeable}]" if mergeable and mergeable != "MERGEABLE" else ""
+            print(f"- **{entry['id']}** {pr_sum['repo']}#{pr_sum['pr']} "
+                  f"(blocked {entry['blocked_days']}d, "
+                  f"+{pr_sum['new_commits']} commits since {pr_sum['submitted_at']}, "
+                  f"HEAD {pr_sum['head']}){m}{tag}")
+            if show_replies and pr_sum["replies"]:
+                addr = sum(1 for r in pr_sum["replies"] if r.get("addressed"))
+                push = sum(1 for r in pr_sum["replies"] if r.get("pushback"))
+                print(f"    threads: {pr_sum['threads_with_reply']}/{pr_sum['my_threads']} "
+                      f"replied — {addr} addressed, {push} pushback")
+                for r in pr_sum["replies"][:5]:
+                    flag = " ⚠pushback" if r.get("pushback") else \
+                           (" ✅addressed" if r.get("addressed") else "")
+                    line = r.get("line") or "?"
+                    print(f"    - `{r['path']}:{line}` by {r['by']} "
+                          f"{r['date']}{flag}: {r['snippet']}")
+
+    _emit("Auto-transition candidates (new commits)", buckets["needs_re_review"], "⚠️")
+    _emit("Replies only — needs your call", buckets["replies_only"], "💬")
+    _emit("No activity", buckets["no_activity"], "✅", show_replies=False)
+    _emit("Merged", buckets["merged"], "🔀", show_replies=False)
+    _emit("Closed", buckets["closed"], "❌", show_replies=False)
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # Subcommand: re-review
 # ----------------------------------------------------------------------------
 
@@ -1412,6 +1644,22 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+    <div class="row" id="row-review" style="margin-top:12px; display:none;">
+      <div class="grp">
+        <span class="lbl">Review status</span>
+        <div class="dd" id="dd-reviewstatus">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-reviewstatus"></div>
+        </div>
+      </div>
+      <div class="grp">
+        <span class="lbl">Author</span>
+        <div class="dd" id="dd-author">
+          <button type="button" class="dd-btn"><span class="dd-label">All</span><span class="dd-caret">▾</span></button>
+          <div class="dd-panel" id="f-author"></div>
+        </div>
+      </div>
+    </div>
     <div class="toolbar">
       <div class="grp" style="flex-direction:row; align-items:center; gap:8px;">
         <span class="lbl" style="color:var(--muted);font-size:11px;">Columns</span>
@@ -1439,6 +1687,7 @@ const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled
 const PRI_ORDER = ["critical","high","medium","low"];
 const CPX_ORDER = ["trivial","small","medium","large","epic"];
 const CATEGORIES = ["development","code-review","planning","testing","track","misc"];
+const RV_ORDER = ["pending","in-progress","commented","changes-requested","waiting-for-re-review","approved","merged"];
 
 const COLUMNS = [
   {key:"id",      label:"ID",        on:true},
@@ -1517,7 +1766,7 @@ function feature(t){
 
 // ---- build filter dropdowns ----
 function uniq(arr){ return [...new Set(arr)]; }
-const DD_GROUPS = ["status","category","priority","complexity","workspace"];
+const DD_GROUPS = ["status","category","priority","complexity","workspace","reviewstatus","author"];
 function ddItem(container, value, label, group){
   const lab=document.createElement("label"); lab.className="dd-opt";
   lab.innerHTML=`<input type="checkbox" data-group="${group}" value="${esc(value)}"> ${esc(label)}`;
@@ -1533,9 +1782,7 @@ function updateDdLabel(group){
   lbl.textContent = vals.length===0 ? "All" : (vals.length===1 ? vals[0] : vals.length+" selected");
 }
 function buildFilters(){
-  ["status","category","priority","complexity","workspace"].forEach(g=>{
-    document.getElementById("f-"+g).innerHTML="";
-  });
+  DD_GROUPS.forEach(g=>{ const el=document.getElementById("f-"+g); if(el) el.innerHTML=""; });
   STATUS_ORDER.filter(s=>TASKS.some(t=>t.status===s))
     .forEach(s=>ddItem(document.getElementById("f-status"),s,s,"status"));
   uniq(TASKS.map(t=>t.category)).sort()
@@ -1546,6 +1793,12 @@ function buildFilters(){
     .forEach(c=>ddItem(document.getElementById("f-complexity"),c,c,"complexity"));
   uniq(TASKS.map(t=>t.workspace).filter(Boolean)).sort()
     .forEach(w=>ddItem(document.getElementById("f-workspace"),w,w,"workspace"));
+  // code-review-only filters: review status + PR author (drawn from PR data)
+  const revPrs=TASKS.filter(t=>t.category==="code-review").flatMap(t=>prs(t));
+  RV_ORDER.filter(s=>revPrs.some(r=>(r.review_status||"pending")===s))
+    .forEach(s=>ddItem(document.getElementById("f-reviewstatus"),s,s,"reviewstatus"));
+  uniq(revPrs.map(r=>r.author||"?")).sort()
+    .forEach(a=>ddItem(document.getElementById("f-author"),a,a,"author"));
   DD_GROUPS.forEach(updateDdLabel);
 }
 
@@ -1570,6 +1823,7 @@ function applyFilters(){
   const q=document.getElementById("q").value.trim().toLowerCase();
   const st=checkedVals("status"), cat=checkedVals("category"), pri=checkedVals("priority");
   const cpx=checkedVals("complexity"), ws=checkedVals("workspace");
+  const rvst=checkedVals("reviewstatus"), auth=checkedVals("author");
   const hideDone=document.getElementById("o-hidedone").checked;
   const needJira=document.getElementById("o-jira").checked;
   const needWs=document.getElementById("o-ws").checked;
@@ -1583,6 +1837,8 @@ function applyFilters(){
     if(pri.length && !pri.includes(t.priority)) return false;
     if(cpx.length && !cpx.includes(t.complexity)) return false;
     if(ws.length && !ws.includes(t.workspace)) return false;
+    if(rvst.length && !prs(t).some(r=>rvst.includes(r.review_status||"pending"))) return false;
+    if(auth.length && !prs(t).some(r=>auth.includes(r.author||"?"))) return false;
     if(needJira && !t.jira) return false;
     if(needWs && !t.workspace) return false;
     if(reviewOnly && t.category!=="code-review") return false;
@@ -1774,6 +2030,14 @@ function selectTab(tab){
   if(tab!=="all"){
     document.querySelectorAll('input[data-group="category"]').forEach(cb=>{ cb.checked=false; });
     updateDdLabel("category");
+  }
+  // review status / author filters only make sense inside the code-review tab
+  const rvRow=document.getElementById("row-review");
+  if(rvRow) rvRow.style.display = tab==="code-review" ? "" : "none";
+  if(tab!=="code-review"){
+    document.querySelectorAll('input[data-group="reviewstatus"],input[data-group="author"]')
+      .forEach(cb=>{ cb.checked=false; });
+    updateDdLabel("reviewstatus"); updateDdLabel("author");
   }
   applyTabPreset(tab);
   render();
@@ -2268,6 +2532,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     a.add_argument("urls", nargs="+", metavar="PR_URL")
     a.set_defaults(func=cmd_re_review)
+
+    # blocked-scan
+    a = sub.add_parser(
+        "blocked-scan",
+        help="check every blocked review task for author activity (new commits / thread replies)",
+    )
+    a.add_argument("--update", action="store_true",
+                   help="auto-transition PRs with new commits to waiting-for-re-review")
+    a.add_argument("--json", action="store_true",
+                   help="emit the compact JSON report instead of markdown")
+    a.set_defaults(func=cmd_blocked_scan)
 
     return p
 
