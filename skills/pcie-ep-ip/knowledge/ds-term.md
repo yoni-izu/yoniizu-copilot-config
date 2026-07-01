@@ -65,8 +65,47 @@ Two trigger sources per gate:
   security/range filters in PIW**, downstream of the DWC DS_TERM gate. Different blocks,
   different schema (`AXI_TERMINATION{,_CFG}.yml`).
 
+### Host-side early clear — workaround, ordering contract (PR #282, 2026-06-30)
+When SoC FW (`fla_runtime`) raises downstream master termination during bring-up, the host's
+BAR-mapped MMIO (master) path is blocked, breaking host tooling (e.g. `fw_host_cli`). The
+**host-only** workaround is a `SYS_INIT` that clears `PF_SW_MSTR_TERM` early. Contract:
+
+- **Clears MSTR only, never ELBI.** The clear travels over ELBI (the only host transport that
+  side-steps MSTR termination), so clearing `PF_SW_ELBI_TERM` would saw off the branch the
+  write is sitting on. `el_pcie_ep_host_set_downstream_termination(false)` →
+  `dwc_ep_ctl_set_downstream_termination` with the MSTR-only mask is the right API.
+- **Init priority `PRE_KERNEL_1, 30`** is chosen to land between the EP device inits and the
+  board sanity check:
+  - `el_pcie_ep` / `dwc_ep_ctl` `INIT_PRIORITY=1`, `el_piw=2` — all `< 30`, so they run first.
+  - Board sanity check (host native board `board_init`) is `PRE_KERNEL_1,
+    CONFIG_KERNEL_INIT_PRIORITY_DEFAULT=40` — `> 30`, so the clear lands first.
+  - The board sanity check reads the **master** path via `sys_read32` and compares to an
+    ELBI-read expected — exactly the path this clear unblocks.
+- **ELBI transport must be usable that early.** `el_pcie_if_elbi_read/write` are stateless
+  `do_xfr()` accessors with no `SYS_INIT`/`DEVICE` init anywhere in `el_pcie_if`. So priority
+  `30` has no transport-init dependency; the assumption "ELBI already works at this stage"
+  holds.
+- **Host-only gating.** Kconfig `EL_PCIE_EP_HOST_CLEAR_DS_TERM` with `depends on
+  EL_PCIE_IF_ELBI` and `default y`. `EL_PCIE_IF_ELBI` is defined/used only on host/native
+  boards (`infra/interfaces/el_pcie_if`, native `el_host_a1`); the ARM SoC FW reaches the EP
+  via direct MMIO and never selects this symbol. So `default y` is safe — it cannot leak onto
+  ARM.
+- **Failure semantics: best-effort.** The init returns `0` on failure with a `LOG_WRN`; the
+  real board sanity check (`board_init`) is the gate that fails the boot if the clear didn't
+  work. Correct call — a host-convenience clear must not be able to brick boot.
+- **Hardening (optional but recommended).** The `30` literal silently depends on
+  `EL_PCIE_EP_INIT_PRIORITY < 30 < KERNEL_INIT_PRIORITY_DEFAULT`. A future priority bump would
+  break ordering with no compile-time signal. Either promote `30` to a Kconfig
+  (e.g. `EL_PCIE_EP_HOST_CLEAR_DS_TERM_PRIORITY`) or add `BUILD_ASSERT`s tying it to both
+  neighbours.
+- **One-time clear, no re-arm.** If SoC re-applies termination after host boot, the host
+  won't auto-re-clear. Inherent to a host-side WA; the real fix is device-side / reaching
+  the management path.
+
 ## Sources
 - RTL: `Elmnt-Internal/ip.pcie.rtl` → `pep_macro/rtl/pep_axi_mstr.v`, `pep_macro/rtl/pcie_iip_device_wrap.v`
 - FW: `fw/ip/pcie/include/el_piw_sei_bits.h`, `fw/ip/pcie/drivers/el_piw/el_piw_sei_tree.c`,
-  `fw/ip/pcie/include/el_pcie.h`, `drivers/snps_ep_ctl/tests/host_tests_sv.c`
+  `fw/ip/pcie/include/el_pcie.h`, `drivers/snps_ep_ctl/tests/host_tests_sv.c`,
+  `drivers/el_pcie_ep/el_pcie_ep_host_ds_term.c` (host-side early clear, PR #282 /
+  `IPPCIESW-514`)
 - Doc: `fw/ip/pcie/docs/pcie-cluster-architecture.md`
