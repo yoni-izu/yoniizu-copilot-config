@@ -1,7 +1,7 @@
 ---
 name: review-mgr
-description: "Manage the incoming code-review queue end-to-end: discover PRs that need your review, log them, align the workspace to a review, scan blocked reviews for author activity, and close out a review pass. Use when: scan for PRs that need my review, find new review requests, add PRs to review, list/track my review queue, start/stop a review checkout, finish a review pass, check if a blocked review bounced back, review queue status. For the actual act of reviewing a PR (drafting findings, the memoir, submitting), use the pr-review skill. For tracking your OWN submitted PRs, use pr-monitor."
-argument-hint: "Action (scan/add/list/start/stop/done/status/check/blocked-scan/msg) and optional PR links or task id"
+description: "Manage the incoming code-review queue end-to-end: discover PRs that need your review, log them, align the workspace to a review, batch auto-draft preliminary reviews of new tasks, scan blocked reviews for author activity, and close out a review pass. Use when: scan for PRs that need my review, find new review requests, add PRs to review, list/track my review queue, start/stop a review checkout, pre-review / auto-draft / review new PRs, finish a review pass, check if a blocked review bounced back, review queue status. For the actual act of reviewing a PR (drafting findings, the memoir, submitting), use the pr-review skill. For tracking your OWN submitted PRs, use pr-monitor."
+argument-hint: "Action (scan/add/list/start/pre-review/stop/done/status/check/blocked-scan/msg) and optional PR links or task id"
 ---
 
 # Review Manager
@@ -65,6 +65,23 @@ Check the workspace's repos out to a review task's branches so you can review lo
 6. Report: which repos switched to review branches, which to main, which were skipped (and why).
 7. Hand off the actual review to **`pr-review`** (local workspace mode).
 
+### `pre-review` — batch auto-draft every new review task ("review new PRs")
+
+Do an unattended **preliminary** pass over every review task you've **never looked at**, leaving a local `pr-review` draft ready for each one. This front-loads the mechanical read so that when the user sits down to review a PR themselves, your draft is already waiting. It **never posts to GitHub** — drafts only.
+
+Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
+
+1. **Select the new tasks.** Read the store; pick every active review task (status `todo`/`in-progress`, not done/cancelled) whose notes do **not** already contain the `initial auto review draft done` marker. These are the never-looked-at tasks. If none qualify, report "no new review tasks to pre-review" and stop. List the selected tasks (ids + PR counts) before starting.
+2. **Process one task at a time**, in order. For each task:
+   a. **Align the workspace** using the `start` mechanics: for each PR entry, `git fetch origin <branch>` then `git checkout <branch>` (fall back to `git fetch origin pull/<pr>/head:<branch>` on a missing ref); switch every other workspace repo to its default branch (`main`). Never create `pr-NNN` branches, never use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
+   b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
+   c. **Mark the task** by appending the note `initial auto review draft done` (with the date) via `tm.py`. Do **not** change `review_status` — this is a preliminary pass, not an actual review; leave the task's status untouched so the user's own review flow (`start` → `pr-review`) still runs normally.
+   d. Move to the next task.
+3. **Return to a clean state.** After the last task, run the `stop` mechanics: switch every workspace repo back to its default branch (skip and report dirty repos; never force).
+4. **Report** a summary: which tasks were drafted, where each draft lives, which tasks/repos were skipped (and why), and confirm the workspace is back on default branches.
+
+Guarantees: drafts only (no GitHub writes), no destructive git, and no review-status transitions — the user still reviews each PR themselves later, now with a head start.
+
 ### `stop`
 
 Switch every workspace repo back to its default branch. Skip (don't force) dirty repos and report them. Don't change task status unless asked.
@@ -114,3 +131,4 @@ For `blocked` review tasks, check whether the author acted (CLI does **not** do 
 6. **Auto-purge:** when every PR in a task is resolved (merged or closed-without-merge) the task is deleted — `review-update` / `review-check` handle this.
 7. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo — a second PR in the same repo is unreachable locally, causes confusion about which code is under review, and forces the reviewer to context-switch branches mid-review. When adding PRs (via `scan` or `add-review`), split any same-repo collisions into separate tasks. When inheriting a task that already violates this, split it before `start`.
 8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
+9. **`pre-review` is drafts-only.** The batch auto-draft pass produces local `pr-review` drafts and never writes to GitHub or transitions review status. It marks each processed task with the `initial auto review draft done` note so subsequent runs skip it; that note is the sole "already looked at" signal.
