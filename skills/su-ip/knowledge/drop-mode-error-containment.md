@@ -154,6 +154,33 @@ at runtime with no error. Look for `ISOLATION_DROP` / `MSTR_TERMINATION` / `SLAV
 programming before believing "isolation mode" is functional. (Surfaced reviewing IPSESW-120/121.)
 Even with that programming, see the tie-off finding above: no live trigger on this silicon.
 
+### FW programming model — payload preprogrammed, only enable is gated (PR #96, 2026-06-30)
+`el_c2c_configure_isolation()` in the SE driver programs the drain-payload registers
+**unconditionally** at port init — independent of the DT `isolation-wd-enable` flag:
+
+| Register | Field | Gated by `iso->enable`? |
+|----------|-------|--------------------------|
+| `ISOLATION_DRAIN_CNTR` (0x3c8) | base count | **No — always written** |
+| `C2C_ISOLATION_DRAIN_CNT` (0x1b8) | iso count (write-only, no shadow) | **No** |
+| `TRANS_PIPE_CFG_2` (RMW) | `ISO_DRAIN_CNT_EN` (mask `0x100`) | **No** |
+| `ISOLATION_DRAIN_RESP` | dummy BRESP/RRESP (2-bit each, masks 0x3 / 0x30) | **No** |
+| `ISOLATION_DRAIN_RUSER` / `_BUSER` | dummy user bits | **No** (hardcoded `0` in the EL_C2C_CONFIG macro today) |
+| `ISOLATION_DRAIN_ENABLE` (0x3c4, `cfg_drain_en`) | drain block enable | **Yes** — the only write conditional on `iso->enable` |
+
+So the timeout/resp/iso-count values are always live in HW; only the drain block's enable bit
+is gated. Functionally harmless because the disabled block does nothing, but the DT binding
+contract is easy to misread: properties like `isolation-wd-timeout / -iso-timeout /
+-use-iso-count / -bresp / -rresp` are **always applied**, not "only applied when
+`isolation-wd-enable` is set".
+
+Implications for reviewers / integrators:
+- Don't expect "leaving `isolation-wd-enable=false`" to mean the values are absent from HW —
+  they're loaded; only the drain is off.
+- Combined with the `int_isolation('0)` tie-off above, an "enabled" config still doesn't arm
+  the WD path; only the async viral path can start a drain on this RTL.
+- RMW only on `TRANS_PIPE_CFG_2` (it's the only RW register in the set — the rest are
+  write-only / one-shot config); the write-only counter is written with its full 32-bit VAL.
+
 ## Sources
 - Directive: **Maxim** (C2C spec owner), relayed by Akshay Bharad via Teams, 2026-06-23 —
   FW reports link-error event only; BMC resets the entire tray on any link error; on the

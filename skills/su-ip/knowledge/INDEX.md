@@ -27,7 +27,9 @@ re-reading the (very large) source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
-| C2C Drop Mode & Isolation Mode (error containment, FW responsibility) | `drop-mode-error-containment.md` | drop mode, isolation mode, viral, error containment, ras, link down, watchdog, completion timeout, fw responsibility, tray reset, scale up reset, reset mask, c2c reset, bmc, isolation drain, isolation drop, drain enable, drain arming | Verified from doc + spec-owner directive + RTL | 2026-06-28 |
+| DM controller RADM clock-gating un-gate (DBI 0x88c bit 0; USP/DSP share register) | [dm-radm-clock-gating.md](dm-radm-clock-gating.md) | dm controller, dwc, clock_gating_ctrl_off, radm_clk_gating_en, radm_clk, async csr2mem, mem2csr, ecc, error reporting, usp, dsp, role-symmetry, init sequence | Verified from RTL + FW driver | 2026-06-30 |
+| C2C Compression register (EN gate, reset 0x6=disabled, field map) | `c2c-compression-register.md` | compression, c2c_compression, en bit, alg_disable, core_dis, cp bit mask, reset default, scale up, se driver | Verified from RTL + regs | 2026-06-29 |
+| C2C Drop Mode & Isolation Mode (error containment, FW responsibility) | `drop-mode-error-containment.md` | drop mode, isolation mode, viral, error containment, ras, link down, watchdog, completion timeout, fw responsibility, tray reset, scale up reset, reset mask, c2c reset, bmc, isolation drain, isolation drop, drain enable, drain arming, payload vs enable | Verified from doc + spec-owner directive + RTL + FW driver | 2026-06-30 |
 
 ## Topic File Template
 
