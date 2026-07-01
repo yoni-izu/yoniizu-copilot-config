@@ -29,6 +29,7 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `review-update <id> <review_status> [--pr N]` | Manual review-status update | Applies to all PR entries unless `--pr`. Auto-derives task status and auto-purges when every PR is resolved. |
 | `review-check` | Poll GitHub, mark merged/closed PRs, purge fully-resolved review tasks | Skips done/cancelled. |
 | `review-msg <id>` | Print a templated review-request message | |
+| `blocked-scan [--update] [--json]` | Check every `blocked` review task for author activity | For each PR: counts commits since `submitted_at`, groups thread replies, flags pushback (`won't fix`, `by design`, `next step`…) and addressed markers (`done`, `fixed`…). Compact output (~2–3 KB). `--update` auto-flips PRs with new commits to `waiting-for-re-review` and moves the task back to `todo`. |
 
 Review statuses: `pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`, `approved`, `merged`.
 
@@ -107,19 +108,27 @@ Combined `stop` + status update.
 
 ### `blocked-scan` — has the ball come back to me?
 
-For `blocked` review tasks, check whether the author acted (CLI does **not** do this).
+For `blocked` review tasks, check whether the author acted. **Delegate the mechanical polling to `tm.py blocked-scan`** — do not fan out `github-pull-request_issue_fetch` calls (that dumps ~10–20 KB of file diffs per PR into context for state you don't need).
 
-- For each `blocked` review task, for each PR entry: use `github-pull-request_issue_fetch` to compare `headRefOid` / latest commit date against the entry's `submitted_at`, and read author replies on review threads.
-- Classify each thread: **addressed** (fix pushed or "done"/"fixed" reply), **pushed back** ("won't fix"/"by design"), or **no response**.
-- If new commits since `submitted_at` → `tm.py review-update <id> waiting-for-re-review`. If only replies, do **not** auto-transition — report and ask.
-- Report per task:
-  ```
-  ## T-NNN: <title> (blocked Xd)
-  ### <repo>#<pr> — ⚠️ Author updated (N new commits)
-  - Your comment on `<file>`: <topic> → Author replied: "<gist>"
-  → **Needs re-review** (X/Y threads addressed)
-  ```
-  Indicators: ⚠️ new commits, 💬 replies only, ✅ no changes, 🔀 merged, ❌ closed.
+1. Run `python3 ~/.copilot/skills/task-manager/tm.py blocked-scan --update` (or `--json` if you want to post-process). The CLI:
+   - For each `blocked` code-review task, for each unresolved PR entry, calls `gh pr view` (state / commits / HEAD / mergeable) and `gh api /pulls/N/comments` (threads).
+   - Counts commits since `submitted_at`, groups author replies to your inline threads, and flags each reply with a `pushback` heuristic (`won't fix`, `by design`, `next step`, `out of scope`, `intentional`, …) or an `addressed` heuristic (`done`, `fixed`, `addressed`, `applied`).
+   - Classifies each PR: `needs_re_review` (new commits) / `replies_only` / `no_activity` / `merged` / `closed`.
+   - With `--update`: transitions PRs classified `needs_re_review` to `review_status: waiting-for-re-review` per-PR (multi-PR tasks: quiet PRs stay put) and moves the task back to `status: todo`.
+2. Read the summary. Your judgment is still required for:
+   - **`replies_only`** PRs — decide whether the author's reply is convincing enough to close the thread, or whether you want a re-review.
+   - **`needs_re_review`** PRs with `pushback` flags — verify the author isn't blowing off a real concern; the heuristic is deliberately loose.
+   - **`no_activity`** PRs that have been blocked for many days — decide whether to nudge the author.
+3. Report to the user per task:
+   ```
+   ## T-NNN: <title> (blocked Xd)
+   ### <repo>#<pr> — ⚠️ Author updated (N new commits)
+   - Your comment on `<file>`: <topic> → Author replied: "<gist>"
+   → **Needs re-review** (X/Y threads addressed)
+   ```
+   Indicators: ⚠️ new commits, 💬 replies only, ✅ no changes, 🔀 merged, ❌ closed.
+
+Only fall back to `github-pull-request_issue_fetch` when you need the actual file diff for one specific PR — never for the sweep.
 
 ## Rules
 
