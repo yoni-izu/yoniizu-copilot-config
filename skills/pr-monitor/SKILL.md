@@ -1,7 +1,7 @@
 ---
 name: pr-monitor
 description: "Monitor pending feature PR submissions across repos. Use when: user wants to log PRs for a feature, check PR status, monitor CI failures, review comments, rebase needs, analyze failures, list pending features, remove merged features, checkout PR branches, rebase PRs, draft review request message, PR monitoring, feature submission tracking."
-argument-hint: "Action (log/status/check/remove/list/checkout/rebase/review-msg) and optionally: feature name or PR URLs"
+argument-hint: "Action (log/status/check/remove/list/checkout/rebase/review-msg) and optionally: feature ID/name or PR URLs"
 ---
 
 # PR Monitor
@@ -15,7 +15,7 @@ The tracking file at `/memories/pr-monitor-features.md` uses this structure:
 ```markdown
 # Pending Feature PRs
 
-## <Feature Name>
+## [N] <Feature Name>
 - **Logged:** YYYY-MM-DD
 - **Description:** <one-line summary>
 - **PRs:**
@@ -23,6 +23,10 @@ The tracking file at `/memories/pr-monitor-features.md` uses this structure:
   |-------|------|-----|--------|-------|--------|
   | Elmnt-Internal | repo-name | 123 | branch-name | PR title | pending |
 ```
+
+Each feature header carries a **running ID** in the form `## [N] <Feature Name>`. The ID is a stable, monotonically increasing integer assigned at log time — it lets the user reference a feature by ID (e.g. "status of #3", "checkout 5") instead of typing the full name. IDs are never renumbered when features are removed; the next `log` always uses `max(existing IDs) + 1`.
+
+**Resolving a feature reference:** when the user names a feature, accept either its numeric ID (`3`, `#3`) or its name (case-insensitive substring match on the header). Always map the reference to a single feature before acting; if it's ambiguous, ask which one.
 
 `Status` column is a local cache updated on each check: `pending`, `merged`, `ci-fail`, `changes-requested`, `approved`, `needs-rebase`, `closed`.
 
@@ -38,9 +42,10 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
 1. Parse each PR reference to extract owner, repo, PR number.
 2. For each PR, use `github-pull-request_issue_fetch` to get title, head branch, and current state.
 3. Read the memory file with the memory tool (`/memories/pr-monitor-features.md`). Create it if it doesn't exist.
-4. Append a new feature section with today's date and all PRs, **including the branch name and title** in the table — these are cached for later use by `checkout`, `status`, and other commands.
-5. Write back with the memory tool.
-6. Confirm with a summary table.
+4. Determine the next running ID: `max(existing feature IDs) + 1` (start at `1` if there are none).
+5. Append a new feature section headed `## [N] <Feature Name>` with today's date and all PRs, **including the branch name and title** in the table — these are cached for later use by `checkout`, `status`, and other commands.
+6. Write back with the memory tool.
+7. Confirm with a summary table, showing the assigned ID.
 
 ### 2. Check All Features (`status` / `check`)
 
@@ -60,7 +65,7 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
 4. Update the status column in the memory file.
 5. Present a per-feature summary table:
 
-   **Feature: <name>** (logged YYYY-MM-DD)
+   **Feature [N]: <name>** (logged YYYY-MM-DD)
    | Repo | PR# | Title | CI | Reviews | Mergeable | Status |
    |------|-----|-------|----|---------|-----------|--------|
 
@@ -95,13 +100,13 @@ When a PR has a CI failure:
 
 **Procedure:**
 1. Read `/memories/pr-monitor-features.md`.
-2. Present a summary of all tracked features with PR counts and high-level status.
+2. Present a summary of all tracked features with their **ID**, PR counts, and high-level status, ordered by ID.
 
 ### 5. Remove a Feature (`remove`)
 
 **Procedure:**
-1. Confirm the feature name with the user.
-2. Read the memory file, remove the feature section.
+1. Resolve the feature by ID or name and confirm with the user.
+2. Read the memory file, remove the feature section. Do **not** renumber the remaining features — IDs stay stable.
 3. Write back with the memory tool.
 4. Confirm removal.
 
@@ -111,7 +116,7 @@ Checkout the local workspace repos to the PR branches for a tracked feature, pul
 
 **Procedure:**
 1. Read `/memories/pr-monitor-features.md`.
-2. If no feature name is given and multiple features exist, ask the user which feature to checkout.
+2. If no feature ID/name is given and multiple features exist, ask the user which feature to checkout.
 3. Read the **Branch** column directly from the memory file — branch names are already cached from the `log` command. No GitHub fetch needed.
 4. Find the workspace manifest XML (`.repo/manifests/` directory) to map repo names to local paths via `<project name="..." path="...">` entries.
 5. For each repo **with a PR branch**, fetch, checkout, and pull to ensure it's synced to the latest state:
@@ -136,7 +141,7 @@ Rebase all PRs in a feature (or all features) that have `needs-rebase` status on
 
 **Procedure:**
 1. Read `/memories/pr-monitor-features.md`.
-2. If a feature name is given, scope to that feature. Otherwise, operate across all features.
+2. If a feature ID/name is given, scope to that feature. Otherwise, operate across all features.
 3. Collect all PRs with status `needs-rebase`.
 4. If no PRs need rebasing, inform the user and stop.
 5. Find the workspace manifest XML (`.repo/manifests/` directory) to map repo names to local paths via `<project name="..." path="...">` entries.
@@ -165,7 +170,7 @@ Rebase all PRs in a feature (or all features) that have `needs-rebase` status on
 7. Present a summary table:
    | Feature | Repo | PR# | Branch | Result |
    |---------|------|-----|--------|--------|
-   | feature | repo | 123 | branch | Rebased & pushed / Conflicts (files) / Error |
+   | [N] feature | repo | 123 | branch | Rebased & pushed / Conflicts (files) / Error |
 8. For any PRs that were successfully rebased, update their status in the memory file to `pending` (CI will re-run).
 9. For PRs with conflicts, keep status as `needs-rebase` and list the conflicting files so the user can resolve manually.
 
@@ -175,7 +180,7 @@ Draft a message asking someone to review the PRs for a feature.
 
 **Procedure:**
 1. Read `/memories/pr-monitor-features.md`.
-2. If a feature name is given, scope to that feature. Otherwise, if multiple features exist, ask the user which feature.
+2. If a feature ID/name is given, scope to that feature. Otherwise, if multiple features exist, ask the user which feature.
 3. If no reviewer name is provided, ask the user for the reviewer's name.
 4. Collect the GitHub PR URLs for all non-merged PRs in the feature: `https://github.com/{Owner}/{Repo}/pull/{PR#}`.
 5. Output the following message for the user to copy:
@@ -202,6 +207,10 @@ Accept these formats:
 
 Extract: owner (default `Elmnt-Internal`), repo name, PR number.
 
+## Referencing Features
+
+A feature can be referenced by its **running ID** (`3`, `#3`) or by **name** (case-insensitive substring match on the header). Always resolve the reference to exactly one feature before acting; if ambiguous, ask the user to disambiguate.
+
 ## Status Priority
 
 When multiple conditions apply, report the highest-priority status:
@@ -216,6 +225,7 @@ When multiple conditions apply, report the highest-priority status:
 ## Rules
 
 - Always use the memory tool to read/write `/memories/pr-monitor-features.md`.
+- Each feature has a stable running ID in its header (`## [N] <Feature Name>`); assign `max(existing)+1` on `log` and never renumber on `remove`.
 - Never delete a feature entry without user confirmation, **except** fully-merged batches, which are auto-removed during `status`/`check`.
 - When checking status, fetch all PRs even if some have cached status — always get fresh data.
 - Use `gh` CLI as fallback if the GitHub tools don't return sufficient detail (e.g., for failure logs).
