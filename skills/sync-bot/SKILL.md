@@ -58,7 +58,7 @@ Each row is one chore. `id` is stable (used in state + `skip`). "Action" is the 
 | `rev-check` | Purge **merged/closed** review tasks | daily | focused | fast | RW¹ | `review-mgr` → `tm.py review-check` |
 | `pr-status` | Status of my **outgoing** feature PRs | daily | focused | med | RW¹ | `pr-monitor` → `status` |
 | `task-stale` | Surface my **stale** in-progress / blocked tasks | daily | focused | fast | RO | `task-manager` → `list --status in-progress` + `--status blocked`, flag age |
-| `ws-sync` | **Sync all workspaces**: stash → base → `elmcli ws sync` + `artifacts download` → restore → pop | daily | focused | slow | RW² | **script** `./sync_all_workspaces.sh [project]` (see below) |
+| `ws-sync` | **Sync all workspaces**: stash → base → `octl ws sync` + `artifacts download` → restore → pop | daily | focused | slow | RW² | **script** `./sync_all_workspaces.sh [project]` (see below) |
 | `team-snapshot` | Capture **weekly milestone snapshot** (tickets, effort, capacity, RAID) — keeps `manager-brief` projections fresh | weekly | wide | slow | RW¹ | `team-planner` → `Snapshot` (capability 8) — writes `~/team-planner/snapshots/YYYY-MM-DD.json` |
 | `staff-fetch` | Pull recent **FW staff-meeting** updates | weekly | wide | med | RW¹ | `team-weekly` → `fetch staff updates` (capability 5) |
 | `jira-merged` | **Stale in-progress** tickets whose **PR already merged** | weekly | wide | slow | RO | `jira-hsi-planning` → scan stale-in-progress-with-merged-PR |
@@ -79,7 +79,7 @@ Some chores are too mechanical to spend tokens narrating turn-by-turn. These run
 
 ### `ws-sync` — `./sync_all_workspaces.sh [project] [--no-artifacts] [--dry-run]`
 
-Syncs every initialized workspace under `~/projects/<project>/` (default `iridium`) to the latest base code, preserving local work. Per run it: (1) `wip_scan` + `wip_save` a recoverable snapshot, (2) stashes uncommitted changes in **all** repos on any branch, (3) returns every repo to its base/upstream branch, (4) runs `elmcli ws sync` + `elmcli artifacts download` per workspace, (5) restores the original branches, (6) pops only the stashes it created (matched by message). It never pushes, force-pushes, or hard-resets.
+Syncs every initialized workspace under `~/projects/<project>/` (default `iridium`) to the latest base code, preserving local work. Per run it: (1) `wip_scan` + `wip_save` a recoverable snapshot, (2) stashes uncommitted changes in **all** repos on any branch, (3) returns every repo to its base/upstream branch, (4) runs `octl ws sync` + `octl artifacts download` per workspace, (5) restores the original branches, (6) pops only the stashes it created (matched by message). It never pushes, force-pushes, or hard-resets.
 
 **How Sync-Bot runs it:**
 1. Invoke `~/.copilot/skills/sync-bot/sync_all_workspaces.sh <project>` (omit project ⇒ `iridium`). For a no-op preview use `--dry-run`; to skip artifact download use `--no-artifacts`.

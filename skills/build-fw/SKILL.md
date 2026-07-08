@@ -12,7 +12,7 @@ When the user wants to build a firmware Zephyr application — optionally target
 
 ## Overview
 
-The FW build system uses `elmcli ws build <project_name> --args "..."` to build.
+The FW build system uses `octl ws build <project_name> --args "..."` to build.
 
 Each Zephyr app lives under `zephyr_apps/<app>/` and has a `.star` file that defines `FW_BOARD_BUILD_LIST` — the list of supported board configurations.
 
@@ -81,7 +81,7 @@ Ask the user to pick from the available options (show as a table). Or if they sa
 
 The build command format:
 ```
-cd <ws_root> && elmcli ws build <project_name> [--args "<key=value> ..."]
+cd <ws_root> && octl ws build <project_name> [--args "<key=value> ..."]
 ```
 
 Build args that can be passed:
@@ -92,19 +92,19 @@ Build args that can be passed:
 **Examples:**
 ```bash
 # Build primeboot for arm/onix
-cd ~/projects/iridium/fb_983/one/fw && elmcli ws build project.iridium.sw.fw.psoc_primeboot --args "platform=arm variant=onix is_test=false"
+cd ~/projects/iridium/fb_983/one/fw && octl ws build project.iridium.sw.fw.psoc_primeboot --args "platform=arm variant=onix is_test=false"
 
 # Build mng for host/sim
-cd ~/projects/iridium/fb_983/one/fw && elmcli ws build project.iridium.sw.fw.psoc_mng --args "platform=host variant=sim is_test=false"
+cd ~/projects/iridium/fb_983/one/fw && octl ws build project.iridium.sw.fw.psoc_mng --args "platform=host variant=sim is_test=false"
 
 # Build fla_runtime for arm/palladium
-cd ~/projects/iridium/fb_983/one/fw && elmcli ws build project.iridium.sw.fw.fla_runtime --args "platform=arm variant=palladium is_test=false"
+cd ~/projects/iridium/fb_983/one/fw && octl ws build project.iridium.sw.fw.fla_runtime --args "platform=arm variant=palladium is_test=false"
 
 # Build sve for host/sim with basedon_app=primeboot
-cd ~/projects/iridium/fb_983/one/fw && elmcli ws build project.iridium.val.sve_app --args "platform=host variant=sim basedon_app=primeboot is_test=false"
+cd ~/projects/iridium/fb_983/one/fw && octl ws build project.iridium.val.sve_app --args "platform=host variant=sim basedon_app=primeboot is_test=false"
 
 # Build all variants of primeboot (no --args filter)
-cd ~/projects/iridium/fb_983/one/fw && elmcli ws build project.iridium.sw.fw.psoc_primeboot
+cd ~/projects/iridium/fb_983/one/fw && octl ws build project.iridium.sw.fw.psoc_primeboot
 ```
 
 **SVE special argument:** SVE supports `basedon_app=<primeboot|pwr_thrm|mng>` to build only one sub-app. Include it when the user specifies it.
@@ -124,4 +124,4 @@ After the build completes (or fails), summarize:
 - **is_test=false** should be passed explicitly when building a non-test variant to avoid ambiguity when the same variant exists in both test and non-test forms (e.g. primeboot `host/sim`).
 - **Commented-out board configs** (lines starting with `#`) are not supported — do not offer them as options.
 - If the user says "build all" or gives no filter, omit `--args` entirely to let the build system build all variants.
-- The workspace root must be passed as the CWD when running `elmcli ws build` — always `cd <ws_root>` first.
+- The workspace root must be passed as the CWD when running `octl ws build` — always `cd <ws_root>` first.

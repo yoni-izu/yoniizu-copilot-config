@@ -52,7 +52,7 @@
         {
           "kind": "commands",
           "commandIdentifiers": [
-            "elmcli"
+            "octl"
           ]
         },
         {

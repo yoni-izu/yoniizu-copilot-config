@@ -84,7 +84,7 @@ The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are sh
 **Local-first strategy**: These skills are global (user-level). The workspace may or may not contain the source code.
 1. Check if FW driver code exists locally — common workspace paths:
    - `fw/ip/se/` or `ip/se/`
-   - Also check the project manifest (e.g., `.star` files or `elmcli` manifests) for the actual deployment path
+   - Also check the project manifest (e.g., `.star` files or `octl` manifests) for the actual deployment path
 2. If found locally — read directly from the workspace (fastest, no network)
 3. If NOT found locally — use GitHub search tools to query the remote repos above
 
