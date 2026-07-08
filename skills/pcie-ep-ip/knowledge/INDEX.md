@@ -24,6 +24,8 @@ re-reading the (very large) source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| RAS DES coverage vs Element PCIe telemetry metrics (counts yes, per-type bytes/credit/tag drops no) | [rasdes-vs-telemetry-metrics.md](rasdes-vs-telemetry-metrics.md) | ras des, event counter, time based analysis, tba, telemetry, metrics, throughput, tlp count, tlp bytes, credit exhaustion, tag unavailability, drops, group 7, group 1, pciemetrics, portmetrics, pcieerrors, bandwidth | Verified from doc | 2026-07-05 |
+| PHY BER counters (DFT_5/DFT_6) are test-mode only — no operational CDR error counter | [ber-cdr-counters.md](ber-cdr-counters.md) | cdr, ber, bit_error_count, dft_5, dft_6, bermon, bert, pattern matcher, prbs, lfsr, test mode, loopback, cdrerrorsperlane, redfish, mission mode, rx margining | Verified from doc | 2026-07-02 |
 | APP_CTRL — CRS hold-off + DRS level-permit; bring-up placement | [app-ctrl-crs-drs.md](app-ctrl-crs-drs.md) | app_ctrl, app_req_retry_en, app_drs_ready, crs, drs, hot reset, dl_down, dl_up, perst, bring-up, set_config_ready | Verified from FW + databook | 2026-06-30 |
 | PHY CPU run/ack — multi-PHY parallel bring-up + timeout contract | [phy-cpu-run-ack.md](phy-cpu-run-ack.md) | phy cpu, cpu_run_req, cpu_run_ack, ppw_ctrl_cpu_ind, multi-phy, parallel bring-up, timeout, etimedout, k_busy_wait, vtable, el_pcie_phy | Verified from FW driver | 2026-06-30 |
 | AXI Terminator STATUS regs are sticky — FW must write-clear after capture | [axi-term-status-sticky.md](axi-term-status-sticky.md) | axi termination, sticky status, AR_TERM_OCCURED, AW_TERM_OCCURED, csr_axi_termination_pkg, capture freeze, allow_log, fw clear | Verified from RTL + generated register headers | 2026-06-29 |

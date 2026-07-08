@@ -82,6 +82,39 @@ simply yields a value < 4 GiB for MNG/CTRL.
 - **Downstream config/CSR termination** = `PEP_CTRL_AUX_DS_TERM_CTRL` (DS_TERM gate at the
   DWC IIP master output). See `ds-term.md`.
 
+## Decoding a captured MNG-port drain address (worked example)
+
+The MNG/CTRL drain address is a **32-bit management CSR-window offset** (BAR0 CFG_MNG
+sub-window). To identify the target, decode against the a1 project bases
+(`build_artifacts/include/a1/project/project_bases.h`, `MNG_*` entries):
+
+- The **valid management CSR decode is only the low 16 MB** (`mask 0x00ff_xxxx`); the
+  populated `MNG_*` register blocks end at window offset `~0x00ffd000`
+  (`MNG_MRTR_VSP_DEALGN_EDGE_EAST_0`). The `0x0100_0000`–`0x03ff_ffff` remainder of the
+  64 MB CFG_MNG BAR sub-window (`CFG_MNG_SIZE 0x4000000`, from `a1_pcie_map.h`) has **no
+  backing CSR slave** → an access there gets no AXI response → PIW MNG drain times out and
+  returns **SLVERR** (resp=2) with reason **timeout** (0). (A truly bogus/undecoded address
+  can instead give DECERR=3; timeout+SLVERR means the fabric accepted but nothing completed.)
+- **Example (real incident, a1, 0000:af:00.0):** two MNG drains —
+  read `0x1030020`, write `0x1ffd084`. Both carry the **same spurious high bit
+  `0x0100_0000`** (bit 24 = 16 MB). Masking to the 24-bit decode (`& 0x00ffffff`):
+  `0x1030020 → 0x030020`, `0x1ffd084 → 0xffd084` = `MNG_MRTR_VSP_DEALGN_EDGE_EAST_0`
+  (`0xffd000`) + `0x84` = `VSP_DEALGN_EDGE_VCORE_INTF_CRD_15`. The intended targets are
+  real low-16 MB CSRs; the initiator added a constant `+0x0100_0000` base error, pushing
+  both into the dead upper window. **Signature: multiple drains sharing an identical high
+  offset ⇒ wrong base pointer / window index in the initiator (host driver or agent),
+  NOT a hung/power-gated IP.** A dead-IP drain would instead land *on* a populated block
+  offset with resp reflecting a stuck slave.
+- **Initiator fingerprinting via the register pair:** the two masked targets were
+  `SOC_EFUSE_0_63 + 0x20` (read) and `VSP_DEALGN_EDGE_EAST + 0x84 = VCORE_INTF_CRD_15`
+  (write). That read-eFuse-then-write-VCore-credit pair is exactly the **VCore binning
+  manager** sequence (`fw/infra/drivers/el_vcore_binning_mgr`: `read_vcore_efuse_binning()`
+  → `dispatch_credit_binning()` → `el_vcore_binning_program_credits()`). Lesson: decode
+  *all* drained addresses together and match them to a known driver's touchpoint sequence —
+  the access *pattern* identifies the initiator even when the base is corrupted. No host
+  KMD/regcli code touches these CSRs, so a host-driven bring-up/binning agent (not the
+  on-die FW driver) is the likely initiator here.
+
 ## Sources
 - FW: `fw/ip/pcie/drivers/el_piw/el_piw.c` (`el_piw_drain_cfg`, `drain_info_list`,
   `el_piw_port_drain_process_cause` — assembles `(high32<<32)|low32`),
