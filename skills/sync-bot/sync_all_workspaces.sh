@@ -5,7 +5,7 @@
 #   1. scans + saves current state via wip-workspace (wip_funcs.sh)
 #   2. stashes uncommitted changes in ALL repos (any branch)
 #   3. returns every repo to its base/upstream branch
-#   4. runs `elmcli ws sync` and `elmcli artifacts download` per workspace
+#   4. runs `octl ws sync` and `octl artifacts download` per workspace
 #   5. restores the branches we had
 #   6. pops the stashes we created
 #
@@ -16,7 +16,7 @@
 #   sync_all_workspaces.sh [project] [--no-artifacts] [--dry-run]
 #
 #   project        WIP root under ~/projects (default: iridium)
-#   --no-artifacts skip `elmcli artifacts download` (sync only)
+#   --no-artifacts skip `octl artifacts download` (sync only)
 #   --dry-run      show what would happen; touch nothing
 #
 # Exit code: 0 if all workspaces synced clean; 1 if any sync/artifact step or
@@ -115,12 +115,12 @@ for ws in "${WORKSPACES[@]}"; do
 	ws_path="$WIP_ROOT/$ws"
 	echo "  --- $ws ---"
 	ws_ok=1
-	if ! ( cd "$ws_path" && run elmcli --plain ws sync ); then
+	if ! ( cd "$ws_path" && run octl --plain ws sync ); then
 		echo "    SYNC FAILED: $ws"
 		ws_ok=0
 	fi
 	if [[ $DO_ARTIFACTS -eq 1 ]]; then
-		if ! ( cd "$ws_path" && run elmcli --plain artifacts download ); then
+		if ! ( cd "$ws_path" && run octl --plain artifacts download ); then
 			echo "    ARTIFACTS FAILED: $ws"
 			ws_ok=0
 		fi

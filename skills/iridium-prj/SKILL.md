@@ -1,6 +1,6 @@
 ---
 name: iridium-prj
-description: 'Project expert for the Iridium project — architecture, PRM, NoC, address map, reset/boot flow, security, redundancy/binning, FW/SW integration, build & manifests. Use when: Iridium project, Iridium PRM, Iridium NoC, address map, scale-up/C2C, D2D isolation, reset flow, boot ROM/streaming boot, security level/group (SL/SG), CfgR/RR/PB, binning/redundancy, VCore/VME/PSOC/CCE/FIU, power/thermal loop, project variants/platforms, elmcli iridium workspace, project-specific build infra.'
+description: 'Project expert for the Iridium project — architecture, PRM, NoC, address map, reset/boot flow, security, redundancy/binning, FW/SW integration, build & manifests. Use when: Iridium project, Iridium PRM, Iridium NoC, address map, scale-up/C2C, D2D isolation, reset flow, boot ROM/streaming boot, security level/group (SL/SG), CfgR/RR/PB, binning/redundancy, VCore/VME/PSOC/CCE/FIU, power/thermal loop, project variants/platforms, octl iridium workspace, project-specific build infra.'
 argument-hint: 'Ask a question about the Iridium project — architecture, PRM/NoC spec, flows, security, or FW/SW integration'
 ---
 
@@ -18,7 +18,7 @@ argument-hint: 'Ask a question about the Iridium project — architecture, PRM/N
   RR, PB, RAC/WAC)**, **redundancy & binning**, **device coordinates / scale-up topology**
 - **FW/SW integration** across IPs as deployed in Iridium (which IP owns what, init order,
   cross-IP dependencies)
-- **Project build, variants, platforms, and manifests** (elmcli workspace, project-specific
+- **Project build, variants, platforms, and manifests** (octl workspace, project-specific
   build infra, `project.iridium.*.star` files)
 - Mapping a feature/requirement to the IP, spec section, and code that implements it
 
@@ -93,16 +93,16 @@ workspace/variant checkout. A typical workspace contains:
 contain the source):
 1. Prefer reading from a local checkout under `~/projects/iridium/<variant>/...`.
 2. Identify the deployment path of an IP driver via the project manifest
-   (`project.iridium.sw.fw.infra.star` and other `.star`/`elmcli` manifests).
+   (`project.iridium.sw.fw.infra.star` and other `.star`/`octl` manifests).
 3. If a needed repo is not local, use the GitHub search tools against the relevant
    `Elmnt-Internal/ip.<ip>.*` repos (see the IP skills for exact repo URLs).
-4. The workspace is multi-repo, with its repo set and layout defined by the `elmcli` manifest.
+4. The workspace is multi-repo, with its repo set and layout defined by the `octl` manifest.
    Each repo has a `.github/` directory containing additional skills / AI resources — check
    the relevant repo's `.github/` for project- or IP-specific guidance before/while researching.
 
 ### Build / Workspace Conventions
 
-- Workspaces are initialized with `elmcli ws init -p iridium -m <manifest>`
+- Workspaces are initialized with `octl ws init -p iridium -m <manifest>`
   (e.g. `spark-ci`, `spark-ci` variants seen as `ws-fb-iridium-fw-ci`).
 - Project-specific build behavior lives in `fw/proj_infra/build_infra/` and
   `project.iridium.sw.fw.infra.star` (collects artifacts per variant).

@@ -1,7 +1,7 @@
 # Always loaded project context instructions
 
 ## VM Management
-For any questions about VMs, EC2 instances, machine IPs, or SSH access, delegate to the `@vm` agent which manages instances via `elmcli vm`.
+For any questions about VMs, EC2 instances, machine IPs, or SSH access, delegate to the `@vm` agent which manages instances via `octl vm`.
 
 <!-- rtk-instructions v2 -->
 # RTK — Token-Optimized CLI
