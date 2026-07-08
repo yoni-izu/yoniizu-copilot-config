@@ -22,7 +22,7 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `add <title> [-c CAT] [-p PRI] [--complexity X] [--cost N] [--jira K] [--context S] [--workspace W] [--no-workspace] [--backlog] [--cwd PATH]` | Add a non-review task | Auto-detects workspace from cwd unless `--no-workspace`. Reports if workspace is occupied. |
 | `list [--status S] [--category C] [--priority P] [--json]` | List tasks | Default hides `done`/`cancelled`. Sorts by priority then category. Shows a "Feature" column (first sentence of `description`, falls back to title with leading `Review:` stripped). Prints summary + workspace map. |
 | `dashboard [-o PATH]` | Generate a self-contained, read-only HTML dashboard | Embeds the live store into one offline HTML file (default `~/tasks/dashboard.html`): search, status/category/priority chip filters, complexity/workspace dropdowns, option tick-boxes, column toggles, clickable sortable headers, stats, expandable per-task detail. Re-run to refresh. |
-| `serve [--port N] [--stop] [--status]` | Serve an **editable** dashboard on `127.0.0.1` | Same UI as `dashboard` but generated live per request and editable: status/priority/category/complexity/cost/workspace + append-note, posted to `/api/task/<id>` and applied through the same store rules (validation, workspace-uniqueness, append-only notes, auto-clear on done/cancelled). Binds localhost only; writes `~/tasks/.dashboard.pid`; refuses to double-start. Review-status edits stay in the CLI. Run-once via the systemd user unit `~/.config/systemd/user/task-dashboard.service` (`systemctl --user enable --now task-dashboard.service`). |
+| `serve [--port N] [--stop] [--status]` | Serve an **editable** dashboard on `127.0.0.1` | Same UI as `dashboard` but generated live per request and editable: status/priority/category/complexity/cost/workspace/review-status + append-note, posted to `/api/task/<id>` and applied through the same store rules (validation, workspace-uniqueness, append-only notes, auto-clear on done/cancelled). For code-review tasks the editor exposes a **Review status** picker that applies a per-PR `review_status` to all of the task's PRs and re-derives the task status. Binds localhost only; writes `~/tasks/.dashboard.pid`; refuses to double-start. Run-once via the systemd user unit `~/.config/systemd/user/task-dashboard.service` (`systemctl --user enable --now task-dashboard.service`). |
 | `workspaces [--project NAME]` | Show workspace occupancy | Default project: `iridium`. |
 | `update <id> <status> [-n NOTE]` | Set arbitrary status | `id` matches `T-NNN` or unique title substring. |
 | `done <id> [-n NOTE]` / `block <id>` / `cancel <id>` | Status shortcuts | `done`/`cancel` auto-clear workspace and set `completed`. |
@@ -36,7 +36,8 @@ Valid values:
 - priorities: `critical`, `high`, `medium`, `low`
 - statuses: `backlog`, `todo`, `in-progress`, `blocked`, `done`, `cancelled`
 - complexities: `trivial`, `small`, `medium`, `large`, `epic`
-- review statuses: `pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`, `approved`, `merged`
+- review statuses (per-PR): `pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`, `approved`, `merged`
+- consolidated review status (task-level, derived): `pending`, `in-progress`, `waiting-for-re-review`, `waiting-for-author`, `approved`, `merged` (see "Consolidated review status" below)
 
 ## Schema (single source of truth)
 
@@ -90,6 +91,31 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
 ```
 
 Only `category: "code-review"` tasks may have `review` / `reviews`; other categories must not.
+
+#### Consolidated review status (one status per task)
+
+Each PR carries its own **per-PR** `review_status` (granular, PR-scoped):
+`pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`,
+`approved`, `merged`. A task can hold several PRs in different states, but the task
+must expose exactly **one** overall status. The CLI derives it with
+`consolidate_review_status()` (mirrored in the dashboard as `consolidateReviewStatus()`)
+using this precedence:
+
+| Overall status | Condition | Ball is with |
+|----------------|-----------|--------------|
+| `merged` | **every** PR merged | — (task done → purged) |
+| `approved` | every PR approved-or-merged, but **not all** merged | maintainer (awaiting merge) |
+| `waiting-for-author` | **any** PR still carries our feedback (`commented`/`changes-requested`) and is not approved | author |
+| `waiting-for-re-review` | author bounced it back (`waiting-for-re-review`), no open feedback | reviewer |
+| `in-progress` | a review is actively underway | reviewer |
+| `pending` | nothing started | reviewer |
+
+`waiting-for-author` is a **consolidated-only** status — it never lives on an individual
+PR (those stay `commented` / `changes-requested`). The overall status maps to the generic
+task `status` field: `merged`→`done`, `approved`/`in-progress`→`in-progress`,
+`waiting-for-author`→`blocked`, `waiting-for-re-review`/`pending`→`todo`. `list-reviews`,
+the dashboard Status column/filter/sort, `review-update`, and `blocked-scan --update` all
+use this single derived value.
 
 ### `track` tasks
 
