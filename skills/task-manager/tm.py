@@ -168,6 +168,65 @@ def pr_resolved(p: dict) -> bool:
 
 
 # ----------------------------------------------------------------------------
+# Review-status consolidation
+# ----------------------------------------------------------------------------
+# A code-review task can hold several PRs, each with its own per-PR
+# ``review_status`` (merged / approved / changes-requested / commented / …).
+# The *task* must expose exactly one overall status. ``consolidate_review_status``
+# collapses the per-PR states into that single value using this precedence:
+#
+#   merged                — every PR merged (whole task landed)
+#   approved              — every PR approved-or-merged, but not all merged
+#                           (our review is done; some PRs still awaiting merge)
+#   waiting-for-author    — at least one PR still carries our feedback
+#                           (commented / changes-requested) and is not approved
+#                           → the ball is with the author
+#   waiting-for-re-review — author bounced it back; the ball is with the reviewer
+#   in-progress           — a review is actively underway
+#   pending               — nothing started yet
+#
+# ``waiting-for-author`` is a *consolidated-only* status: it never lives on an
+# individual PR (those stay granular as commented / changes-requested).
+
+CONSOLIDATED_REVIEW_STATUSES = [
+    "pending",
+    "in-progress",
+    "waiting-for-re-review",
+    "waiting-for-author",
+    "approved",
+    "merged",
+]
+
+# Consolidated review status → generic task status.
+REVIEW_CONSOLIDATED_TO_TASK = {
+    "pending": "todo",
+    "in-progress": "in-progress",
+    "waiting-for-author": "blocked",
+    "waiting-for-re-review": "todo",
+    "approved": "in-progress",   # reviewer done; awaiting merge (purged on merge)
+    "merged": "done",
+}
+
+
+def consolidate_review_status(prs: list[dict]) -> str:
+    """Collapse per-PR review statuses into one overall task review status."""
+    ss = [p.get("review_status") or "pending" for p in prs]
+    if not ss:
+        return "pending"
+    if all(s == "merged" for s in ss):
+        return "merged"
+    if all(s in ("approved", "merged") for s in ss):
+        return "approved"
+    if any(s in ("commented", "changes-requested") for s in ss):
+        return "waiting-for-author"
+    if any(s == "waiting-for-re-review" for s in ss):
+        return "waiting-for-re-review"
+    if any(s == "in-progress" for s in ss):
+        return "in-progress"
+    return "pending"
+
+
+# ----------------------------------------------------------------------------
 # GitHub / git helpers (use gh CLI + git ls-remote, no API keys needed)
 # ----------------------------------------------------------------------------
 
@@ -534,7 +593,7 @@ def cmd_list_reviews(args: argparse.Namespace) -> int:
         dele = sum((p.get("deletions") or 0) for p in prs)
         pr_nums = ",".join(f"#{p['pr_number']}" for p in prs)
         rows.append((
-            t["id"], pr_nums, repos, authors, t["status"],
+            t["id"], pr_nums, repos, authors, consolidate_review_status(prs),
             str(files), f"+{add}/-{dele}", f"{days_since(t.get('created', TODAY))}d",
             last_worked_label(t),
             feature_blurb(t),
@@ -711,17 +770,6 @@ def cmd_remove(args: argparse.Namespace) -> int:
 # Subcommand: review-update (manual)
 # ----------------------------------------------------------------------------
 
-# Map review_status → task status delta
-REVIEW_TO_TASK = {
-    "pending": None,
-    "in-progress": "in-progress",
-    "commented": "blocked",
-    "changes-requested": "blocked",
-    "waiting-for-re-review": "todo",
-    "approved": "done_if_all",
-    "merged": "done_if_all",
-}
-
 
 def cmd_review_update(args: argparse.Namespace) -> int:
     if args.status not in REVIEW_STATUSES:
@@ -759,21 +807,20 @@ def cmd_review_update(args: argparse.Namespace) -> int:
             if args.status in ("commented", "changes-requested", "approved"):
                 p["submitted_at"] = TODAY
 
-    # Derive task status
-    all_resolved = all(p["review_status"] in ("approved", "merged") for p in prs)
-    desired = REVIEW_TO_TASK[args.status]
-    if desired == "done_if_all" and all_resolved:
+    # Derive task status from the consolidated review status of ALL PRs
+    consolidated = consolidate_review_status(prs)
+    new_status = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+    if new_status == "done":
         t["status"] = "done"
         t["completed"] = TODAY
         t["workspace"] = None
-    elif desired == "done_if_all":
-        t["status"] = "in-progress"
-    elif desired:
-        t["status"] = desired
-        if desired in ("blocked", "todo"):
+    else:
+        t["status"] = new_status
+        if new_status in ("blocked", "todo"):
             t["workspace"] = None  # free slot when ball is with author / awaiting re-review
     t["updated"] = TODAY
-    append_note(t, f"review-update: {args.status}" + (f" on #{args.pr}" if args.pr else " on all PRs"))
+    append_note(t, f"review-update: {args.status}" + (f" on #{args.pr}" if args.pr else " on all PRs")
+                + f" (overall: {consolidated})")
 
     # Auto-purge if all PRs are resolved (merged or closed without merge)
     if all(pr_resolved(p) for p in prs):
@@ -784,7 +831,7 @@ def cmd_review_update(args: argparse.Namespace) -> int:
         return 0
 
     save(d)
-    print(f"{t['id']} status={t['status']} review_status={args.status}")
+    print(f"{t['id']} status={t['status']} overall-review={consolidated} (set {args.status})")
     return 0
 
 
@@ -1190,13 +1237,16 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
                         p["review_status"] = "waiting-for-re-review"
                         pr_sum["transitioned"] = "waiting-for-re-review"
                         transitioned.append((t["id"], pr_sum["repo"], pr_sum["pr"]))
-            # Derive task status: any non-resolved, non-blocked-still means it's back with reviewer.
+            # Derive task status: consolidate all PRs; a bounced-back PR
+            # (waiting-for-re-review) moves the ball back to the reviewer.
             prs = pr_entries(t)
-            if any(pp.get("review_status") == "waiting-for-re-review" for pp in prs) \
-                    and t.get("status") == "blocked":
-                t["status"] = "todo"
-                t["updated"] = TODAY
-                append_note(t, "blocked-scan: bounced back → waiting-for-re-review")
+            if t.get("status") == "blocked":
+                consolidated = consolidate_review_status(prs)
+                target = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+                if target != "blocked":
+                    t["status"] = target
+                    t["updated"] = TODAY
+                    append_note(t, f"blocked-scan: bounced back → {consolidated}")
         save(d)
 
     if args.json:
@@ -1533,11 +1583,13 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .tab.on .badge-count { color:var(--accent); }
   .rv-pending{background:#e5e7eb;color:#6b7280;} .rv-in-progress{background:#fef3c7;color:#92400e;}
   .rv-commented{background:#e0edff;color:#1d4ed8;} .rv-changes-requested{background:#fee2e2;color:#b91c1c;}
+  .rv-waiting-for-author{background:#ffedd5;color:#c2410c;}
   .rv-waiting-for-re-review{background:#ede9fe;color:#6d28d9;} .rv-approved{background:#dcfce7;color:#15803d;}
   .rv-merged{background:#dcfce7;color:#15803d;}
   @media (prefers-color-scheme: dark){
     .rv-pending{background:#37415133;color:#9ca3af;} .rv-in-progress{background:#78350f44;color:#fcd34d;}
     .rv-commented{background:#1e3a8a33;color:#93c5fd;} .rv-changes-requested{background:#7f1d1d44;color:#fca5a5;}
+    .rv-waiting-for-author{background:#7c2d1244;color:#fdba74;}
     .rv-waiting-for-re-review{background:#4c1d9544;color:#c4b5fd;} .rv-approved,.rv-merged{background:#14532d44;color:#86efac;}
   }
   .detail td { background:var(--bg); }
@@ -1560,6 +1612,7 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .editor textarea { min-width:280px; min-height:42px; text-transform:none; }
   .editor .actions { display:flex; gap:8px; align-items:center; }
   .editor .msg { font-size:12px; color:var(--muted); }
+  .editor .hint { font-size:11px; color:var(--muted); font-style:italic; align-self:center; text-transform:none; }
   .ro-note { color:var(--muted); font-size:12px; font-style:italic; }
 </style>
 </head>
@@ -1687,7 +1740,10 @@ const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled
 const PRI_ORDER = ["critical","high","medium","low"];
 const CPX_ORDER = ["trivial","small","medium","large","epic"];
 const CATEGORIES = ["development","code-review","planning","testing","track","misc"];
-const RV_ORDER = ["pending","in-progress","commented","changes-requested","waiting-for-re-review","approved","merged"];
+const RV_ORDER = ["pending","in-progress","commented","changes-requested","waiting-for-author","waiting-for-re-review","approved","merged"];
+// Per-PR review statuses that can be *set* from the editor (excludes the
+// consolidated-only "waiting-for-author").
+const RV_SETTABLE = RV_ORDER.filter(s=>s!=="waiting-for-author");
 
 const COLUMNS = [
   {key:"id",      label:"ID",        on:true},
@@ -1733,7 +1789,7 @@ function sortVal(t,key){
     case "age": return t.created||"";        // ascending = oldest first
     case "created": return t.created||"";
     case "worked": return lastWorked(t)||"";
-    case "reviewstatus": { const p=prs(t); return p.length?(p.map(r=>r.review_status||"").sort()[0]||""):"~"; }
+    case "reviewstatus": { const p=prs(t); return p.length?idx(RV_ORDER,consolidateReviewStatus(p)):99; }
     case "prs": { const p=prs(t); return p.length?(p[0].repo+"#"+p[0].pr_number):"~"; }
     case "author": { const p=prs(t); return p.length?(p[0].author||""):"~"; }
   }
@@ -1756,6 +1812,18 @@ function lastWorked(t){
 function workedLabel(t){ const iso=lastWorked(t); if(!iso) return "—";
   const n=daysSince(iso); return n===0?"today":n+"d ago"; }
 function prs(t){ return t.reviews && t.reviews.length ? t.reviews : (t.review?[t.review]:[]); }
+// Collapse per-PR review statuses into one overall task review status.
+// Mirrors consolidate_review_status() in the Python CLI.
+function consolidateReviewStatus(pl){
+  const ss=(pl||[]).map(r=>r.review_status||"pending");
+  if(!ss.length) return "pending";
+  if(ss.every(s=>s==="merged")) return "merged";
+  if(ss.every(s=>s==="approved"||s==="merged")) return "approved";
+  if(ss.some(s=>s==="commented"||s==="changes-requested")) return "waiting-for-author";
+  if(ss.some(s=>s==="waiting-for-re-review")) return "waiting-for-re-review";
+  if(ss.some(s=>s==="in-progress")) return "in-progress";
+  return "pending";
+}
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function feature(t){
   let d=(t.description||"").trim();
@@ -1793,9 +1861,10 @@ function buildFilters(){
     .forEach(c=>ddItem(document.getElementById("f-complexity"),c,c,"complexity"));
   uniq(TASKS.map(t=>t.workspace).filter(Boolean)).sort()
     .forEach(w=>ddItem(document.getElementById("f-workspace"),w,w,"workspace"));
-  // code-review-only filters: review status + PR author (drawn from PR data)
+  // code-review-only filters: consolidated review status + PR author
   const revPrs=TASKS.filter(t=>t.category==="code-review").flatMap(t=>prs(t));
-  RV_ORDER.filter(s=>revPrs.some(r=>(r.review_status||"pending")===s))
+  const revStatuses=TASKS.filter(t=>t.category==="code-review").map(t=>consolidateReviewStatus(prs(t)));
+  RV_ORDER.filter(s=>revStatuses.includes(s))
     .forEach(s=>ddItem(document.getElementById("f-reviewstatus"),s,s,"reviewstatus"));
   uniq(revPrs.map(r=>r.author||"?")).sort()
     .forEach(a=>ddItem(document.getElementById("f-author"),a,a,"author"));
@@ -1837,7 +1906,7 @@ function applyFilters(){
     if(pri.length && !pri.includes(t.priority)) return false;
     if(cpx.length && !cpx.includes(t.complexity)) return false;
     if(ws.length && !ws.includes(t.workspace)) return false;
-    if(rvst.length && !prs(t).some(r=>rvst.includes(r.review_status||"pending"))) return false;
+    if(rvst.length && !rvst.includes(consolidateReviewStatus(prs(t)))) return false;
     if(auth.length && !prs(t).some(r=>auth.includes(r.author||"?"))) return false;
     if(needJira && !t.jira) return false;
     if(needWs && !t.workspace) return false;
@@ -1880,8 +1949,8 @@ function cellFor(t,key){
     case "age": { const n=daysSince(t.created); return `<td>${n==null?"—":n+"d"}</td>`; }
     case "worked": return `<td>${esc(workedLabel(t))}</td>`;
     case "reviewstatus": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
-      const ss=[...new Set(p.map(r=>r.review_status||"pending"))];
-      return `<td>${ss.map(s=>`<span class="badge rv-${esc(s)}">${esc(s)}</span>`).join(" ")}</td>`; }
+      const cs=consolidateReviewStatus(p);
+      return `<td><span class="badge rv-${esc(cs)}">${esc(cs)}</span></td>`; }
     case "prs": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
       return `<td>${p.map(r=>`<a href="${esc(r.pr_url)}" target="_blank" onclick="event.stopPropagation()">${esc(r.repo)}#${esc(r.pr_number)}</a>${r.merged?" \u2713":""}`).join("<br>")}</td>`; }
     case "author": { const p=prs(t); if(!p.length) return "<td>\u2014</td>";
@@ -1896,6 +1965,11 @@ function selOpts(values, current){
 
 function editorHtml(t){
   if(!SERVED) return `<div class="ro-note">Read-only. Run <code>tm.py serve</code> and open the served page to edit.</div>`;
+  const p=prs(t);
+  const reviewRow = (t.category==="code-review" && p.length) ? `<div class="fields">
+      <label>Review status<select class="e-review-status"><option value="">— set on all PRs —</option>${selOpts(RV_SETTABLE,"")}</select></label>
+      <span class="hint">Applies to all ${p.length} PR${p.length>1?"s":""}; task status is re-derived.</span>
+    </div>` : "";
   return `<div class="editor" data-id="${esc(t.id)}">
     <div class="fields">
       <label>Status<select class="e-status">${selOpts(STATUS_ORDER,t.status)}</select></label>
@@ -1905,6 +1979,7 @@ function editorHtml(t){
       <label>Est (h)<input type="number" step="0.5" class="e-cost" value="${t.cost_hours!=null?t.cost_hours:""}" style="min-width:90px"></label>
       <label>Workspace<input type="text" class="e-workspace" value="${esc(t.workspace||"")}" style="min-width:140px"></label>
     </div>
+    ${reviewRow}
     <div class="fields">
       <label style="flex:1">Add note<textarea class="e-note" placeholder="Optional note to append…"></textarea></label>
     </div>
@@ -1917,7 +1992,7 @@ function editorHtml(t){
 
 function detailRow(t,ncols){
   const p=prs(t);
-  const prHtml = p.length ? `<div><h4>Pull Requests</h4><div class="pr-list">`+
+  const prHtml = p.length ? `<div><h4>Pull Requests <span class="badge rv-${esc(consolidateReviewStatus(p))}">overall: ${esc(consolidateReviewStatus(p))}</span></h4><div class="pr-list">`+
     p.map(r=>`<div class="pr"><a href="${esc(r.pr_url)}" target="_blank">${esc(r.repo)}#${esc(r.pr_number)}</a> `+
       `by ${esc(r.author||"?")} · <code>${esc(r.branch||"?")}</code> · ${r.files_changed||0} files `+
       `+${r.additions||0}/-${r.deletions||0} · <b>${esc(r.review_status||"")}</b>${r.merged?" · merged":""}</div>`).join("")+
@@ -1949,6 +2024,8 @@ function wireEditor(detEl,t){
     const cpx=v(".e-complexity"); if((cpx||null)!==(t.complexity||null)) payload.complexity=cpx;
     const cost=v(".e-cost"); if(cost!=="" && Number(cost)!==t.cost_hours) payload.cost_hours=Number(cost);
     const ws=v(".e-workspace"); if(ws!==(t.workspace||"")) payload.workspace=ws;
+    const rvSel=ed.querySelector(".e-review-status");
+    if(rvSel && rvSel.value) payload.review_status=rvSel.value;
     const note=v(".e-note").trim(); if(note) payload.add_note=note;
     if(Object.keys(payload).length===0){ msg.textContent="No changes."; return; }
     btn.disabled=true; msg.textContent="Saving…";
@@ -2071,10 +2148,13 @@ function renderStats(){
     const ws=new Set(open.map(t=>t.workspace).filter(Boolean));
     cards.push(["Workspaces&nbsp;busy",ws.size]);
   } else if(activeTab==="code-review"){
+    const revTasks=scope.filter(t=>t.category==="code-review" && !["done","cancelled"].includes(t.status));
     const allPrs=scope.flatMap(t=>prs(t));
-    const awaiting=allPrs.filter(r=>["pending","in-progress"].includes(r.review_status)).length;
-    const changes=allPrs.filter(r=>r.review_status==="changes-requested").length;
-    cards.push(["PRs",allPrs.length],["Awaiting",awaiting],["Changes&nbsp;req",changes]);
+    const by={}; revTasks.forEach(t=>{ const s=consolidateReviewStatus(prs(t)); by[s]=(by[s]||0)+1; });
+    cards.push(["PRs",allPrs.length],
+               ["Waiting&nbsp;author",by["waiting-for-author"]||0],
+               ["Re-review",by["waiting-for-re-review"]||0],
+               ["Approved",by["approved"]||0]);
   } else if(activeTab==="planning"){
     cards.push(["With&nbsp;Jira",scope.filter(t=>t.jira).length]);
   }
@@ -2194,7 +2274,8 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
     """Apply a constrained set of edits to a task, enforcing store rules.
 
     Allowed keys: status, priority, category, complexity, cost_hours,
-    workspace, add_note. Returns (ok, message).
+    workspace, review_status, add_note. ``review_status`` applies to every PR
+    of a code-review task and re-derives the task status. Returns (ok, message).
     """
     d = load()
     t = find_task(d, ident)
@@ -2268,6 +2349,35 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
             if t["status"] == "todo":
                 t["status"] = "in-progress"
             changes.append(f"workspace → {ws}")
+
+    if "review_status" in payload:
+        new = payload["review_status"]
+        if new not in REVIEW_STATUSES:
+            return False, f"invalid review status: {new}"
+        if t.get("category") != "code-review":
+            return False, "review_status only applies to code-review tasks"
+        prs = pr_entries(t)
+        if not prs:
+            return False, "task has no PR entries"
+        # Apply to all PRs (mirrors `review-update` without --pr).
+        for p in prs:
+            p["review_status"] = new
+            if new == "merged":
+                p["merged"] = True
+            if new in ("commented", "changes-requested", "approved"):
+                p["submitted_at"] = TODAY
+        # Derive the task status from the consolidated review status of all PRs.
+        consolidated = consolidate_review_status(prs)
+        new_task_status = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+        if new_task_status != t.get("status"):
+            changes.append(f"status {t.get('status')} → {new_task_status}")
+        t["status"] = new_task_status
+        if new_task_status == "done":
+            t["completed"] = TODAY
+            t["workspace"] = None
+        elif new_task_status in ("blocked", "todo"):
+            t["workspace"] = None  # ball with author / awaiting re-review
+        changes.append(f"review-status → {new} (overall: {consolidated})")
 
     note = (payload.get("add_note") or "").strip()
     if note:
