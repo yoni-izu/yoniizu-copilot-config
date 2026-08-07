@@ -59,6 +59,39 @@ Two trigger sources per gate:
 - API: `dwc_ep_ctl_set_downstream_termination(dev, enable)` toggles both `PF_SW_MSTR_TERM` and
   `PF_SW_ELBI_TERM` together
 
+### Device Info SRAM — is it blocked by DS_TERM? (YES, by the MSTR gate)
+
+The **Device Info SRAM** (8KB, `D0_CTRL_PCIE_EP_CLS_PIW_CTRL_SRAM_INFO_0`, in the PIW CTRL
+block on the CTRL/LBW fabric; FW writes device info via `el_utils_update_device_info` /
+`el_arm_boot_status_notify_boot_done`, host reads it BAR-mapped, upper-16B access raises a
+FW interrupt) is **not** a special carve-out. The host reaches it as an ordinary BAR / iATU
+MEM target:
+
+  host TLP → DWC controller → **`pep_axi_mstr` master output (DS_TERM MSTR gate here)** →
+  `pcil_pep2piw_axi_dns` → PIW LBW CTRL fabric → Info SRAM.
+
+So it sits **downstream of the MSTR gate**, on the single PEP→PIW downstream master AXI that
+carries *all* host BAR/iATU MEM traffic. Consequences:
+
+- **`PF_SW_MSTR_TERM` (or RASDP auto-term) DOES block host MEM access to the Info SRAM** —
+  same gate, same bus as every other BAR-mapped MMIO target. It is not exempt.
+- **`PF_SW_ELBI_TERM` does NOT gate it.** ELBI is the parallel CSR-register path
+  (`pcil_pep2piw_elbi_axi`); the Info SRAM is a *memory* region reached over the master path,
+  not a CSR block. The ELBI gate and the Info SRAM are on different buses.
+- **Device-side (embedded EP CPU / FW) access is unaffected** — FW writes the SRAM via local
+  LBW, never through the DWC master, so DS_TERM never blocks FW population of device info.
+- **Separate, unrelated restriction:** FLA.ROM programs a CTRL-fabric secure Range Register
+  **`CTRL_RR_2`** covering the Device Info SRAM (`DEVICE_INFO_SRAM_SIZE=0x2000`), qualified by
+  the `<dbg_ifc>.boot_log_dis` efuse (I2C/SPI/PCIE debug/recovery interfaces). That is a
+  security range filter (`fla_rom/src/sec_access_ctrl.c`), **not** DS_TERM — don't conflate the
+  two when a host read of the Info SRAM is denied.
+
+Datapath verified from RTL: DS_TERM MSTR gate is in `pep_axi_mstr.v`
+(`pcil_pf_mstr_ds_term` → `pcil_mstr_term`) on `pcil_pep2piw_axi_dns`; the microarch doc
+`PCIE_IIP_DEVICE_WRAP_Micro_Architecture.md` §4.2.3 confirms the master-downstream isolation is
+"post Synopsys AXI master and per-function termination; destination side drives toward PIW
+downstream AXI" — i.e. upstream of the PIW routing that reaches the Info SRAM.
+
 ### Unrelated mechanism — don't confuse
 - `PIW_RR_MAIN_CFG_ELBI_MNG_SEC_TERM_*`, `PIW_*_CFG_TEE_TERM_*`,
   `PIW_MNG_CFG_{SEC,EMPTY_STRB,NARROW_BURST,MSI_WR,MSIX_WR}_TERM_*` are **separate AXI
@@ -103,7 +136,14 @@ BAR-mapped MMIO (master) path is blocked, breaking host tooling (e.g. `fw_host_c
   the management path.
 
 ## Sources
-- RTL: `Elmnt-Internal/ip.pcie.rtl` → `pep_macro/rtl/pep_axi_mstr.v`, `pep_macro/rtl/pcie_iip_device_wrap.v`
+- RTL: `Elmnt-Internal/ip.pcie.rtl` → `pep_macro/rtl/pep_axi_mstr.v`, `pep_macro/rtl/pcie_iip_device_wrap.v`,
+  `pep_macro/misc/PCIE_IIP_DEVICE_WRAP_Micro_Architecture.md` §4.2.3 (master-downstream isolation),
+  `piw_macro/rtl/piw_lbw_ctrl.v` (PIW CTRL fabric routing)
+- Info SRAM: FW `baremetal/fla_rom/src/sec_access_ctrl.c` (`CTRL_RR_2`, `DEVICE_INFO_SRAM_SIZE=0x2000`,
+  base `D0_CTRL_PCIE_EP_CLS_PIW_CTRL_SRAM_INFO_0`), `baremetal/fla_rom/src/device_status.c`,
+  `fw/ip/pcie/drivers/el_pcie_ep/el_pcie_ep.c` (`el_arm_boot_status_notify_boot_done` →
+  `el_utils_update_device_info`); doc `docs/PCIe EP/HSI_Features_Research.md` Feature 13 (8KB, CTRL
+  fabric, PF/VF accessible, upper-16B interrupt)
 - FW: `fw/ip/pcie/include/el_piw_sei_bits.h`, `fw/ip/pcie/drivers/el_piw/el_piw_sei_tree.c`,
   `fw/ip/pcie/include/el_pcie.h`, `drivers/snps_ep_ctl/tests/host_tests_sv.c`,
   `drivers/el_pcie_ep/el_pcie_ep_host_ds_term.c` (host-side early clear, PR #282 /

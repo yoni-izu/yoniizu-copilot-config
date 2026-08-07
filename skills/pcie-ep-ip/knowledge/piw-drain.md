@@ -102,18 +102,26 @@ sub-window). To identify the target, decode against the a1 project bases
   (`0xffd000`) + `0x84` = `VSP_DEALGN_EDGE_VCORE_INTF_CRD_15`. The intended targets are
   real low-16 MB CSRs; the initiator added a constant `+0x0100_0000` base error, pushing
   both into the dead upper window. **Signature: multiple drains sharing an identical high
-  offset ⇒ wrong base pointer / window index in the initiator (host driver or agent),
-  NOT a hung/power-gated IP.** A dead-IP drain would instead land *on* a populated block
-  offset with resp reflecting a stuck slave.
-- **Initiator fingerprinting via the register pair:** the two masked targets were
-  `SOC_EFUSE_0_63 + 0x20` (read) and `VSP_DEALGN_EDGE_EAST + 0x84 = VCORE_INTF_CRD_15`
-  (write). That read-eFuse-then-write-VCore-credit pair is exactly the **VCore binning
-  manager** sequence (`fw/infra/drivers/el_vcore_binning_mgr`: `read_vcore_efuse_binning()`
-  → `dispatch_credit_binning()` → `el_vcore_binning_program_credits()`). Lesson: decode
-  *all* drained addresses together and match them to a known driver's touchpoint sequence —
-  the access *pattern* identifies the initiator even when the base is corrupted. No host
-  KMD/regcli code touches these CSRs, so a host-driven bring-up/binning agent (not the
-  on-die FW driver) is the likely initiator here.
+  offset ⇒ the offset is a structural stride, not random corruption.** Here the shared
+  `+0x0100_0000` is exactly the **per-die management stride**: the a1 project bases define
+  `D0_…SOC_EFUSE_0_63_LO=0x30000` vs `D1_…=0x1030000`, and
+  `D0_…VSP_DEALGN_EDGE_EAST` flat `0xffd000` vs `D1_…0x1ffd000` — i.e. **die stride =
+  0x0100_0000 (16 MB)** in the flat CFG_MNG BAR view. So the two drained addresses are not
+  corrupted at all; they are the **exact, correctly-formed die-1 CSR addresses**
+  (`0x1030020 = D1 SOC_EFUSE_0_63 + 0x20`, `0x1ffd084 = D1 VCORE_INTF_CRD_15`).
+- **Root cause = die iteration over the wrong port.** The initiator is the VCore binning
+  sequence (`read_vcore_efuse_binning()` → `dispatch_credit_binning()` in
+  `fw/infra/drivers/el_vcore_binning_mgr`), which **loops `die_id = 0..N`**. Die 0's local
+  PCIe **management BAR window only decodes the local die's low 16 MB**; cross-die
+  management (die 1/2/3) must go over the **D2D/NoC** path, not the local die-0 MNG port.
+  When the iterator reached `die_id=1` and issued the eFuse read + credit write through the
+  die-0 management port, the die-1 addresses landed in the undecoded `0x0100_0000+` region →
+  PIW MNG drain → SLVERR/timeout. Matches the incident BDF (`0000:af:00.0` = die-0 function).
+- **Diagnostic takeaway:** when drains share a fixed high offset, check it against the
+  **per-die stride** in the project bases (`D0_* vs D1_* LO`) before assuming a pointer bug —
+  a legitimate cross-die address issued on the wrong (local) port looks identical to a
+  base-corruption, but the fix is different (route cross-die access over D2D/NoC, or gate the
+  binning iterator to the local die on this port).
 
 ## Sources
 - FW: `fw/ip/pcie/drivers/el_piw/el_piw.c` (`el_piw_drain_cfg`, `drain_info_list`,
