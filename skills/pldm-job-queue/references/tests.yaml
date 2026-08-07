@@ -1,0 +1,42 @@
+# Example PLDM Job Queue tests-config files
+#
+# Used with:
+#   octl ws build --remote --target pldm --from-file <this-file>   # remote: build branch(es) on CI, then enqueue
+#   octl ws build --local  --target pldm --from-file <this-file>   # local:  enqueue against locally-built artifacts
+#
+# Validation rules:
+#   - `tests` must have at least one entry
+#   - `image_type` is required for every entry
+#   - `timeout_minutes` must be 1–120
+#
+# Only submit image_type values annotated "(currently available for pldm job queue)"
+# in the interactive picker if you want the job to start promptly.
+
+# ---------------------------------------------------------------------------
+# Minimal single-test example
+# ---------------------------------------------------------------------------
+display_name: "smoke-1die"
+tests:
+  - image_type: "1die_w_gmem"     # required: EDK image label
+    group: "default"              # test group filter; "" = all groups
+    timeout_minutes: 20           # required: 1–120
+    args: "smoke"                 # optional: per-test octl args (e.g. a star-file filter)
+    extra_flags: ""               # optional: extra octl flags for this test
+
+# ---------------------------------------------------------------------------
+# Multi-test batch (uncomment to use instead of the block above).
+# All jobs share the same build/manifest and the same display_name — good for
+# testing one PR set across several images/groups in a single submission.
+# ---------------------------------------------------------------------------
+# display_name: "ippciesw-516-regression"
+# tests:
+#   - image_type: "1die_w_gmem"
+#     group: "default"
+#     timeout_minutes: 30
+#     args: "pcie_ep_*"
+#     extra_flags: ""
+#   - image_type: "2die_w_gmem"
+#     group: ""                   # all groups
+#     timeout_minutes: 60
+#     args: ""
+#     extra_flags: "--show-summary"
