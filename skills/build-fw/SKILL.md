@@ -40,10 +40,10 @@ The user may refer to apps by short name, folder name, or alias. Use this mappin
 
 | User input (any of these)            | Folder         | Project name                              | Star file                                                   |
 |--------------------------------------|----------------|-------------------------------------------|-------------------------------------------------------------|
-| primeboot, psoc_primeboot, ewbp      | primeboot      | project.iridium.sw.fw.psoc_primeboot      | zephyr_apps/primeboot/project.iridium.sw.fw.psoc_primeboot.star |
-| fla, fla_runtime, ewbf               | fla_runtime    | project.iridium.sw.fw.fla_runtime         | zephyr_apps/fla_runtime/project.iridium.sw.fw.fla_runtime.star  |
-| mng, psoc_mng, ewbm                  | mng            | project.iridium.sw.fw.psoc_mng            | zephyr_apps/mng/project.iridium.sw.fw.psoc_mng.star             |
-| pwr_thrm, power_thermal, thermal, ewbt | pwr_thrm     | project.iridium.sw.fw.psoc_power_thermal  | zephyr_apps/pwr_thrm/project.iridium.sw.fw.psoc_power_thermal.star |
+| primeboot, psoc_primeboot, owbp      | primeboot      | project.iridium.sw.fw.psoc_primeboot      | zephyr_apps/primeboot/project.iridium.sw.fw.psoc_primeboot.star |
+| fla, fla_runtime, owbf               | fla_runtime    | project.iridium.sw.fw.fla_runtime         | zephyr_apps/fla_runtime/project.iridium.sw.fw.fla_runtime.star  |
+| mng, psoc_mng, owbm                  | mng            | project.iridium.sw.fw.psoc_mng            | zephyr_apps/mng/project.iridium.sw.fw.psoc_mng.star             |
+| pwr_thrm, power_thermal, thermal, owbt | pwr_thrm     | project.iridium.sw.fw.psoc_power_thermal  | zephyr_apps/pwr_thrm/project.iridium.sw.fw.psoc_power_thermal.star |
 | sve, sve_app                         | sve            | project.iridium.val.sve_app               | zephyr_apps/sve/project.iridium.val.sve_app.star                |
 
 If the user doesn't specify an app name but is inside a `zephyr_apps/<app>/` directory, infer the app from the path.
