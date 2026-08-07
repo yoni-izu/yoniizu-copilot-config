@@ -90,6 +90,14 @@ After the review, fold genuinely new, reusable lessons into [references/memoir.m
 
 Review PRs from repos already checked out to author branches in the local workspace (typically left by `review-mgr start`). This replaces only the diff-acquisition part of Step 1; everything else (read existing review state, analyze, draft, present, submit, memoir) is unchanged.
 
+### Decide fresh vs. re-review automatically (do this first, every time)
+Local mode always begins by determining, **per repo/PR and without asking the user**, whether this is a first look or a re-review — invocation with an explicit `re-review` keyword is only a hint, not a precondition. For each review repo, resolve the last-reviewed baseline SHA in the priority order given in [Re-Review](#re-review-force-push--rebase) step 1 (task-note `reviewed @ <repo>:<sha>` → latest matching draft's `Head SHA reviewed` → last submitted review's `commit.oid`). Then:
+- **No baseline found** → **fresh review**: diff the full working branch against the merge-base (below).
+- **Baseline found, current head differs** → **re-review**: follow the [Re-Review](#re-review-force-push--rebase) flow (diff `baseline..new-head`, triage only what changed, carry forward still-open prior findings).
+- **Baseline found, head identical** → no new code since the last pass: report that and stop (don't redraft), unless the user explicitly asks for a re-read.
+
+Make this decision independently for each repo in a multi-repo task.
+
 ### Resolve which repos/branches/PRs to review
 1. **Prefer the review-mgr task store** as the source of truth. Read it with `python3 ~/.copilot/skills/task-manager/tm.py list --category code-review` (or read the store JSON). Pick the in-progress `code-review` task (the one matching the current `workspace`, or ask if several). Each `reviews[]` entry gives `repo`, `branch`, `owner`, `pr_number`, `pr_url`, `author` — this is the local-path-to-PR mapping needed for posting later.
 2. **Workspace root:** the task's `workspace` field, else the current `~/projects/<project>/<ws>` root, else cwd. Map repo names to local paths via the workspace manifest (`.repo/manifests/` → `<project name="..." path="...">`). Note the manifest `revision` attribute — that fb/base branch is the diff base, **not** `main`.
