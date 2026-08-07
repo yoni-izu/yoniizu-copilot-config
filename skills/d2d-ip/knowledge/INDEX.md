@@ -23,6 +23,7 @@ next query on the same subject is fast and does not require re-reading the sourc
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| VDM over SB support (Vendor Defined Messages over sideband) | `vdm-over-sb-support.md` | vdm, vendor defined message, sideband, sb, ucie.sb, fw download, mng fabric, mainband debug, generation fsm, reception fsm, message code 0xff, axi to vdm, credits, checksum, hardware mode, software mode | Verified from spec | 2026-07-15 |
 | Pre-FIU transport reachability — SPI-GW reaches horizontal links MMIO can't | `pre-fiu-transport-reachability.md` | spi gateway, spi-gw, mmio transport, fiu, transport switch, dup broadcast, horizontal links, d2-d3, primeboot, sbinit, re-bring-up, verification reads | Verified from FW driver | 2026-06-30 |
 | SBINIT-done probe (spare bit vs intr summary) | `sbinit-done-probe.md` | sbinit, sideband init, cmn_top_int2, spare_cfg0, cmn_top_int1, intr1_summary, rom marker, boot probe, link bring-up | Verified from spec + reg header | 2026-06-29 |
 | D2D link health monitoring | `health-monitoring.md` | health monitor, link health, eye monitoring, running parity, runtime link testing, ber, slm, per-lane, retrain, autonomous bw, pll lock, ointerrupt_0, ointerrupt_1 | Verified from spec | 2026-06-23 |
