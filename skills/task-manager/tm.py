@@ -16,6 +16,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+# workspace-manager owns all slot occupancy. tm.py delegates every workspace
+# mutation/read to it (imported as a module; also a standalone CLI).
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/workspace-manager"))
+import wm  # noqa: E402
+
 # ----------------------------------------------------------------------------
 # Constants & helpers
 # ----------------------------------------------------------------------------
@@ -128,25 +133,26 @@ def last_worked_label(t: dict) -> str:
 
 
 def detect_workspace(cwd: str | None = None) -> str | None:
-    """Return workspace name if cwd is under ~/projects/<project>/<ws>/..."""
-    p = Path(cwd) if cwd else Path.cwd()
-    try:
-        rel = p.resolve().relative_to(PROJECTS_ROOT.resolve())
-    except ValueError:
-        return None
-    parts = rel.parts
-    if len(parts) < 2:
-        return None
-    return parts[1]  # parts[0] = project, parts[1] = workspace name
+    """Return workspace slot name if cwd is under ~/projects/<project>/<ws>/..."""
+    return wm.slot_from_cwd(cwd)
 
 
-def workspace_holder(d: dict, ws: str) -> dict | None:
-    for t in d["tasks"]:
-        if t.get("status") in ("done", "cancelled"):
-            continue
-        if t.get("workspace") == ws:
-            return t
+def slot_holder_task(d: dict, slot: str) -> dict | None:
+    """Resolve the task currently holding ``slot`` (if a task holds it)."""
+    holder = wm.get_holder(slot)
+    if holder and holder.get("type") == "task":
+        return find_task(d, holder["task_id"])
     return None
+
+
+def task_slot(task_id: str) -> str | None:
+    """Slot a task currently holds, or ``None``."""
+    return wm.slot_of_task(task_id)
+
+
+def release_task_slot(t: dict) -> str | None:
+    """Release whatever slot task ``t`` holds. Returns freed slot or ``None``."""
+    return wm.release_task(t["id"])
 
 
 def append_note(t: dict, msg: str) -> None:
@@ -203,7 +209,7 @@ REVIEW_CONSOLIDATED_TO_TASK = {
     "in-progress": "in-progress",
     "waiting-for-author": "blocked",
     "waiting-for-re-review": "todo",
-    "approved": "in-progress",   # reviewer done; awaiting merge (purged on merge)
+    "approved": "in-progress",   # reviewer done; task stays open until every PR merges
     "merged": "done",
 }
 
@@ -346,7 +352,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     complexity = args.complexity or "medium"
     cost = args.cost if args.cost is not None else COMPLEXITY_DEFAULT_COST[complexity]
 
-    # Workspace auto-assignment
+    # Workspace auto-assignment (delegated to workspace-manager)
     ws_name = args.workspace or (None if args.no_workspace else detect_workspace(args.cwd))
     status = "todo"
     notes = [f"{NOW}: initial submission"]
@@ -357,13 +363,14 @@ def cmd_add(args: argparse.Namespace) -> int:
         status = "backlog"
         ws_name = None
     elif ws_name:
-        holder = workspace_holder(d, ws_name)
+        root = wm.normalize_slot(ws_name)
+        holder = wm.get_holder(root)
         if holder is None:
-            assigned_ws = ws_name
-            notes.append(f"{NOW}: auto-assigned to workspace {ws_name}")
+            assigned_ws = root
+            notes.append(f"{NOW}: auto-assigned to workspace {root}")
         else:
             status = "backlog"
-            skip_reason = f"workspace '{ws_name}' occupied by {holder['id']} ({holder['title']})"
+            skip_reason = f"workspace '{root}' occupied by {wm.holder_summary(holder)}"
             ws_name = None
 
     task = {
@@ -380,12 +387,13 @@ def cmd_add(args: argparse.Namespace) -> int:
         "created": TODAY,
         "updated": TODAY,
         "completed": None,
-        "workspace": assigned_ws,
         "notes": notes,
     }
     d["tasks"].append(task)
     d["next_id"] += 1
     save(d)
+    if assigned_ws:
+        wm.occupy_task(assigned_ws, tid, detail=ws_name)
 
     summary = f"{tid} | {complexity} | {cost}h | status={status}"
     if assigned_ws:
@@ -490,7 +498,6 @@ def cmd_add_review(args: argparse.Namespace) -> int:
         "created": today,
         "updated": today,
         "completed": None,
-        "workspace": None,
         "notes": [f"{NOW}: initial submission" +
                   (f" ({len(reviews)} PRs)" if len(reviews) > 1 else "")],
         "reviews": reviews,
@@ -540,6 +547,9 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps(tasks, indent=2))
         return 0
 
+    holders = wm.all_holders()
+    tid_slot = {h["task_id"]: s for s, h in holders.items() if h.get("type") == "task"}
+
     rows = [("ID", "Title", "Feature", "Cat", "Pri", "Status", "Cx", "Est", "Age", "Worked", "WS")]
     for t in tasks:
         title = t["title"]
@@ -556,7 +566,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"{t.get('cost_hours', 0)}h",
             f"{days_since(t.get('created', TODAY))}d",
             last_worked_label(t),
-            t.get("workspace") or "—",
+            tid_slot.get(t["id"], "—"),
         ))
     _print_table(rows)
 
@@ -566,10 +576,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     total_est = sum(t.get("cost_hours", 0) for t in tasks)
     print(f"\n{active} active | {blocked} blocked | {done} done | total est: {total_est}h remaining")
 
-    ws_map = {t["workspace"]: t["id"] for t in d["tasks"]
-              if t.get("workspace") and t.get("status") not in ("done", "cancelled")}
-    if ws_map:
-        print("Workspaces: " + ", ".join(f"{k} → {v}" for k, v in sorted(ws_map.items())))
+    if holders:
+        parts = []
+        for s in sorted(holders):
+            h = holders[s]
+            parts.append(f"{s} → {h['task_id']}" if h.get("type") == "task"
+                         else f"{s} → {h.get('label')} [{h.get('tag', 'other')}]")
+        print("Workspaces: " + ", ".join(parts))
     return 0
 
 
@@ -648,13 +661,33 @@ def _set_status(d: dict, ident: str, new_status: str, note: str | None) -> int:
         print(f"[tm] task not found: {ident}", file=sys.stderr)
         return 1
     old = t["status"]
+    # Code-review tasks are only truly "done" once every PR has merged. Marking
+    # one done early means the reviewer is finished → approve the open PRs and keep
+    # the task in-progress until the merges actually land.
+    if new_status == "done" and t.get("category") == "code-review":
+        prs = pr_entries(t)
+        if prs and not all(p.get("review_status") == "merged" for p in prs):
+            for p in prs:
+                if p.get("review_status") != "merged":
+                    p["review_status"] = "approved"
+                    p["submitted_at"] = TODAY
+            consolidated = consolidate_review_status(prs)
+            derived = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+            t["status"] = derived
+            t["updated"] = TODAY
+            if derived in ("blocked", "todo"):
+                release_task_slot(t)
+            append_note(t, note or f"review approved; awaiting merge (overall: {consolidated})")
+            save(d)
+            print(f"{t['id']} {old} → {derived} (review approved; not merged yet)")
+            return 0
     t["status"] = new_status
     t["updated"] = TODAY
     if new_status == "done":
         t["completed"] = TODAY
-        t["workspace"] = None
+        release_task_slot(t)
     elif new_status == "cancelled":
-        t["workspace"] = None
+        release_task_slot(t)
     if note:
         append_note(t, note)
     else:
@@ -695,21 +728,49 @@ def cmd_assign(args: argparse.Namespace) -> int:
         print(f"[tm] task not found: {args.id}", file=sys.stderr)
         return 1
     ws = args.workspace
-    holder = workspace_holder(d, ws)
-    if holder and holder["id"] != t["id"] and not args.force:
-        print(f"[tm] workspace '{ws}' occupied by {holder['id']} ({holder['title']}). "
-              f"Use --force to displace.", file=sys.stderr)
+    ok, msg, displaced = wm.occupy_task(ws, t["id"], detail=ws, force=args.force)
+    if not ok:
+        print(f"[tm] {msg}. Use --force to displace.", file=sys.stderr)
         return 1
-    if holder and holder["id"] != t["id"] and args.force:
-        holder["workspace"] = None
-        append_note(holder, f"workspace {ws} released to {t['id']}")
-    t["workspace"] = ws
+    root = wm.normalize_slot(ws)
+    if displaced and displaced.get("type") == "task":
+        other = find_task(d, displaced["task_id"])
+        if other:
+            append_note(other, f"workspace {root} released to {t['id']}")
+    elif displaced:
+        print(f"[tm] displaced {wm.holder_summary(displaced)}")
     if t["status"] == "todo":
         t["status"] = "in-progress"
     t["updated"] = TODAY
-    append_note(t, f"assigned to workspace {ws}")
+    append_note(t, f"assigned to workspace {root}")
     save(d)
-    print(f"{t['id']} → workspace {ws} ({t['status']})")
+    print(f"{t['id']} → workspace {root} ({t['status']})")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# Subcommand: release
+# ----------------------------------------------------------------------------
+
+def cmd_release(args: argparse.Namespace) -> int:
+    """Free a task's workspace slot without forcing a status change.
+
+    Used when you stop working in a workspace but the task itself is not done
+    (e.g. review 'stop', switching contexts). Leaves ``status`` untouched.
+    """
+    d = load()
+    t = find_task(d, args.id)
+    if not t:
+        print(f"[tm] task not found: {args.id}", file=sys.stderr)
+        return 1
+    prev = release_task_slot(t)
+    if not prev:
+        print(f"{t['id']} holds no workspace")
+        return 0
+    t["updated"] = TODAY
+    append_note(t, args.note or f"released workspace {prev}")
+    save(d)
+    print(f"{t['id']} released workspace {prev} ({t['status']})")
     return 0
 
 
@@ -720,29 +781,35 @@ def cmd_assign(args: argparse.Namespace) -> int:
 def cmd_workspaces(args: argparse.Namespace) -> int:
     d = load()
     project = args.project or DEFAULT_PROJECT
-    proj_dir = PROJECTS_ROOT / project
-    if not proj_dir.is_dir():
-        print(f"[tm] project dir not found: {proj_dir}", file=sys.stderr)
-        return 1
-    ws_dirs = sorted(p.name for p in proj_dir.iterdir() if p.is_dir())
-    by_ws: dict[str, dict] = {}
-    for t in d["tasks"]:
-        if t.get("workspace") and t.get("status") not in ("done", "cancelled"):
-            by_ws[t["workspace"]] = t
-    rows = [("Workspace", "Task ID", "Title", "Status")]
+    wd = wm.load()
+    slots = wm.canonical_slots(project)
+    for s in wd["slots"]:
+        if s not in slots and wm.get_holder(s, wd):
+            slots.append(s)
+    rows = [("Workspace", "Holder", "Kind", "Status", "Since")]
     occupied = 0
-    for ws in ws_dirs:
-        t = by_ws.get(ws)
-        if t:
-            occupied += 1
-            title = t["title"]
-            if len(title) > 50:
-                title = title[:47] + "..."
-            rows.append((ws, t["id"], title, t["status"]))
+    for ws in slots:
+        holder = wm.get_holder(ws, wd)
+        if not holder:
+            rows.append((ws, "—", "—", "—", "—"))
+            continue
+        occupied += 1
+        since = holder.get("since") or "—"
+        if holder.get("type") == "task":
+            t = find_task(d, holder["task_id"])
+            hid = holder["task_id"]
+            title = (t["title"] if t else "?")
+            if len(title) > 40:
+                title = title[:37] + "..."
+            rows.append((ws, f"{hid} · {title}", "task",
+                         (t["status"] if t else "?"), since))
         else:
-            rows.append((ws, "—", "—", "—"))
+            label = holder.get("label", "")
+            if len(label) > 44:
+                label = label[:41] + "..."
+            rows.append((ws, label, f"adhoc/{holder.get('tag', 'other')}", "—", since))
     _print_table(rows)
-    print(f"\n{occupied} / {len(ws_dirs)} workspaces occupied")
+    print(f"\n{occupied} / {len(slots)} workspaces occupied")
     return 0
 
 
@@ -813,23 +880,18 @@ def cmd_review_update(args: argparse.Namespace) -> int:
     if new_status == "done":
         t["status"] = "done"
         t["completed"] = TODAY
-        t["workspace"] = None
+        release_task_slot(t)
     else:
         t["status"] = new_status
         if new_status in ("blocked", "todo"):
-            t["workspace"] = None  # free slot when ball is with author / awaiting re-review
+            release_task_slot(t)  # free slot when ball is with author / awaiting re-review
     t["updated"] = TODAY
     append_note(t, f"review-update: {args.status}" + (f" on #{args.pr}" if args.pr else " on all PRs")
                 + f" (overall: {consolidated})")
 
-    # Auto-purge if all PRs are resolved (merged or closed without merge)
-    if all(pr_resolved(p) for p in prs):
-        d["tasks"] = [x for x in d["tasks"] if x["id"] != t["id"]]
-        save(d)
-        reason = "merged" if all(p.get("merged") for p in prs) else "merged/closed"
-        print(f"{t['id']} all PRs {reason} → purged")
-        return 0
-
+    # A code-review task is only ever "done" once every PR has merged; until then
+    # it stays tracked (no purge). The merged → done transition is handled above
+    # via REVIEW_CONSOLIDATED_TO_TASK, so merged tasks persist as a done record.
     save(d)
     print(f"{t['id']} status={t['status']} overall-review={consolidated} (set {args.status})")
     return 0
@@ -841,7 +903,7 @@ def cmd_review_update(args: argparse.Namespace) -> int:
 
 def cmd_review_check(args: argparse.Namespace) -> int:
     d = load()
-    purged = []
+    completed = []
     updates = []
     keep = []
     for t in d["tasks"]:
@@ -875,17 +937,25 @@ def cmd_review_check(args: argparse.Namespace) -> int:
                 updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: closed")
         if changed:
             t["updated"] = TODAY
-        if prs and all(pr_resolved(p) for p in prs):
-            purged.append(t["id"])
-            continue
+            # Re-derive the task status from all PRs. The task only becomes done
+            # once every PR has merged; otherwise it stays tracked (not purged).
+            consolidated = consolidate_review_status(prs)
+            new_status = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+            t["status"] = new_status
+            if new_status == "done":
+                t["completed"] = TODAY
+                release_task_slot(t)
+                completed.append(t["id"])
+            elif new_status in ("blocked", "todo"):
+                release_task_slot(t)
         keep.append(t)
     d["tasks"] = keep
     save(d)
     for u in updates:
         print(u)
-    if purged:
-        print("purged: " + ", ".join(purged))
-    if not updates and not purged:
+    if completed:
+        print("merged → done: " + ", ".join(completed))
+    if not updates and not completed:
         print("no changes")
     return 0
 
@@ -1427,7 +1497,7 @@ def cmd_re_review(args: argparse.Namespace) -> int:
         for p in pr_entries(task):
             p["review_status"] = "waiting-for-re-review"
         task["status"] = "todo"
-        task["workspace"] = None
+        release_task_slot(task)
         task["updated"] = TODAY
         append_note(task, "re-review: waiting-for-re-review on all PRs")
         print(f"{tid} status=todo review_status=waiting-for-re-review "
@@ -1614,6 +1684,44 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .editor .msg { font-size:12px; color:var(--muted); }
   .editor .hint { font-size:11px; color:var(--muted); font-style:italic; align-self:center; text-transform:none; }
   .ro-note { color:var(--muted); font-size:12px; font-style:italic; }
+  /* --- workspace state view --- */
+  .ws-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:16px; }
+  .ws-grid.cols-2 { grid-template-columns:repeat(2,1fr); }
+  .ws-grid.cols-3 { grid-template-columns:repeat(3,1fr); }
+  @media (max-width:900px){ .ws-grid, .ws-grid.cols-2, .ws-grid.cols-3 { grid-template-columns:1fr; } }
+  .ws-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+  .ws-layout { display:inline-flex; align-items:center; gap:6px; }
+  .ws-layout .lbl { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .ws-seg { display:inline-flex; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .ws-seg button { background:var(--bg); color:var(--text); border:none; padding:6px 12px; cursor:pointer; font:inherit; font-size:12px; }
+  .ws-seg button + button { border-left:1px solid var(--border); }
+  .ws-seg button.on { background:var(--accent); color:#fff; }
+  .ws-card { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+             padding:14px 16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; }
+  .ws-card.occupied { border-left:4px solid var(--accent); }
+  .ws-card.free { border-left:4px solid #16a34a; }
+  .ws-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .ws-name { font-size:15px; font-weight:700; display:flex; align-items:center; }
+  .ws-name .num { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px;
+                  border-radius:6px; background:var(--accent-soft); color:var(--accent); font-size:12px; margin-right:8px; }
+  .ws-topic { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ws-free-name { color:var(--muted); font-weight:600; text-transform:capitalize; }
+  .ws-badge-free{ background:#dcfce7; color:#15803d; }
+  .ws-badge-occupied{ background:#fef3c7; color:#92400e; }
+  @media (prefers-color-scheme: dark){
+    .ws-badge-free{ background:#14532d44; color:#86efac; }
+    .ws-badge-occupied{ background:#78350f44; color:#fcd34d; }
+  }
+  .ws-task { border:1px solid var(--border); border-radius:8px; padding:8px 10px; display:grid; gap:6px; background:var(--bg); }
+  .ws-task .t-title { font-weight:600; }
+  .ws-task .t-meta { font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; }
+  .ws-empty { color:var(--muted); font-size:13px; font-style:italic; padding:6px 2px; }
+  .ws-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .ws-actions select { min-width:180px; }
+  .ws-occupy-box { flex-direction:column; align-items:stretch; }
+  .ws-occ-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .ws-occ-row input[type=text] { flex:1; min-width:180px; }
+  .ws-msg { font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -1730,10 +1838,12 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <thead><tr id="head"></tr></thead>
     <tbody id="body"></tbody>
   </table>
+  <div id="wsview" style="display:none;"></div>
 </div>
 
 <script>
 let TASKS = __DATA__;
+let WORKSPACES = __WSDATA__;
 let SERVED = false;
 const JIRA_BASE = "https://elementlabs.atlassian.net/browse/";
 const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled"];
@@ -1744,6 +1854,14 @@ const RV_ORDER = ["pending","in-progress","commented","changes-requested","waiti
 // Per-PR review statuses that can be *set* from the editor (excludes the
 // consolidated-only "waiting-for-author").
 const RV_SETTABLE = RV_ORDER.filter(s=>s!=="waiting-for-author");
+
+// Numbered workspaces only: the Workspace State tab tracks slots whose name is a
+// number-word, mapped to that number (one→1, two→2, … six→6). Other checkout dirs
+// (e.g. main, elpci) are intentionally not shown here.
+const WS_TAB = "__workspaces__";
+const WS_NUMBER_NAMES = ["one","two","three","four","five","six"];
+const WORKSPACE_SLOTS = WS_NUMBER_NAMES.map((slot,i)=>({slot, n:i+1}));
+let wsGridCols = 3;   // Workspace State grid: 3 columns (3×2) or 2 columns (2×3)
 
 const COLUMNS = [
   {key:"id",      label:"ID",        on:true},
@@ -1900,7 +2018,10 @@ function applyFilters(){
 
   return TASKS.filter(t=>{
     if(activeTab!=="all" && t.category!==activeTab) return false;
-    if(hideDone && (t.status==="done"||t.status==="cancelled")) return false;
+    // Merged code-review tasks are "done" but stay visible in the review section
+    // so the terminal `merged` status is trackable (until all PRs land they were open).
+    const keepMerged = t.category==="code-review" && consolidateReviewStatus(prs(t))==="merged";
+    if(hideDone && (t.status==="done"||t.status==="cancelled") && !keepMerged) return false;
     if(st.length && !st.includes(t.status)) return false;
     if(cat.length && !cat.includes(t.category)) return false;
     if(pri.length && !pri.includes(t.priority)) return false;
@@ -2043,6 +2164,7 @@ function wireEditor(detEl,t){
 }
 
 function render(){
+  if(activeTab===WS_TAB){ renderWorkspaces(); return; }
   const cols=COLUMNS.filter(c=>c.on);
   document.getElementById("head").innerHTML=cols.map(c=>{
     const active=sortState.key===c.key;
@@ -2083,11 +2205,12 @@ function render(){
 
 // ---- tabs (category views) ----
 function tabCount(cat){
+  if(cat===WS_TAB){ return WORKSPACE_SLOTS.filter(s=>wsHolder(s.slot)).length; }
   return TASKS.filter(t=>(cat==="all"||t.category===cat) && !(["done","cancelled"].includes(t.status))).length;
 }
 function buildTabs(){
   const present=CATEGORIES.filter(c=>TASKS.some(t=>t.category===c));
-  const tabs=[["all","All"], ...present.map(c=>[c,c])];
+  const tabs=[["all","All"], ...present.map(c=>[c,c]), [WS_TAB,"Workspace State"]];
   const box=document.getElementById("tabs");
   box.innerHTML=tabs.map(([k,l])=>
     `<button class="tab${k===activeTab?" on":""}" data-tab="${esc(k)}">${esc(l)}<span class="badge-count">${tabCount(k)}</span></button>`).join("");
@@ -2098,9 +2221,22 @@ function applyTabPreset(tab){
   COLUMNS.forEach(c=>{ c.on=preset.includes(c.key); });
   buildColumns();
 }
+// Show/hide the standard filter+table chrome (hidden by the Workspace State tab).
+function setChromeVisible(show){
+  const disp=show?"":"none";
+  const ctl=document.querySelector(".controls"); if(ctl) ctl.style.display=disp;
+  ["tbl","count","stats"].forEach(id=>{ const el=document.getElementById(id); if(el) el.style.display=disp; });
+  const wv=document.getElementById("wsview"); if(wv) wv.style.display=show?"none":"";
+}
 function selectTab(tab){
   activeTab=tab;
   document.querySelectorAll("#tabs .tab").forEach(b=>b.classList.toggle("on",b.dataset.tab===tab));
+  if(tab===WS_TAB){
+    setChromeVisible(false);
+    renderWorkspaces();
+    return;
+  }
+  setChromeVisible(true);
   // category filter is redundant inside a category tab: clear + hide it
   const gc=document.getElementById("grp-category");
   if(gc) gc.style.display = tab==="all" ? "" : "none";
@@ -2118,6 +2254,162 @@ function selectTab(tab){
   }
   applyTabPreset(tab);
   render();
+}
+
+// ---- workspace state view ----
+// Occupancy lives in the workspace-manager store (WORKSPACES), not on tasks.
+function wsHolder(slot){ const r=WORKSPACES.slots&&WORKSPACES.slots[slot]; return (r&&r.holder)||null; }
+function wsTaskById(id){ return TASKS.find(t=>t.id===id)||null; }
+function activeTaskList(){ return TASKS.filter(t=>!["done","cancelled"].includes(t.status)); }
+function ago(iso){ if(!iso) return ""; const n=daysSince(iso); return n==null?"":(n===0?"today":n+"d ago"); }
+const WS_ADHOC_TAGS=["monitor","debug","experiment","other"];
+
+// POST a slot occupy/free to the workspace API, then refresh the whole view.
+async function wsSlotPost(slot, payload, msgEl){
+  if(!SERVED){ if(msgEl) msgEl.textContent="Read-only — run tm.py serve to edit."; return; }
+  if(msgEl) msgEl.textContent="Saving…";
+  try{
+    const res=await fetch("/api/workspace/"+encodeURIComponent(slot),{
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+    const data=await res.json();
+    if(!res.ok){ if(msgEl) msgEl.textContent="Error: "+(data.error||res.status); return; }
+    TASKS=data.tasks; if(data.workspaces) WORKSPACES=data.workspaces;
+    buildFilters(); buildTabs(); render();
+  }catch(err){ if(msgEl) msgEl.textContent="Network error: "+err; }
+}
+
+function wsTaskCard(t, holder){
+  const acq=holder&&holder.since; const rel=ago(acq);
+  const detail=(holder&&holder.detail)||"";
+  return `<div class="ws-task">
+    <div class="t-title">${esc(t.id)} · ${esc(t.title)}</div>
+    <div class="t-meta">
+      <span class="badge s-${esc(t.status)}">${esc(t.status)}</span>
+      ${t.priority?`<span class="badge p-${esc(t.priority)}">${esc(t.priority)}</span>`:""}
+      ${detail&&detail!==t.workspace?`<span><b>path</b> <code>${esc(detail)}</code></span>`:""}
+      <span><b>acquired</b> ${acq?esc(acq)+(rel?` (${esc(rel)})`:""):"—"}</span>
+      ${t.jira?`<span><a href="${JIRA_BASE+encodeURIComponent(t.jira)}" target="_blank">${esc(t.jira)}</a></span>`:""}
+    </div>
+  </div>`;
+}
+
+function wsAdhocCard(holder){
+  const acq=holder.since; const rel=ago(acq);
+  return `<div class="ws-task">
+    <div class="t-title">${esc(holder.label||"")}</div>
+    <div class="t-meta">
+      <span class="badge ws-badge-occupied">ad-hoc</span>
+      <span class="badge">${esc(holder.tag||"other")}</span>
+      <span><b>since</b> ${acq?esc(acq)+(rel?` (${esc(rel)})`:""):"—"}</span>
+    </div>
+  </div>`;
+}
+
+// Topic-based card title: what work is happening on this slot, not the slot name.
+// Honors an explicit holder.header; otherwise derives from the task/ad-hoc hold.
+function holderHeader(holder){
+  if(!holder) return "";
+  if(holder.header) return esc(holder.header);
+  if(holder.type==="task"){
+    const t=wsTaskById(holder.task_id);
+    if(!t) return esc(holder.task_id);
+    let s=(t.title||"").replace(/^review:\s*/i,"").replace(/^\[[^\]]*\]\s*/,"").trim();
+    if(t.category==="code-review" && !/\breview\b|\bPR\b/i.test(s)) s+=" PR review";
+    if(s.length>52) s=s.slice(0,51)+"…";
+    return esc(s+" ("+t.id+")");
+  }
+  let s=holder.label||"";
+  if(s.length>60) s=s.slice(0,59)+"…";
+  return esc(s);
+}
+
+function wsCard(s){
+  const holder=wsHolder(s.slot);
+  const occ=!!holder;
+  let bodyHtml;
+  if(!holder){
+    bodyHtml=`<div class="ws-empty">Free — no task or ad-hoc hold.</div>`;
+  }else if(holder.type==="task"){
+    const t=wsTaskById(holder.task_id);
+    bodyHtml=t?wsTaskCard(t,holder):`<div class="ws-empty">Held by ${esc(holder.task_id)} (not in view)</div>`;
+  }else{
+    bodyHtml=wsAdhocCard(holder);
+  }
+  let ctlHtml="";
+  if(SERVED){
+    if(occ){
+      ctlHtml=`<div class="ws-actions">
+        <button class="link ws-free" data-slot="${esc(s.slot)}">Set free</button>
+        <span class="ws-msg"></span></div>`;
+    }else{
+      const cand=activeTaskList().filter(t=>t.workspace!==s.slot);
+      ctlHtml=`<div class="ws-actions ws-occupy-box" data-slot="${esc(s.slot)}">
+        <div class="ws-occ-row">
+          <select class="ws-pick"><option value="">— occupy with a task —</option>${
+            cand.map(t=>`<option value="${esc(t.id)}">${esc(t.id)} · ${esc((t.title||"").slice(0,48))}${t.workspace?` (moves from ${esc(t.workspace)})`:""}</option>`).join("")}</select>
+          <button class="primary ws-occupy-task">Occupy</button>
+        </div>
+        <div class="ws-occ-row">
+          <input type="text" class="ws-adhoc-label" placeholder="…or an ad-hoc purpose (e.g. monitor PRs)">
+          <select class="ws-adhoc-tag">${WS_ADHOC_TAGS.map(g=>`<option value="${g}">${g}</option>`).join("")}</select>
+          <button class="ws-occupy-adhoc">Hold</button>
+        </div>
+        <span class="ws-msg"></span></div>`;
+    }
+  }else{
+    ctlHtml=`<div class="ro-note">Read-only. Run <code>tm.py serve</code> and open the served page to change occupancy.</div>`;
+  }
+  const headTitle = occ
+    ? `<span class="ws-topic">${holderHeader(holder)}</span>`
+    : `<span class="ws-topic ws-free-name">${esc(s.slot)}</span>`;
+  return `<div class="ws-card ${occ?"occupied":"free"}">
+    <div class="ws-head">
+      <div class="ws-name"><span class="num">${s.n}</span>${headTitle}</div>
+      <span class="badge ws-badge-${occ?"occupied":"free"}">${occ?"occupied":"free"}</span>
+    </div>
+    <div class="ws-body">${bodyHtml}</div>
+    ${ctlHtml}
+  </div>`;
+}
+
+function renderWorkspaces(){
+  const box=document.getElementById("wsview");
+  const occupied=WORKSPACE_SLOTS.filter(s=>wsHolder(s.slot)).length;
+  const free=WORKSPACE_SLOTS.length-occupied;
+  const stats=`<div class="stats">
+    <div class="stat"><div class="n">${WORKSPACE_SLOTS.length}</div><div class="l">Workspaces</div></div>
+    <div class="stat"><div class="n">${occupied}</div><div class="l">Occupied</div></div>
+    <div class="stat"><div class="n">${free}</div><div class="l">Free</div></div>
+  </div>`;
+  const layout=`<div class="ws-layout"><span class="lbl">Layout</span>
+    <div class="ws-seg">
+      <button data-cols="3" class="${wsGridCols===3?"on":""}">3×2</button>
+      <button data-cols="2" class="${wsGridCols===2?"on":""}">2×3</button>
+    </div></div>`;
+  box.innerHTML = `<div class="ws-toolbar">${stats}${layout}</div>`
+    + `<div class="ws-grid cols-${wsGridCols}">${WORKSPACE_SLOTS.map(wsCard).join("")}</div>`;
+  // layout toggle
+  box.querySelectorAll(".ws-seg button").forEach(b=>b.addEventListener("click",()=>{
+    wsGridCols=Number(b.dataset.cols); renderWorkspaces();
+  }));
+  // wire controls
+  box.querySelectorAll(".ws-free").forEach(b=>b.addEventListener("click",()=>{
+    const msg=b.closest(".ws-actions").querySelector(".ws-msg");
+    wsSlotPost(b.dataset.slot,{action:"free"},msg);
+  }));
+  box.querySelectorAll(".ws-occupy-task").forEach(b=>b.addEventListener("click",()=>{
+    const wrap=b.closest(".ws-occupy-box");
+    const sel=wrap.querySelector(".ws-pick"); const msg=wrap.querySelector(".ws-msg");
+    if(!sel.value){ msg.textContent="Pick a task first."; return; }
+    wsSlotPost(wrap.dataset.slot,{action:"occupy",type:"task",task_id:sel.value},msg);
+  }));
+  box.querySelectorAll(".ws-occupy-adhoc").forEach(b=>b.addEventListener("click",()=>{
+    const wrap=b.closest(".ws-occupy-box");
+    const lbl=wrap.querySelector(".ws-adhoc-label"); const tag=wrap.querySelector(".ws-adhoc-tag");
+    const msg=wrap.querySelector(".ws-msg");
+    if(!lbl.value.trim()){ msg.textContent="Describe the ad-hoc hold first."; return; }
+    wsSlotPost(wrap.dataset.slot,{action:"occupy",type:"adhoc",label:lbl.value.trim(),tag:tag.value},msg);
+  }));
 }
 
 // ---- column toggles ----
@@ -2151,10 +2443,12 @@ function renderStats(){
     const revTasks=scope.filter(t=>t.category==="code-review" && !["done","cancelled"].includes(t.status));
     const allPrs=scope.flatMap(t=>prs(t));
     const by={}; revTasks.forEach(t=>{ const s=consolidateReviewStatus(prs(t)); by[s]=(by[s]||0)+1; });
+    const merged=scope.filter(t=>t.category==="code-review" && consolidateReviewStatus(prs(t))==="merged").length;
     cards.push(["PRs",allPrs.length],
                ["Waiting&nbsp;author",by["waiting-for-author"]||0],
                ["Re-review",by["waiting-for-re-review"]||0],
-               ["Approved",by["approved"]||0]);
+               ["Approved",by["approved"]||0],
+               ["Merged",merged]);
   } else if(activeTab==="planning"){
     cards.push(["With&nbsp;Jira",scope.filter(t=>t.jira).length]);
   }
@@ -2203,7 +2497,7 @@ async function refreshData(){
   try{
     if(SERVED){
       const r=await fetch("/api/tasks",{cache:"no-store"});
-      if(r.ok){ TASKS=await r.json(); }
+      if(r.ok){ const j=await r.json(); TASKS=j.tasks||j; if(j.workspaces) WORKSPACES=j.workspaces; }
     }
     const fstate=captureFilterState();   // preserve active filter selections
     buildFilters();                       // rebuild options (may include new values)
@@ -2233,7 +2527,7 @@ async function init(){
       const badge=document.getElementById("modebadge");
       badge.textContent="editable"; badge.className="mode edit";
       const r=await fetch("/api/tasks",{cache:"no-store"});
-      if(r.ok){ TASKS=await r.json(); }
+      if(r.ok){ const j=await r.json(); TASKS=j.tasks||j; if(j.workspaces) WORKSPACES=j.workspaces; }
     }
   }catch(e){ /* file:// — stay read-only with embedded data */ }
   document.getElementById("total").textContent=`${TASKS.length} tasks`;
@@ -2249,10 +2543,31 @@ init();
 """
 
 
+def _annotate_tasks(tasks: list[dict], wd: dict | None = None) -> list[dict]:
+    """Return shallow task copies annotated with a transient ``workspace`` slot.
+
+    The task store no longer holds a ``workspace`` field — occupancy lives in the
+    workspace-manager store. The dashboard's task views still read ``t.workspace``
+    for display, so we resolve each task's slot from the wm store at render time.
+    """
+    wd = wd if wd is not None else wm.load()
+    tid_slot = {h["task_id"]: s for s, h in wm.all_holders(wd).items()
+                if h.get("type") == "task"}
+    out = []
+    for t in tasks:
+        c = dict(t)
+        c["workspace"] = tid_slot.get(t["id"])
+        out.append(c)
+    return out
+
+
 def render_dashboard_html(tasks: list[dict]) -> str:
-    payload = json.dumps(tasks, ensure_ascii=False).replace("</", "<\\/")
+    wd = wm.load()
+    payload = json.dumps(_annotate_tasks(tasks, wd), ensure_ascii=False).replace("</", "<\\/")
+    wspayload = json.dumps(wd, ensure_ascii=False).replace("</", "<\\/")
     return (DASHBOARD_TEMPLATE
             .replace("__DATA__", payload)
+            .replace("__WSDATA__", wspayload)
             .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
@@ -2293,9 +2608,9 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
             t["status"] = new
             if new == "done":
                 t["completed"] = TODAY
-                t["workspace"] = None
+                release_task_slot(t)
             elif new == "cancelled":
-                t["workspace"] = None
+                release_task_slot(t)
             changes.append(f"status {old} → {new}")
 
     if "priority" in payload:
@@ -2337,18 +2652,20 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
 
     if "workspace" in payload:
         ws = (payload["workspace"] or "").strip()
+        cur_slot = task_slot(t["id"])
         if ws == "":
-            if t.get("workspace"):
-                changes.append(f"workspace {t['workspace']} → (cleared)")
-            t["workspace"] = None
-        elif ws != t.get("workspace"):
-            holder = workspace_holder(d, ws)
-            if holder and holder["id"] != t["id"]:
-                return False, f"workspace '{ws}' occupied by {holder['id']}"
-            t["workspace"] = ws
-            if t["status"] == "todo":
-                t["status"] = "in-progress"
-            changes.append(f"workspace → {ws}")
+            if cur_slot:
+                changes.append(f"workspace {cur_slot} → (cleared)")
+                release_task_slot(t)
+        else:
+            root = wm.normalize_slot(ws)
+            if root != cur_slot:
+                ok, msg, _ = wm.occupy_task(root, t["id"], detail=ws, force=False)
+                if not ok:
+                    return False, msg
+                if t["status"] == "todo":
+                    t["status"] = "in-progress"
+                changes.append(f"workspace → {root}")
 
     if "review_status" in payload:
         new = payload["review_status"]
@@ -2374,9 +2691,9 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
         t["status"] = new_task_status
         if new_task_status == "done":
             t["completed"] = TODAY
-            t["workspace"] = None
+            release_task_slot(t)
         elif new_task_status in ("blocked", "todo"):
-            t["workspace"] = None  # ball with author / awaiting re-review
+            release_task_slot(t)  # ball with author / awaiting re-review
         changes.append(f"review-status → {new} (overall: {consolidated})")
 
     note = (payload.get("add_note") or "").strip()
@@ -2391,6 +2708,72 @@ def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
         append_note(t, "dashboard: " + "; ".join(changes))
     save(d)
     return True, "; ".join(changes) if changes else "note added"
+
+
+def apply_workspace_edit(slot: str, payload: dict) -> tuple[bool, str]:
+    """Occupy or free a workspace slot from the dashboard.
+
+    Payloads:
+      * ``{"action": "free"}`` — release the slot's holder.
+      * ``{"action": "occupy", "type": "task", "task_id": "T-NNN", "force": bool}``
+      * ``{"action": "occupy", "type": "adhoc", "label": "...", "tag": "monitor", "force": bool}``
+
+    Task holds are kept consistent with the task store (status promotion + notes);
+    ad-hoc holds live only in the workspace-manager store.
+    """
+    root = wm.normalize_slot(slot)
+    if not root:
+        return False, f"invalid slot: {slot!r}"
+    action = payload.get("action", "occupy")
+    force = bool(payload.get("force"))
+
+    if action == "free":
+        ok, holder = wm.release(root)
+        if not ok:
+            return False, f"invalid slot: {slot!r}"
+        if holder is None:
+            return True, f"{root} already free"
+        if holder.get("type") == "task":
+            d = load()
+            t = find_task(d, holder["task_id"])
+            if t:
+                t["updated"] = TODAY
+                append_note(t, f"dashboard: released workspace {root}")
+                save(d)
+        return True, f"{root} freed ({wm.holder_summary(holder)})"
+
+    htype = payload.get("type", "task")
+    if htype == "task":
+        tid = (payload.get("task_id") or "").strip()
+        if not tid:
+            return False, "task_id required"
+        d = load()
+        t = find_task(d, tid)
+        if not t:
+            return False, f"task not found: {tid}"
+        ok, msg, displaced = wm.occupy_task(root, t["id"], detail=root, force=force)
+        if not ok:
+            return False, msg
+        if displaced and displaced.get("type") == "task":
+            other = find_task(d, displaced["task_id"])
+            if other:
+                append_note(other, f"dashboard: workspace {root} released to {t['id']}")
+        if t["status"] == "todo":
+            t["status"] = "in-progress"
+        t["updated"] = TODAY
+        append_note(t, f"dashboard: assigned to workspace {root}")
+        save(d)
+        return True, f"{t['id']} → {root}"
+
+    if htype == "adhoc":
+        label = (payload.get("label") or "").strip()
+        tag = payload.get("tag") or "other"
+        ok, msg, _ = wm.occupy_adhoc(root, label, tag=tag, force=force)
+        if not ok:
+            return False, msg
+        return True, msg
+
+    return False, f"invalid holder type: {htype}"
 
 
 def _server_running() -> int | None:
@@ -2456,27 +2839,45 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, html, "text/html; charset=utf-8")
             if self.path == "/api/tasks":
                 with lock:
-                    return self._send(200, json.dumps(load()["tasks"], ensure_ascii=False))
+                    wd = wm.load()
+                    return self._send(200, json.dumps(
+                        {"tasks": _annotate_tasks(load()["tasks"], wd), "workspaces": wd},
+                        ensure_ascii=False))
             return self._send(404, json.dumps({"error": "not found"}))
 
         def do_POST(self):
-            if not self.path.startswith("/api/task/"):
-                return self._send(404, json.dumps({"error": "not found"}))
-            ident = self.path[len("/api/task/"):]
             from urllib.parse import unquote
-            ident = unquote(ident)
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._send(400, json.dumps({"error": "invalid JSON"}))
+
+            if self.path.startswith("/api/workspace/"):
+                slot = unquote(self.path[len("/api/workspace/"):])
+                with lock:
+                    ok, msg = apply_workspace_edit(slot, payload)
+                    if not ok:
+                        return self._send(400, json.dumps({"error": msg}))
+                    wd = wm.load()
+                    tasks = _annotate_tasks(load()["tasks"], wd)
+                return self._send(200, json.dumps(
+                    {"ok": True, "message": msg, "tasks": tasks, "workspaces": wd},
+                    ensure_ascii=False))
+
+            if not self.path.startswith("/api/task/"):
+                return self._send(404, json.dumps({"error": "not found"}))
+            ident = self.path[len("/api/task/"):]
+            ident = unquote(ident)
             with lock:
                 ok, msg = apply_task_edit(ident, payload)
                 if not ok:
                     return self._send(400, json.dumps({"error": msg}))
-                tasks = load()["tasks"]
-            return self._send(200, json.dumps({"ok": True, "message": msg, "tasks": tasks},
-                                              ensure_ascii=False))
+                wd = wm.load()
+                tasks = _annotate_tasks(load()["tasks"], wd)
+            return self._send(200, json.dumps(
+                {"ok": True, "message": msg, "tasks": tasks, "workspaces": wd},
+                ensure_ascii=False))
 
     class Server(ThreadingHTTPServer):
         # Avoid "Address already in use" on quick restarts (TIME_WAIT sockets).
@@ -2594,6 +2995,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="displace the current holder of that workspace")
     a.set_defaults(func=cmd_assign)
 
+    # release
+    a = sub.add_parser("release", help="free a task's workspace without changing status")
+    a.add_argument("id")
+    a.add_argument("-n", "--note")
+    a.set_defaults(func=cmd_release)
+
     # workspaces
     a = sub.add_parser("workspaces", help="show workspace occupancy")
     a.add_argument("--project", default=DEFAULT_PROJECT)
@@ -2613,7 +3020,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_review_update)
 
     # review-check
-    a = sub.add_parser("review-check", help="poll GitHub for merges, purge merged tasks")
+    a = sub.add_parser("review-check", help="poll GitHub for merges; mark fully-merged tasks done")
     a.set_defaults(func=cmd_review_check)
 
     # review-msg
