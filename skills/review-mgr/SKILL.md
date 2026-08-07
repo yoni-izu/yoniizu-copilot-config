@@ -26,14 +26,14 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `scan-reviews [--fw | --all] [--limit N] [--json]` | Discover open PRs that request your review | Three scope tiers: **hsi** (default) = D2D, PCIe (EP), SE; **`--fw`** = the broader FW team repo allowlist; **`--all`** = every repo GitHub flags. Allowlists in [references/hsi-repos.txt](./references/hsi-repos.txt) and [references/fw-repos.txt](./references/fw-repos.txt). Filters out self-authored PRs, `ip.infra.sw.manifests`, and `MODINFSDKSW-*` families. Annotates each candidate as `[new]` or `[tracked T-NNN]` and tags PRs sharing a Jira key as a group. |
 | `add-review <url> [<url>...] [-t TITLE] [-d DESC] [-p PRI] [--complexity X] [--cost N] [--jira K]` | Create a review task from one or more PR URLs | Fetches title/author/branch/stats via `gh`. Auto-estimates complexity. Multiple URLs → one multi-PR task. |
 | `list-reviews` | List active review tasks | Hides done/cancelled and all-merged tasks. |
-| `review-update <id> <review_status> [--pr N]` | Manual review-status update | Applies to all PR entries unless `--pr`. Auto-derives task status and auto-purges when every PR is resolved. |
-| `review-check` | Poll GitHub, mark merged/closed PRs, purge fully-resolved review tasks | Skips done/cancelled. |
+| `review-update <id> <review_status> [--pr N]` | Manual review-status update | Applies to all PR entries unless `--pr`. Auto-derives task status; the task is only `done` once **every** PR is `merged` (no purge — merged tasks persist as a record). |
+| `review-check` | Poll GitHub, mark merged/closed PRs, mark fully-merged tasks `done` | Skips done/cancelled. Re-derives status; a task becomes `done` only when every PR has merged. |
 | `review-msg <id>` | Print a templated review-request message | |
 | `blocked-scan [--update] [--json]` | Check every `blocked` review task for author activity | For each PR: counts commits since `submitted_at`, groups thread replies, flags pushback (`won't fix`, `by design`, `next step`…) and addressed markers (`done`, `fixed`…). Compact output (~2–3 KB). `--update` auto-flips PRs with new commits to `waiting-for-re-review` and moves the task back to `todo`. |
 
 Review statuses: `pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`, `approved`, `merged`.
 
-Review lifecycle: `todo` → `in-progress` → `blocked` (comments/changes-requested submitted) → `todo` (author updated) → … → `done` (only when **all** PRs approved/merged). Never mark a review task `done` after submitting non-approval feedback — `review-update` enforces this.
+Review lifecycle: `todo` → `in-progress` → `blocked` (comments/changes-requested submitted) → `todo` (author updated) → … → `approved` (reviewer finished, task stays `in-progress`) → `done` (only when **all** PRs are **merged**). Approval is *not* completion — the task keeps tracking until every PR merges. Never mark a review task `done` after submitting non-approval feedback — `review-update` enforces this.
 
 ## Workflows
 
@@ -62,9 +62,13 @@ Check the workspace's repos out to a review task's branches so you can review lo
    - **Never** create local `pr-NNN` branches — always use the real `reviews[].branch` name.
    - **Never** use destructive resets. If a repo has local changes and checkout is blocked, leave it and report it.
 4. Switch all other workspace repos to their default branch (`main`) so the workspace reflects only the review context.
-5. Update the task: `status: in-progress` if it was `todo`; each selected PR entry `review_status: in-progress` if `pending`; append a note. Use `tm.py review-update <id> in-progress` or edit the store.
-6. Report: which repos switched to review branches, which to main, which were skipped (and why).
-7. Hand off the actual review to **`pr-review`** (local workspace mode).
+5. **Record workspace occupancy.** Detect the workspace you are aligning (the `~/projects/<project>/<ws>` slot the repos live in). Before occupying it, check it is not already held by a *different* holder — a task **or** an ad-hoc hold (`tm.py workspaces`, backed by the [workspace-manager](../workspace-manager/SKILL.md) store). If free, claim it with `tm.py assign <id> <ws>` — this records the slot in `wm.py` and promotes `todo`→`in-progress`. If it is already held, don't clobber it: report the conflict and let the user decide (`--force` displaces the holder).
+6. Update the task: each selected PR entry `review_status: in-progress` if `pending`; append a note. Use `tm.py review-update <id> in-progress` or edit the store. (`assign` in step 5 already handled the task `status`.)
+7. Report: which repos switched to review branches, which to main, which were skipped (and why), and which workspace slot is now occupied.
+8. **Auto-invoke `pr-review local`** — starting a review always runs the review, never just aligns the workspace. Hand off to the **`pr-review`** skill in local workspace mode against the just-checked-out branches. Do **not** stop after the checkout; the checkout exists to be reviewed.
+   - **Fresh vs. re-review is decided automatically** (never ask, never wait for a keyword). For each PR entry, look for a prior baseline in this order: (a) a `reviewed @ <repo>:<sha>` note in the task (recorded by `done`); (b) the head SHA in the most recent [drafts/](../pr-review/drafts/) file for that PR; (c) the `commit.oid` of your last submitted GitHub review. If **no** baseline exists → **fresh review** (full local diff against the merge-base). If a baseline exists and the current head differs → **re-review** (diff `baseline..new-head`, triage only what changed). If a baseline exists and the head is identical → tell the user there are no new changes since the last review and skip the heavy pass (offer a re-read only if asked).
+   - Multi-PR tasks: make the fresh/re-review decision per PR entry independently.
+   - This stays drafts-only — `pr-review local` never posts to GitHub without explicit approval (its Hard Rules still apply).
 
 ### `pre-review` — batch auto-draft every new review task ("review new PRs")
 
@@ -85,7 +89,7 @@ Guarantees: drafts only (no GitHub writes), no destructive git, and no review-st
 
 ### `stop`
 
-Switch every workspace repo back to its default branch. Skip (don't force) dirty repos and report them. Don't change task status unless asked.
+Switch every workspace repo back to its default branch. Skip (don't force) dirty repos and report them. Don't change task status unless asked. **Release the workspace slot** you were occupying so the store reflects that you stopped working there: `tm.py release <id>` (frees the slot in `wm.py`, leaves `status` untouched).
 
 ### `done <task-id> [outcome]` — close out a review pass
 
@@ -94,11 +98,12 @@ Combined `stop` + status update.
 1. Switch all workspace repos to default branch (skip dirty ones; never force).
 2. Set `review_status` on the relevant PR entries to the outcome (`commented`, `changes-requested`, `approved`, …). If unspecified, keep current.
 3. Derive task status:
-   - All PR entries `approved`/`merged` → task `done`, clear `workspace`, set `completed`.
+   - **All** PR entries `merged` → task `done`, clear `workspace`, set `completed`.
+   - All PR entries `approved`/`merged` but not all merged → task stays `in-progress` (review complete, awaiting merge); keep tracking until every PR lands. **Release the workspace** (`tm.py release <id>`) since you're no longer actively editing it, but leave the task `in-progress`.
    - Outcome `commented`/`changes-requested` → task `blocked`, clear `workspace`.
-   - Outcome `in-progress` (just stopping) → keep `in-progress`, clear `workspace`.
+   - Outcome `in-progress` (just stopping) → keep `in-progress`, release `workspace` (`tm.py release <id>`).
 4. Always: `updated = today`, append a note describing the outcome.
-5. Easiest path: `tm.py review-update <id> <review_status>` (handles the derivation), then adjust notes / `workspace` if needed.
+5. Easiest path: `tm.py review-update <id> <review_status>` (handles the status derivation and auto-clears `workspace`/`workspace_since` for the `done`/`blocked`/`todo` outcomes). For the "still in-progress, just stopping" case, follow with `tm.py release <id>` to free the slot.
 6. **Memoir update** — append lessons to `pr-review`'s memoir at `~/.copilot/skills/pr-review/references/memoir.md`:
    - Read it first to avoid duplicates and respect existing section names.
    - Consolidate: fold each lesson under the right theme heading and merge duplicates — no per-review log section.
@@ -136,8 +141,8 @@ Only fall back to `github-pull-request_issue_fetch` when you need the actual fil
 2. **Never post to GitHub without explicit user approval** — that gate belongs to `pr-review`; `review-mgr` only queues and tracks.
 3. **Curate, don't auto-add.** `scan` always goes through the tick step.
 4. **Never destructive git.** No resets; skip and report dirty repos.
-5. **Done gating:** a review task is `done` only when every PR is approved/merged. Submitting comments/changes-requested → `blocked`.
-6. **Auto-purge:** when every PR in a task is resolved (merged or closed-without-merge) the task is deleted — `review-update` / `review-check` handle this.
+5. **Done gating:** a review task is `done` only when every PR is **merged**. Approval alone keeps the task `in-progress` (awaiting merge). Submitting comments/changes-requested → `blocked`.
+6. **No purge — track until merged:** the task-manager keeps a review task until every PR merges; fully-merged tasks persist as a `done`/`merged` record (surfaced in the dashboard code-review section) rather than being deleted. `review-update` / `review-check` re-derive status without purging.
 7. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo — a second PR in the same repo is unreachable locally, causes confusion about which code is under review, and forces the reviewer to context-switch branches mid-review. When adding PRs (via `scan` or `add-review`), split any same-repo collisions into separate tasks. When inheriting a task that already violates this, split it before `start`.
 8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
 9. **`pre-review` is drafts-only.** The batch auto-draft pass produces local `pr-review` drafts and never writes to GitHub or transitions review status. It marks each processed task with the `initial auto review draft done` note so subsequent runs skip it; that note is the sole "already looked at" signal.
