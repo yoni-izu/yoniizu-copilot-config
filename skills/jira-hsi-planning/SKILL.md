@@ -1,6 +1,6 @@
 ---
 name: jira-hsi-planning
-description: "HSI team Jira planning assistant. Use when: analyzing sprint or milestone progress, finding orphan stories without epics, setting due dates based on team bandwidth, identifying planning risks, drafting tickets, querying Jira in natural language, generating status reports for HSI/Iridium project, scanning stale in-progress tickets with merged PRs, scanning overdue or near-deadline tickets."
+description: "HSI team Jira planning assistant. Use when: analyzing sprint or milestone progress, finding orphan stories without epics, setting due dates based on team bandwidth, identifying planning risks, drafting tickets, querying Jira in natural language, generating status reports for HSI/Iridium project, scanning stale in-progress tickets with merged PRs, scanning overdue or near-deadline tickets, running plan maintenance / scanning tickets for planning-guideline violations (parent hierarchy, milestone, sprint, estimate, status hygiene)."
 argument-hint: "Describe what you want: milestone analysis, sprint report, find orphan stories, set due dates, risk analysis, draft a ticket, or a JQL query in plain English."
 ---
 
@@ -18,15 +18,21 @@ argument-hint: "Describe what you want: milestone analysis, sprint report, find 
 
 ### Sprints
 
-| Sprint ID | Name | Dates |
-|---|---|---|
-| 2012 | FW HSI MS6 Sprint 1 | May 19 – Jun 2 |
-| 2013 | FW HSI MS6 Sprint 2 | Jun 2 – Jun 16 |
-| 2014 | FW HSI MS6.5 Sprint 1 *(now MS6 Sprint 3 — MS6.5 discontinued, see below)* | Jun 9 – Jun 28 |
-| 2015 | FW HSI MS6.5 Sprint 2 *(now MS6 Sprint 4 — MS6.5 discontinued, see below)* | Jun 28 – Jul 14 |
-| 2016 | FW HSI MS7 Sprint 1 | Jul 15 – Jul 29 |
+> Sprint IDs rotate every milestone — **always re-discover the live set** instead of trusting a snapshot:
+> `GET /rest/agile/1.0/board/823/sprint?state=active,future`. Snapshot verified 2026-08-03:
 
-> **⚠️ MS6.5 discontinued (RAID I-002, closed 2026-06-08):** Karin Shteingaus confirmed MS6.5 is retired. Sprints 2014 and 2015 retain their Jira names ("MS6.5 Sprint 1/2") but now fall **within the MS6.0 window**. All work previously labelled `iridium-system-sw-6.5` was bulk-restored to `iridium-system-sw-6.0` (35 tickets, 2026-06-08). When scheduling stories/epics, treat sprints 2012–2015 as MS6 sprints and sprint 2016+ as MS7.
+| Sprint ID | Name | Dates | Milestone |
+|---|---|---|---|
+| 3645 | FW HSI MS7.1 | Jul 20 – Aug 2 | MS7 (closed 2026-08-03) |
+| 3646 | FW HSI MS7.2 | Aug 2 – Aug 16 | MS7 |
+| 3647 | FW HSI MS7.3 | Aug 16 – Aug 30 | MS7 — **power-on execution** |
+| 3749 | FW HSI MS8.1 | Aug 30 – Sep 13 | MS8 |
+| 3750 | FW HSI MS8.2 | Sep 13 – Sep 27 | MS8 |
+| 3751 | FW HSI MS8.3 | Sep 27 – Oct 19 | MS8 |
+
+> **Power-on planning rule (2026-08, silicon ETA Aug 16–26):** MS7.1/MS7.2 work must land **before** power-on; MS7.3 is the power-on execution sprint. **RAS and Middleware work is deliberately postponed past power-on to MS8** (stories → MS8.x sprints, parent epics → MS8 milestone).
+
+> **⚠️ MS6.5 discontinued (RAID I-002, 2026-06-08):** MS6.5 was retired (confirmed by Karin Shteingaus); all `iridium-system-sw-6.5` work was restored to `iridium-system-sw-6.0`. Do **not** assign tickets to MS6.5.
 
 ### Jira Projects
 
@@ -46,10 +52,14 @@ When querying HSI tickets across all projects, use the team field filter (see be
 | Field | Jira field ID | Notes |
 |---|---|---|
 | Team | `customfield_10001` | Value: `"HSI Firmware"` (ID: `705f36d3-e7b3-4b7e-a220-d28f31f013ab`) |
-| SW Internal Milestone | `customfield_10702` | e.g. `"iridium-system-sw-5.0"` — **not** `customfield_10182` |
+| SW Internal Milestone | `customfield_10702` | e.g. `"iridium-system-sw-5.0"` — **not** `customfield_10182`. Pass as ARRAY `[{"id":"..."}]`. IDs: MS6=`11591`, MS7=`11682`, MS8=`11683`. |
+| Sprint | `customfield_10020` | Set as integer sprint ID. |
 | Story Points | `customfield_10016` | |
+| Work estimation | `timeoriginalestimate` (`timetracking.originalEstimate`, seconds) | Effort days = value / 28800. Required on every Story/Bug. |
+| PO Activities | `customfield_13236` | Multi-checkbox: `Yes`, `Test ready`. Add `Test ready` when a power-on story has a test (dedicated OR indirect coverage). |
 
 - **Milestone naming:** MS5 means `SW Internal Milestone` = `iridium-system-sw-5.0` (use this value in JQL)
+- **Milestone auto-follows the parent epic** via Jira automation — set the milestone on the **epic** only; child stories inherit it automatically. Do **not** set `customfield_10702` directly on stories.
 - **Milestones:** ~2-month planning intervals. Full list on Confluence: `https://elementlabs.atlassian.net/wiki/spaces/RPI/pages/284524644/Iridium+System+Software+milestones` (due dates on that page may be stale — use actual milestone names, not dates, unless confirmed)
 
 ### Team Members
@@ -85,6 +95,24 @@ This distinction is shared by the `one-on-one`, `team-planner`, `manager-brief`,
 - **Stories, Bugs, and Tasks** are planned at the **sprint** scope — they carry the `Sprint` assignment.
 - Stories/Bugs/Tasks **inherit** their milestone from their parent epic. Do not set `SW Internal Milestone` directly on a story/bug/task; instead, ensure its parent epic is on the correct milestone.
 - When planning a milestone, place epics into the milestone first, then schedule their child stories/bugs/tasks across the sprints that fall within that milestone's window.
+
+### Ticket Hierarchy & Hygiene Rules
+
+The planning-hygiene invariants the team strives for. The **Plan Maintenance** action (capability #10) scans for violations of these.
+
+- **Parentage:** every ticket should have a parent — **stories → epics, epics → initiatives.** "Floaters" (parentless non-bug tickets) are *allowed* (agile work, or no good parent fit) but **discouraged** — flag them for review.
+- **Bugs are exempt from the parent rule** — a Bug may be parentless. But a Bug **must still** carry a milestone **and** a sprint.
+- **Milestone populated:** every ticket should have `SW Internal Milestone` set. Stories inherit it from their parent epic (automation). A floater with an empty milestone is a **bug, not a feature** — flag it.
+- **Current-milestone tickets must have a sprint.** Day-to-day tracking happens through sprints; a ticket in the current milestone with **no sprint** will silently slip in the backlog. Flag current-milestone tickets lacking a sprint.
+- **Estimation:** every Story and Bug must have the work-estimation field (`originalEstimate`) populated.
+- **Bug tracking:** bugs must be actively tracked. Flag any Bug with **no comment, field change, or status transition** in the tracking window (default > 7 days).
+
+### Bandwidth & Capacity Model
+
+- **BW in-progress count excludes `Initiative` issuetype** — initiatives are lead-owned and massively inflate the tally (observed 64 initiatives vs 2 real epics/stories). Count only Epic/Story/Bug/Task/Attribute.
+- **Effective capacity** per person for a sprint = `working_days × 0.7` focus factor; the **lead (Yoni) × 0.5** for management overhead; subtract PTO days.
+- **Calibrate velocity against the prior sprint's actual hit-rate** before trusting a plan (e.g. MS7.1 delivered only 33% of planned days — a plan at 2× capacity will repeat that miss). Report planned-days vs effective-capacity per person and flag anyone > 100%.
+- **`In Review` = code-complete** (≈ 0 remaining effort) — discount it from *remaining* load when assessing sprint risk.
 
 ### ✅ AI-owned operations (safe to execute after showing the user what will happen)
 - Read/query Jira tickets, sprints, boards, epics, milestones
@@ -180,7 +208,7 @@ Milestone: <name>
 Bandwidth is assessed dynamically from Jira — no manual input needed. The more in-progress tickets a person has, the lower their effective available capacity for new work.
 
 **BW derivation formula:**
-1. Query all HSI tickets in status `In Progress` per assignee (across all active sprints/milestone, not just the target one).
+1. Query all HSI tickets in status `In Progress` per assignee (across all active sprints/milestone, not just the target one). **Exclude `Initiative` issuetype** — initiatives are lead-owned and inflate the count (observed 64 initiatives vs 2 real epics/stories); count only Epic/Story/Bug/Task/Attribute.
 2. Count in-progress tickets per person and their total in-progress story points.
 3. Apply this heuristic to estimate remaining capacity:
 
@@ -428,6 +456,42 @@ Bug tickets have **project-specific required fields** beyond the standard summar
 
 ---
 
+### 10. Plan Maintenance — Guideline Violation Scan
+
+**Trigger:** User asks to run plan maintenance, scan for planning-guideline violations, clean up the backlog, or "check ticket hygiene."
+
+**Purpose:** Scan all open HSI tickets against the [Ticket Hierarchy & Hygiene Rules](#ticket-hierarchy--hygiene-rules) and status-consistency rules, and produce a prioritized list of violations with suggested fixes.
+
+**Scope query (baseline):** use the **Team field by ID** — it catches all HSI-tagged work across *every* project (incl. IPNOCSW, IPMNGSW, IPPSOCSW), not just a hardcoded project list, and picks up unassigned / other-assignee HSI tickets a `project + assignee` filter misses:
+```
+"Team[Team]" = 705f36d3-e7b3-4b7e-a220-d28f31f013ab AND statusCategory != Done
+```
+> The display-name form `"Team[Team]" = "HSI Firmware"` returns EMPTY — always use the account ID.
+
+**Exclusions (apply before flagging):**
+- **`Initiative` issuetype is excluded entirely** — initiatives are the apex of the hierarchy (legitimately parentless) and lead-owned strategic containers; including them floods the floater/stuck buckets with false positives.
+- **`FW_PO`-labelled parentless stories are whitelisted** for the missing-parent check — the power-on plan deliberately created them parentless.
+
+**Checks to run:**
+
+*Hierarchy / metadata*
+1. **Missing parent** — non-Bug ticket with no parent (floater). Flag as discouraged; suggest a best-fit epic/initiative (reuse capability #2 logic). **Bugs and `FW_PO`-labelled stories are exempt.**
+2. **Missing milestone** — any ticket with empty `SW Internal Milestone`. For stories, fix via the parent epic (inheritance); for floaters/bugs, flag (it's a bug, not a feature).
+3. **Current-milestone without sprint** — ticket whose milestone = the current milestone but `Sprint` is empty → backlog-slip risk. Flag to schedule into a sprint within that milestone's window.
+4. **Bug without milestone or sprint** — bugs are parent-exempt but still require **both** a milestone and a sprint. Flag.
+5. **Missing estimate** — Story or Bug with empty work-estimation field. Flag.
+
+*Tracking / status consistency*
+6. **Untracked bug** — Bug with no comment, field change, or status transition in > 7 days. Flag for owner follow-up.
+7. **Backlog with PRs** — ticket in `Backlog`/`To Do` but PRs referencing its key exist (PR-scan approach from capability #8). Should be `In Progress` or `In Review`. Flag.
+8. **In Review without PRs** — ticket in `In Review` but no PR references its key. Either the PR link is missing or the status is wrong. Flag.
+9. **Stuck status** — ticket in the same status (any status **except** `Backlog`) for > 7 days with no update, PR activity, or merge. Flag as stalled.
+10. **Due date outside milestone window** — ticket whose `duedate` falls outside its assigned milestone's `[start, end]` window (start = prior milestone's end). Windows: MS6 `…→2026-07-21`, MS7 `2026-07-21→2026-09-01`, MS8 `2026-09-01→2026-10-19` (MS9+ unknown → skip). Flag the mismatch (either the due date or the milestone is wrong).
+
+**Output:** group by severity (missing milestone / bug-missing-sprint / current-milestone-no-sprint = 🔴 HIGH; floaters / stuck / status-mismatch = 🟡 MEDIUM; missing estimate / untracked bug = 🟢 LOW), one row per violation with the suggested fix. Then ask which fixes to apply — **all writes remain human-confirmed** (see AI-owned vs Human-confirmed rules above).
+
+---
+
 ### GitHub Repos for PR Scanning
 
 These are the HSI FW repos to check for PRs:
@@ -450,17 +514,18 @@ Fetch the current list from Confluence when needed:
 Page: https://elementlabs.atlassian.net/wiki/spaces/RPI/pages/284524644/Iridium+System+Software+milestones
 ```
 
-**Confirmed milestone dates (RAID I-002, 2026-06-08):**
+**Confirmed milestone dates:**
 
-| Milestone | Jira value | End date | Notes |
-|---|---|---|---|
-| MS6.0 | `iridium-system-sw-6.0` | **2026-07-21** | Pre-power-on. Covers sprints 2012–2015. |
-| MS6.5 | *(retired)* | — | Discontinued 2026-06-02 by automation; confirmed by Karin 2026-06-08. Do **not** assign tickets to this milestone. |
-| MS7.0 | `iridium-system-sw-7.0` | **2026-09-01** | Post-power-on. Starts sprint 2016+. |
+| Milestone | Jira value | cf10702 id | End date | Notes |
+|---|---|---|---|---|
+| MS6.0 | `iridium-system-sw-6.0` | 11591 | 2026-07-21 | Retired era. |
+| MS6.5 | *(retired)* | — | — | Discontinued; do **not** use. |
+| MS7.0 | `iridium-system-sw-7.0` | 11682 | 2026-09-01 | Sprints MS7.1–7.3. **Power-on executes in MS7.3 (Aug 16–30); silicon ETA Aug 16–26.** |
+| MS8.0 | `iridium-system-sw-8.0` | 11683 | 2026-10-19 | Post-power-on. Sprints MS8.1–8.3. RAS + Middleware land here. |
 
-> **Rule:** Pre-power-on work → MS6.0. Post-power-on work → MS7.0. If unsure, default to MS6.0 and flag for per-ticket review.
+> **Rule:** Pre-power-on work → MS7 (must finish before silicon, ~Aug 16–26). RAS/Middleware & post-power-on work → MS8.
 
-The `SW Internal Milestone` custom field in Jira is the source of truth for milestone assignment.
+The `SW Internal Milestone` custom field is the source of truth for milestone assignment; it auto-propagates from a parent epic to its children.
 
 ---
 
