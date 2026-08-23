@@ -205,7 +205,7 @@ manageability expert over time. RAS findings that are equally relevant to one sp
 > non-trivial RAS/manageability fact during this turn, regardless of *why* you were invoked.
 > The trigger is the verification, not the question shape. This fires when:
 > - the user asked you directly (the obvious case);
-> - another skill (e.g. `pr-review`, `iridium-prj`, `pcie-ep-ip`, `su-ip`, `d2d-ip`) consulted you;
+> - another skill (e.g. `pr-review`, `iridium-prj`, `atlantic-prj`, `pcie-ep-ip`, `su-ip`, `d2d-ip`) consulted you;
 > - you read FW driver code, IRQ-tree wiring, PLDM/MCTP handlers, or design docs during a
 >   code review and locked in a durable contract/sequence/erratum fact;
 > - you reconciled two sources (RAS spec vs FW, manageability spec vs PLDM handler, spec-owner
@@ -219,9 +219,9 @@ manageability expert over time. RAS findings that are equally relevant to one sp
 > If in doubt, **record**. A too-detailed knowledge base costs milliseconds; a missing entry
 > costs the next query a full re-read of a multi-hundred-page spec.
 >
-> Skip only: pure code-style nits, project-specific FW architecture (belongs in
-> `iridium-prj`), tooling/CI/Python issues, and re-statements of facts already fully covered
-> by an existing entry.
+> Skip only: pure code-style nits, project-specific FW architecture (belongs in the
+> project skill, e.g. `iridium-prj` / `atlantic-prj`), tooling/CI/Python issues, and
+> re-statements of facts already fully covered by an existing entry.
 
 ## Procedure
 

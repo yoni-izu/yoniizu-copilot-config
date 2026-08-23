@@ -119,9 +119,41 @@ After the build completes (or fails), summarize:
 - ✅ Success: app name, platform, variant
 - ❌ Failure: show the relevant error lines from the output
 
+## proj_infra (Post-Build) Dependencies
+
+`project.iridium.sw.fw.infra` (proj_infra) regenerates the SPI image and other
+post-build artifacts. Its post-build scripts now **depend on `ip/d2d` and
+`ip/pcie/phy` being built**.
+
+- **Complete build** (`octl ws build` with no project) — no change needed; it
+  builds everything including `ip/d2d` and `ip/pcie/phy`.
+- **Manual / individual app builds** — you must build `ip/d2d` and
+  `ip/pcie/phy` **once** before building proj_infra:
+  ```bash
+  cd <ws_root> && octl ws build ip/d2d
+  cd <ws_root> && octl ws build ip/pcie/phy
+  ```
+  After these are built once, when you change an individual app you can rebuild
+  just that app and then build proj_infra directly — no need to rebuild `ip/d2d`
+  or `ip/pcie/phy` again. Example flow:
+  ```bash
+  cd <ws_root> && octl ws build                                   # once: build all components
+  cd <ws_root> && octl ws build ip/d2d                            # once: proj_infra dep
+  cd <ws_root> && octl ws build ip/pcie/phy                       # once: proj_infra dep
+  # ... modify some mng app code ...
+  cd <ws_root> && octl ws build project.iridium.sw.fw.psoc_mng   # rebuild changed app
+  cd <ws_root> && octl ws build project.iridium.sw.fw.infra      # rebuild proj_infra (SPI image etc.)
+  ```
+
+> **Clean + sync required after post-build script updates.** The proj_infra
+> post-build scripts were recently updated. After syncing, **clean and sync the
+> workspace before building** — without a clean, the proj_infra build will fail.
+
 ## Additional Notes
 
 - **is_test=false** should be passed explicitly when building a non-test variant to avoid ambiguity when the same variant exists in both test and non-test forms (e.g. primeboot `host/sim`).
 - **Commented-out board configs** (lines starting with `#`) are not supported — do not offer them as options.
 - If the user says "build all" or gives no filter, omit `--args` entirely to let the build system build all variants.
 - The workspace root must be passed as the CWD when running `octl ws build` — always `cd <ws_root>` first.
+- **Before an individual proj_infra build**, ensure `ip/d2d` and `ip/pcie/phy` have been built at least once (see "proj_infra (Post-Build) Dependencies"). A full `octl ws build` covers this automatically.
+- **If a proj_infra build fails after a recent sync**, clean and sync the workspace first — stale post-build scripts cause the failure.
