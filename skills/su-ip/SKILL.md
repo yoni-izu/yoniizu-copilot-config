@@ -81,6 +81,13 @@ The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are sh
 | RTL | https://github.com/Elmnt-Internal/ip.se.rtl |
 | Firmware | https://github.com/Elmnt-Internal/ip.se.sw.fw |
 
+> **RTL branch strategy:** In the RTL repo, the **`main`** branch holds the **latest
+> implementation for the most recent project** we are working on (currently **Atlantic**).
+> Each **previous** project is frozen on its own **freezed RTL** branch — e.g. **Iridium**'s
+> RTL lives on the Iridium *freezed rtl* branch, not on `main`. When researching RTL for a
+> specific project, check out the matching branch: `main` for Atlantic, the project's
+> freezed-RTL branch for Iridium (and any earlier project).
+
 **Local-first strategy**: These skills are global (user-level). The workspace may or may not contain the source code.
 1. Check if FW driver code exists locally — common workspace paths:
    - `fw/ip/se/` or `ip/se/`
@@ -118,7 +125,7 @@ knowledge base — the PHY is identical.)
 > non-trivial IP fact during this turn, regardless of *why* you were invoked. The
 > trigger is the verification, not the question shape. This fires when:
 > - the user asked you directly (the obvious case);
-> - another skill (e.g. `pr-review`, `iridium-prj`, `ras-manageability`) consulted you;
+> - another skill (e.g. `pr-review`, `iridium-prj`, `atlantic-prj`, `ras-manageability`) consulted you;
 > - you read FW driver code, generated register headers, or RTL during a code review
 >   and locked in a durable register/protocol/sequence/erratum fact;
 > - you reconciled two sources (databook vs RTL, C2C spec vs FW) and resolved which is current.
@@ -129,9 +136,9 @@ knowledge base — the PHY is identical.)
 > contract. If in doubt, **record**. A too-detailed knowledge base costs milliseconds;
 > a missing entry costs the next query a full re-read of an 18k-page databook.
 >
-> Skip only: pure code-style nits, project-specific FW architecture (belongs in
-> `iridium-prj`), tooling/CI/Python issues, and re-statements of facts already fully
-> covered by an existing entry.
+> Skip only: pure code-style nits, project-specific FW architecture (belongs in the
+> project skill, e.g. `iridium-prj` / `atlantic-prj`), tooling/CI/Python issues, and
+> re-statements of facts already fully covered by an existing entry.
 
 ## Procedure
 
