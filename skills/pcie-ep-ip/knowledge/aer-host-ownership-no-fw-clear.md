@@ -8,6 +8,19 @@
 Local FW gets an IIP_AUX SEI when an AER condition sets. May FW read *and clear* (W1C) the
 controller's AER status registers to stop the SEI cause re-asserting? What breaks if it does?
 
+## Terminology note: two different "ownership" concepts (do not conflate)
+1. **Host ownership of the PCIe front** (what this note is about). The host always owns the
+   protocol-facing surface: configuration space, the architected AER capability, and the error
+   records its AER driver reads and RW1C-clears. FW is a read-only observer there.
+2. **System-manager ownership of our PCIe hardware** (a separate product feature). An
+   out-of-band system manager (BMC, hypervisor, management controller) can take ownership of
+   the device's PCIe blocks over an OOB path and perform the role FW would otherwise play
+   (configuration, bring-up decisions, error policy). This is *not* the host, and it is not the
+   host taking over the device: it is an OOB entity displacing FW.
+
+Neither concept implies "the host owns the device". Say *host owns the PCIe front* or
+*system manager owns the PCIe hardware from OOB*, never "the host owns the device".
+
 ## Findings
 
 ### AER is a host-facing capability — the status registers are the host's record
