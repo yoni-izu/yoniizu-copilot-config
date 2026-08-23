@@ -25,6 +25,11 @@ argument-hint: 'Ask a question about the Iridium project — architecture, PRM/N
 > This is a **project-scope** skill. For deep single-IP questions, defer to the dedicated IP
 > skills (`pcie-ep-ip`, `d2d-ip`, `su-ip`, `ras-manageability`) and use this skill to provide
 > the project context, the cross-IP picture, and where things live in the Iridium tree.
+>
+> **Iridium is a previous project.** The most recent project we work on is **Atlantic** — see
+> the `atlantic-prj` skill. In the RTL repos, Atlantic's latest implementation is on the
+> **`main`** branch, while **Iridium's RTL is frozen on its *freezed rtl* branch**. Use this
+> skill for Iridium; use `atlantic-prj` for Atlantic.
 
 ## Project Context
 
