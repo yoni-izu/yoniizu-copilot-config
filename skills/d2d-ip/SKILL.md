@@ -51,6 +51,33 @@ D2D responsibilities by stage (per the proposed driver-functionality split):
 |------|------|---------|
 | `D2D Specification Rev 2.0.0.docx` | ~5.5MB | Internal Element D2D specification — protocol, PHY, registers, integration |
 | `ucie_1p1_with_legal_disclaimer_july_10th_2023.pdf` | ~7MB | UCIe 1.1 specification — industry standard for Universal Chiplet Interconnect Express (UCIe), relevant for D2D/Chiplet/Inter-die standards, protocol, and PHY |
+| `ucie_1p1.txt` | ~0.8MB | Searchable plain-text extraction of the UCIe 1.1 PDF (grep-friendly) |
+
+### AlphaWave IP Vendor Docs (`~/docs/D2D/`)
+
+AlphaWave (Alphawave Semi) supplies Element's licensed D2D/UCIe silicon IP. The stack has three
+layers: **AresCORE** (the UCIe D2D **PHY** IP) → **GammaCORE** (the UCIe D2D **controller** IP) →
+**GammaCORE32** (the packaged **1×S32 subsystem** = controller + PHY, 32 lanes). In Element FW
+terms these map to the **EL AW D2D** driver family; the "UCIe PHY FW image" loaded/authenticated
+during PRIMEBOOT is the **AresCORE PHY** firmware.
+
+| File | Size | Content |
+|------|------|---------|
+| `arco_arescore_ucie_datasheet_n5_base_0_8_7_element.pdf` | ~6.1MB | **AresCORE™ UCIe D2D PHY IP** — 5nm Base Datasheet, v0.1.0_0.8.7 (Sep 2024, NDA for Element). PHY layer: TX/RX/common-lane configurability, SerDes, supported standards, electricals |
+| `Eland_gammaN64B1Tn5_ss_a_controller_100_051.pdf` | ~2.9MB | **GammaCORE™ UCIe D2D Controller IP** — Base Datasheet (Eland_S variant), v1.0.0_0.5.1 (Oct 2025). Controller layer: streaming protocol, packing/mux, TX/RX buffers, flit gen/termination, end-to-end credit-based flow control, AXI4/FDI |
+| `Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` | ~1.2MB | **GammaCORE32™ 1×S32 Subsystem for UCIe** — 5nm Datasheet (Eland_S variant), v1.0.0_0.5.3 (Oct 2025). Subsystem-level: interfaces (APB, FDI, UCIe standard package, iJTAG), integration, miscellaneous signals |
+| `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.pdf` | ~3.1MB | **GammaCORE32 Register Descriptions (MMR)** — Eland variant, v1.0.0_0.5.3 (Oct 2025). Memory-mapped registers: DVSEC1/DVSEC2 (PCIe extended cap, UCIe Link DVSEC, sideband mailbox), GLOBAL_REG, CMN MCU control/IRQ registers, etc. |
+| `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` | ~3.5MB | Searchable plain-text extraction of the MMR PDF — **use this for register/bitfield keyword searches** (grep-friendly, page-delimited) |
+
+> **Vendor docs vs. internal spec:** For **register offsets/bitfields, PHY electricals, controller
+> streaming/flit/credit behaviour, and interface signals**, the AlphaWave docs above are the
+> authoritative source. For **Element-specific integration** (wrapper, manageability bridge,
+> multi-die topology, boot-flow responsibilities) the internal `D2D Specification Rev 2.0.0.docx`
+> is authoritative. When they disagree on IP-internal behaviour, prefer the AlphaWave doc and
+> record the reconciliation in the knowledge base.
+>
+> The MMR register doc ships as both `.pdf` and `.txt`; **search the `.txt`** (page-delimited,
+> grep/`python-docx`-free) for fast register lookups, then cite the PDF page.
 
 ## Source Code Repositories
 
@@ -58,6 +85,13 @@ D2D responsibilities by stage (per the proposed driver-functionality split):
 |------|------------|
 | RTL | https://github.com/Elmnt-Internal/ip.d2d.rtl |
 | Firmware | https://github.com/Elmnt-Internal/ip.d2d.sw.fw |
+
+> **RTL branch strategy:** In the RTL repo, the **`main`** branch holds the **latest
+> implementation for the most recent project** we are working on (currently **Atlantic**).
+> Each **previous** project is frozen on its own **freezed RTL** branch — e.g. **Iridium**'s
+> RTL lives on the Iridium *freezed rtl* branch, not on `main`. When researching RTL for a
+> specific project, check out the matching branch: `main` for Atlantic, the project's
+> freezed-RTL branch for Iridium (and any earlier project).
 
 **Local-first strategy**: These skills are global (user-level). The workspace may or may not contain the source code.
 1. Check if FW driver code exists locally — common workspace paths:
@@ -83,7 +117,7 @@ over time.
 > non-trivial IP fact during this turn, regardless of *why* you were invoked. The
 > trigger is the verification, not the question shape. This fires when:
 > - the user asked you directly (the obvious case);
-> - another skill (e.g. `pr-review`, `iridium-prj`, `ras-manageability`) consulted you;
+> - another skill (e.g. `pr-review`, `iridium-prj`, `atlantic-prj`, `ras-manageability`) consulted you;
 > - you read FW driver code, generated register headers, or RTL during a code review
 >   and locked in a durable register/protocol/sequence/erratum fact;
 > - you reconciled two sources (spec vs RTL, doc vs FW) and resolved which is current.
@@ -94,9 +128,9 @@ over time.
 > If in doubt, **record**. A too-detailed knowledge base costs milliseconds; a missing
 > entry costs the next query a full re-read of a multi-thousand-page source.
 >
-> Skip only: pure code-style nits, project-specific FW architecture (belongs in
-> `iridium-prj`), tooling/CI/Python issues, and re-statements of facts already fully
-> covered by an existing entry.
+> Skip only: pure code-style nits, project-specific FW architecture (belongs in the
+> project skill, e.g. `iridium-prj` / `atlantic-prj`), tooling/CI/Python issues, and
+> re-statements of facts already fully covered by an existing entry.
 
 ## Procedure
 
