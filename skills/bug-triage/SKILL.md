@@ -91,16 +91,18 @@ field, sequence, or reset value often flips the conclusion:
 | Die-to-die / D2D link/PHY/protocol | `d2d-ip` |
 | RAS / manageability / PLDM/MCTP / power-thermal / error handling | `ras-manageability` |
 | Register address / CSR offset / bitfield / base address | `csr-bot` |
-| Cross-IP picture, address map, reset/boot flow, security, project layout, manifests | `iridium-prj` (or the matching `*-prj`) |
+| Cross-IP picture, address map, reset/boot flow, security, project layout, manifests | `iridium-prj` / `atlantic-prj` (or the matching `*-prj`) |
 
 Ground the hypothesis in the spec/RTL these skills expose (e.g. "the field is RW1C, so this read-modify-
 write is wrong"). Cite what you relied on.
 
-### Step 5 — Scan Jira for known issues
+### Step 5 — Scan Jira for known issues, then correlate
 Determine whether this is **already known** (duplicate, regression re-open, or a documented limitation)
 before deep-diving. Use the **Atlassian MCP** tools (Jira instance, projects, and fields per the
 `jira-hsi-planning` skill). See [Known-Issue Scan](#known-issue-scan-jira) below for the JQL patterns.
-If a matching bug exists, pivot to *confirm & link* rather than re-investigate from scratch.
+Then **correlate & classify** the matches — is this bug a *reproduction* of an existing family or a
+*new* issue? See [Correlate & Classify](#correlate--classify-reproduction-vs-new). If it's a
+reproduction, pivot to *confirm & link* rather than re-investigate from scratch.
 
 ### Step 6 — Bisect the workspace by manifest version (for regressions)
 When it's a regression and code-localization hasn't already pinned the cause, **binary-search the manifest
@@ -144,6 +146,32 @@ Scan strategy:
 Report matches with key, status, and why it matches. **Never create or comment on a Jira ticket without
 explicit approval** — draft it and present it.
 
+## Correlate & Classify (Reproduction vs New)
+
+Bug DBs — especially auto-filed regression tickets (reporter *AI Investigator* / regression-analysis
+skill) — fragment **one** underlying failure into many per-station, per-run, per-surface-signature
+tickets. Before investigating, decide whether this ticket is a **reproduction** of a known family or a
+genuinely **new** issue. This is often the highest-value output.
+
+Build a small **family table** across the candidate tickets and compare on these axes:
+
+| Axis | Why it matters |
+|---|---|
+| **Image / FC tag** | The FC tag (e.g. `2_18_0_2p0_1240`) is the **RTL design tag** the Palladium image is built from — it is *hardware*, and does **not** encode the FW. Same FC tag ⇒ same RTL image, but says **nothing** about the FW version. Useful to spot same-*image* runs; **never** use it to judge whether a FW fix is present. |
+| **psoc-fw manifest (artifact) version** | The actual **FW version** the run executed with (pinned in the run's `regression-ci.xml`). This — not the FC tag — brackets whether a FW fix is in. A shared bad psoc-fw artifact range points at one culprit change; compare against the version that first carries the fix. |
+| **Failure stage** | *Never enumerated* (no vendor id) vs *enumerated then probe/FW-boot timeout* (`-110`/`-5`, "component ready 0x1") vs *driver-load/ABI* (`Invalid module format`) vs *mgmt-FW* (PSOC channel init) — different **stages** can still share one root cause if they flip run-to-run on the same image/station. |
+| **Station / zone** | Same station flipping between surface signatures across runs ⇒ one flaky bring-up cause, not N bugs. Different stations with identical signature ⇒ systemic (image/FW), not station-local. |
+| **Component** | `ip-pcie-firmware-ep` vs `ip-pcie-kmd` vs `ip-psoc-firmware` — a different owning component is a strong hint of a **distinct** issue. |
+
+Classify the ticket as:
+- **Reproduction / duplicate** — same image+family; an existing ticket already tracks the root cause (esp. one resolved *Known Error* or with a fix-set). Action: recommend linking (duplicate/relates-to) and inheriting that ticket's fix status, not a fresh bisect.
+- **Same family, new surface/station** — same root-cause family, a facet not yet captured. Action: link as *relates to*; carry the family's fix forward.
+- **New / distinct** — different component or a failure stage that doesn't flip to the family's signatures. Action: investigate independently (do not close as dup).
+
+A ticket whose *exact run + station + error* already appears in another ticket's comment thread is a
+re-file — treat as a duplicate. **Any linking/closing is approval-gated** (Hard Rules) — present the
+classification and a draft link/close, don't apply it.
+
 ## CI-Log Debugging
 
 When the bug surfaces as a **failed CI check / workflow run** (not yet a local repro), fetch and read the
@@ -154,16 +182,25 @@ known-issues → bisect if it's a regression).
 Prefer the `gh` CLI; fall back to the `github-pull-request_pullRequestStatusChecks` MCP tool when `gh` is
 unavailable or a structured fetch is easier.
 
+**Two entry points:**
+- **PR check** — a failed check on a PR. Start from `gh pr checks <PR#>`.
+- **Scheduled / regression workflow run (no PR)** — the ticket gives a run URL like
+  `github.com/<owner>/<repo>/actions/runs/<run-id>/job/<job-id>` (common for auto-filed regression
+  tickets). There is **no PR**; go straight to the run/job id. Extract `<owner>/<repo>`, `<run-id>`, and
+  `<job-id>` from the URL and pass `--repo <owner>/<repo>` to every `gh run` call.
+
 ```bash
-gh pr checks <PR#>                         # deduplicated latest-per-context status (true current state)
-gh run list -b <branch> -L 5               # recent runs for the branch (newest conclusion first)
-gh run view <run-id>                       # jobs + steps of a run
-gh run view <run-id> --log-failed          # logs of only the FAILED steps (start here)
-gh run view --job <job-id> --log           # full log of one job when you need context around the failure
+gh pr checks <PR#>                                   # PR entry: latest-per-context status
+gh run list -b <branch> -L 5 --repo <owner>/<repo>   # recent runs for a branch (newest first)
+gh run view <run-id> --repo <owner>/<repo>           # jobs + steps of a run
+gh run view <run-id> --repo <owner>/<repo> --log-failed   # logs of only FAILED steps (start here)
+gh run view --job <job-id> --repo <owner>/<repo> --log   # full log of one job for surrounding context
 ```
 
-`<run-id>` comes from `gh pr checks` / `gh run list`. Read `--log-failed` first; widen to the full job log
-only for surrounding context.
+`<run-id>`/`<job-id>` come from the ticket's run URL or from `gh pr checks` / `gh run list`. Read
+`--log-failed` first; widen to the full job log only for surrounding context. For a green-vs-red history
+of the same scheduled suite, `gh run list --workflow <name> --repo <owner>/<repo>` gives the last-known-
+good run (its manifest version is the bisect's good end).
 
 ### Categorize the failure
 Classify before diving — the category dictates the fix path:
@@ -194,11 +231,17 @@ Classify before diving — the category dictates the fix path:
 
 ## Manifest Bisection (Per-Repo)
 
-The workspace repo set and each repo's pinned revision are defined by a **versioned manifest**. `octl`
-manifests live under `~/octl/manifests/projects/<project>/<variant>/*.xml`; each has a `version=` attribute
-and a `<project name=… path=… revision=…>` per repo. A live workspace records its manifest under
-`.repo/manifests/`. A regression is bisected by binary-searching manifest versions, then narrowing to the
-one repo whose revision moved.
+The workspace repo set and each repo's pinned revision are defined by a **versioned manifest**. Resolve
+**which manifest repo** owns the failing suite first — it is not always `~/octl/manifests`:
+- `octl` project manifests: `~/octl/manifests/projects/<project>/<variant>/*.xml`.
+- **Regression / CI manifests** (e.g. `regression-ci.xml`, `kernels-ci.xml`): live in the CI manifests
+  repo the failing run belongs to (e.g. `Elmnt-Internal/ip.infra.sw.manifests`) — take the repo from the
+  ticket's CI run URL. The manifest **version** the run used is printed in the ticket / run env
+  (e.g. `regression-ci.xml v1.79.0-03082026-183118`).
+- A live workspace records its manifest under `.repo/manifests/`.
+
+Each manifest has a `version=` attribute and a `<project name=… path=… revision=…>` per repo. A regression
+is bisected by binary-searching manifest versions, then narrowing to the one repo whose revision moved.
 
 **Preconditions (Hard Rules apply):** work in a dedicated/throwaway workspace, or have the user save state
 first (`wip-workspace` → save). Never bisect over a dirty tree or the user's active dev workspace.
@@ -216,10 +259,10 @@ first (`wip-workspace` → save). Never bisect over a dirty tree or the user's a
    every `<project>` whose `revision` (or the manifest artifact `version`) changed. Usually one repo moved;
    that repo owns the regression window.
    ```bash
-   diff <(git -C ~/octl/manifests show <good>:projects/<proj>/<variant>/<name>.xml) \
-        <(git -C ~/octl/manifests show <bad>:projects/<proj>/<variant>/<name>.xml)
+   diff <(git -C <manifests-repo> show <good>:projects/<proj>/<variant>/<name>.xml) \
+        <(git -C <manifests-repo> show <bad>:projects/<proj>/<variant>/<name>.xml)
    ```
-   (or diff the two `.repo/manifests/` snapshots.)
+   (`<manifests-repo>` = the CI/octl manifests repo resolved above; or diff the two `.repo/manifests/` snapshots.)
 4. **Bisect inside the offending repo.** With the repo's good and bad revisions from step 3, run
    `git bisect` within that single repo (`git bisect start <bad> <good>`), building + reproducing at each
    step, to land on the exact offending commit.
@@ -242,7 +285,7 @@ seen *this* codebase's bugs before.
 
 ## Related Skills
 
-`iridium-prj` / `*-prj` (project context), `pcie-ep-ip`/`su-ip`/`d2d-ip`/`ras-manageability`/`csr-bot`
+`iridium-prj` / `atlantic-prj` / `*-prj` (project context), `pcie-ep-ip`/`su-ip`/`d2d-ip`/`ras-manageability`/`csr-bot`
 (IP knowledge), `jira-hsi-planning` (Jira access & fields), `wip-workspace` (multi-repo git),
 `build-fw` (build a candidate image), `pldm`/`pldm-job-queue` (HW/emulation repro), `pr-monitor`
 (CI-failure analysis on tracked PRs, `/ci` re-trigger convention) / `pr-review` (tie a bug to an
