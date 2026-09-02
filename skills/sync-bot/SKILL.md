@@ -23,6 +23,7 @@ Sync-Bot **owns no domain logic**. Every chore is a thin call into the owning sk
 | FW staff-meeting updates | `team-weekly` (capability 5) |
 | Stale / overdue / merged-PR Jira tickets | `jira-hsi-planning` |
 | Personal task hygiene | `task-manager` |
+| HSI bug mirror, bug progress, duplicate families | `bug-monitor` |
 | RAID rows, milestone risk | `team-planner` |
 | Commitments / decisions to Timor | `manager-brief` |
 
@@ -58,18 +59,20 @@ Each row is one chore. `id` is stable (used in state + `skip`). "Action" is the 
 | `rev-check` | Purge **merged/closed** review tasks | daily | focused | fast | RW¹ | `review-mgr` → `tm.py review-check` |
 | `pr-status` | Status of my **outgoing** feature PRs | daily | focused | med | RW¹ | `pr-monitor` → `status` |
 | `task-stale` | Surface my **stale** in-progress / blocked tasks | daily | focused | fast | RO | `task-manager` → `list --status in-progress` + `--status blocked`, flag age |
+| `bug-scan` | Refresh the **HSI bug mirror** from Jira; surface **new** bugs and **changed** ones | daily | focused | fast | RW¹ | `bug-monitor` → `bm.py scan` |
 | `ws-sync` | **Sync all workspaces**: stash → base → `octl ws sync` + `artifacts download` → restore → pop | daily | focused | slow | RW² | **script** `./sync_all_workspaces.sh [project]` (see below) |
 | `team-snapshot` | Capture **weekly milestone snapshot** (tickets, effort, capacity, RAID) — keeps `manager-brief` projections fresh | weekly | wide | slow | RW¹ | `team-planner` → `Snapshot` (capability 8) — writes `~/team-planner/snapshots/YYYY-MM-DD.json` |
 | `staff-fetch` | Pull recent **FW staff-meeting** updates | weekly | wide | med | RW¹ | `team-weekly` → `fetch staff updates` (capability 5) |
+| `bug-pulse` | **Open-bug health**: dormant/stalled buckets, per-owner load, untriaged backlog, duplicate candidates | weekly | wide | fast | RO | `bug-monitor` → `bm.py pulse` (+ `bm.py dups` when the untriaged count grew) |
 | `jira-merged` | **Stale in-progress** tickets whose **PR already merged** | weekly | wide | slow | RO | `jira-hsi-planning` → scan stale-in-progress-with-merged-PR |
 | `jira-due` | **Overdue / near-deadline** tickets | weekly | wide | slow | RO | `jira-hsi-planning` → scan overdue / near-deadline |
 | `mgr-reconcile` | Reconcile **open commitments & decisions** to Timor | weekly | wide | med | RO | `manager-brief` → `what's pending with Timor` |
 | `raid-review` | **RAID** rows: stale / overdue / unowned | monthly | wide | med | RO | `team-planner` → RAID review |
 | `drafts-ip-mine` | Mine archived **PR-review drafts** for IP knowledge **not yet captured** in the `*-ip` skills | monthly | focused | slow | RO | `pr-review` → mine drafts for IP knowledge (Explore subagent across `~/.copilot/skills/pr-review/drafts/`, cross-ref `d2d-ip` / `pcie-ep-ip` / `su-ip` / `ras-manageability` `knowledge/` dirs; emit grouped promotable nuggets) |
 
-**Ordering note:** within a `weekly` run, `team-snapshot` should land **before** `mgr-reconcile` so the manager brief's MS projection always sees a ≤7-day-old snapshot. The Workflow-1 ordering rule (focused→wide, fast→slow) already places it correctly relative to the daily·focused block; the only intra-weekly preference is `team-snapshot` before any chore that reads snapshots.
+**Ordering note:** within a `weekly` run, `team-snapshot` should land **before** `mgr-reconcile` so the manager brief's MS projection always sees a ≤7-day-old snapshot. The Workflow-1 ordering rule (focused→wide, fast→slow) already places it correctly relative to the daily·focused block; the only intra-weekly preference is `team-snapshot` before any chore that reads snapshots. Likewise `bug-scan` (daily) must land **before** `bug-pulse` (weekly) so the pulse reads a same-day mirror.
 
-¹ "RW" chores update a local cache/log inside their owning skill (review-task statuses, PR status column, `staff-updates.md`). None of them post to GitHub/Jira/Confluence. **Sync-Bot never writes to a remote system** — see Principles.
+¹ "RW" chores update a local cache/log inside their owning skill (review-task statuses, PR status column, `staff-updates.md`, the `~/tasks/bugs.json` Jira mirror). None of them post to GitHub/Jira/Confluence. **Sync-Bot never writes to a remote system** — see Principles.
 
 ² `ws-sync` mutates the **local working tree** (stash/checkout/pull-rebase/artifact download) but performs **no remote writes** — no push, no force, no reset. It snapshots state first (`wip_save`) so any interruption is recoverable. See "Scripted chores" below.
 

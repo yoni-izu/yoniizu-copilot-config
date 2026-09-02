@@ -21,6 +21,29 @@ from typing import Any
 sys.path.insert(0, os.path.expanduser("~/.copilot/skills/workspace-manager"))
 import wm  # noqa: E402
 
+# bug-monitor owns the HSI bug store. The portal dashboard renders its Bugs
+# section from it; tm.py never touches ~/tasks/bugs.json directly.
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/bug-monitor"))
+try:
+    import bm  # noqa: E402
+except ImportError:      # bug-monitor not installed -> portal hides the section
+    bm = None
+
+# pr-monitor owns the outgoing feature-PR memoir. Its refresh runs `gh` only,
+# so the portal's scan button costs nothing.
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/pr-monitor"))
+try:
+    import pm  # noqa: E402
+except ImportError:
+    pm = None
+
+# team-planner owns ~/team-planner/raid.md; rd.py reads and surgically edits it.
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/team-planner"))
+try:
+    import rd  # noqa: E402
+except ImportError:
+    rd = None
+
 # ----------------------------------------------------------------------------
 # Constants & helpers
 # ----------------------------------------------------------------------------
@@ -1651,6 +1674,273 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .tab.on { color:var(--accent); background:var(--panel); border-color:var(--border); margin-bottom:-1px; }
   .tab .badge-count { font-size:11px; font-weight:500; color:var(--muted); margin-left:7px; }
   .tab.on .badge-count { color:var(--accent); }
+  /* --- portal section nav (My Work / Bugs / Team) --- */
+  .sections { display:flex; gap:8px; flex-wrap:wrap; margin:4px 0 2px; }
+  .section-btn { display:inline-flex; align-items:center; gap:8px; padding:9px 18px; border-radius:10px;
+                 border:1px solid var(--border); background:var(--panel); color:var(--muted);
+                 cursor:pointer; font:inherit; font-size:13px; font-weight:700; box-shadow:var(--shadow); }
+  .section-btn:hover:not(:disabled) { color:var(--accent); border-color:var(--accent); }
+  .section-btn.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .section-btn .badge-count { font-size:11px; font-weight:600; opacity:.85; }
+  .section-btn:disabled { opacity:.45; cursor:not-allowed; }
+  /* --- bug monitor view --- */
+  .bug-controls { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+                  padding:14px 16px; box-shadow:var(--shadow); margin-bottom:16px; }
+  .sg-moving{background:#dcfce7;color:#15803d;} .sg-slow{background:#fef3c7;color:#92400e;}
+  .sg-stalled{background:#ffedd5;color:#c2410c;} .sg-dormant{background:#fee2e2;color:#b91c1c;}
+  .sg-closed{background:#e5e7eb;color:#6b7280;}
+  .tr-untriaged{background:#fee2e2;color:#b91c1c;} .tr-in-triage{background:#fef3c7;color:#92400e;}
+  .tr-triaged{background:#dcfce7;color:#15803d;} .tr-deferred{background:#e5e7eb;color:#6b7280;}
+  @media (prefers-color-scheme: dark){
+    .sg-moving,.tr-triaged{background:#14532d44;color:#86efac;}
+    .sg-slow,.tr-in-triage{background:#78350f44;color:#fcd34d;}
+    .sg-stalled{background:#7c2d1244;color:#fdba74;}
+    .sg-dormant,.tr-untriaged{background:#7f1d1d44;color:#fca5a5;}
+    .sg-closed,.tr-deferred{background:#37415133;color:#9ca3af;}
+  }
+  .flag { display:inline-block; padding:1px 6px; margin:0 3px 3px 0; border-radius:5px; font-size:10px;
+          background:var(--bg); border:1px solid var(--border); color:var(--muted); white-space:nowrap; }
+  .flag.warn { border-color:#f59e0b; color:#b45309; }
+  .fam-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:14px; margin-top:16px; }
+  .fam-card { background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--accent);
+              border-radius:12px; padding:14px 16px; box-shadow:var(--shadow); display:grid; gap:8px;
+              min-width:0; overflow:hidden; }
+  .fam-card.closed { border-left-color:#16a34a; opacity:.75; }
+  .fam-title { font-size:15px; font-weight:700; }
+  .fam-meta { font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:4px 14px; }
+  .fam-members { display:grid; gap:4px; font-size:13px; min-width:0; }
+  .fam-members .m { display:flex; gap:8px; align-items:baseline; min-width:0; }
+  .fam-members .m.primary { font-weight:700; }
+  .stale-note { font-size:12px; color:#c2410c; }
+  /* --- report canvas shared by the Overview and PRs sections --- */
+  :root { --track:#e8ebf0; --grid:#eef0f4;
+          --tile-sh:0 1px 2px rgba(16,24,40,.05), 0 6px 16px rgba(16,24,40,.07); }
+  @media (prefers-color-scheme: dark) { :root { --track:#242a36; --grid:#232833;
+          --tile-sh:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.35); } }
+  .rpt-head { display:flex; align-items:flex-end; justify-content:space-between; gap:16px;
+              flex-wrap:wrap; margin:18px 0 14px; padding-bottom:12px; border-bottom:2px solid var(--border); }
+  .rpt-head h2 { margin:0; font-size:20px; font-weight:800; letter-spacing:-.02em; }
+  .rpt-head .sub { margin:3px 0 0; font-size:12px; color:var(--muted); }
+  .rpt-head .sub b { color:var(--text); font-weight:700; }
+  .slicer { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .slicer .sl-l { font-size:9.5px; font-weight:800; letter-spacing:.12em; color:var(--muted);
+                  text-transform:uppercase; margin-right:2px; }
+  .sprint { border:1px solid var(--border); border-radius:5px; padding:5px 10px; font-size:11.5px;
+            background:var(--panel); line-height:1.25; }
+  .sprint.now { border-color:transparent; background:#118DFF; color:#fff; font-weight:700; box-shadow:0 2px 8px rgba(17,141,255,.35); }
+  .sprint .w { display:block; color:var(--muted); font-size:10px; font-weight:400; }
+  .sprint.now .w { color:rgba(255,255,255,.85); }
+
+  .ov-canvas { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:12px; align-items:start; }
+  .t2{grid-column:span 2;} .t3{grid-column:span 3;} .t4{grid-column:span 4;}
+  .t5{grid-column:span 5;} .t6{grid-column:span 6;} .t7{grid-column:span 7;}
+  .t8{grid-column:span 8;} .t9{grid-column:span 9;} .t12{grid-column:span 12;}
+  @media (max-width:1240px){
+    .t2{grid-column:span 4;} .t3,.t4,.t5{grid-column:span 6;}
+    .t7,.t8,.t9{grid-column:span 12;} .t6{grid-column:span 6;}
+  }
+  @media (max-width:780px){ .ov-canvas > * { grid-column:span 12; } }
+
+  .tile { background:var(--panel); border-radius:8px; padding:14px 16px 16px; min-width:0;
+          overflow:hidden; box-shadow:var(--tile-sh); border:1px solid transparent;
+          transition:box-shadow .16s ease, transform .16s ease; }
+  .tile:hover { transform:translateY(-1px); box-shadow:0 2px 6px rgba(16,24,40,.09), 0 14px 30px rgba(16,24,40,.12); }
+  @media (prefers-color-scheme: dark) { .tile { border-color:var(--border); } }
+  .tile > h3 { margin:0; font-size:13px; font-weight:700; letter-spacing:-.01em;
+               display:flex; align-items:center; gap:8px; }
+  .tile > h3::before { content:""; width:4px; height:15px; border-radius:2px; flex:none;
+                       background:var(--tk,#118DFF); }
+  .tile > .cap { margin:4px 0 12px 12px; font-size:11px; color:var(--muted); line-height:1.45; }
+  .tile > .cap:last-child { margin-bottom:0; }
+
+  /* KPI cards */
+  .kpis { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:12px; margin-bottom:12px; }
+  .kpi { position:relative; grid-column:span 2; background:var(--panel); border-radius:8px;
+         padding:13px 15px 12px 18px; box-shadow:var(--tile-sh); border:1px solid transparent;
+         overflow:hidden; display:grid; gap:1px; align-content:start;
+         transition:box-shadow .16s ease, transform .16s ease; }
+  .kpi:hover { transform:translateY(-1px); box-shadow:0 2px 6px rgba(16,24,40,.09), 0 14px 30px rgba(16,24,40,.12); }
+  @media (prefers-color-scheme: dark) { .kpi { border-color:var(--border); } }
+  @media (max-width:1240px){ .kpi { grid-column:span 4; } }
+  @media (max-width:780px){ .kpi { grid-column:span 6; } }
+  .kpi::before { content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--k,#118DFF); }
+  .kpi .l { font-size:9.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.11em; font-weight:800; }
+  .kpi .n { font-size:34px; font-weight:800; line-height:1.05; color:var(--k,#118DFF);
+            font-variant-numeric:tabular-nums; letter-spacing:-.03em; }
+  .kpi .n small { font-size:12px; font-weight:700; color:var(--muted); margin-left:4px; letter-spacing:0; }
+  .kpi .s { font-size:11px; color:var(--muted); line-height:1.4; }
+  .kpi .bar { height:4px; border-radius:2px; background:var(--track); overflow:hidden; margin-top:7px; }
+  .kpi .bar > i { display:block; height:100%; background:var(--k,#118DFF); border-radius:2px; }
+  .kpi .l, .kpi .n, .kpi .s, .kpi .bar { position:relative; z-index:1; }
+  .kpi .spark { position:absolute; right:-1px; bottom:-1px; width:58%; opacity:.3; pointer-events:none; z-index:0; }
+
+  .chart-row { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  .donut .seg { transition:opacity .15s; }
+  .donut:hover .seg { opacity:.45; } .donut .seg:hover { opacity:1; }
+  .col { transition:opacity .15s; } svg:hover .col { opacity:.55; } .col:hover { opacity:1; }
+  .legend { display:grid; gap:6px; font-size:12px; min-width:0; flex:1; }
+  .legend .li { display:flex; align-items:center; gap:8px; white-space:nowrap; }
+  .legend .sw { width:10px; height:10px; border-radius:2px; flex:none; }
+  .legend .v { margin-left:auto; color:var(--muted); font-variant-numeric:tabular-nums; padding-left:10px;
+               font-weight:700; }
+  /* horizontal bar visual */
+  .hbars { display:grid; gap:11px; }
+  .hb-t { display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:12px; margin-bottom:4px; }
+  .hb-t b { font-size:13px; font-variant-numeric:tabular-nums; }
+  .hb-r { height:8px; border-radius:4px; background:var(--track); overflow:hidden; }
+  .hb-r > i { display:block; height:100%; border-radius:4px; }
+  .hb-s { font-size:10px; color:var(--muted); margin-top:3px; }
+
+  .sb { width:100%; border-collapse:collapse; font-size:13px; }
+  .sb th { text-align:left; font-size:9.5px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted);
+           font-weight:800; padding:0 8px 7px 0; border-bottom:2px solid var(--border); }
+  .sb td { padding:9px 8px 9px 0; border-bottom:1px solid var(--grid); vertical-align:middle; }
+  .sb tbody tr:last-child td { border-bottom:none; }
+  .sb tbody tr:hover { background:var(--accent-soft); }
+  .sb .num { text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }
+  .sb .who { color:var(--muted); font-size:11px; font-weight:400; }
+  .rag { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:7px; vertical-align:middle; }
+  .rag.red{background:#D64550;} .rag.orange{background:#E66C37;}
+  .rag.yellow{background:#D9B300;} .rag.green{background:#1AAB40;} .rag.gray{background:#9B9B9B;}
+  .feed { display:grid; gap:3px; }
+  .feed .it { display:flex; gap:10px; align-items:baseline; padding:8px 10px; font-size:13px;
+              border-radius:6px; border-left:3px solid var(--fk,#9B9B9B); background:var(--bg); }
+  .feed .it:hover { background:var(--accent-soft); }
+  .feed .it .w { flex:1; min-width:0; }
+  .feed .it .why { color:var(--muted); font-size:11px; margin-top:2px; }
+  .feed .it .when { color:var(--muted); font-size:11px; white-space:nowrap; font-weight:600; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:4px; font-size:9.5px; font-weight:800;
+          text-transform:uppercase; letter-spacing:.07em; color:#fff; background:var(--fk,#9B9B9B); }
+  .slots { display:flex; gap:8px; flex-wrap:wrap; }
+  .slot { border-radius:6px; padding:9px 12px; font-size:12px; min-width:104px;
+          background:var(--bg); border:1px solid var(--border); border-top:3px solid var(--track); }
+  .slot.busy { border-top-color:#118DFF; background:var(--accent-soft); border-color:transparent; }
+  .slot .nm { font-weight:800; font-size:10px; text-transform:uppercase; letter-spacing:.09em; }
+  .slot .oc { color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px; }
+
+  /* --- PRs section --- */
+  .prf { background:var(--panel); border-radius:8px; box-shadow:var(--tile-sh);
+         border:1px solid transparent; border-left:5px solid var(--fk,#9B9B9B);
+         padding:13px 16px 14px; margin-bottom:12px; }
+  @media (prefers-color-scheme: dark) { .prf { border-color:var(--border); border-left-color:var(--fk,#9B9B9B); } }
+  .prf > header { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .prf h3 { margin:0; font-size:14px; font-weight:700; flex:1; min-width:220px; }
+  .prf .fid { font-size:10px; font-weight:800; color:var(--muted); letter-spacing:.08em; }
+  .prf .desc { margin:6px 0 0; font-size:11.5px; color:var(--muted); line-height:1.5;
+               display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .prf .prog { height:5px; border-radius:3px; background:var(--track); overflow:hidden; margin:10px 0 4px; }
+  .prf .prog > i { display:block; height:100%; background:#1AAB40; border-radius:3px; }
+  .prf .note { margin-top:9px; font-size:11.5px; color:var(--muted); line-height:1.5;
+               border-left:2px solid var(--border); padding-left:9px;
+               display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+  .pr-tbl { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:9px; table-layout:fixed; }
+  .pr-tbl th { text-align:left; font-size:9px; text-transform:uppercase; letter-spacing:.1em;
+               color:var(--muted); font-weight:800; padding:0 8px 6px 0; border-bottom:2px solid var(--border); }
+  .pr-tbl td { padding:6px 8px 6px 0; border-bottom:1px solid var(--grid); vertical-align:middle;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pr-tbl tr:last-child td { border-bottom:none; }
+  .pr-tbl tr:hover td { background:var(--accent-soft); }
+  .st { display:inline-block; padding:2px 8px; border-radius:4px; font-size:9.5px; font-weight:800;
+        text-transform:uppercase; letter-spacing:.05em; color:#fff; background:var(--sk,#9B9B9B); }
+  .chk { font-variant-numeric:tabular-nums; font-size:11px; color:var(--muted); }
+  .chk b { color:#D64550; }
+  .ci { display:inline-block; padding:2px 7px; border-radius:9px; font-size:10px; font-weight:700;
+        text-transform:uppercase; letter-spacing:.04em; color:#fff; background:var(--ck); white-space:nowrap; }
+  .ci.none { color:var(--muted); background:transparent; border:1px dashed var(--grid); font-weight:600; }
+  .pldm { font-size:9.5px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
+          padding:2px 8px; border-radius:4px; background:var(--track); color:var(--muted); }
+  .pldm-btn { font-size:10px; font-weight:700; padding:3px 9px; border-radius:4px; cursor:pointer;
+              border:1px solid var(--grid); background:var(--track); color:var(--fg); white-space:nowrap; }
+  .pldm-btn:hover { border-color:#118DFF; color:#118DFF; }
+  .pldm-box { margin-top:10px; padding:11px 13px; border:1px solid var(--grid);
+              border-radius:6px; background:var(--track); }
+  .pldm-form { display:grid; grid-template-columns:repeat(3,1fr); gap:9px 13px; }
+  .pldm-form label { display:flex; flex-direction:column; gap:3px; font-size:10px;
+                     font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .pldm-form input, .pldm-form select { font:inherit; font-size:12px; padding:4px 6px;
+              border:1px solid var(--grid); border-radius:4px; background:var(--bg); color:var(--fg); }
+  .pldm-warn { margin:10px 0 8px; font-size:11px; color:var(--muted); line-height:1.5; }
+  .pldm-act { display:flex; align-items:center; gap:9px; }
+  .pldm-act button { font:inherit; font-size:11px; font-weight:700; padding:4px 12px;
+                     border-radius:4px; cursor:pointer; border:1px solid var(--grid); }
+  .pldm-act .go { background:#118DFF; border-color:#118DFF; color:#fff; }
+  .pldm-act .go:disabled { opacity:.55; cursor:default; }
+  .pldm-act .cancel { background:transparent; color:var(--muted); }
+  .pldm-note { font-size:11px; color:var(--muted); }
+  .pldm-prog { font-size:11.5px; margin-bottom:7px; }
+  .pldm-prog .ok { color:#1AAB40; } .pldm-prog .bad { color:#D64550; }
+  .pl-row { font-size:11px; padding:2px 0; border-top:1px solid var(--grid); }
+  .pl-row span { color:var(--muted); }
+  .pl-row.error, .pl-row.not-found { color:#D64550; }
+  .spin { display:inline-block; animation:sp 1s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+
+  /* --- development hygiene tile --- */
+  .hyg-wrap { display:flex; align-items:flex-start; gap:26px; flex-wrap:wrap; }
+  .hyg-score { flex:0 0 220px; padding-top:6px; }
+  .hyg-rules { flex:1 1 520px; display:grid; gap:14px 22px;
+               grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
+  .hyg-h { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .hyg-l { font-size:11.5px; font-weight:700; }
+  .hyg-n { font-size:11px; font-variant-numeric:tabular-nums; color:var(--muted); }
+  .hyg-bar { height:6px; border-radius:3px; background:var(--track); margin:6px 0 4px; overflow:hidden; }
+  .hyg-bar i { display:block; height:100%; border-radius:3px; background:var(--hc); }
+  .hyg-s { font-size:10.5px; color:var(--muted); }
+  .hyg-s b { color:var(--hc); }
+  @media (max-width:780px) { .hyg-score { flex:1 1 100%; } }
+
+  /* --- RAID section --- */
+  #raid-tbl { table-layout:fixed; width:100%; margin-top:14px; }
+  #raid-tbl th, #raid-body tr.raid-row td { overflow-wrap:break-word; }
+  #raid-body tr.raid-row { cursor:pointer; }
+  #raid-body tr.raid-row:hover td { background:var(--grid); }
+  #raid-body .rid { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                    font-size:11.5px; font-weight:700; }
+  #raid-body .ttl { font-weight:600; }
+  #raid-body .stt, #raid-body td:nth-child(4) { color:var(--muted); font-size:12px; }
+  #raid-body td.od { color:#D64550; font-weight:700; }
+  .ragp { display:inline-block; padding:2px 9px; border-radius:999px; font-size:9.5px;
+         font-weight:800; letter-spacing:.06em; text-transform:uppercase;
+         color:#fff; background:var(--rk,#9B9B9B); }
+  .raid-det { padding:14px 6px 18px; }
+  .rf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px 22px; }
+  .rf span { display:block; font-size:9.5px; font-weight:800; letter-spacing:.07em;
+             text-transform:uppercase; color:var(--muted); margin-bottom:3px; }
+  .rf p { margin:0; font-size:12.5px; line-height:1.55; }
+  .raid-edit, .raid-new { margin-top:16px; padding:14px 16px; border-radius:8px;
+                          background:var(--grid); }
+  .raid-new { margin-bottom:4px; }
+  .re-row { display:flex; flex-wrap:wrap; gap:10px 14px; margin-bottom:10px; }
+  .re-row label { display:flex; flex-direction:column; gap:4px; font-size:9.5px;
+                  font-weight:800; letter-spacing:.07em; text-transform:uppercase;
+                  color:var(--muted); }
+  .re-row input, .re-row select { font:inherit; font-size:12.5px; font-weight:400;
+      letter-spacing:0; text-transform:none; color:var(--text); padding:6px 8px;
+      border:1px solid var(--border); border-radius:5px; background:var(--card); }
+  .re-row label:first-child input { min-width:420px; }
+  .re-act { display:flex; align-items:center; gap:10px; }
+  /* Bug table uses a fixed layout so 11 columns never overflow the card.
+     Percentages must sum to 100. Scoped to tr.task so the full-width
+     colspan detail row keeps its own alignment. */
+  #bug-tbl { table-layout:fixed; width:100%; }
+  #bug-tbl th, #bug-body tr.task td { overflow-wrap:break-word; }
+  #bug-head th:nth-child(1)  { width:3%;  }
+  #bug-head th:nth-child(2)  { width:14%; }
+  #bug-head th:nth-child(3)  { width:21%; }
+  #bug-head th:nth-child(4)  { width:6%;  }
+  #bug-head th:nth-child(5)  { width:9%;  }
+  #bug-head th:nth-child(6)  { width:10%; }
+  #bug-head th:nth-child(7)  { width:5%;  }
+  #bug-head th:nth-child(8)  { width:5%;  }
+  #bug-head th:nth-child(9)  { width:4%;  }
+  #bug-head th:nth-child(10) { width:8%;  }
+  #bug-head th:nth-child(11) { width:5%;  }
+  #bug-head th:nth-child(12) { width:10%; }
+  #bug-body tr.task td:nth-child(7), #bug-body tr.task td:nth-child(8),
+  #bug-body tr.task td:nth-child(9), #bug-body tr.task td:nth-child(11) { white-space:nowrap; }
+  #bug-body tr.task td:nth-child(2) a { overflow-wrap:anywhere; }
+  #bug-head th:nth-child(9), #bug-body tr.task td:nth-child(9) { text-align:center; }
+  #bug-head th:nth-child(1), #bug-body tr.task td:nth-child(1) { text-align:center; padding-left:8px; padding-right:0; }
   .rv-pending{background:#e5e7eb;color:#6b7280;} .rv-in-progress{background:#fef3c7;color:#92400e;}
   .rv-commented{background:#e0edff;color:#1d4ed8;} .rv-changes-requested{background:#fee2e2;color:#b91c1c;}
   .rv-waiting-for-author{background:#ffedd5;color:#c2410c;}
@@ -1725,10 +2015,24 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="align-banner" style="display:none;position:fixed;top:12px;right:12px;z-index:9999;
+  max-width:420px;padding:12px 14px;border-radius:8px;background:#1e293b;color:#e2e8f0;
+  box-shadow:0 6px 24px rgba(0,0,0,.35);font-size:13px;line-height:1.4;">
+  <div style="display:flex;align-items:center;gap:8px;">
+    <span id="align-spin" style="width:14px;height:14px;border:2px solid #64748b;
+      border-top-color:#38bdf8;border-radius:50%;display:inline-block;
+      animation:align-spin 0.8s linear infinite;"></span>
+    <b id="align-title">Aligning workspace…</b>
+    <button id="align-close" style="margin-left:auto;background:none;border:none;
+      color:#94a3b8;cursor:pointer;font-size:16px;line-height:1;">×</button>
+  </div>
+  <div id="align-body" style="margin-top:8px;max-height:52vh;overflow:auto;"></div>
+</div>
+<style>@keyframes align-spin{to{transform:rotate(360deg)}}</style>
 <header>
   <div class="header-top">
     <div>
-      <h1>Task Dashboard <span id="modebadge" class="mode ro">read-only</span></h1>
+      <h1>Team Portal <span id="modebadge" class="mode ro">read-only</span></h1>
       <div class="sub">Generated __GENERATED__ · <span id="total"></span></div>
     </div>
     <div>
@@ -1738,6 +2042,92 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </header>
 <div class="wrap">
+  <nav class="sections" id="sections"></nav>
+
+  <div id="sec-overview">
+    <div class="rpt-head">
+      <div>
+        <h2>HSI Firmware — team report</h2>
+        <p class="sub" id="ov-asof"></p>
+      </div>
+      <div class="slicer" id="ov-sprints"></div>
+    </div>
+
+    <div class="kpis" id="ov-kpis"></div>
+
+    <div class="ov-canvas">
+      <div class="tile t8" style="--tk:#118DFF;">
+        <h3>Bug flow — open vs closed</h3>
+        <p class="cap">Cumulative over 90 days, from each bug's created/resolved date in the local mirror.</p>
+        <div id="ov-bugflow"></div>
+      </div>
+      <div class="tile t4" style="--tk:#1AAB40;">
+        <h3>Bug backlog health</h3>
+        <p class="cap">Share of open bugs that are triaged, and that carry a milestone and a sprint.</p>
+        <div id="ov-gauges"></div>
+      </div>
+
+      <div class="tile t8" style="--tk:#E66C37;">
+        <h3>Mean time to close — monthly</h3>
+        <p class="cap" id="ov-ttc-cap">Days from created to resolved, bucketed by the month the bug closed.</p>
+        <div id="ov-ttc"></div>
+      </div>
+      <div class="tile t4" style="--tk:#6B007B;">
+        <h3>Open bugs by IP</h3>
+        <p class="cap">Components mapped to an IP via the team-weekly scoreboard.</p>
+        <div class="chart-row"><div id="ov-bugip"></div><div class="legend" id="ov-bugip-lg"></div></div>
+      </div>
+
+      <div class="tile t8" style="--tk:#12239E;">
+        <h3>Per-IP scoreboard</h3>
+        <p class="cap">Open bugs, attention load, review pressure and the 12-week load trend per IP.</p>
+        <div id="ov-scoreboard"></div>
+      </div>
+      <div class="tile t4" style="--tk:#E044A7;">
+        <h3>Open bugs by owner</h3>
+        <p class="cap">Who is actually carrying the open bug load.</p>
+        <div class="chart-row"><div id="ov-bugowner"></div><div class="legend" id="ov-bugowner-lg"></div></div>
+      </div>
+
+      <div class="tile t8" style="--tk:#D64550;">
+        <h3>Needs you now</h3>
+        <p class="cap">One ranked queue across bugs, RAID, reviews and blocked tasks — worst first.</p>
+        <div id="ov-feed"></div>
+      </div>
+      <div class="tile t4" style="--tk:#D9B300;">
+        <h3>Bug hygiene — missing planning fields</h3>
+        <p class="cap">Open bugs carrying each flag. These are the gaps to close in Jira.</p>
+        <div id="ov-flags"></div>
+      </div>
+
+      <div class="tile t12" style="--tk:#197278;">
+        <h3>Development hygiene</h3>
+        <p class="cap">How cleanly work is flowing through the pipe — outgoing PRs, my review turnaround, and work-in-progress discipline.</p>
+        <div class="hyg-wrap">
+          <div class="hyg-score" id="ov-hyg-score"></div>
+          <div class="hyg-rules" id="ov-hygiene"></div>
+        </div>
+      </div>
+
+      <div class="tile t5" style="--tk:#744EC2;">
+        <h3>RAID — open rows</h3>
+        <p class="cap">From <code>~/team-planner/raid.md</code>, worst RAG then worst score.</p>
+        <div id="ov-raid"></div>
+      </div>
+      <div class="tile t3" style="--tk:#197278;">
+        <h3>Review queue</h3>
+        <p class="cap">PRs in my incoming review queue, by consolidated state.</p>
+        <div id="ov-reviews"></div>
+      </div>
+      <div class="tile t4" style="--tk:#3599B8;">
+        <h3>Workspace occupancy</h3>
+        <p class="cap">Which physical checkouts are in use, and by what.</p>
+        <div class="slots" id="ov-slots"></div>
+      </div>
+    </div>
+  </div><!-- /sec-overview -->
+
+  <div id="sec-work" style="display:none;">
   <nav class="tabs" id="tabs"></nav>
   <div class="stats" id="stats"></div>
 
@@ -1839,11 +2229,127 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <tbody id="body"></tbody>
   </table>
   <div id="wsview" style="display:none;"></div>
+  </div><!-- /sec-work -->
+
+  <div id="sec-bugs" style="display:none;">
+    <nav class="tabs" id="bug-tabs"></nav>
+    <div class="stats" id="bug-stats"></div>
+
+    <div class="bug-controls" id="bug-controls">
+      <div class="row">
+        <div class="grp search-wrap">
+          <span class="lbl">Search</span>
+          <input type="search" id="bq" placeholder="Search key, summary, description, root cause, notes…">
+        </div>
+        <div class="grp">
+          <span class="lbl">Signal</span>
+          <div class="chips" id="bug-signals"></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <div class="grp">
+          <span class="lbl">Owner</span>
+          <select id="b-owner"><option value="">All</option></select>
+        </div>
+        <div class="grp">
+          <span class="lbl">Priority</span>
+          <select id="b-priority"><option value="">All</option></select>
+        </div>
+        <div class="grp">
+          <span class="lbl">Component</span>
+          <select id="b-component"><option value="">All</option></select>
+        </div>
+        <div class="grp">
+          <span class="lbl">Family</span>
+          <select id="b-family"><option value="">All</option></select>
+        </div>
+        <div class="grp">
+          <span class="lbl">Sort by</span>
+          <select id="b-sort">
+            <option value="signal">Signal (worst first)</option>
+            <option value="idle">Idle (longest)</option>
+            <option value="age">Age (oldest)</option>
+            <option value="pings">Pings from Oded (most)</option>
+            <option value="priority">Priority</option>
+            <option value="key">Key</option>
+          </select>
+        </div>
+        <div class="grp">
+          <span class="lbl">Options</span>
+          <div class="chips">
+            <label class="chip on"><input type="checkbox" id="b-openonly" checked> Open only</label>
+            <label class="chip"><input type="checkbox" id="b-untriaged"> Untriaged only</label>
+            <label class="chip"><input type="checkbox" id="b-flagged"> Has hygiene flag</label>
+            <label class="chip on"><input type="checkbox" id="b-hidemuted" checked> Hide muted</label>
+          </div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button id="bug-scan" class="btn" title="Re-read every in-scope bug from Jira into the local mirror. No model, no tokens.">↻ Scan Jira</button>
+        <span class="ro-note" id="bug-scanline"></span>
+        <button class="link" id="b-reset" style="margin-left:auto;">Reset filters</button>
+      </div>
+    </div>
+
+    <div class="count" id="bug-count"></div>
+    <table id="bug-tbl">
+      <thead><tr id="bug-head"></tr></thead>
+      <tbody id="bug-body"></tbody>
+    </table>
+    <div id="famview" style="display:none;"></div>
+  </div><!-- /sec-bugs -->
+
+  <div id="sec-prs" style="display:none;">
+    <div class="rpt-head">
+      <div>
+        <h2>My feature PRs</h2>
+        <p class="sub" id="pr-asof"></p>
+      </div>
+      <div class="slicer">
+        <button id="pr-scan" class="btn primary" title="Re-probe every tracked PR through the gh CLI, and retire features whose PRs are all merged. No model, no tokens.">↻ Scan PRs</button>
+        <span id="pr-scan-note" class="ro-note"></span>
+      </div>
+    </div>
+    <div class="kpis" id="pr-kpis"></div>
+    <div id="pr-list"></div>
+  </div><!-- /sec-prs -->
+
+  <div id="sec-raid" style="display:none;">
+    <div class="rpt-head">
+      <div>
+        <h2>RAID log</h2>
+        <p class="sub" id="raid-asof"></p>
+      </div>
+      <div class="slicer">
+        <label class="chip"><input type="checkbox" id="raid-showclosed"> Show closed</label>
+        <button id="raid-new" class="btn primary">+ New row</button>
+      </div>
+    </div>
+    <div class="kpis" id="raid-kpis"></div>
+    <div id="raid-form" class="raid-new" style="display:none;"></div>
+    <table id="raid-tbl">
+      <thead><tr>
+        <th style="width:8%;">ID</th><th style="width:34%;">Title</th>
+        <th style="width:9%;">RAG</th><th style="width:7%;">Score</th>
+        <th style="width:11%;">Owner</th><th style="width:12%;">Due</th>
+        <th style="width:19%;">Status</th>
+      </tr></thead>
+      <tbody id="raid-body"></tbody>
+    </table>
+  </div><!-- /sec-raid -->
+
+  <div id="sec-team" style="display:none;">
+    <div class="empty">Team task monitoring lands here.</div>
+  </div>
 </div>
 
 <script>
 let TASKS = __DATA__;
 let WORKSPACES = __WSDATA__;
+let BUGS = __BUGDATA__;
+let OVERVIEW = __OVDATA__;
+let PRS = __PRDATA__;
+let RAID = __RAIDDATA__;
 let SERVED = false;
 const JIRA_BASE = "https://elementlabs.atlassian.net/browse/";
 const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled"];
@@ -1943,6 +2449,73 @@ function consolidateReviewStatus(pl){
   return "pending";
 }
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- workspace alignment (manual-review checkout) progress banner ----
+const ALIGN_ICONS={"checked-out":"✓","skipped-dirty":"⚠","error":"✕","not-found":"✕","already":"✓"};
+const TONE_COLOR={ok:"#4ade80",warn:"#fbbf24",bad:"#f87171"};
+function alignRepoRow(r){
+  const ic=r.icon||ALIGN_ICONS[r.action]||"·";
+  const col=r.tone?(TONE_COLOR[r.tone]||"#94a3b8")
+    :(r.action==="checked-out"?"#4ade80":(r.action==="skipped-dirty"?"#fbbf24":"#f87171"));
+  const tag=r.role==="review"?" <b style='color:#38bdf8'>[PR]</b>":"";
+  return `<div style="margin-top:3px"><span style="color:${col}">${ic}</span> `
+    +`<code>${esc(r.name)}</code>${tag} — ${esc(r.detail||r.action)}</div>`;
+}
+function renderAlign(job){
+  const banner=document.getElementById("align-banner");
+  const spin=document.getElementById("align-spin");
+  const title=document.getElementById("align-title");
+  const body=document.getElementById("align-body");
+  banner.style.display="block";
+  const running=job.status==="running";
+  const reset=job.kind==="reset";
+  const prScan=job.kind==="pr-scan";
+  spin.style.display=running?"inline-block":"none";
+  if(running){
+    const prog=job.total?` (${job.repos.length}/${job.total})`:"";
+    if(prScan){
+      title.textContent=`Scanning PRs${prog}`+(job.current?" · "+job.current:"");
+    }else{
+      const verb=reset?"Resetting":"Aligning";
+      title.textContent=`${verb} ${esc(job.slot)}${prog}${job.current?" · "+esc(job.current):""}`;
+    }
+  }else if(job.status==="error"){
+    const what=prScan?"PR scan":(reset?"Reset":"Alignment");
+    title.innerHTML=`<span style="color:#f87171">✕ ${what} failed</span>`;
+  }else{
+    const done=prScan?`✓ Probed ${job.repos.length} PRs`
+      :(reset?`✓ ${esc(job.slot)} reset to main`:`✓ Aligned ${esc(job.slot)}`);
+    title.innerHTML=`<span style="color:#4ade80">${done}</span>`;
+  }
+  const rows=(job.repos||[]).map(alignRepoRow).join("");
+  const msg=job.message?`<div style="margin-top:6px;color:#cbd5e1">${esc(job.message)}</div>`:"";
+  body.innerHTML=rows+msg;
+  if(running) body.scrollTop=body.scrollHeight;
+}
+async function pollAlign(jobId,label){
+  const banner=document.getElementById("align-banner");
+  banner.style.display="block";
+  document.getElementById("align-spin").style.display="inline-block";
+  document.getElementById("align-title").textContent=label||"Aligning workspace…";
+  document.getElementById("align-body").innerHTML="";
+  let done=false, last=null;
+  while(!done){
+    try{
+      const r=await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"});
+      if(!r.ok){ document.getElementById("align-title").textContent="Alignment status unavailable"; return null; }
+      last=await r.json();
+      renderAlign(last);
+      done=last.status!=="running";
+    }catch(err){ document.getElementById("align-title").textContent="Network error during alignment"; return null; }
+    if(!done) await new Promise(res=>setTimeout(res,900));
+  }
+  return last;
+}
+document.addEventListener("click",e=>{
+  if(e.target && e.target.id==="align-close")
+    document.getElementById("align-banner").style.display="none";
+});
+
 function feature(t){
   let d=(t.description||"").trim();
   let f = d ? d.split(". ")[0] : (t.title||"").replace(/^Review:\s*/i,"");
@@ -2157,6 +2730,7 @@ function wireEditor(detEl,t){
       if(!res.ok){ msg.textContent="Error: "+(data.error||res.status); btn.disabled=false; return; }
       TASKS=data.tasks; buildFilters(); buildTabs(); render();
       msg.textContent="Saved.";
+      if(data.align_job) pollAlign(data.align_job);
     }catch(err){ msg.textContent="Network error: "+err; btn.disabled=false; }
   });
   ed.querySelectorAll("select,input,textarea").forEach(el=>
@@ -2275,6 +2849,7 @@ async function wsSlotPost(slot, payload, msgEl){
     if(!res.ok){ if(msgEl) msgEl.textContent="Error: "+(data.error||res.status); return; }
     TASKS=data.tasks; if(data.workspaces) WORKSPACES=data.workspaces;
     buildFilters(); buildTabs(); render();
+    if(data.align_job) pollAlign(data.align_job);
   }catch(err){ if(msgEl) msgEl.textContent="Network error: "+err; }
 }
 
@@ -2478,6 +3053,1075 @@ document.getElementById("reset").addEventListener("click",()=>{
   render();
 });
 
+// ============================================================================
+// Bugs section — HSI bug monitor (store: ~/tasks/bugs.json, owned by bm.py)
+// ============================================================================
+const SIGNALS = ["dormant","stalled","slow","moving","closed"];
+const SIGNAL_ICON = {moving:"🟢", slow:"🟡", stalled:"🟠", dormant:"🔴", closed:"✅"};
+const SIGNAL_COLOR = {moving:"#1AAB40", slow:"#D9B300", stalled:"#E66C37",
+                      dormant:"#D64550", closed:"#9B9B9B"};
+const TRIAGE_STATES = ["untriaged","in-triage","triaged","deferred"];
+const TRIAGE_VERDICTS = ["new","reproduction","duplicate","known-error","not-a-bug","not-ours"];
+const BUG_SEVERITIES = ["critical","high","medium","low"];
+const WATCH_STATES = ["active","muted","resolved"];
+const JIRA_PRI_ORDER = ["Blocker","Critical","High","Medium","Low"];
+const FAM_TAB = "__families__";
+// Bug tabs are saved filter presets, not categories.
+const BUG_TABS = [
+  ["open","Open"], ["new","New"], ["untriaged","Untriaged"],
+  ["attention","Needs attention"], [FAM_TAB,"Families"], ["all","All"],
+];
+let bugTab = "open";
+let bugSigFilter = new Set();
+const bugSort = {key:"signal", dir:1};
+
+function bugList(){ return (BUGS && BUGS.bugs) || []; }
+function bugFamilies(){ return (BUGS && BUGS.families) || []; }
+function famById(id){ return bugFamilies().find(f=>f.id===id)||null; }
+function bugTri(b){ return b.triage||{}; }
+function bugNeedsAttention(b){
+  return b.open && (["stalled","dormant"].includes(b.signal)
+                    || bugTri(b).state==="untriaged" || !b.assignee
+                    || (b.flags||[]).includes("pinged"));
+}
+function bugMatchesTab(b, tab){
+  switch(tab){
+    case "open":      return b.open;
+    case "new":       return b.open && b.is_new;
+    case "untriaged": return b.open && (bugTri(b).state||"untriaged")==="untriaged";
+    case "attention": return bugNeedsAttention(b);
+    case "all":       return true;
+  }
+  return true;
+}
+function bugTabCount(tab){
+  if(tab===FAM_TAB) return bugFamilies().filter(f=>f.status!=="closed").length;
+  return bugList().filter(b=>bugMatchesTab(b,tab)).length;
+}
+function buildBugTabs(){
+  const box=document.getElementById("bug-tabs");
+  box.innerHTML=BUG_TABS.map(([k,l])=>
+    `<button class="tab${k===bugTab?" on":""}" data-btab="${esc(k)}">${esc(l)}<span class="badge-count">${bugTabCount(k)}</span></button>`).join("");
+  box.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>selectBugTab(t.dataset.btab)));
+}
+function selectBugTab(tab){
+  bugTab=tab;
+  document.querySelectorAll("#bug-tabs .tab").forEach(t=>t.classList.toggle("on",t.dataset.btab===tab));
+  const fam = tab===FAM_TAB;
+  document.getElementById("bug-controls").style.display = fam?"none":"";
+  document.getElementById("bug-tbl").style.display     = fam?"none":"";
+  document.getElementById("bug-count").style.display   = fam?"none":"";
+  document.getElementById("bug-stats").style.display   = fam?"none":"";
+  document.getElementById("famview").style.display     = fam?"":"none";
+  applyBugTabPreset(tab);
+  renderBugs();
+}
+// Tabs are presets: "All" opens the whole mirror (incl. closed + muted);
+// every other tab is an open-bug lens.
+function applyBugTabPreset(tab){
+  if(tab===FAM_TAB) return;
+  const set=(id,on)=>{ const cb=document.getElementById(id);
+    cb.checked=on; cb.closest(".chip").classList.toggle("on",on); };
+  set("b-openonly", tab!=="all");
+  set("b-hidemuted", tab!=="all");
+}
+
+function buildBugFilters(){
+  const bugs=bugList();
+  const fill=(id, vals, labelFn)=>{
+    const sel=document.getElementById(id); const keep=sel.value;
+    sel.innerHTML='<option value="">All</option>'+vals.map(v=>
+      `<option value="${esc(v)}">${esc(labelFn?labelFn(v):v)}</option>`).join("");
+    if(vals.includes(keep)) sel.value=keep;
+  };
+  fill("b-owner", [...new Set(bugs.map(b=>b.assignee||"unassigned"))].sort());
+  fill("b-priority", JIRA_PRI_ORDER.filter(p=>bugs.some(b=>b.priority===p)));
+  fill("b-component", [...new Set(bugs.flatMap(b=>b.components||[]))].sort());
+  fill("b-family", bugFamilies().map(f=>f.id), id=>{
+    const f=famById(id); return f?`${id} · ${f.title.slice(0,40)}`:id; });
+  const sig=document.getElementById("bug-signals");
+  if(!sig.dataset.built){
+    sig.innerHTML=SIGNALS.map(s=>
+      `<label class="chip"><input type="checkbox" data-sig="${s}"> ${SIGNAL_ICON[s]} ${s}</label>`).join("");
+    sig.querySelectorAll("input[data-sig]").forEach(cb=>cb.addEventListener("change",()=>{
+      cb.closest(".chip").classList.toggle("on",cb.checked);
+      if(cb.checked) bugSigFilter.add(cb.dataset.sig); else bugSigFilter.delete(cb.dataset.sig);
+      renderBugs();
+    }));
+    sig.dataset.built="1";
+  }
+  const scan=document.getElementById("bug-scanline");
+  const stale=daysSince((BUGS.last_scan||"").slice(0,10));
+  const advice=SERVED ? "hit Scan Jira" : "run <code>bm.py scan</code>";
+  scan.innerHTML = BUGS.last_scan
+    ? `Jira mirror last scanned ${esc(BUGS.last_scan)}` +
+      (stale!=null && stale>=1 ? ` <span class="stale-note">— ${stale}d old; ${advice}</span>` : "")
+    : `<span class="stale-note">Never scanned — ${advice}</span>`;
+  const btn=document.getElementById("bug-scan");
+  btn.style.display = SERVED ? "" : "none";
+}
+
+// Server-side Jira pull via bm.do_scan — REST only, no model call.
+async function scanBugs(){
+  const btn=document.getElementById("bug-scan"), line=document.getElementById("bug-scanline");
+  btn.disabled=true; btn.innerHTML='<span class="spin">↻</span> Scanning…';
+  line.innerHTML="pulling from Jira…";
+  try{
+    const r=await fetch("/api/bug-scan",{method:"POST"});
+    const j=await r.json();
+    if(!r.ok||j.error) throw new Error(j.error||"scan failed");
+    BUGS=j; renderBugs(); buildSections();
+    const s=j.scan||{};
+    const bits=[(s.fetched||0)+" mirrored"];
+    if((s.new||[]).length) bits.push("<b>"+s.new.length+" new</b>: "+s.new.slice(0,4).map(esc).join(", "));
+    if(s.changed) bits.push(s.changed+" changed");
+    if((s.closed||[]).length) bits.push(s.closed.length+" closed");
+    if(s.activity) bits.push(s.activity+" refreshed");
+    if(s.pings) bits.push(s.pings+" 📣");
+    if(s.ci_runs) bits.push(s.ci_runs+" CI links");
+    line.innerHTML=bits.join(" · ");
+  }catch(e){
+    line.innerHTML='<span class="stale-note">Scan failed: '+esc(e.message)+'</span>';
+  }finally{
+    btn.disabled=false; btn.textContent="↻ Scan Jira";
+  }
+}
+document.getElementById("bug-scan").addEventListener("click",scanBugs);
+
+function bugFilters(){
+  const q=(document.getElementById("bq").value||"").toLowerCase().trim();
+  const owner=document.getElementById("b-owner").value;
+  const pri=document.getElementById("b-priority").value;
+  const comp=document.getElementById("b-component").value;
+  const fam=document.getElementById("b-family").value;
+  const openOnly=document.getElementById("b-openonly").checked;
+  const untriOnly=document.getElementById("b-untriaged").checked;
+  const flagged=document.getElementById("b-flagged").checked;
+  const hideMuted=document.getElementById("b-hidemuted").checked;
+  return bugList().filter(b=>{
+    if(!bugMatchesTab(b,bugTab)) return false;
+    if(openOnly && !b.open) return false;
+    if(untriOnly && (bugTri(b).state||"untriaged")!=="untriaged") return false;
+    if(flagged && !(b.flags||[]).length) return false;
+    if(hideMuted && b.watch==="muted") return false;
+    if(bugSigFilter.size && !bugSigFilter.has(b.signal)) return false;
+    if(owner && (b.assignee||"unassigned")!==owner) return false;
+    if(pri && b.priority!==pri) return false;
+    if(comp && !(b.components||[]).includes(comp)) return false;
+    if(fam && bugTri(b).family!==fam) return false;
+    if(q){
+      const hay=[b.key,b.summary,b.description,b.assignee,b.status,
+                 bugTri(b).root_cause,bugTri(b).next_step,b.family_title,
+                 (b.components||[]).join(" "),(b.labels||[]).join(" "),
+                 (b.notes||[]).join(" ")].join(" ").toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+function bugSortVal(b,key){
+  switch(key){
+    case "signal": return SIGNALS.indexOf(b.signal);
+    case "idle": return -(b.idle_days==null?-1:b.idle_days);
+    case "age": return -(b.age_days||0);
+    case "priority": { const i=JIRA_PRI_ORDER.indexOf(b.priority); return i<0?99:i; }
+    case "key": return b.key||"";
+    case "status": return b.status||"";
+    case "owner": return b.assignee||"~";
+    case "triage": return TRIAGE_STATES.indexOf(bugTri(b).state||"untriaged");
+    case "family": return bugTri(b).family||"~";
+    case "pings": return -(b.oded_pings||0);
+    case "ci": return -((b.ci_runs||[]).length);
+    case "summary": return (b.summary||"").toLowerCase();
+  }
+  return "";
+}
+const BUG_COLS=[
+  {key:"signal", label:""}, {key:"key", label:"Bug"}, {key:"summary", label:"Summary"},
+  {key:"priority", label:"Pri"}, {key:"status", label:"Status"}, {key:"owner", label:"Owner"},
+  {key:"idle", label:"Idle"}, {key:"age", label:"Age"}, {key:"pings", label:"\uD83D\uDCE3"},
+  {key:"ci", label:"CI"},
+  {key:"triage", label:"Triage"}, {key:"family", label:"Fam"}, {key:"flags", label:"Flags"},
+];
+function bugCell(b,key){
+  switch(key){
+    case "signal": return `<td title="${esc(b.signal)}">${SIGNAL_ICON[b.signal]||""}</td>`;
+    case "key": return `<td class="id"><a href="${esc(b.url)}" target="_blank" rel="noopener"
+        onclick="event.stopPropagation()">${esc(b.key)}</a></td>`;
+    case "summary": return `<td class="title-cell">${esc(b.summary)}${
+        b.family_title?`<div class="feature">🧬 ${esc(b.family_title)}</div>`:""}</td>`;
+    case "priority": return `<td><span class="badge p-${esc((b.priority||"").toLowerCase())}">${esc(b.priority||"—")}</span></td>`;
+    case "status": return `<td><span class="badge sg-${esc(b.signal)}">${esc(b.status||"—")}</span></td>`;
+    case "owner": return `<td>${esc(b.assignee||"unassigned")}</td>`;
+    case "idle": return `<td>${b.idle_days==null?"—":b.idle_days+"d"}</td>`;
+    case "age": return `<td>${b.age_days==null?"—":b.age_days+"d"}</td>`;
+    case "pings": { const n=b.oded_pings||0;
+      const man=b.manual_pings||0;
+      const src=man?` (${b.jira_pings||0} in Jira + ${man} manual)`:"";
+      return `<td title="Pings from Oded${src}${b.last_ping?` · last ${esc(b.last_ping)}`:""}"${
+        n?' style="font-weight:700;color:#c2410c;"':''}>${n||"—"}</td>`; }
+    case "ci": { const runs=b.ci_runs||[], r=runs[0];
+      if(!r) return `<td>—</td>`;
+      const more=runs.length>1?`<span class="feature">+${runs.length-1}</span>`:"";
+      return `<td><a href="${esc(r.url)}" target="_blank" rel="noopener"`
+        +` onclick="event.stopPropagation()"`
+        +` title="${esc(r.at+(r.station?" · "+r.station:""))}">run</a>${more}</td>`; }
+    case "triage": { const s=bugTri(b).state||"untriaged";
+      const v=bugTri(b).verdict;
+      return `<td><span class="badge tr-${esc(s)}">${esc(s)}</span>${v?`<div class="feature">${esc(v)}</div>`:""}</td>`; }
+    case "family": return `<td>${esc(bugTri(b).family||"—")}</td>`;
+    case "flags": return `<td>${(b.flags||[]).map(f=>
+        `<span class="flag${["untriaged","unassigned","overdue","pinged"].includes(f)?" warn":""}">${esc(f)}</span>`).join("")||"—"}</td>`;
+  }
+  return "<td></td>";
+}
+function bugDetail(b,span){
+  const t=bugTri(b), a=b.activity||{};
+  const opts=(list,cur)=>list.map(v=>`<option value="${esc(v)}"${v===cur?" selected":""}>${esc(v)}</option>`).join("");
+  const famOpts=bugFamilies().map(f=>
+    `<option value="${esc(f.id)}"${f.id===t.family?" selected":""}>${esc(f.id+" · "+f.title.slice(0,44))}</option>`).join("");
+  const editor=`
+    <div class="editor" data-key="${esc(b.key)}">
+      <h4>Triage &amp; monitoring — local only, never written to Jira</h4>
+      <div class="fields">
+        <label>Triage state<select class="b-state">${opts(TRIAGE_STATES,t.state||"untriaged")}</select></label>
+        <label>Verdict<select class="b-verdict"><option value="">—</option>${opts(TRIAGE_VERDICTS,t.verdict)}</select></label>
+        <label>Severity call<select class="b-severity"><option value="">—</option>${opts(BUG_SEVERITIES,t.severity_call)}</select></label>
+        <label>Family<select class="b-family2"><option value="">—</option>${famOpts}</select></label>
+        <label>Watch<select class="b-watch">${opts(WATCH_STATES,b.watch||"active")}</select></label>
+        <label>Pings from Oded<input type="number" class="b-pings" min="0" style="width:64px;" value="${b.oded_pings||0}" title="Overrides the auto-derived count until the next scan"></label>
+        <label>&nbsp;<button class="b-ping" title="Oded chased outside Jira — bump the manual counter and save">📣 +1 ping</button></label>
+      </div>
+      <div class="fields">
+        <label style="flex:1;">Root cause<input type="text" class="b-root" style="min-width:320px;" value="${esc(t.root_cause||"")}"></label>
+        <label style="flex:1;">Next step<input type="text" class="b-next" style="min-width:320px;" value="${esc(t.next_step||"")}"></label>
+        <label>Owner (driver)<input type="text" class="b-owner2" value="${esc(t.owner||"")}"></label>
+      </div>
+      <div class="fields">
+        <label style="flex:1;">Append note<textarea class="b-note" placeholder="What you observed / decided"></textarea></label>
+      </div>
+      <div class="actions">
+        <button class="primary b-save">Save</button>
+        <span class="msg"></span>
+        ${SERVED?"":'<span class="hint">read-only — run tm.py serve to edit</span>'}
+      </div>
+    </div>`;
+  return `<tr class="detail"><td colspan="${span}"><div class="detail-box">
+    <div class="kv">
+      <span><b>Jira</b> <a href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.key)}</a></span>
+      <span><b>Project</b> ${esc(b.project||"—")}</span>
+      <span><b>Reporter</b> ${esc(b.reporter||"—")}</span>
+      <span><b>Components</b> ${esc((b.components||[]).join(", ")||"—")}</span>
+      <span><b>Labels</b> ${esc((b.labels||[]).join(", ")||"—")}</span>
+    </div>
+    <div class="kv">
+      <span><b>Milestone</b> ${esc(b.milestone||"—")}</span>
+      <span><b>Sprint</b> ${esc((b.sprints||[]).join(", ")||"—")}</span>
+      <span><b>Estimate</b> ${b.estimate_h?esc(b.estimate_h)+"h":"—"}</span>
+      <span><b>Due</b> ${esc(b.duedate||"—")}</span>
+      <span><b>Created</b> ${esc(b.created||"—")}</span>
+      <span><b>First seen</b> ${esc(b.first_seen||"—")}</span>
+    </div>
+    <div class="kv">
+      <span><b>Last activity</b> ${esc(b.last_activity||"—")} (${b.idle_days==null?"—":b.idle_days+"d idle"})</span>
+      <span><b>Comments</b> ${esc(a.comment_count||0)}${a.last_comment?` (last ${esc(a.last_comment)} by ${esc(a.last_comment_by||"—")})`:""}</span>
+      <span><b>Field changes</b> ${esc(a.change_count||0)}</span>
+      <span><b>Last status change</b> ${esc(a.last_status_change||"—")}</span>
+      <span><b>Pings from Oded</b> ${b.oded_pings||0}${
+        b.manual_pings?` (${b.jira_pings||0} in Jira + ${b.manual_pings} manual)`:""}${
+        b.last_ping?` (last ${esc(b.last_ping)}${b.days_since_ping==null?"":`, ${b.days_since_ping}d ago`})`:""}</span>
+    </div>
+    ${(b.ci_runs||[]).length?`<div><h4>CI runs <span class="feature">scraped from Jira comments</span></h4><div class="kv">${
+      b.ci_runs.map(r=>`<span><a href="${esc(r.url)}" target="_blank" rel="noopener">run ${esc(r.run_id)}</a> ${esc(r.at)}${r.station?` · ${esc(r.station)}`:""}</span>`).join("")}</div></div>`:""}
+    ${(b.links||[]).length?`<div><h4>Jira links</h4><div class="kv">${
+      b.links.map(l=>`<span>${esc(l.type||"relates")} <a href="${JIRA_BASE}${esc(l.key)}" target="_blank" rel="noopener">${esc(l.key)}</a></span>`).join("")}</div></div>`:""}
+    ${b.description?`<div><h4>Description</h4><pre style="white-space:pre-wrap;margin:0;font-size:12px;">${esc(b.description)}</pre></div>`:""}
+    ${(b.changes||[]).length?`<div><h4>Observed changes</h4><ul class="notes">${
+      b.changes.slice(-6).reverse().map(c=>`<li>${esc(c.at)}: ${esc(c.diff.join("; "))}</li>`).join("")}</ul></div>`:""}
+    ${(b.notes||[]).length?`<div><h4>Notes</h4><ul class="notes">${
+      b.notes.slice(-8).reverse().map(n=>`<li>${esc(n)}</li>`).join("")}</ul></div>`:""}
+    ${editor}
+  </div></td></tr>`;
+}
+function wireBugEditor(row,b){
+  const ed=row.querySelector(".editor"); if(!ed) return;
+  const btn=ed.querySelector(".b-save"), msg=ed.querySelector(".msg");
+  const pingBtn=ed.querySelector(".b-ping");
+  if(!SERVED){ btn.disabled=true; if(pingBtn) pingBtn.disabled=true; return; }
+  async function post(payload,who){
+    who.disabled=true; msg.textContent="Saving…";
+    try{
+      const res=await fetch("/api/bug/"+encodeURIComponent(b.key),{
+        method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data=await res.json();
+      if(!res.ok){ msg.textContent="Error: "+(data.error||res.status); who.disabled=false; return; }
+      BUGS=data.bugs; buildBugFilters(); buildBugTabs(); buildSections(); renderBugs();
+      msg.textContent="Saved.";
+    }catch(err){ msg.textContent="Network error: "+err; who.disabled=false; }
+  }
+  btn.addEventListener("click",e=>{
+    e.stopPropagation();
+    post({
+      triage_state: ed.querySelector(".b-state").value,
+      verdict:      ed.querySelector(".b-verdict").value,
+      severity:     ed.querySelector(".b-severity").value,
+      family:       ed.querySelector(".b-family2").value,
+      watch:        ed.querySelector(".b-watch").value,
+      oded_pings:   ed.querySelector(".b-pings").value,
+      root_cause:   ed.querySelector(".b-root").value,
+      next_step:    ed.querySelector(".b-next").value,
+      owner:        ed.querySelector(".b-owner2").value,
+      note:         ed.querySelector(".b-note").value.trim(),
+    }, btn);
+  });
+  // Bumping a ping is its own one-click action so it never drags along a
+  // half-filled triage form.
+  pingBtn.addEventListener("click",e=>{ e.stopPropagation(); post({ping:1}, pingBtn); });
+  ed.querySelectorAll("select,input,textarea,button").forEach(el=>
+    el.addEventListener("click",e=>e.stopPropagation()));
+}
+function renderBugStats(){
+  const bugs=bugList(), open=bugs.filter(b=>b.open);
+  const n=f=>open.filter(f).length;
+  const cards=[
+    ["Open", open.length],
+    ["New", n(b=>b.is_new)],
+    ["Untriaged", n(b=>(bugTri(b).state||"untriaged")==="untriaged")],
+    ["Stalled", n(b=>["stalled","dormant"].includes(b.signal))],
+    ["Unassigned", n(b=>!b.assignee)],
+    ["Pinged", n(b=>b.oded_pings)],
+    ["Families", bugFamilies().filter(f=>f.status!=="closed").length],
+  ];
+  document.getElementById("bug-stats").innerHTML=cards.map(([l,v])=>
+    `<div class="stat"><div class="n">${v}</div><div class="l">${esc(l)}</div></div>`).join("");
+}
+function renderFamilies(){
+  const box=document.getElementById("famview");
+  const fams=bugFamilies();
+  if(!fams.length){
+    box.innerHTML=`<div class="empty">No duplicate families yet.<br>
+      Run <code>bm.py dups</code> to get proposals, then <code>bm.py family new …</code> to confirm one.</div>`;
+    return;
+  }
+  const byKey=Object.fromEntries(bugList().map(b=>[b.key,b]));
+  box.innerHTML='<div class="fam-grid">'+fams.map(f=>{
+    const members=(f.members||[]).map(k=>byKey[k]).filter(Boolean);
+    const openN=members.filter(m=>m.open).length;
+    return `<div class="fam-card${f.status==="closed"?" closed":""}">
+      <div class="fam-title">${esc(f.id)} · ${esc(f.title)}</div>
+      <div class="fam-meta">
+        <span>${esc(f.status||"open")}</span>
+        <span>${openN} open / ${(f.members||[]).length} members</span>
+        <span>primary ${esc(f.primary||"—")}</span>
+        ${f.created?`<span>since ${esc(f.created)}</span>`:""}
+      </div>
+      ${f.root_cause?`<div style="font-size:13px;"><b style="color:var(--muted);">Root cause</b> ${esc(f.root_cause)}</div>`:""}
+      <div class="fam-members">${(f.members||[]).map(k=>{
+        const m=byKey[k];
+        if(!m) return `<div class="m"><span>${esc(k)}</span><span class="feature">not in store</span></div>`;
+        return `<div class="m${k===f.primary?" primary":""}">
+          <span>${SIGNAL_ICON[m.signal]||""}</span>
+          <a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(k)}</a>
+          <span class="badge sg-${esc(m.signal)}">${esc(m.status||"—")}</span>
+          <span class="feature" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(m.summary)}</span>
+        </div>`;}).join("")}</div>
+      ${(f.notes||[]).length?`<ul class="notes">${f.notes.slice(-3).map(n=>`<li>${esc(n)}</li>`).join("")}</ul>`:""}
+    </div>`;}).join("")+'</div>';
+}
+function renderBugs(){
+  if(bugTab===FAM_TAB){ renderFamilies(); return; }
+  renderBugStats();
+  document.getElementById("bug-head").innerHTML=BUG_COLS.map(c=>{
+    const arr=bugSort.key===c.key?(bugSort.dir>0?"▲":"▼"):"";
+    return `<th data-bkey="${c.key}">${esc(c.label)}<span class="arr">${arr}</span></th>`;
+  }).join("");
+  document.querySelectorAll("#bug-head th").forEach(th=>th.addEventListener("click",()=>{
+    const k=th.dataset.bkey;
+    if(bugSort.key===k) bugSort.dir*=-1; else { bugSort.key=k; bugSort.dir=1; }
+    const dd=document.getElementById("b-sort");
+    if([...dd.options].some(o=>o.value===k)) dd.value=k;
+    renderBugs();
+  }));
+  const rows=bugFilters().slice().sort((x,y)=>{
+    const a=bugSortVal(x,bugSort.key), b=bugSortVal(y,bugSort.key);
+    return (a<b?-1:a>b?1:0)*bugSort.dir || (x.key<y.key?-1:1);
+  });
+  const body=document.getElementById("bug-body");
+  body.innerHTML="";
+  if(!rows.length){
+    body.innerHTML=`<tr><td class="empty" colspan="${BUG_COLS.length}">No bugs match the current filters.</td></tr>`;
+  }
+  rows.forEach(b=>{
+    const tr=document.createElement("tr"); tr.className="task";
+    tr.innerHTML=BUG_COLS.map(c=>bugCell(b,c.key)).join("");
+    const tpl=document.createElement("template");
+    tpl.innerHTML=bugDetail(b,BUG_COLS.length);
+    const det=tpl.content.firstChild; det.style.display="none";
+    tr.addEventListener("click",()=>{
+      const show=det.style.display==="none";
+      det.style.display=show?"":"none";
+      if(show) wireBugEditor(det,b);
+    });
+    body.appendChild(tr); body.appendChild(det);
+  });
+  document.getElementById("bug-count").textContent=
+    `Showing ${rows.length} of ${bugList().length} bugs`;
+}
+["bq","b-owner","b-priority","b-component","b-family"].forEach(id=>{
+  const el=document.getElementById(id);
+  el.addEventListener(id==="bq"?"input":"change",renderBugs);
+});
+document.getElementById("b-sort").addEventListener("change",e=>{
+  bugSort.key=e.target.value; bugSort.dir=1; renderBugs(); });
+["b-openonly","b-untriaged","b-flagged","b-hidemuted"].forEach(id=>{
+  const cb=document.getElementById(id);
+  cb.addEventListener("change",()=>{ cb.closest(".chip").classList.toggle("on",cb.checked); renderBugs(); });
+});
+document.getElementById("b-reset").addEventListener("click",()=>{
+  document.getElementById("bq").value="";
+  ["b-owner","b-priority","b-component","b-family"].forEach(id=>{document.getElementById(id).value="";});
+  document.querySelectorAll("#bug-signals input[data-sig]").forEach(cb=>{
+    cb.checked=false; cb.closest(".chip").classList.remove("on"); });
+  bugSigFilter.clear();
+  [["b-untriaged",false],["b-flagged",false]].forEach(([id,on])=>{
+    const cb=document.getElementById(id); cb.checked=on; cb.closest(".chip").classList.toggle("on",on); });
+  applyBugTabPreset(bugTab);
+  bugSort.key="signal"; bugSort.dir=1; document.getElementById("b-sort").value="signal";
+  renderBugs();
+});
+
+// ============================================================================
+// Overview storefront — team status at a glance. Everything is derived from
+// data already on the page; no extra fetches and no Jira calls.
+// ============================================================================
+// Power BI default theme palette — categorical, high contrast, colour-safe order.
+const PALETTE = ["#118DFF","#E66C37","#6B007B","#E044A7","#744EC2","#D9B300",
+                 "#12239E","#1AAB40","#D64550","#197278","#3599B8","#9B9B9B"];
+const PBI = {blue:"#118DFF", navy:"#12239E", orange:"#E66C37", purple:"#6B007B",
+             pink:"#E044A7", violet:"#744EC2", gold:"#D9B300", green:"#1AAB40",
+             red:"#D64550", teal:"#197278", grey:"#9B9B9B"};
+const RAG_RANK = {red:0, orange:1, yellow:2, green:3};
+
+function ovIps(){ return (OVERVIEW && OVERVIEW.ips) || []; }
+function ipOf(b){
+  const comps=(b.components||[]).map(c=>String(c).toLowerCase());
+  for(const ip of ovIps())
+    if(comps.some(c=>(ip.hints||[]).some(h=>c.includes(String(h).toLowerCase())))) return ip.name;
+  return "Other";
+}
+function daysUntil(iso){
+  if(!iso) return null;
+  return Math.round((new Date(iso+"T00:00:00") - new Date(new Date().toDateString()))/86400000);
+}
+// Local-calendar YYYY-MM-DD. toISOString() would shift by the UTC offset and
+// silently misplace "today" for anyone east of Greenwich.
+function isoDay(d){
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")
+         +"-"+String(d.getDate()).padStart(2,"0");
+}
+
+// ---- SVG primitives -------------------------------------------------------
+// Charts render as ONE svg with an intrinsic viewBox and no explicit height, so
+// they scale proportionally inside the tile. That keeps text crisp and removes
+// the plot/label alignment drift a split-svg layout suffers from.
+function svgDonut(segs, size, thick, capt){
+  size=size||152; thick=thick||20;
+  const total=segs.reduce((a,s)=>a+s.v,0);
+  const cx=size/2, r=(size-thick)/2, circ=2*Math.PI*r;
+  let off=0;
+  const arcs=segs.filter(s=>s.v>0).map(s=>{
+    const len=total?circ*s.v/total:0;
+    const el='<circle class="seg" cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="'+s.c+'" stroke-width="'+thick+'"'
+      +' stroke-dasharray="'+len.toFixed(2)+' '+(circ-len).toFixed(2)+'" stroke-dashoffset="'+(-off).toFixed(2)+'">'
+      +'<title>'+esc(s.l)+': '+s.v+(total?' ('+Math.round(100*s.v/total)+'%)':'')+'</title></circle>';
+    off+=len; return el;
+  }).join("");
+  return '<svg class="donut" width="'+size+'" height="'+size+'" viewBox="0 0 '+size+' '+size+'" style="flex:none;">'
+    +'<g transform="rotate(-90 '+cx+' '+cx+')">'
+    +'<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="var(--track)" stroke-width="'+thick+'"/>'
+    +arcs+'</g>'
+    +'<text x="'+cx+'" y="'+(cx-2)+'" text-anchor="middle" dominant-baseline="middle"'
+    +' style="font:800 30px system-ui;fill:var(--text);">'+total+'</text>'
+    +'<text x="'+cx+'" y="'+(cx+20)+'" text-anchor="middle" dominant-baseline="middle"'
+    +' style="font:700 9px system-ui;fill:var(--muted);letter-spacing:.12em;">'
+    +esc(capt||"OPEN")+'</text></svg>';
+}
+// Semicircular gauge — the Power BI KPI staple. Value is a percentage.
+function svgGauge(pct, label, color, sub){
+  pct=Math.max(0,Math.min(100,pct||0));
+  const w=200, h=124, cx=w/2, cy=104, r=76, t=18;
+  const pt=(deg,rad)=>[cx+rad*Math.cos(Math.PI*deg/180), cy+rad*Math.sin(Math.PI*deg/180)];
+  const arc=(from,to,rad,col,width)=>{
+    const a=pt(from,rad), b=pt(to,rad);
+    return '<path d="M'+a[0].toFixed(1)+' '+a[1].toFixed(1)+' A'+rad+' '+rad+' 0 '
+      +((to-from)>180?1:0)+' 1 '+b[0].toFixed(1)+' '+b[1].toFixed(1)+'" fill="none" stroke="'+col
+      +'" stroke-width="'+width+'" stroke-linecap="round"/>';
+  };
+  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;max-width:220px;margin:0 auto;">'
+    +arc(180,359.9,r,"var(--track)",t)
+    +(pct>0.6?arc(180,180+180*pct/100,r,color,t):"")
+    +'<text x="'+cx+'" y="'+(cy-18)+'" text-anchor="middle" style="font:800 32px system-ui;fill:'+color+';">'
+      +Math.round(pct)+'<tspan style="font:700 15px system-ui;">%</tspan></text>'
+    +'<text x="'+cx+'" y="'+(cy-1)+'" text-anchor="middle" style="font:700 10px system-ui;fill:var(--muted);letter-spacing:.07em;">'
+      +esc(label||"")+'</text>'
+    +'<text x="'+(cx-r)+'" y="'+(cy+17)+'" text-anchor="middle" style="font:9px system-ui;fill:var(--muted);">0</text>'
+    +'<text x="'+(cx+r)+'" y="'+(cy+17)+'" text-anchor="middle" style="font:9px system-ui;fill:var(--muted);">100</text>'
+    +'<title>'+esc(sub||label||"")+'</title></svg>';
+}
+function svgLegend(segs, total){
+  return segs.filter(s=>s.v>0).map(s=>'<div class="li">'
+    +'<span class="sw" style="background:'+s.c+'"></span>'
+    +'<span style="overflow:hidden;text-overflow:ellipsis;">'+esc(s.l)+'</span>'
+    +'<span class="v">'+s.v+(total?' \u00b7 '+Math.round(100*s.v/total)+'%':'')+'</span></div>').join("");
+}
+// Stacked area over a daily x-axis. series = [{l,c,vals:[]}], stacked bottom-up.
+function svgStackedArea(labels, series, w, h){
+  w=w||780; h=h||250;
+  const L=34, R=58, T=14, B=34, iw=w-L-R, ih=h-T-B, n=labels.length;
+  if(!n) return '<div class="empty">No history yet.</div>';
+  const tops=labels.map((_,i)=>series.reduce((a,s)=>a+(s.vals[i]||0),0));
+  const max=Math.max(1,...tops);
+  const X=i=>L+(n===1?iw/2:iw*i/(n-1));
+  const Y=v=>T+ih-ih*v/max;
+  const uid="g"+Math.random().toString(36).slice(2,8);
+  const defs=[], bands=[], caps=[];
+  let base=labels.map(()=>0);
+  series.forEach((s,si)=>{
+    const top=labels.map((_,i)=>base[i]+(s.vals[i]||0));
+    const up=top.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(" ");
+    const down=base.map((_,i)=>X(n-1-i).toFixed(1)+','+Y(base[n-1-i]).toFixed(1)).join(" ");
+    defs.push('<linearGradient id="'+uid+si+'" x1="0" y1="0" x2="0" y2="1">'
+      +'<stop offset="0%" stop-color="'+s.c+'" stop-opacity=".95"/>'
+      +'<stop offset="100%" stop-color="'+s.c+'" stop-opacity=".55"/></linearGradient>');
+    bands.push('<polygon points="'+up+' '+down+'" fill="url(#'+uid+si+')"/>'
+      +'<polyline points="'+up+'" fill="none" stroke="'+s.c+'" stroke-width="2" stroke-linejoin="round"/>');
+    const ly=Math.max(T+12,(Y(top[n-1])+Y(base[n-1]))/2);
+    caps.push('<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(top[n-1]).toFixed(1)+'" r="3.6" fill="'+s.c
+      +'" stroke="var(--panel)" stroke-width="1.6"/>'
+      +'<text x="'+(w-R+9)+'" y="'+(ly+3).toFixed(1)+'" style="font:800 15px system-ui;fill:'+s.c+';">'
+      +(s.vals[n-1]||0)+'</text>'
+      +'<text x="'+(w-R+9)+'" y="'+(ly+15).toFixed(1)+'" style="font:700 8.5px system-ui;fill:var(--muted);letter-spacing:.1em;">'
+      +esc(s.l.toUpperCase())+'</text>');
+    base=top;
+  });
+  const ticks=[0,.5,1].map(f=>{
+    const v=Math.round(max*f);
+    return '<line x1="'+L+'" y1="'+Y(v)+'" x2="'+(w-R)+'" y2="'+Y(v)+'" stroke="var(--grid)"/>'
+      +'<text x="'+(L-7)+'" y="'+(Y(v)+3.5)+'" text-anchor="end" style="font:10px system-ui;fill:var(--muted);">'+v+'</text>';
+  }).join("");
+  const step=Math.max(1,Math.floor(n/6));
+  const xlab=labels.map((d,i)=>(i%step===0||i===n-1)
+    ? '<text x="'+X(i)+'" y="'+(T+ih+17)+'" text-anchor="middle" style="font:10px system-ui;fill:var(--muted);">'
+      +d.slice(5).replace("-","/")+'</text>' : "").join("");
+  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;">'
+    +'<defs>'+defs.join("")+'</defs>'+ticks+bands.join("")+caps.join("")
+    +'<line x1="'+L+'" y1="'+(T+ih)+'" x2="'+(w-R)+'" y2="'+(T+ih)+'" stroke="var(--border)"/>'
+    +xlab+'</svg>';
+}
+// Horizontal bar visual — category and value share a header line above the bar.
+function barTable(rows, max){
+  if(!rows.length) return '<div class="empty">Nothing to show.</div>';
+  const m=Math.max(1,max);
+  return '<div class="hbars">'+rows.map(r=>'<div class="hb">'
+    +'<div class="hb-t"><span>'+esc(r.l)+'</span><b>'+r.v+'</b></div>'
+    +'<div class="hb-r"><i style="width:'+(100*r.v/m).toFixed(1)+'%;background:'+(r.c||PBI.blue)+';"></i></div>'
+    +(r.sub?'<div class="hb-s">'+esc(r.sub)+'</div>':'')
+    +'</div>').join("")+'</div>';
+}
+// Axis-less inline trend line. Colour carries a second dimension (the signal).
+function svgSparkline(vals, color, w, h){
+  w=w||104; h=h||26;
+  if(!vals || vals.length<2) return '<span style="color:var(--muted);">\u2014</span>';
+  const n=vals.length, max=Math.max(1,...vals);
+  const X=i=>1.5+(w-3)*i/(n-1), Y=v=>h-2-(h-6)*v/max;
+  const pts=vals.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(" ");
+  const last=vals[n-1], first=vals[0];
+  const delta=last-first;
+  return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" style="vertical-align:middle;display:block;">'
+    +'<polygon points="'+X(0).toFixed(1)+','+(h-1)+' '+pts+' '+X(n-1).toFixed(1)+','+(h-1)+'"'
+      +' fill="'+color+'" fill-opacity=".15"/>'
+    +'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.6"'
+      +' stroke-linejoin="round" stroke-linecap="round"/>'
+    +'<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(last).toFixed(1)+'" r="2.4" fill="'+color+'"/>'
+    +'<title>'+first+' \u2192 '+last+' open over '+n+' weeks (peak '+max+', '
+      +(delta>0?"+"+delta:delta===0?"flat":delta)+')</title></svg>';
+}
+// Column visual with data labels and a dashed average line.
+function svgBars(items, ref, unit, w, h){
+  w=w||780; h=h||250;
+  const L=34, R=12, T=24, B=44, iw=w-L-R, ih=h-T-B, n=items.length;
+  if(!n) return '<div class="empty">Nothing to show.</div>';
+  const max=Math.max(1, ...items.map(i=>i.v), ref||0)*1.14;
+  const bw=Math.min(74, (iw/n)*0.56);
+  const X=i=>L+iw*(i+0.5)/n, Y=v=>T+ih-ih*v/max;
+  const ticks=[0,.5,1].map(f=>{
+    const v=Math.round(max*f);
+    return '<line x1="'+L+'" y1="'+Y(v)+'" x2="'+(w-R)+'" y2="'+Y(v)+'" stroke="var(--grid)"/>'
+      +'<text x="'+(L-7)+'" y="'+(Y(v)+3.5)+'" text-anchor="end" style="font:10px system-ui;fill:var(--muted);">'+v+'</text>';
+  }).join("");
+  const bars=items.map((it,i)=>{
+    if(!it.v) return '<text x="'+X(i)+'" y="'+(T+ih-7)+'" text-anchor="middle"'
+      +' style="font:12px system-ui;fill:var(--muted);">\u2013</text>';
+    return '<rect class="col" x="'+(X(i)-bw/2).toFixed(1)+'" y="'+Y(it.v).toFixed(1)+'" width="'+bw.toFixed(1)
+      +'" height="'+(T+ih-Y(it.v)).toFixed(1)+'" rx="4" fill="'+(it.c||PBI.blue)+'">'
+      +'<title>'+esc(it.label)+': '+it.v+unit+(it.sub?' ('+esc(it.sub)+')':'')+'</title></rect>'
+      +'<text x="'+X(i)+'" y="'+(Y(it.v)-8).toFixed(1)+'" text-anchor="middle"'
+      +' style="font:800 13px system-ui;fill:var(--text);">'+it.v+'</text>';
+  }).join("");
+  const refline=ref ? '<line x1="'+L+'" y1="'+Y(ref)+'" x2="'+(w-R)+'" y2="'+Y(ref)
+      +'" stroke="'+PBI.red+'" stroke-width="1.4" stroke-dasharray="6 4"/>'
+      +'<text x="'+(w-R)+'" y="'+(Y(ref)-6)+'" text-anchor="end"'
+      +' style="font:800 9px system-ui;fill:'+PBI.red+';letter-spacing:.08em;">AVG '+ref+unit+'</text>' : "";
+  const xlab=items.map((it,i)=>'<text x="'+X(i)+'" y="'+(T+ih+18)+'" text-anchor="middle"'
+      +' style="font:700 11px system-ui;fill:var(--text);">'+esc(it.label)+'</text>'
+    +'<text x="'+X(i)+'" y="'+(T+ih+31)+'" text-anchor="middle"'
+      +' style="font:9.5px system-ui;fill:var(--muted);">'+esc(it.sub||"")+'</text>').join("");
+  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;">'
+    +ticks+bars+refline
+    +'<line x1="'+L+'" y1="'+(T+ih)+'" x2="'+(w-R)+'" y2="'+(T+ih)+'" stroke="var(--border)"/>'
+    +xlab+'</svg>';
+}
+
+// ---- derived series -------------------------------------------------------
+function ovBugFlow(){
+  const bugs=bugList();
+  if(!bugs.length) return {labels:[], series:[]};
+  const days=90, today=new Date(new Date().toDateString());
+  // Closed bugs occasionally lack a resolution date; fall back to when they
+  // last entered their current status so the burn-up still balances.
+  const pts=bugs.map(b=>({
+    c:(b.created||"").slice(0,10),
+    r:(b.resolved || (b.open?null:(b.status_since||b.updated)) || "").slice(0,10),
+  })).filter(p=>p.c);
+  const labels=[], open=[], closed=[];
+  for(let i=days-1;i>=0;i--){
+    const d=new Date(today); d.setDate(d.getDate()-i);
+    const iso=isoDay(d);
+    let c=0, o=0;
+    pts.forEach(p=>{
+      if(p.c>iso) return;
+      if(p.r && p.r<=iso) c++; else o++;
+    });
+    labels.push(iso); closed.push(c); open.push(o);
+  }
+  return {labels, series:[
+    {l:"Closed", c:"#16a34a", vals:closed},
+    {l:"Open",   c:"#2563eb", vals:open},
+  ]};
+}
+const MONTH_ABBR=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+// Days from created \u2192 resolved, bucketed by the month the bug CLOSED. Bucketing
+// by close date (not open date) keeps every bucket final \u2014 it can never move.
+function ovCloseTime(months){
+  months=months||6;
+  const byMonth={};
+  bugList().forEach(b=>{
+    if(b.open) return;
+    const c=(b.created||"").slice(0,10);
+    const r=(b.resolved || b.status_since || b.updated || "").slice(0,10);
+    if(!c || !r) return;
+    const d=Math.max(0, Math.round((new Date(r+"T00:00:00")-new Date(c+"T00:00:00"))/86400000));
+    (byMonth[r.slice(0,7)] = byMonth[r.slice(0,7)] || []).push(d);
+  });
+  const now=new Date(), out=[];
+  for(let i=months-1;i>=0;i--){
+    const d=new Date(now.getFullYear(), now.getMonth()-i, 1);
+    const vals=(byMonth[d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")]||[])
+      .slice().sort((a,b)=>a-b);
+    const mean=vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : 0;
+    out.push({label:MONTH_ABBR[d.getMonth()], v:Math.round(mean*10)/10, n:vals.length,
+              sub:vals.length?vals.length+" closed":"", 
+              median:vals.length?vals[Math.floor(vals.length/2)]:0});
+  }
+  return out;
+}
+// Weekly open-bug count per IP \u2014 the shape of each IP's load over time.
+function ovIpTrend(weeks){
+  weeks=weeks||12;
+  const pts=bugList().map(b=>({ip:ipOf(b),
+    c:(b.created||"").slice(0,10),
+    r:(b.resolved || (b.open?null:(b.status_since||b.updated)) || "").slice(0,10)}))
+    .filter(p=>p.c);
+  const today=new Date(new Date().toDateString()), labels=[];
+  for(let i=weeks-1;i>=0;i--){ const d=new Date(today); d.setDate(d.getDate()-i*7); labels.push(isoDay(d)); }
+  const byIp={};
+  pts.forEach(p=>{ byIp[p.ip]=byIp[p.ip]||labels.map(()=>0); });
+  labels.forEach((iso,i)=>pts.forEach(p=>{
+    if(p.c<=iso && !(p.r && p.r<=iso)) byIp[p.ip][i]++;
+  }));
+  return {labels, byIp};
+}
+function ovReviewTasks(){
+  return TASKS.filter(t=>t.category==="code-review" && !["done","cancelled"].includes(t.status));
+}function ovReviewRows(){
+  const cnt={};
+  ovReviewTasks().forEach(t=>{ const p=prs(t); if(!p.length) return;
+    const s=consolidateReviewStatus(p); cnt[s]=(cnt[s]||0)+1; });
+  const colors={pending:"#9B9B9B","in-progress":"#D9B300",commented:"#118DFF",
+    "changes-requested":"#D64550","waiting-for-author":"#E66C37",
+    "waiting-for-re-review":"#744EC2",approved:"#1AAB40",merged:"#197278"};
+  return RV_ORDER.filter(s=>cnt[s]).map(s=>({l:s, v:cnt[s], c:colors[s]}));
+}
+
+// ---- development hygiene ---------------------------------------------------
+// Each rule is "bad out of total"; a rule with no population is skipped rather
+// than scored, so an empty PR queue can't flatter the score.
+const HYG_STALE_PR_DAYS = 7;
+const HYG_REVIEW_SLA_DAYS = 3;
+
+function hygieneRules(){
+  const feats=(PRS.features||[]).filter(f=>!f.complete);
+  const prsAll=[].concat.apply([], feats.map(f=>f.prs||[]));
+  const live=prsAll.filter(p=>!["merged","closed"].includes(p.status));
+  const rvTasks=ovReviewTasks().filter(t=>prs(t).length);
+  const rvWaiting=rvTasks.filter(t=>
+    !["approved","merged","waiting-for-author"].includes(consolidateReviewStatus(prs(t))));
+  const inProgress=TASKS.filter(t=>t.status==="in-progress");
+
+  const rule=(label,bad,total,hint)=>({label, bad, total, hint});
+  return [
+    rule("CI green on open PRs",
+         live.filter(p=>p.status==="ci-fail").length, live.length,
+         "red checks block every reviewer behind you"),
+    rule("Rebased on target",
+         live.filter(p=>p.status==="needs-rebase").length, live.length,
+         "behind or conflicting with the base branch"),
+    rule("Approved PRs landed",
+         live.filter(p=>p.status==="approved").length, live.length,
+         "approved but still not merged"),
+    rule("PRs moving",
+         live.filter(p=>{const d=daysSince((p.updated||"").slice(0,10));
+                         return d!=null && d>=HYG_STALE_PR_DAYS;}).length, live.length,
+         "no activity for "+HYG_STALE_PR_DAYS+"+ days"),
+    rule("Features PLDM-tested",
+         feats.filter(f=>!f.pldm||f.pldm==="not-tested").length, feats.length,
+         "never exercised on Palladium"),
+    rule("Reviews answered in "+HYG_REVIEW_SLA_DAYS+"d",
+         rvWaiting.filter(t=>{const d=daysSince(t.updated); return d!=null && d>HYG_REVIEW_SLA_DAYS;}).length,
+         rvWaiting.length, "waiting on me past the turnaround target"),
+    rule("WIP bound to a workspace",
+         inProgress.filter(t=>!t.workspace).length, inProgress.length,
+         "in-progress with no checkout assigned"),
+  ].filter(r=>r.total>0);
+}
+
+function renderHygiene(){
+  const rules=hygieneRules();
+  const box=document.getElementById("ov-hygiene");
+  if(!rules.length){
+    document.getElementById("ov-hyg-score").innerHTML="";
+    box.innerHTML='<div class="empty">Nothing in flight to measure.</div>';
+    return;
+  }
+  const totBad=rules.reduce((a,r)=>a+r.bad,0), totAll=rules.reduce((a,r)=>a+r.total,0);
+  const score=Math.round(100*(1-totBad/Math.max(1,totAll)));
+  const sc=score>=85?PBI.green:score>=65?PBI.gold:PBI.red;
+  document.getElementById("ov-hyg-score").innerHTML=
+    svgGauge(score,"Pipeline clean",sc,totBad+" of "+totAll+" checks failing");
+
+  box.innerHTML=rules.map(r=>{
+    const pct=Math.round(100*r.bad/r.total);
+    const c=r.bad===0?PBI.green:pct>=34?PBI.red:PBI.gold;
+    return '<div class="hyg" style="--hc:'+c+'">'
+      +'<div class="hyg-h"><span class="hyg-l">'+esc(r.label)+'</span>'
+      +'<span class="hyg-n">'+(r.total-r.bad)+' / '+r.total+'</span></div>'
+      +'<div class="hyg-bar"><i style="width:'+(100-pct)+'%"></i></div>'
+      +'<div class="hyg-s">'+(r.bad?'<b>'+r.bad+'</b> '+esc(r.hint):"all clear")+'</div>'
+      +'</div>';
+  }).join("");
+}
+
+// ---- render ---------------------------------------------------------------
+function renderOverview(){
+  const bugs=bugList(), open=bugs.filter(b=>b.open);
+  const attention=open.filter(bugNeedsAttention);
+  const trend=ovIpTrend(12);
+  const raid=((OVERVIEW&&OVERVIEW.raid)||[]).filter(r=>!r.closed);
+  const raidHot=raid.filter(r=>["red","orange"].includes(r.rag));
+  const rvRows=ovReviewRows();
+  const rvTotal=rvRows.reduce((a,r)=>a+r.v,0);
+  const rvOpen=rvRows.filter(r=>!["merged","approved"].includes(r.l)).reduce((a,r)=>a+r.v,0);
+  const activeTasks=TASKS.filter(t=>!["done","cancelled"].includes(t.status));
+  const prog=(OVERVIEW&&OVERVIEW.program)||{};
+  const slots=(WORKSPACES&&WORKSPACES.slots)||{};
+  const slotNames=Object.keys(slots);
+  const busy=slotNames.filter(k=>slots[k]&&slots[k].holder).length;
+  const today=isoDay(new Date());
+
+  // --- KPI band ---
+  const po=daysUntil(prog.power_on), a1=daysUntil(prog.a1_delivery);
+  const kpi=o=>'<div class="kpi" style="--k:'+o.c+'">'
+    +(o.spark?'<div class="spark">'+o.spark+'</div>':'')
+    +'<div class="l">'+esc(o.label)+'</div>'
+    +'<div class="n">'+o.n+(o.unit?'<small>'+esc(o.unit)+'</small>':'')+'</div>'
+    +'<div class="s">'+(o.sub||"")+'</div>'
+    +(o.pct==null?'':'<div class="bar"><i style="width:'+Math.max(0,Math.min(100,o.pct)).toFixed(0)+'%"></i></div>')
+    +'</div>';
+  // Program progress: how far into the window that ends at power-on, taking the
+  // same-length run-up before it as the start of the window.
+  const span=(po!=null)?100*(1-Math.max(0,po)/Math.max(1,po+60)):null;
+  const openTrend=Object.values(trend.byIp).reduce((acc,v)=>
+    v.map((x,i)=>x+(acc[i]||0)), []);
+  document.getElementById("ov-kpis").innerHTML=[
+    kpi({c:po!=null&&po<21?PBI.red:(po!=null&&po<45?PBI.orange:PBI.blue), label:"Power-on",
+         n:po==null?"\u2014":po, unit:"days", pct:span,
+         sub:esc(prog.power_on||"date unknown")+" \u00b7 A1 silicon"}),
+    kpi({c:a1!=null&&a1<45?PBI.orange:PBI.navy, label:"A1 big delivery",
+         n:a1==null?"\u2014":a1, unit:"days",
+         sub:esc(prog.a1_delivery||"date unknown")+" \u00b7 end of MS8"}),
+    kpi({c:attention.length?PBI.orange:PBI.green, label:"Open bugs", n:open.length,
+         sub:attention.length+" need attention",
+         pct:open.length?100*attention.length/open.length:0,
+         spark:openTrend.length>1?svgSparkline(openTrend,
+           attention.length?PBI.orange:PBI.green, 150, 44):""}),
+    kpi({c:rvOpen>6?PBI.orange:PBI.teal, label:"Reviews on me", n:rvOpen,
+         sub:rvTotal+" PR group"+(rvTotal===1?"":"s")+" in queue"}),
+    kpi({c:raidHot.length?PBI.red:PBI.violet, label:"RAID open", n:raid.length,
+         sub:raidHot.length+" red / orange",
+         pct:raid.length?100*raidHot.length/raid.length:0}),
+    kpi({c:PBI.purple, label:"Workspaces", n:busy+'<small>/'+slotNames.length+'</small>',
+         sub:activeTasks.length+" active tasks",
+         pct:slotNames.length?100*busy/slotNames.length:0}),
+  ].join("");
+
+  // --- report header + sprint slicer ---
+  const curSprint=(prog.sprints||[]).find(s=>s.start&&s.end&&s.start<=today&&today<=s.end);
+  document.getElementById("ov-asof").innerHTML=
+    "As of <b>"+esc(today)+"</b> \u00b7 "+bugs.length+" bugs mirrored \u00b7 "
+    +(curSprint?"sprint <b>"+esc(curSprint.name)+"</b>":"between sprints")
+    +" \u00b7 "+(SERVED?"live":"static snapshot");
+  document.getElementById("ov-sprints").innerHTML='<span class="sl-l">Sprint</span>'
+    +(prog.sprints||[]).map(s=>{
+      const now=s.start&&s.end&&s.start<=today&&today<=s.end;
+      return '<div class="sprint'+(now?" now":"")+'">'+esc(s.name)
+        +'<span class="w">'+esc(s.window)+'</span></div>';
+    }).join("");
+
+  // --- bug flow ---
+  const flow=ovBugFlow();
+  document.getElementById("ov-bugflow").innerHTML=svgStackedArea(flow.labels, flow.series);
+
+  // --- backlog health gauges ---
+  const gPct=(f)=>open.length?100*open.filter(f).length/open.length:0;
+  const triaged=gPct(b=>(bugTri(b).state||"untriaged")!=="untriaged");
+  const planned=gPct(b=>!(b.flags||[]).some(f=>f==="no-milestone"||f==="no-sprint"));
+  const owned=gPct(b=>!!b.assignee);
+  const gcol=p=>p>=80?PBI.green:p>=50?PBI.gold:PBI.red;
+  document.getElementById("ov-gauges").innerHTML=open.length
+    ? '<div style="display:grid;gap:10px;">'
+      +svgGauge(triaged,"TRIAGED",gcol(triaged),
+         Math.round(triaged*open.length/100)+" of "+open.length+" open bugs have left untriaged")
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">'
+      +svgGauge(planned,"PLANNED",gcol(planned),"Has both a milestone and a sprint")
+      +svgGauge(owned,"ASSIGNED",gcol(owned),"Has an assignee in Jira")
+      +'</div></div>'
+    : '<div class="empty">No open bugs.</div>';
+
+  // --- mean time to close ---
+  const ttc=ovCloseTime(6), ttcLive=ttc.filter(m=>m.n);
+  const ttcAll=ttcLive.reduce((a,m)=>a+m.v*m.n,0)/Math.max(1,ttcLive.reduce((a,m)=>a+m.n,0));
+  document.getElementById("ov-ttc").innerHTML=ttcLive.length
+    ? svgBars(ttc.map(m=>({...m, c:m.v>ttcAll?"#f97316":"#2563eb"})), Math.round(ttcAll*10)/10, "d")
+    : '<div class="empty">No bugs closed in the last 6 months.</div>';
+  if(ttcLive.length){
+    const last=ttcLive[ttcLive.length-1], prev=ttcLive[ttcLive.length-2];
+    const dir=!prev ? "" : last.v<prev.v ? " \u2193 faster than "+prev.label
+            : last.v>prev.v ? " \u2191 slower than "+prev.label : " \u2192 flat vs "+prev.label;
+    document.getElementById("ov-ttc-cap").textContent=
+      "Days from created to resolved, by close month. Dashed line = "
+      +Math.round(ttcAll)+"d average." + dir + ". Bars above average are orange.";
+  }
+
+  // --- donuts ---
+  const byIp={}; open.forEach(b=>{ const k=ipOf(b); byIp[k]=(byIp[k]||0)+1; });
+  const ipSegs=Object.entries(byIp).sort((a,b)=>b[1]-a[1])
+    .map((e,i)=>({l:e[0], v:e[1], c:PALETTE[i%PALETTE.length]}));
+  document.getElementById("ov-bugip").innerHTML=svgDonut(ipSegs);
+  document.getElementById("ov-bugip-lg").innerHTML=svgLegend(ipSegs, open.length);
+
+  const byOwner={}; open.forEach(b=>{ const k=b.assignee||"Unassigned"; byOwner[k]=(byOwner[k]||0)+1; });
+  const ownerSegs=Object.entries(byOwner).sort((a,b)=>b[1]-a[1])
+    .map((e,i)=>({l:e[0], v:e[1], c:e[0]==="Unassigned"?"#9ca3af":PALETTE[i%PALETTE.length]}));
+  document.getElementById("ov-bugowner").innerHTML=svgDonut(ownerSegs);
+  document.getElementById("ov-bugowner-lg").innerHTML=svgLegend(ownerSegs, open.length);
+
+  // --- per-IP scoreboard ---
+  const rvByIp={};
+  ovReviewTasks().forEach(t=>{
+    const hay=((t.title||"")+" "+(t.description||"")+" "
+      +prs(t).map(p=>p.repo||"").join(" ")).toLowerCase();
+    const ip=ovIps().find(i=>(i.hints||[]).some(h=>hay.includes(String(h).toLowerCase())));
+    const k=ip?ip.name:"Other"; rvByIp[k]=(rvByIp[k]||0)+1;
+  });
+  const rows=ovIps().map(i=>i.name).concat(["Other"]).map(name=>{
+    const mine=open.filter(b=>ipOf(b)===name);
+    const worst=mine.length?Math.min(...mine.map(b=>{
+      const ix=SIGNALS.indexOf(b.signal); return ix<0?99:ix; })):99;
+    return {name, owner:((ovIps().find(i=>i.name===name)||{}).owners)||"\u2014",
+            n:mine.length, att:mine.filter(bugNeedsAttention).length,
+            worst:worst<SIGNALS.length?SIGNALS[worst]:null,
+            idle:mine.length?Math.max(...mine.map(b=>b.idle_days||0)):null,
+            rv:rvByIp[name]||0};
+  }).filter(r=>r.n||r.rv);
+  document.getElementById("ov-scoreboard").innerHTML=rows.length
+    ? '<table class="sb"><thead><tr><th>IP</th><th class="num">Bugs</th><th class="num">Attn</th>'
+      +'<th class="num">Max idle</th><th class="num">Reviews</th><th>12-week trend</th></tr></thead><tbody>'
+      +rows.map(r=>'<tr><td><b>'+esc(r.name)+'</b><div class="who">'+esc(r.owner)+'</div></td>'
+        +'<td class="num">'+(r.n||"\u2014")+'</td>'
+        +'<td class="num"'+(r.att?' style="color:'+PBI.orange+';"':'')+'>'+(r.att||"\u2014")+'</td>'
+        +'<td class="num">'+(r.idle==null?"\u2014":r.idle+"d")+'</td>'
+        +'<td class="num">'+(r.rv||"\u2014")+'</td>'
+        +'<td style="width:130px;">'+svgSparkline(trend.byIp[r.name],
+            SIGNAL_COLOR[r.worst]||"#9ca3af")+'</td></tr>').join("")
+      +'</tbody></table>'
+      +'<p class="cap" style="margin:8px 0 0;">Line = open bugs per week. '
+      +'Colour = worst signal in that IP right now '
+      +SIGNALS.filter(s=>s!=="closed").reverse().map(s=>SIGNAL_ICON[s]+" "+s).join(" \u00b7 ")+'.</p>'
+    : '<div class="empty">No open bugs or reviews.</div>';
+
+  // --- hygiene flags ---
+  const fc={}; open.forEach(b=>(b.flags||[]).forEach(f=>{ fc[f]=(fc[f]||0)+1; }));
+  const flagColor={untriaged:PBI.red, unassigned:PBI.red, overdue:PBI.red,
+    pinged:PBI.orange,
+    "no-milestone":PBI.gold, "no-sprint":PBI.gold, "no-estimate":PBI.gold,
+    aging:PBI.purple, "no-discussion":PBI.grey};
+  const frows=Object.entries(fc).sort((a,b)=>b[1]-a[1]).map(e=>({
+    l:e[0], v:e[1], c:flagColor[e[0]]||"#6b7280",
+    sub:Math.round(100*e[1]/Math.max(1,open.length))+"% of open bugs"}));
+  document.getElementById("ov-flags").innerHTML=barTable(frows, open.length);
+
+  // --- review queue ---
+  document.getElementById("ov-reviews").innerHTML=
+    barTable(rvRows, Math.max.apply(null, rvRows.map(r=>r.v).concat([1])));
+
+  renderHygiene();
+
+  // --- RAID ---
+  const raidSorted=raid.slice().sort((a,b)=>
+    ((RAG_RANK[a.rag]==null?9:RAG_RANK[a.rag])-(RAG_RANK[b.rag]==null?9:RAG_RANK[b.rag]))
+    || (b.score-a.score));
+  document.getElementById("ov-raid").innerHTML=raidSorted.length
+    ? '<table class="sb"><thead><tr><th>Row</th><th>Owner</th><th class="num">Score</th>'
+      +'<th class="num">Due</th></tr></thead><tbody>'
+      +raidSorted.slice(0,8).map(r=>'<tr>'
+        +'<td><span class="rag '+esc(r.rag||"gray")+'"></span><b>'+esc(r.id)+'</b>'
+        +'<div class="who" style="white-space:normal;">'+esc(r.title)+'</div></td>'
+        +'<td>'+esc(r.owner||"\u2014")+'</td>'
+        +'<td class="num">'+(r.score||"\u2014")+'</td>'
+        +'<td class="num"'+((r.due&&r.due<today)?' style="color:'+PBI.red+';"':'')+'>'
+        +esc(r.due||"\u2014")+'</td></tr>').join("")
+      +'</tbody></table>'
+      +(raidSorted.length>8?'<div class="ro-note" style="margin-top:8px;">+'+(raidSorted.length-8)+' more open rows</div>':'')
+    : '<div class="empty">No open RAID rows.</div>';
+
+  // --- needs you now ---
+  const feed=[];
+  attention.forEach(b=>{
+    const why=[], pings=b.oded_pings||0;
+    if(pings) why.push("Oded pinged \u00d7"+pings+(b.last_ping?" (last "+b.last_ping+")":""));
+    if(["stalled","dormant"].includes(b.signal)) why.push(b.signal+" \u2014 "+b.idle_days+"d idle");
+    if((bugTri(b).state||"untriaged")==="untriaged") why.push("untriaged");
+    if(!b.assignee) why.push("unassigned");
+    feed.push({rank:((b.flags||[]).includes("pinged")||["dormant","stalled"].includes(b.signal))?0:1,
+      kind:"bug", label:b.key,
+      text:b.summary||"", why:why.join(" \u00b7 "),
+      when:(b.idle_days==null?"":b.idle_days+"d idle"), href:b.url, sortv:b.idle_days||0});
+  });
+  // RAID is capped so a long-standing risk backlog can't crowd out live bugs.
+  raidSorted.filter(r=>r.rag==="red"||(r.due&&r.due<today)).slice(0,3).forEach(r=>feed.push({
+    rank:r.rag==="red"?0:2, kind:"raid", label:r.id, text:r.title||"",
+    why:((r.due&&r.due<today)?"overdue since "+r.due:"red risk")+" \u00b7 "+(r.owner||"unowned"),
+    when:r.score?"score "+r.score:"", sortv:r.score||0}));
+  ovReviewTasks().forEach(t=>{
+    const p=prs(t); if(!p.length) return;
+    const s=consolidateReviewStatus(p);
+    if(!["pending","in-progress","waiting-for-re-review"].includes(s)) return;
+    const age=t.created?daysSince(t.created):0;
+    feed.push({rank:s==="pending"?3:2, kind:"review", label:t.id,
+      text:(t.title||"").slice(0,110), why:s+" \u00b7 "+p.length+" PR"+(p.length>1?"s":""),
+      when:age?age+"d old":"", sortv:age});
+  });
+  TASKS.filter(t=>t.status==="blocked").forEach(t=>feed.push({
+    rank:2, kind:"task", label:t.id, text:t.title||"", why:"blocked",
+    when:"", sortv:0}));
+  feed.sort((a,b)=>(a.rank-b.rank)||(b.sortv-a.sortv));
+  const feedColor={bug:PBI.red, raid:PBI.orange, review:PBI.blue, task:PBI.purple};
+  document.getElementById("ov-feed").innerHTML=feed.length
+    ? '<div class="feed">'+feed.slice(0,12).map(f=>'<div class="it" style="--fk:'+feedColor[f.kind]+'">'
+        +'<span class="pill">'+f.kind+'</span>'
+        +'<span class="w"><b>'+(f.href?'<a href="'+esc(f.href)+'" target="_blank" rel="noopener">'+esc(f.label)+'</a>':esc(f.label))+'</b> '
+        +esc((f.text||"").slice(0,110))
+        +'<div class="why">'+esc(f.why)+'</div></span>'
+        +'<span class="when">'+esc(f.when)+'</span></div>').join("")+'</div>'
+      +(feed.length>12?'<div class="ro-note" style="margin-top:9px;">+'+(feed.length-12)+' more</div>':'')
+    : '<div class="empty">Nothing is screaming for attention.</div>';
+
+  // --- workspaces ---
+  document.getElementById("ov-slots").innerHTML=slotNames.map(name=>{
+    const h=slots[name]&&slots[name].holder;
+    const who=h?(h.type==="task"?(h.task_id+" \u00b7 "+(h.detail||h.tag||"")):(h.label||h.tag||"ad-hoc")):"free";
+    return '<div class="slot'+(h?" busy":"")+'"><div class="nm">'+esc(name)+'</div>'
+      +'<div class="oc" title="'+esc(who)+'">'+esc(who)+'</div></div>';
+  }).join("");
+}
+
+// ============================================================================
+// Portal section nav — Overview / My Work / Bugs / PRs / Team
+// ============================================================================
+const SECTIONS=[
+  {id:"overview", label:"Overview", ready:true},
+  {id:"work",     label:"My Work",  ready:true},
+  {id:"bugs",     label:"Bugs",     ready:true},
+  {id:"prs",      label:"PRs",      ready:true},
+  {id:"raid",     label:"RAID",     ready:true},
+  {id:"team",     label:"Team",     ready:false},
+];
+let activeSection="overview";
+function sectionCount(id){
+  if(id==="overview"){
+    const raid=((OVERVIEW&&OVERVIEW.raid)||[]).filter(r=>!r.closed&&["red","orange"].includes(r.rag));
+    return bugList().filter(b=>bugNeedsAttention(b)).length + raid.length;
+  }
+  if(id==="work") return TASKS.filter(t=>!["done","cancelled"].includes(t.status)).length;
+  if(id==="bugs") return bugList().filter(b=>bugNeedsAttention(b)).length;
+  if(id==="prs") return (PRS.features||[]).filter(f=>(f.blocked||[]).length).length;
+  if(id==="raid") return ((RAID.counts||{}).hot)||0;
+  return 0;
+}
+function buildSections(){
+  const box=document.getElementById("sections");
+  box.innerHTML=SECTIONS.map(s=>{
+    const n=sectionCount(s.id);
+    const badge = s.ready ? `<span class="badge-count">${n}</span>`
+                          : `<span class="badge-count">soon</span>`;
+    const title = s.id==="bugs" ? "Bugs needing attention (stalled, untriaged, or unassigned)"
+                : s.id==="work" ? "Active tasks"
+                : s.id==="prs" ? "My outgoing feature PRs that are blocked (CI, review or rebase)"
+                : s.id==="raid" ? "Open RAID rows at Red or Orange"
+                : s.id==="overview" ? "Things demanding attention right now (bugs + hot RAID)"
+                : "Team task monitoring — not built yet";
+    return `<button class="section-btn${s.id===activeSection?" on":""}" data-section="${s.id}"
+      title="${esc(title)}"${s.ready?"":" disabled"}>${esc(s.label)}${badge}</button>`;
+  }).join("");
+  box.querySelectorAll(".section-btn").forEach(b=>
+    b.addEventListener("click",()=>selectSection(b.dataset.section)));
+}
+function selectSection(id){
+  const sec=SECTIONS.find(s=>s.id===id);
+  if(!sec || !sec.ready) return;
+  activeSection=id;
+  document.querySelectorAll(".section-btn").forEach(b=>b.classList.toggle("on",b.dataset.section===id));
+  SECTIONS.forEach(s=>{
+    const el=document.getElementById("sec-"+s.id);
+    if(el) el.style.display = s.id===id ? "" : "none";
+  });
+  if(id==="bugs"){ buildBugFilters(); buildBugTabs(); selectBugTab(bugTab); }
+  else if(id==="work"){ render(); }
+  else if(id==="prs"){ renderPrs(); }
+  else if(id==="raid"){ renderRaid(); }
+  else if(id==="overview"){ renderOverview(); }
+}
+
 // ---- refresh: reload entry values in place, keeping filters/tab/sort/columns ----
 function captureFilterState(){
   const s={}; DD_GROUPS.forEach(g=>{ s[g]=checkedVals(g); }); return s;
@@ -2490,6 +4134,423 @@ function restoreFilterState(s){
     updateDdLabel(g);
   });
 }
+// ============================================================================
+// PRs section — outgoing feature PRs mirrored from pr-monitor
+// ============================================================================
+const PR_STATUS_COLOR={merged:"#1AAB40", "merge-queue":"#118DFF", approved:"#197278", pending:"#9B9B9B",
+  "needs-rebase":"#D9B300", "changes-requested":"#E66C37", "ci-fail":"#D64550",
+  closed:"#6B7280"};
+const PLDM_COLOR={passed:"#1AAB40", failed:"#D64550", running:"#118DFF",
+  queued:"#D9B300", cancelled:"#9B9B9B"};
+
+function renderPrs(){
+  const feats=PRS.features||[], counts=PRS.counts||{};
+  const n=s=>counts[s]||0;
+  const totalPrs=feats.reduce((a,f)=>a+f.total,0);
+  const blocked=feats.filter(f=>(f.blocked||[]).length);
+  const done=feats.filter(f=>f.total&&f.merged===f.total);
+  document.getElementById("pr-asof").innerHTML=
+    feats.length+" active feature"+(feats.length===1?"":"s")+" \u00b7 "+totalPrs+" PRs \u00b7 "
+    +(PRS.last_scan?"scanned <b>"+esc(PRS.last_scan)+"</b>":"<b>never scanned</b>")
+    +(PRS.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(PRS.error)+'</span>':"");
+
+  document.getElementById("pr-kpis").innerHTML=[    kpi({c:blocked.length?PBI.red:PBI.green, label:"Blocked features", n:blocked.length,
+         sub:"of "+feats.length+" tracked"}),
+    kpi({c:n("ci-fail")?PBI.red:PBI.grey, label:"CI failing", n:n("ci-fail"), sub:"PRs"}),
+    kpi({c:n("needs-rebase")?PBI.gold:PBI.grey, label:"Needs rebase", n:n("needs-rebase"), sub:"PRs"}),
+    kpi({c:n("changes-requested")?PBI.orange:PBI.grey, label:"Changes req.",
+         n:n("changes-requested"), sub:"PRs"}),
+    kpi({c:PBI.teal, label:"Approved", n:n("approved"), sub:"waiting to land"}),
+    kpi({c:n("merge-queue")?PBI.blue:PBI.grey, label:"Merge queue", n:n("merge-queue"),
+         sub:"landing now"}),
+    kpi({c:PBI.green, label:"Merged", n:n("merged"),
+         sub:done.length?done.length+" feature"+(done.length===1?"":"s")+" complete":"of "+totalPrs+" PRs"}),
+  ].join("");
+
+  document.getElementById("pr-list").innerHTML=feats.length
+    ? feats.map(prFeature).join("")
+    : '<div class="empty">Nothing tracked. Log a feature with the pr-monitor skill.</div>';
+}
+
+// CI never runs on its own here — it fires on a `/ci` comment — so "not run" is
+// a real, actionable state rather than a gap in the data.
+function ciCell(p){
+  const f=p.checks_fail||0, r=p.checks_pending||0, s=p.checks_pass||0;
+  let label,color,tip;
+  if(f){ label="fail"; color=PBI.red;
+         tip=f+" failing: "+((p.failed_checks||[]).join(", ")||"see PR"); }
+  else if(r){ label="running"; color=PBI.gold; tip=r+" check"+(r===1?"":"s")+" still running"; }
+  else if(s){ label="pass"; color=PBI.green; tip="all "+s+" checks green"; }
+  else { return '<span class="ci none" title="No check runs on this commit '
+           +'\u2014 comment /ci on the PR to trigger it">not run</span>'; }
+  return '<span class="ci" style="--ck:'+color+'" title="'+esc(tip)+'">'+label+'</span>';
+}
+
+function prFeature(f){
+  const c=PR_STATUS_COLOR[f.worst]||PBI.grey;
+  const complete=f.total&&f.merged===f.total;
+  const rows=f.prs.map(p=>{
+    const sc=PR_STATUS_COLOR[p.status]||PBI.grey;
+    // A failing check count is the actionable bit; everything else is noise.
+    let detail="\u2014";
+    if(p.checks_fail) detail='<b>'+p.checks_fail+'F</b>/'+(p.checks_pass||0)+'P';
+    else if(p.checks_pass) detail=p.checks_pass+'P'+(p.checks_pending?' \u00b7 '+p.checks_pending+' run':'');
+    const ci=ciCell(p);
+    const gate=p.status==="merged"?"\u2014"
+      :p.status==="merge-queue"?"in queue"
+      :p.auto_merge?"auto-merge"
+      :(p.merge_state==="BEHIND"||p.merge_state==="DIRTY")?(p.merge_state||"").toLowerCase()
+      :(p.review||"").toLowerCase().replace(/_/g," ")||"\u2014";
+    return '<tr><td><a href="'+esc(p.url||"#")+'" target="_blank" rel="noopener" title="'+esc(p.title||"")+'">'
+      +esc(p.repo)+' #'+p.number+'</a></td>'
+      +'<td title="'+esc(p.title||"")+'">'+esc(p.title||"")+'</td>'
+      +'<td>'+ci+'</td>'
+      +'<td class="chk">'+detail+'</td>'
+      +'<td class="chk">'+esc(gate)+'</td>'
+      +'<td><span class="st" style="--sk:'+sc+'">'+esc(p.status||"?")+'</span></td></tr>';
+  }).join("");
+  const pct=f.total?100*f.merged/f.total:0;
+  const note=f.last_note
+    ? '<div class="note"><b>'+esc(f.last_note.date)+'</b> \u2014 '+esc(f.last_note.text)+'</div>' : "";
+  const pldm=f.pldm&&f.pldm!=="not-tested"
+    ? '<span class="pldm" style="background:'+(PLDM_COLOR[f.pldm]||PBI.grey)+';color:#fff;">PLDM '+esc(f.pldm)+'</span>'
+    : '<span class="pldm">PLDM untested</span>';
+  const testable=SERVED&&f.prs.some(p=>p.status!=="closed");
+  const btn=testable
+    ? '<button class="pldm-btn" data-pldm="'+f.id+'" title="Grab a free workspace slot, '
+      +'check it out to this feature\'s PR branches, and dispatch a remote PLDM build">'
+      +'\u25b6 PLDM test</button>' : "";
+  return '<div class="prf" style="--fk:'+c+'">'
+    +'<header><span class="fid">['+f.id+']</span><h3>'+esc(f.name)+'</h3>'
+    +btn+pldm+'<span class="st" style="--sk:'+c+'">'+esc(complete?"complete":f.worst)+'</span></header>'
+    +(f.description?'<p class="desc">'+esc(f.description)+'</p>':"")
+    +'<div class="prog"><i style="width:'+pct.toFixed(0)+'%"></i></div>'
+    +'<div class="ro-note">'+f.merged+' of '+f.total+' merged'
+    +(complete?' \u2014 retires on the next scan':'')+'</div>'
+    +'<table class="pr-tbl"><thead><tr><th style="width:23%">Repo / PR</th><th style="width:31%">Title</th>'
+    +'<th style="width:10%">CI</th><th style="width:10%">Checks</th>'
+    +'<th style="width:12%">Gate</th><th style="width:14%">Status</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table>'
+    +'<div class="pldm-box" id="pldm-box-'+f.id+'" hidden></div>'
+    +note+'</div>';
+}
+
+// ---------------- PLDM submission ----------------
+// Remote mode builds from a workspace manifest, so submitting is a checkout +
+// preflight + dispatch chain rather than a single call — hence the progress log.
+const PLDM_IMAGES=["1die_w_gmem","2die_w_gmem","1die_wo_gmem","4die_w_gmem"];
+
+function allSlots(){
+  // Only number-named dirs are real multi-repo checkouts; the server rejects
+  // the rest, so offering them here would just be a trap.
+  const canon=(WORKSPACES&&WORKSPACES.canonical)||[];
+  return canon.length?[...canon].sort():WS_NUMBER_NAMES.slice();
+}
+
+function freeSlots(){
+  const slots=(WORKSPACES&&WORKSPACES.slots)||{};
+  return allSlots().filter(s=>!(slots[s]&&slots[s].holder));
+}
+
+function pldmForm(f){
+  const free=freeSlots();
+  const jira=(f.name.match(/[A-Z]+-\d+/)||[])[0];
+  const dn=(jira||f.name).toLowerCase().replace(/[^a-z0-9]+/g,"-").slice(0,32);
+  const slotOpts='<option value="">auto \u2014 first free slot</option>'
+    +allSlots().map(s=>{const f=free.includes(s);
+      return '<option value="'+esc(s)+'"'+(f?"":" disabled")+'>'+esc(s)
+        +(f?" (free)":" (occupied)")+'</option>';}).join("");
+  return '<div class="pldm-form">'
+    +'<label>Display name<input id="pl-dn-'+f.id+'" value="'+esc(dn)+'"></label>'
+    +'<label>Image type<select id="pl-img-'+f.id+'">'
+      +PLDM_IMAGES.map(i=>'<option>'+i+'</option>').join("")+'</select></label>'
+    +'<label>Group<input id="pl-grp-'+f.id+'" value="default" placeholder="empty = all groups"></label>'
+    +'<label>Timeout (min)<input id="pl-to-'+f.id+'" type="number" min="1" max="120" value="20"></label>'
+    +'<label>Args<input id="pl-args-'+f.id+'" placeholder="e.g. smoke"></label>'
+    +'<label>Workspace<select id="pl-slot-'+f.id+'">'+slotOpts+'</select></label>'
+    +'</div>'
+    +'<div class="pldm-warn">Dispatches a real CI build and queues hardware. '
+    +'The chosen slot is checked out to this feature\u2019s PR branches \u2014 all commits must be pushed.'
+    +(free.length?"":' <b>No free slot right now.</b>')+'</div>'
+    +'<div class="pldm-act"><button class="go" data-go="'+f.id+'">Submit to queue</button>'
+    +'<button class="cancel" data-cancel="'+f.id+'">Cancel</button>'
+    +'<span class="pldm-note" id="pl-note-'+f.id+'"></span></div>';
+}
+
+function togglePldm(id){
+  const box=document.getElementById("pldm-box-"+id);
+  if(!box) return;
+  if(!box.hidden){ box.hidden=true; box.innerHTML=""; return; }
+  const f=(PRS.features||[]).find(x=>x.id===id);
+  if(!f) return;
+  box.innerHTML=pldmForm(f); box.hidden=false;
+}
+
+async function submitPldm(id){
+  const note=document.getElementById("pl-note-"+id);
+  const go=document.querySelector('[data-go="'+id+'"]');
+  const body={feature_id:id,
+    display_name:document.getElementById("pl-dn-"+id).value.trim(),
+    image_type:document.getElementById("pl-img-"+id).value,
+    group:document.getElementById("pl-grp-"+id).value.trim(),
+    timeout:parseInt(document.getElementById("pl-to-"+id).value,10)||20,
+    args:document.getElementById("pl-args-"+id).value.trim(),
+    slot:document.getElementById("pl-slot-"+id).value};
+  go.disabled=true; note.textContent="dispatching\u2026";
+  try{
+    const r=await fetch("/api/pldm-test",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok||j.error) throw new Error(j.error||"submit failed");
+    note.textContent=j.message||"";
+    pollPldm(j.align_job,id);
+  }catch(e){
+    note.textContent="Failed: "+e.message; go.disabled=false;
+  }
+}
+
+async function pollPldm(jobId,id){
+  const box=document.getElementById("pldm-box-"+id);
+  const PHASE={align:"checking out PR branches",preflight:"verifying pushed state",
+               dispatch:"running octl \u2014 this takes a few minutes",done:"done"};
+  for(;;){
+    await new Promise(s=>setTimeout(s,2000));
+    let j;
+    try{ j=await (await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"})).json(); }
+    catch(e){ break; }
+    if(!j||j.error) break;
+    const log=(j.repos||[]).map(r=>'<div class="pl-row '+r.action+'">'+esc(r.name)
+      +' <span>'+esc(r.detail||r.action)+'</span></div>').join("");
+    const head=j.status==="running"
+      ? '<b>'+esc(PHASE[j.phase]||j.phase||"working")+'</b>'
+        +(j.current?' \u00b7 '+esc(j.current):"")
+      : (j.status==="done"?'<b class="ok">Queued.</b> '+esc(j.message||"")
+          +(j.run_url?' \u00b7 <a href="'+esc(j.run_url)+'" target="_blank" rel="noopener">Actions run</a>':"")
+        : '<b class="bad">Failed.</b> '+esc(j.message||""));
+    box.innerHTML='<div class="pldm-prog">'+head+'</div>'+log
+      +(j.status==="running"?"":'<div class="pldm-act">'
+        +'<button class="cancel" data-cancel="'+id+'">Close</button></div>');
+    if(j.status!=="running"){
+      if(j.status==="done") scanPrs();
+      break;
+    }
+  }
+}
+
+document.addEventListener("click",e=>{
+  const t=e.target.closest("[data-pldm],[data-go],[data-cancel]");
+  if(!t) return;
+  if(t.dataset.pldm) togglePldm(parseInt(t.dataset.pldm,10));
+  else if(t.dataset.go) submitPldm(parseInt(t.dataset.go,10));
+  else if(t.dataset.cancel) togglePldm(parseInt(t.dataset.cancel,10));
+});
+
+// The scan runs `gh` server-side — no model call, so it is free to hammer.
+async function scanPrs(){
+  const btn=document.getElementById("pr-scan"), note=document.getElementById("pr-scan-note");
+  if(!SERVED){ note.textContent="Serve the portal to scan"; return; }
+  btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Scanning\u2026';
+  note.textContent="probing GitHub via gh\u2026";
+  try{
+    const r=await fetch("/api/pr-scan",{method:"POST"});
+    const j=await r.json();
+    if(!r.ok||j.error) throw new Error(j.error||"scan failed");
+    const job=await pollAlign(j.job,"Scanning PRs…");
+    if(!job||job.status==="error") throw new Error((job&&job.message)||"scan failed");
+    const res=job.result||{};
+    PRS=res; renderPrs(); buildSections();
+    const gone=res.purged||[];
+    note.innerHTML="probed "+(res.scanned||0)+" PRs"
+      +(gone.length?' \u00b7 <b>retired '+gone.length+'</b>: '
+        +gone.map(f=>esc(f.name)+" ("+f.total+"/"+f.total+")").join(", "):"");
+  }catch(e){
+    note.textContent="Scan failed: "+e.message;
+  }finally{
+    btn.disabled=false; btn.textContent="\u21bb Scan PRs";
+  }
+}
+document.getElementById("pr-scan").addEventListener("click",scanPrs);
+
+// ---------------- RAID ----------------
+const kpi=o=>'<div class="kpi" style="--k:'+o.c+'"><div class="l">'+esc(o.label)+'</div>'
+  +'<div class="n">'+o.n+'</div><div class="s">'+(o.sub||"")+'</div></div>';
+const RAG_COLOR={red:PBI.red, orange:PBI.orange, yellow:PBI.gold, green:PBI.green};
+const RAID_TYPES=[["risk","Risk"],["assumption","Assumption"],["issue","Issue"],["dependency","Dependency"]];
+let raidOpenRow=null;
+
+function raidRows(){
+  const showClosed=document.getElementById("raid-showclosed").checked;
+  return (RAID.rows||[]).filter(r=>showClosed||!r.closed);
+}
+
+function renderRaid(){
+  const c=RAID.counts||{}, rows=raidRows(), today=isoDay(new Date());
+  document.getElementById("raid-asof").innerHTML=
+    "<b>"+(c.open||0)+"</b> open \u00b7 <b>"+(c.hot||0)+"</b> red / orange \u00b7 <b>"
+    +(c.overdue||0)+"</b> overdue \u00b7 "+(c.closed||0)+" closed"
+    +(RAID.error?' \u00b7 <span class="stale-note">'+esc(RAID.error)+"</span>":"")
+    +(SERVED?"":' \u00b7 <span class="ro-note">serve the portal to edit</span>');
+
+  const open=(RAID.rows||[]).filter(r=>!r.closed);
+  const byRag=g=>open.filter(r=>r.rag===g).length;
+  document.getElementById("raid-kpis").innerHTML=[
+    kpi({c:PBI.red,    label:"Red",      n:byRag("red"),      sub:"act now"}),
+    kpi({c:PBI.orange, label:"Orange",   n:byRag("orange"),   sub:"needs a plan"}),
+    kpi({c:PBI.gold,   label:"Yellow",   n:byRag("yellow"),   sub:"watch"}),
+    kpi({c:PBI.green,  label:"Green",    n:byRag("green"),    sub:"under control"}),
+    kpi({c:PBI.violet, label:"Overdue",  n:c.overdue||0,      sub:"trigger date passed"}),
+    kpi({c:PBI.grey,   label:"Closed",   n:c.closed||0,       sub:"resolved to date"}),
+  ].join("");
+
+  document.getElementById("raid-body").innerHTML = rows.length
+    ? rows.map(r=>{
+        const overdue=!r.closed && r.due && r.due<today;
+        return '<tr class="task raid-row" data-id="'+esc(r.id)+'">'
+          +'<td><span class="rid">'+esc(r.id)+'</span></td>'
+          +'<td class="ttl">'+esc(r.title||"\u2014")+'</td>'
+          +'<td><span class="ragp" style="--rk:'+(RAG_COLOR[r.rag]||PBI.grey)+'">'+esc(r.rag||"\u2014")+'</span></td>'
+          +'<td>'+r.score+'</td><td>'+esc(r.owner||"\u2014")+'</td>'
+          +'<td'+(overdue?' class="od"':'')+'>'+esc(r.due||"\u2014")+'</td>'
+          +'<td class="stt">'+esc(r.closed?"closed":(r.status||"open"))+'</td></tr>'
+          +'<tr class="detail" data-for="'+esc(r.id)+'" style="display:none;"><td colspan="7"></td></tr>';
+      }).join("")
+    : '<tr><td colspan="7"><div class="empty">No RAID rows.</div></td></tr>';
+
+  document.querySelectorAll("#raid-body tr.raid-row").forEach(tr=>
+    tr.addEventListener("click",()=>toggleRaid(tr.dataset.id)));
+  if(raidOpenRow && rows.some(r=>r.id===raidOpenRow)){ const id=raidOpenRow; raidOpenRow=null; toggleRaid(id); }
+}
+
+function toggleRaid(id){
+  const det=document.querySelector('#raid-body tr.detail[data-for="'+id+'"]');
+  if(!det) return;
+  if(det.style.display!=="none"){ det.style.display="none"; raidOpenRow=null; return; }
+  document.querySelectorAll("#raid-body tr.detail").forEach(d=>d.style.display="none");
+  const r=(RAID.rows||[]).find(x=>x.id===id);
+  det.firstElementChild.innerHTML=raidDetail(r);
+  det.style.display="";
+  raidOpenRow=id;
+  wireRaidEditor(id);
+}
+
+function raidField(label,val){
+  return val ? '<div class="rf"><span>'+esc(label)+'</span><p>'+esc(val)+'</p></div>' : "";
+}
+
+function raidDetail(r){
+  const ro=!SERVED;
+  // data-orig lets Save submit only what actually changed, so untouched fields
+  // keep their original markdown in raid.md.
+  const inp=(name,val,extra)=>'<input data-f="'+name+'" data-orig="'+esc(val||"")+'" value="'
+    +esc(val||"")+'"'+(extra||"")+(ro?" disabled":"")+'>';
+  const sel=(name,opts,cur)=>{
+    const vals=opts.map(o=>Array.isArray(o)?o[0]:o);
+    const hit=vals.find(v=>String(v).toLowerCase()===String(cur).toLowerCase());
+    return '<select data-f="'+name+'" data-orig="'+esc(hit==null?"":hit)+'"'+(ro?" disabled":"")+'>'
+      +opts.map(o=>{const[v,l]=Array.isArray(o)?o:[o,o];
+        return '<option value="'+esc(v)+'"'+(String(cur).toLowerCase()===String(v).toLowerCase()?" selected":"")+'>'+esc(l)+'</option>';}).join("")+'</select>';
+  };
+  const num=n=>[1,2,3,4,5].map(v=>[v,String(v)]);
+  return '<div class="raid-det">'
+    +'<div class="rf-grid">'
+      +raidField("Description",r.description)+raidField("Trigger",r.trigger)
+      +raidField("Mitigation",r.mitigation)+raidField("Contingency",r.contingency)
+      +raidField("External owner",r.external)+raidField("Link",r.link)
+      +raidField("Status",r.status)
+    +'</div>'
+    +'<div class="raid-edit">'
+      +'<div class="re-row">'
+        +'<label>Title'+inp("title",r.title_raw!=null?r.title_raw:r.title)+'</label>'
+      +'</div>'
+      +'<div class="re-row">'
+        +'<label>Type'+sel("type",RAID_TYPES,r.type)+'</label>'
+        +'<label>Owner'+inp("fw_owner",r.owner)+'</label>'
+        +'<label>P'+sel("p",num(),r.p)+'</label>'
+        +'<label>I'+sel("i",num(),r.i)+'</label>'
+        +'<label>RAG'+sel("rag",["green","yellow","orange","red"],r.rag)+'</label>'
+        +'<label>Due'+inp("due",r.due_raw!=null?r.due_raw:r.due,' placeholder="YYYY-MM-DD"')+'</label>'
+      +'</div>'
+      +'<div class="re-row">'
+        +'<label>Mitigation<input data-f="mitigation" placeholder="leave blank to keep" '+(ro?"disabled":"")+'></label>'
+        +'<label>Status<input data-f="status" placeholder="leave blank to keep" '+(ro?"disabled":"")+'></label>'
+      +'</div>'
+      +'<div class="re-act">'
+        +'<button class="btn primary" data-a="save"'+(ro?" disabled":"")+'>Save</button>'
+        +(r.closed?"":'<button class="btn" data-a="close"'+(ro?" disabled":"")+'>Close row\u2026</button>')
+        +'<span class="ro-note" data-a="msg"></span>'
+      +'</div>'
+    +'</div></div>';
+}
+
+function wireRaidEditor(id){
+  const root=document.querySelector('#raid-body tr.detail[data-for="'+id+'"] .raid-edit');
+  if(!root) return;
+  const msg=root.querySelector('[data-a="msg"]');
+  const post=async body=>{
+    msg.textContent="saving\u2026";
+    try{
+      const res=await fetch("/api/raid/"+encodeURIComponent(id),
+        {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const j=await res.json();
+      if(!res.ok||j.error) throw new Error(j.error||"save failed");
+      RAID=j.payload; raidOpenRow=id; renderRaid(); buildSections(); renderOverview();
+    }catch(e){ msg.textContent="Failed: "+e.message; }
+  };
+  root.querySelector('[data-a="save"]').addEventListener("click",()=>{
+    const body={};
+    root.querySelectorAll("[data-f]").forEach(el=>{
+      const v=(el.value||"").trim();
+      if(!v) return;
+      const orig=el.dataset.orig;
+      if(orig!==undefined && v===orig.trim()) return;   // untouched
+      body[el.dataset.f]=v;
+    });
+    if(!Object.keys(body).length){ msg.textContent="Nothing changed"; return; }
+    post(body);
+  });
+  const cb=root.querySelector('[data-a="close"]');
+  if(cb) cb.addEventListener("click",()=>{
+    const res=prompt("Resolution for "+id+":");
+    if(res && res.trim()) post({close:res.trim()});
+  });
+}
+
+function raidNewForm(){
+  const box=document.getElementById("raid-form");
+  if(box.style.display!=="none"){ box.style.display="none"; return; }
+  box.innerHTML='<div class="re-row">'
+    +'<label>Type<select id="nr-type">'+RAID_TYPES.map(([v,l])=>'<option value="'+v+'">'+l+'</option>').join("")+'</select></label>'
+    +'<label style="flex:1 1 320px;">Title<input id="nr-title" placeholder="What is the risk / issue?"></label>'
+    +'<label>Owner<input id="nr-owner" value="Yoni"></label>'
+    +'<label>P<select id="nr-p">'+[1,2,3,4,5].map(v=>'<option'+(v===3?" selected":"")+'>'+v+'</option>').join("")+'</select></label>'
+    +'<label>I<select id="nr-i">'+[1,2,3,4,5].map(v=>'<option'+(v===3?" selected":"")+'>'+v+'</option>').join("")+'</select></label>'
+    +'<label>Due<input id="nr-due" placeholder="YYYY-MM-DD"></label>'
+    +'</div>'
+    +'<div class="re-row"><label style="flex:1 1 100%;">Description<input id="nr-desc" placeholder="Context, blast radius, who is affected"></label></div>'
+    +'<div class="re-act"><button class="btn primary" id="nr-save">Create</button><span class="ro-note" id="nr-msg"></span></div>';
+  box.style.display="";
+  document.getElementById("nr-save").addEventListener("click",async()=>{
+    const m=document.getElementById("nr-msg");
+    const title=document.getElementById("nr-title").value.trim();
+    if(!title){ m.textContent="Title is required"; return; }
+    m.textContent="creating\u2026";
+    try{
+      const res=await fetch("/api/raid-new",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({type:document.getElementById("nr-type").value, title:title,
+          fw_owner:document.getElementById("nr-owner").value.trim(),
+          p:document.getElementById("nr-p").value, i:document.getElementById("nr-i").value,
+          due:document.getElementById("nr-due").value.trim(),
+          description:document.getElementById("nr-desc").value.trim()})});
+      const j=await res.json();
+      if(!res.ok||j.error) throw new Error(j.error||"create failed");
+      RAID=j.payload; box.style.display="none"; raidOpenRow=j.id;
+      renderRaid(); buildSections(); renderOverview();
+    }catch(e){ m.textContent="Failed: "+e.message; }
+  });
+}
+document.getElementById("raid-new").addEventListener("click",raidNewForm);
+document.getElementById("raid-showclosed").addEventListener("change",renderRaid);
+
 async function refreshData(){
   const btn=document.getElementById("refresh");
   const note=document.getElementById("refresh-note");
@@ -2498,13 +4559,27 @@ async function refreshData(){
     if(SERVED){
       const r=await fetch("/api/tasks",{cache:"no-store"});
       if(r.ok){ const j=await r.json(); TASKS=j.tasks||j; if(j.workspaces) WORKSPACES=j.workspaces; }
+      const rb=await fetch("/api/bugs",{cache:"no-store"});
+      if(rb.ok) BUGS=await rb.json();
+      const ro=await fetch("/api/overview",{cache:"no-store"});
+      if(ro.ok) OVERVIEW=await ro.json();
+      const rp=await fetch("/api/prs",{cache:"no-store"});
+      if(rp.ok) PRS=await rp.json();
+      const rr=await fetch("/api/raid",{cache:"no-store"});
+      if(rr.ok) RAID=await rr.json();
     }
     const fstate=captureFilterState();   // preserve active filter selections
     buildFilters();                       // rebuild options (may include new values)
     restoreFilterState(fstate);           // re-apply selections that still exist
     buildTabs();                          // refresh tab counts, keep activeTab
-    document.getElementById("total").textContent=`${TASKS.length} tasks`;
-    render();                             // sort/columns/options state untouched
+    buildBugFilters(); buildBugTabs(); buildSections();
+    document.getElementById("total").textContent=
+      `${TASKS.length} tasks · ${bugList().filter(b=>b.open).length} open bugs`;
+    if(activeSection==="bugs") renderBugs();
+    else if(activeSection==="overview") renderOverview();
+    else if(activeSection==="prs") renderPrs();
+    else if(activeSection==="raid") renderRaid();
+    else render();
     if(note){
       const now=new Date();
       const hh=String(now.getHours()).padStart(2,"0"), mm=String(now.getMinutes()).padStart(2,"0"), ss=String(now.getSeconds()).padStart(2,"0");
@@ -2528,13 +4603,28 @@ async function init(){
       badge.textContent="editable"; badge.className="mode edit";
       const r=await fetch("/api/tasks",{cache:"no-store"});
       if(r.ok){ const j=await r.json(); TASKS=j.tasks||j; if(j.workspaces) WORKSPACES=j.workspaces; }
+      const rb=await fetch("/api/bugs",{cache:"no-store"});
+      if(rb.ok) BUGS=await rb.json();
+      const ro=await fetch("/api/overview",{cache:"no-store"});
+      if(ro.ok) OVERVIEW=await ro.json();
+      const rp=await fetch("/api/prs",{cache:"no-store"});
+      if(rp.ok) PRS=await rp.json();
+      const rr=await fetch("/api/raid",{cache:"no-store"});
+      if(rr.ok) RAID=await rr.json();
     }
   }catch(e){ /* file:// — stay read-only with embedded data */ }
-  document.getElementById("total").textContent=`${TASKS.length} tasks`;
+  document.getElementById("total").textContent=
+    `${TASKS.length} tasks · ${bugList().filter(b=>b.open).length} open bugs`;
   buildFilters();
   buildTabs();
   applyTabPreset(activeTab);
   render();
+  buildBugFilters();
+  buildBugTabs();
+  buildSections();
+  renderOverview();
+  renderPrs();
+  renderRaid();
 }
 init();
 </script>
@@ -2561,13 +4651,179 @@ def _annotate_tasks(tasks: list[dict], wd: dict | None = None) -> list[dict]:
     return out
 
 
+TEAM_PLANNER = Path(os.path.expanduser("~/team-planner"))
+IP_SCOREBOARD = Path(os.path.expanduser(
+    "~/.copilot/skills/team-weekly/references/ip-scoreboard.md"))
+
+# Fallback if the team-weekly reference table is missing or unparseable.
+DEFAULT_IPS = [
+    {"name": "PCIe EP", "owners": "Mateusz + Vasyl", "hints": ["pcie"]},
+    {"name": "SE", "owners": "Akshay", "hints": ["ip-se-"]},
+    {"name": "D2D", "owners": "Igal", "hints": ["d2d"]},
+    {"name": "Infra/Mng", "owners": "Yoni", "hints": ["infra", "mng", "noc"]},
+]
+
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+
+
+def _plain(s: str) -> str:
+    """Strip markdown links and bold markers from a field value."""
+    return _MD_LINK.sub(r"\1", s or "").replace("**", "").strip()
+
+
+def _parse_program_dates() -> dict:
+    """Power-on / delivery gates and the sprint calendar from guidelines.md."""
+    out = {"power_on": None, "a1_delivery": None, "sprints": []}
+    f = TEAM_PLANNER / "guidelines.md"
+    if not f.exists():
+        return out
+    txt = f.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"\*\*Power-on:\*\*\s*\*\*(\d{4}-\d{2}-\d{2})\*\*", txt)
+    if m:
+        out["power_on"] = m.group(1)
+    m = re.search(r"\*\*A1 big delivery:\*\*.*?\*\*(\d{4}-\d{2}-\d{2})\*\*", txt)
+    if m:
+        out["a1_delivery"] = m.group(1)
+
+    year = int((out["power_on"] or out["a1_delivery"] or "2026")[:4])
+    # "MS8.1=3749 (Aug 30–Sep 13)" — windows carry no year, so infer it and roll
+    # over when the end month wraps past the start month.
+    for name, sid, window in re.findall(r"(MS[\d.]+)=(\d+)\s*\(([^)]*)\)", txt):
+        span = re.match(r"([A-Z][a-z]{2})\s+(\d{1,2})\s*[–-]\s*"
+                        r"(?:([A-Z][a-z]{2})\s+)?(\d{1,2})", window.strip())
+        start = end = None
+        if span:
+            sm, sd, em, ed = span.groups()
+            em = em or sm
+            try:
+                start = date(year, _MONTHS[sm], int(sd))
+                ey = year + 1 if _MONTHS[em] < _MONTHS[sm] else year
+                end = date(ey, _MONTHS[em], int(ed))
+            except (KeyError, ValueError):
+                start = end = None
+        out["sprints"].append({
+            "name": name, "id": sid, "window": window.split(",")[0].strip(),
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+        })
+    return out
+
+
+def _parse_raid() -> list[dict]:
+    """RAID rows for the Overview. team-planner's rd.py owns the parsing."""
+    if rd is None:
+        return []
+    return rd.payload()["rows"]
+
+
+def _parse_ips() -> list[dict]:
+    """IP → owner → component-hint mapping from the team-weekly reference."""
+    if not IP_SCOREBOARD.exists():
+        return DEFAULT_IPS
+    ips = []
+    txt = IP_SCOREBOARD.read_text(encoding="utf-8", errors="replace")
+    for line in txt.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 3 or cells[0] in ("IP", "---") or set(cells[0]) == {"-"}:
+            continue
+        hints = re.findall(r'"([^"]+)"', cells[2])
+        if not hints:
+            continue
+        ips.append({"name": cells[0], "owners": cells[1], "hints": hints})
+    return ips or DEFAULT_IPS
+
+
+def overview_payload() -> dict:
+    """Team-level context for the portal's Overview storefront. All of it comes
+    from local files — the portal never calls Jira/GitHub."""
+    try:
+        raid = _parse_raid()
+    except Exception:
+        raid = []
+    try:
+        program = _parse_program_dates()
+    except Exception:
+        program = {"power_on": None, "a1_delivery": None, "sprints": []}
+    try:
+        ips = _parse_ips()
+    except Exception:
+        ips = DEFAULT_IPS
+    return {"program": program, "raid": raid, "ips": ips,
+            "today": date.today().isoformat()}
+
+
+def bug_payload() -> dict:
+    """Bugs section data. Empty shell when bug-monitor isn't installed."""
+    if bm is None:
+        return {"bugs": [], "families": [], "config": {}, "last_scan": None}
+    try:
+        return bm.dashboard_payload()
+    except Exception as e:                       # never let a bug store break the portal
+        return {"bugs": [], "families": [], "config": {}, "last_scan": None,
+                "error": str(e)}
+
+
+def pr_payload() -> dict:
+    """Outgoing feature-PR data from pr-monitor. Read-only; the scan button is
+    what refreshes it."""
+    if pm is None:
+        return {"features": [], "counts": {}, "last_scan": None}
+    try:
+        return pm.payload()
+    except Exception as e:
+        return {"features": [], "counts": {}, "last_scan": None, "error": str(e)}
+
+
+def raid_payload() -> dict:
+    """RAID rows from team-planner. Editable from the portal via rd.apply_edit."""
+    if rd is None:
+        return {"rows": [], "owners": [], "counts": {}, "path": ""}
+    try:
+        return rd.payload()
+    except Exception as e:
+        return {"rows": [], "owners": [], "counts": {}, "path": "", "error": str(e)}
+
+
+WS_SLOT_NAMES = ["one", "two", "three", "four", "five", "six"]
+
+
+def viable_slots() -> list[str]:
+    """Slots that are real, buildable workspaces.
+
+    ``wm.canonical_slots()`` lists every directory under the project root, but
+    only the number-named ones are full multi-repo checkouts — the rest
+    (``main``, ``rtk``, ``elpci``, …) are scratch dirs that can't be built.
+    """
+    return [s for s in wm.canonical_slots(DEFAULT_PROJECT) if s in WS_SLOT_NAMES]
+
+
+def ws_ui_payload(wd: dict) -> dict:
+    """Workspace state plus the roster of buildable slots.
+
+    ``wm.load()`` only records slots that have *ever* been held, so a UI built
+    from it alone can't tell a free slot from one that doesn't exist.
+    """
+    return dict(wd, canonical=viable_slots())
+
+
 def render_dashboard_html(tasks: list[dict]) -> str:
     wd = wm.load()
     payload = json.dumps(_annotate_tasks(tasks, wd), ensure_ascii=False).replace("</", "<\\/")
-    wspayload = json.dumps(wd, ensure_ascii=False).replace("</", "<\\/")
+    wspayload = json.dumps(ws_ui_payload(wd), ensure_ascii=False).replace("</", "<\\/")
+    bugpayload = json.dumps(bug_payload(), ensure_ascii=False).replace("</", "<\\/")
+    ovpayload = json.dumps(overview_payload(), ensure_ascii=False).replace("</", "<\\/")
+    prpayload = json.dumps(pr_payload(), ensure_ascii=False).replace("</", "<\\/")
+    raidpayload = json.dumps(raid_payload(), ensure_ascii=False).replace("</", "<\\/")
     return (DASHBOARD_TEMPLATE
             .replace("__DATA__", payload)
             .replace("__WSDATA__", wspayload)
+            .replace("__BUGDATA__", bugpayload)
+            .replace("__OVDATA__", ovpayload)
+            .replace("__PRDATA__", prpayload)
+            .replace("__RAIDDATA__", raidpayload)
             .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
@@ -2576,7 +4832,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     out = Path(os.path.expanduser(args.output)) if args.output else STORE.parent / "dashboard.html"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_dashboard_html(d["tasks"]), encoding="utf-8")
-    print(f"[tm] wrote dashboard with {len(d['tasks'])} tasks -> {out}")
+    print(f"[tm] wrote portal with {len(d['tasks'])} tasks and "
+          f"{len(bug_payload()['bugs'])} bugs -> {out}")
     return 0
 
 
@@ -2776,6 +5033,591 @@ def apply_workspace_edit(slot: str, payload: dict) -> tuple[bool, str]:
     return False, f"invalid holder type: {htype}"
 
 
+# ----------------------------------------------------------------------------
+# Workspace alignment (dashboard "manual review" checkout)
+# ----------------------------------------------------------------------------
+# When a code-review task is assigned to a workspace slot from the dashboard,
+# the server checks the slot's repos out to the PR branches (everything else to
+# the default branch) so the user can review by hand — the no-AI/no-credit
+# equivalent of review-mgr `start --manual`. This runs as a background job so
+# the request returns immediately; the UI polls ``/api/align/<job>`` for a
+# progress/done indicator. Non-destructive: dirty repos are skipped and
+# reported, never reset.
+
+import threading as _threading  # noqa: E402
+
+ALIGN_JOBS: dict[str, dict] = {}
+ALIGN_LOCK = _threading.Lock()
+# Serialises the PR scan so a double-click can't launch two gh storms.
+PR_SCAN_LOCK = _threading.Lock()
+
+# Same for the Jira mirror refresh.
+BUG_SCAN_LOCK = _threading.Lock()
+
+# raid.md is a plain file with no locking of its own.
+RAID_LOCK = _threading.Lock()
+
+
+def _git(repo_dir: Path, *args: str, timeout: int = 180) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        capture_output=True, text=True, timeout=timeout, check=False,
+    )
+
+
+# owner/repo out of any GitHub remote (git@…:o/r.git, ssh://…/o/r.git, https://…/o/r).
+_REMOTE_RE = re.compile(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?/?$", re.I)
+
+
+def _worktree_remote_key(repo_dir: Path) -> tuple[str, str] | None:
+    """(owner, repo) lower-cased for a worktree's origin remote, or None."""
+    r = _git(repo_dir, "remote", "get-url", "origin", timeout=15)
+    if r.returncode != 0:
+        return None
+    m = _REMOTE_RE.search(r.stdout.strip())
+    return (m.group(1).lower(), m.group(2).lower()) if m else None
+
+
+def _discover_worktrees(ws_dir: Path) -> list[Path]:
+    """All git worktrees under a (repo/west-style) workspace.
+
+    Repos live at arbitrary nested paths whose dir name does not match the
+    GitHub repo name, so we walk the tree, stop descending once a `.git` is
+    found (repos aren't nested under each other here), and prune tool internals.
+    """
+    found: list[Path] = []
+    skip = {".repo", ".west", ".cache", "node_modules", "build", ".venv"}
+    for root, dirs, files in os.walk(ws_dir):
+        dirs[:] = [d for d in dirs if d not in skip]
+        if ".git" in dirs or ".git" in files:
+            found.append(Path(root))
+            dirs[:] = []  # don't descend into a repo's source tree
+    return sorted(found)
+
+
+def _repo_default_branch(repo_dir: Path) -> str:
+    """Best-effort default branch for a repo (origin/HEAD, else main/master)."""
+    r = _git(repo_dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", timeout=15)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split("/")[-1]
+    for cand in ("main", "master"):
+        if _git(repo_dir, "rev-parse", "--verify", cand, timeout=15).returncode == 0:
+            return cand
+    return "main"
+
+
+def _is_dirty(repo_dir: Path) -> bool:
+    r = _git(repo_dir, "status", "--porcelain", timeout=30)
+    return bool(r.stdout.strip())
+
+
+def _checkout_pr_branch(repo_dir: Path, branch: str, pr_number: int | None) -> tuple[bool, str]:
+    """Fetch + checkout a PR branch; fall back to pull/<n>/head. Non-destructive."""
+    _git(repo_dir, "fetch", "origin", branch, timeout=180)
+    r = _git(repo_dir, "checkout", branch, timeout=60)
+    if r.returncode == 0:
+        return True, f"on {branch}"
+    if pr_number:
+        f = _git(repo_dir, "fetch", "origin",
+                 f"pull/{pr_number}/head:{branch}", timeout=180)
+        if f.returncode == 0 and _git(repo_dir, "checkout", branch, timeout=60).returncode == 0:
+            return True, f"on {branch} (via pull/{pr_number}/head)"
+    return False, (r.stderr.strip() or "checkout failed").splitlines()[-1]
+
+
+def run_workspace_alignment(job: dict, store_lock=None) -> None:
+    """Background worker: align a workspace slot for a code-review task.
+
+    Updates ``job`` in place (guarded by ALIGN_LOCK) so the UI can poll progress.
+    """
+    def upd(**kw):
+        with ALIGN_LOCK:
+            job.update(kw)
+
+    def add_repo(rec):
+        with ALIGN_LOCK:
+            job["repos"].append(rec)
+
+    d = load()
+    t = find_task(d, job["task_id"])
+    if not t:
+        upd(status="error", message="task not found", finished=NOW)
+        return
+    prs = [p for p in pr_entries(t) if not pr_resolved(p)]
+    pr_by_repo = {(p.get("owner", "").lower(), p.get("repo", "").lower()): p
+                  for p in prs if p.get("repo")}
+
+    ws_dir = PROJECTS_ROOT / DEFAULT_PROJECT / job["slot"]
+    if not ws_dir.is_dir():
+        upd(status="error", message=f"workspace dir not found: {ws_dir}", finished=NOW)
+        return
+
+    # Match repos to PR entries by their origin remote (owner/repo), NOT by dir
+    # name — this is a repo/west workspace where dir names differ from repo names.
+    worktrees = _discover_worktrees(ws_dir)
+    upd(total=len(worktrees))
+    seen_review: set[tuple[str, str]] = set()
+    left_alone = 0
+
+    for repo_dir in worktrees:
+        key = _worktree_remote_key(repo_dir)
+        try:
+            upd(current=str(repo_dir.relative_to(ws_dir)))
+        except ValueError:
+            upd(current=repo_dir.name)
+        pr = pr_by_repo.get(key) if key else None
+        label = pr.get("repo") if pr else (f"{key[0]}/{key[1]}" if key else repo_dir.name)
+        if pr:
+            seen_review.add(key)
+            if _is_dirty(repo_dir):
+                add_repo({"name": label, "role": "review", "action": "skipped-dirty",
+                          "detail": "uncommitted changes — left as-is"})
+                continue
+            ok, detail = _checkout_pr_branch(
+                repo_dir, pr.get("branch") or "", pr.get("pr_number"))
+            add_repo({"name": label, "role": "review",
+                      "action": "checked-out" if ok else "error", "detail": detail})
+            continue
+        # Non-PR repo → switch to default branch, but never disturb a
+        # manifest-pinned (detached HEAD) checkout — leave it as the manifest set it.
+        cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
+        if not key or cur == "HEAD":
+            left_alone += 1
+            continue
+        default = _repo_default_branch(repo_dir)
+        if cur == default:
+            left_alone += 1
+            continue
+        if _is_dirty(repo_dir):
+            add_repo({"name": label, "role": "default", "action": "skipped-dirty",
+                      "detail": f"on {cur}, uncommitted changes — left as-is"})
+            continue
+        r = _git(repo_dir, "checkout", default, timeout=60)
+        ok = r.returncode == 0
+        add_repo({"name": label, "role": "default",
+                  "action": "checked-out" if ok else "error",
+                  "detail": (f"{cur} → {default}" if ok
+                             else (r.stderr.strip() or "checkout failed").splitlines()[-1])})
+
+    # Report review repos the task references but that aren't in the workspace.
+    for key, pr in pr_by_repo.items():
+        if key not in seen_review:
+            add_repo({"name": pr.get("repo") or f"{key[0]}/{key[1]}",
+                      "role": "review", "action": "not-found",
+                      "detail": "repo not present in this workspace"})
+
+    errors = sum(1 for r in job["repos"] if r["action"] in ("error", "not-found"))
+    dirty = sum(1 for r in job["repos"] if r["action"] == "skipped-dirty")
+    ok_n = sum(1 for r in job["repos"] if r["action"] == "checked-out")
+    msg = f"{ok_n} aligned"
+    if left_alone:
+        msg += f", {left_alone} left as-is"
+    if dirty:
+        msg += f", {dirty} skipped (dirty)"
+    if errors:
+        msg += f", {errors} problem(s)"
+    upd(status="done", current=None, finished=NOW, message=msg)
+
+    # Record the outcome on the task (best-effort, guarded by the store lock).
+    note = f"dashboard: workspace {job['slot']} aligned for manual review — {msg}"
+    if store_lock is not None:
+        store_lock.acquire()
+    try:
+        d2 = load()
+        t2 = find_task(d2, job["task_id"])
+        if t2:
+            append_note(t2, note)
+            t2["updated"] = TODAY
+            save(d2)
+    finally:
+        if store_lock is not None:
+            store_lock.release()
+
+
+def run_workspace_reset(job: dict, store_lock=None) -> None:
+    """Background worker: switch every repo in a workspace slot back to `main`.
+
+    Fired when a slot is set free — returns the whole workspace to a clean
+    default-branch state. Non-destructive: dirty repos are skipped and reported.
+    """
+    def upd(**kw):
+        with ALIGN_LOCK:
+            job.update(kw)
+
+    def add_repo(rec):
+        with ALIGN_LOCK:
+            job["repos"].append(rec)
+
+    ws_dir = PROJECTS_ROOT / DEFAULT_PROJECT / job["slot"]
+    if not ws_dir.is_dir():
+        upd(status="error", message=f"workspace dir not found: {ws_dir}", finished=NOW)
+        return
+
+    worktrees = _discover_worktrees(ws_dir)
+    upd(total=len(worktrees))
+    left_alone = 0
+    for repo_dir in worktrees:
+        try:
+            upd(current=str(repo_dir.relative_to(ws_dir)))
+        except ValueError:
+            upd(current=repo_dir.name)
+        key = _worktree_remote_key(repo_dir)
+        label = f"{key[0]}/{key[1]}" if key else repo_dir.name
+        default = _repo_default_branch(repo_dir)
+        cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
+        if cur == default:
+            left_alone += 1
+            continue
+        if _is_dirty(repo_dir):
+            add_repo({"name": label, "role": "default", "action": "skipped-dirty",
+                      "detail": f"on {cur}, uncommitted changes — left as-is"})
+            continue
+        r = _git(repo_dir, "checkout", default, timeout=60)
+        ok = r.returncode == 0
+        add_repo({"name": label, "role": "default",
+                  "action": "checked-out" if ok else "error",
+                  "detail": (f"{cur} → {default}" if ok
+                             else (r.stderr.strip() or "checkout failed").splitlines()[-1])})
+
+    dirty = sum(1 for r in job["repos"] if r["action"] == "skipped-dirty")
+    errs = sum(1 for r in job["repos"] if r["action"] == "error")
+    ok_n = sum(1 for r in job["repos"] if r["action"] == "checked-out")
+    msg = f"{ok_n} → main"
+    if left_alone:
+        msg += f", {left_alone} already on main"
+    if dirty:
+        msg += f", {dirty} skipped (dirty)"
+    if errs:
+        msg += f", {errs} problem(s)"
+    upd(status="done", current=None, finished=NOW, message=msg)
+
+
+# ----------------------------------------------------------------------------
+# PLDM (Palladium) test submission
+# ----------------------------------------------------------------------------
+# `octl ws build --remote --target pldm` builds from the *workspace manifest*,
+# not from a PR reference, so a feature can only be submitted once a slot is
+# physically checked out on every one of its PR branches, clean and pushed.
+# The job therefore does the whole chain: grab a free slot, align it, preflight,
+# write the tests-config, dispatch, then stamp the result back on the memoir.
+
+PLDM_LOCK = _threading.Lock()
+PLDM_IMAGE_TYPES = ["1die_w_gmem", "2die_w_gmem", "1die_wo_gmem", "4die_w_gmem"]
+# Anything above this and the run is almost certainly stuck behind a busy EDK
+# rather than actually building; octl itself caps a test at 120 minutes.
+PLDM_DISPATCH_TIMEOUT = 1800
+
+_RUN_URL_RE = re.compile(r"https://github\.com/\S+/actions/runs/\d+")
+
+
+def _unpushed(repo_dir: Path) -> str | None:
+    """Describe unpushed commits on the current branch, or None if in sync."""
+    br = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
+    if not br or br == "HEAD":
+        return None
+    r = _git(repo_dir, "rev-list", "--count", f"origin/{br}..{br}", timeout=30)
+    if r.returncode != 0:
+        return f"{br} has no upstream on origin"
+    n = r.stdout.strip()
+    return f"{n} unpushed commit(s) on {br}" if n.isdigit() and int(n) else None
+
+
+def run_pldm_submit(job: dict) -> None:
+    """Background worker: align a slot to a feature's PRs and enqueue a PLDM job."""
+    def upd(**kw):
+        with ALIGN_LOCK:
+            job.update(kw)
+
+    def add_repo(rec):
+        with ALIGN_LOCK:
+            job["repos"].append(rec)
+
+    def fail(msg):
+        upd(status="error", current=None, finished=NOW, message=msg)
+        if job.get("held"):
+            wm.release(job["slot"])
+            upd(held=False)
+
+    prs = job["prs"]
+    pr_by_repo = {(p["owner"].lower(), p["repo"].lower()): p for p in prs}
+    ws_dir = PROJECTS_ROOT / DEFAULT_PROJECT / job["slot"]
+    if not ws_dir.is_dir():
+        return fail(f"workspace dir not found: {ws_dir}")
+
+    upd(phase="align", current="scanning workspace")
+    worktrees = _discover_worktrees(ws_dir)
+    upd(total=len(worktrees))
+    seen: set[tuple[str, str]] = set()
+    for repo_dir in worktrees:
+        key = _worktree_remote_key(repo_dir)
+        upd(current=repo_dir.name)
+        pr = pr_by_repo.get(key) if key else None
+        if not pr:
+            continue
+        seen.add(key)
+        label = f"{pr['repo']}#{pr['number']}"
+        if _is_dirty(repo_dir):
+            add_repo({"name": label, "action": "error",
+                      "detail": "uncommitted changes — commit or stash first"})
+            continue
+        ok, detail = _checkout_pr_branch(repo_dir, pr.get("branch") or "", pr["number"])
+        add_repo({"name": label, "action": "checked-out" if ok else "error",
+                  "detail": detail})
+    for key, pr in pr_by_repo.items():
+        if key not in seen:
+            add_repo({"name": f"{pr['repo']}#{pr['number']}", "action": "not-found",
+                      "detail": "repo not present in this workspace"})
+
+    bad = [r for r in job["repos"] if r["action"] != "checked-out"]
+    if bad:
+        return fail(f"{len(bad)} repo(s) not ready — nothing dispatched")
+
+    # Remote mode rebuilds from origin, so an unpushed commit would silently be
+    # left out of the very build meant to test it.
+    upd(phase="preflight", current="checking for unpushed commits")
+    stray = []
+    for repo_dir in worktrees:
+        key = _worktree_remote_key(repo_dir)
+        if key and key in pr_by_repo:
+            u = _unpushed(repo_dir)
+            if u:
+                stray.append(f"{pr_by_repo[key]['repo']}: {u}")
+    if stray:
+        return fail("push these first — " + "; ".join(stray))
+
+    cfg_dir = Path(os.path.expanduser("~/tasks/pldm"))
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg_dir / f"{job['display_name']}.yaml"
+    cfg.write_text(
+        f'display_name: "{job["display_name"]}"\n'
+        "tests:\n"
+        f'  - image_type: "{job["image_type"]}"\n'
+        f'    group: "{job["group"]}"\n'
+        f'    timeout_minutes: {job["timeout"]}\n'
+        f'    args: "{job["args"]}"\n'
+        '    extra_flags: ""\n', encoding="utf-8")
+    upd(phase="dispatch", current="octl ws build --remote --target pldm",
+        config=str(cfg))
+
+    try:
+        r = subprocess.run(
+            ["octl", "ws", "build", "--remote", "--target", "pldm",
+             "--from-file", str(cfg)],
+            cwd=str(ws_dir), capture_output=True, text=True,
+            timeout=PLDM_DISPATCH_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return fail(f"octl dispatch failed: {e}")
+
+    out = (r.stdout or "") + (r.stderr or "")
+    upd(output=out[-4000:])
+    if r.returncode != 0:
+        tail = [ln for ln in out.splitlines() if ln.strip()][-1:] or ["see output"]
+        return fail(f"octl exited {r.returncode}: {tail[0][:200]}")
+
+    m = _RUN_URL_RE.search(out)
+    url = m.group(0) if m else ""
+    detail = f"{job['display_name']} · {url or 'run URL not printed'} · updated {TODAY}"
+    ok, msg = pm.set_pldm(job["feature_id"], "queued", detail)
+
+    upd(status="done", phase="done", current=None, finished=NOW, run_url=url,
+        message=f"queued on {job['image_type']}" + ("" if ok else f" (memoir: {msg})"))
+    if job.get("held"):
+        wm.release(job["slot"])
+        upd(held=False)
+
+
+def start_pldm_job(feature: dict, opts: dict) -> tuple[str | None, str]:
+    """Reserve a slot and launch a PLDM submission job. Returns (job_id, message).
+
+    ``opts["dry"]`` resolves and validates everything, then reports the plan
+    without reserving a slot, touching a checkout or dispatching a build.
+    """
+    prs = [p for p in feature.get("prs", []) if p.get("status") != "closed"]
+    if not prs:
+        return None, "feature has no open PRs to test"
+
+    slot = (opts.get("slot") or "").strip()
+    held = False
+    known = viable_slots()
+    if not known:
+        return None, "no buildable workspace slots found"
+    if slot:
+        # Must name a real slot: normalize_slot() happily passes ".." through,
+        # which would point the checkout at the whole projects root.
+        slot = wm.normalize_slot(slot) or ""
+        if slot not in known:
+            return None, (f"{opts.get('slot')!r} is not a buildable workspace "
+                          f"(use one of: {', '.join(known)})")
+    else:
+        free = [s for s in known if wm.is_free(s)]
+        if not free:
+            return None, "no free workspace slot — release one or pick a slot"
+        slot = free[0]
+    name = re.sub(r"[^a-z0-9]+", "-", feature["name"].lower()).strip("-")[:40]
+    display = (opts.get("display_name") or f"{name}-{datetime.now():%m%d-%H%M}").strip()
+
+    if not wm.is_free(slot) and not opts.get("force"):
+        # Aligning would check PR branches out over someone else's work.
+        return None, (f"slot '{slot}' is held by {wm.holder_summary(wm.get_holder(slot))}"
+                      " \u2014 free it or choose another slot")
+    if opts.get("dry"):
+        return None, (f"dry run OK \u2014 would submit '{display}' from slot '{slot}' "
+                      f"({len(prs)} PR(s), image {opts.get('image_type') or PLDM_IMAGE_TYPES[0]})")
+
+    if wm.is_free(slot):
+        ok, msg, _ = wm.occupy_adhoc(slot, f"PLDM test: {display}", tag="experiment")
+        if not ok:
+            return None, msg
+        held = True
+
+    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "kind": "pldm", "slot": slot, "held": held,
+        "feature_id": feature["id"], "feature": feature["name"],
+        "display_name": display,
+        "image_type": opts.get("image_type") or PLDM_IMAGE_TYPES[0],
+        "group": opts.get("group", "default"),
+        "timeout": max(1, min(120, int(opts.get("timeout") or 20))),
+        "args": opts.get("args", ""),
+        "prs": prs, "status": "running", "phase": "align",
+        "started": NOW, "finished": None, "current": None, "total": 0,
+        "message": "", "repos": [], "run_url": "",
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    _threading.Thread(target=run_pldm_submit, args=(job,), daemon=True).start()
+    return jid, f"{display} → {slot}"
+
+
+PR_SCAN_ICONS = {
+    "merged": ("\u2713", "ok"), "approved": ("\u2713", "ok"),
+    "merge-queue": ("\u21bb", "ok"),
+    "pending": ("\u00b7", "warn"), "needs-rebase": ("\u26a0", "warn"),
+    "ci-fail": ("\u2715", "bad"), "changes-requested": ("\u2715", "bad"),
+    "closed": ("\u2715", "bad"),
+}
+
+
+def run_pr_scan(job: dict) -> None:
+    """Re-probe every tracked PR, streaming one row per PR into the job.
+
+    Runs on a worker thread and releases PR_SCAN_LOCK, which the request handler
+    acquired, so a second scan can't start while this one is in flight.
+    """
+    try:
+        _run_pr_scan(job)
+    finally:
+        PR_SCAN_LOCK.release()
+
+
+def _run_pr_scan(job: dict) -> None:
+    def progress(done, total, feat, pr):
+        with ALIGN_LOCK:
+            job["total"] = total
+            if pr is None:          # opening callback: batch queue-state lookup
+                job["current"] = "merge-queue states"
+                return
+            icon, tone = PR_SCAN_ICONS.get(pr.get("status") or "", ("\u00b7", "warn"))
+            name = f"{pr['owner']}/{pr['repo']} #{pr['number']}"
+            job["current"] = name
+            job["repos"].append({
+                "name": name, "action": pr.get("status") or "unknown",
+                "icon": icon, "tone": tone,
+                "detail": f"{pr.get('status') or 'unknown'} \u00b7 {feat['name']}",
+            })
+    try:
+        result = pm.refresh(progress=progress)
+    except Exception as e:
+        with ALIGN_LOCK:
+            job.update(status="error", finished=NOW, current=None, message=str(e))
+        return
+    with ALIGN_LOCK:
+        job["current"] = None
+        job["finished"] = NOW
+        if result.get("error"):
+            job.update(status="error", message=result["error"])
+            return
+        job["status"] = "done"
+        job["result"] = result
+        gone = result.get("purged") or []
+        job["message"] = (
+            f"retired {len(gone)}: " + ", ".join(f["name"] for f in gone)) if gone else ""
+
+
+def start_pr_scan_job() -> str:
+    """Register + launch a background PR scan; return its id."""
+    jid = f"prscan-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "kind": "pr-scan", "slot": "PRs",
+        "status": "running", "started": NOW, "finished": None,
+        "current": None, "total": 0, "message": "", "repos": [],
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    _threading.Thread(target=run_pr_scan, args=(job,), daemon=True).start()
+    return jid
+
+
+def start_alignment_job(task_id: str, slot_root: str, store_lock=None) -> str:
+    """Register + launch a background alignment job; return its id."""
+    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "task_id": task_id, "slot": slot_root, "kind": "align",
+        "status": "running", "started": NOW, "finished": None,
+        "current": None, "total": 0, "message": "", "repos": [],
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    th = _threading.Thread(
+        target=run_workspace_alignment, args=(job, store_lock), daemon=True)
+    th.start()
+    return jid
+
+
+def start_reset_job(slot_root: str, store_lock=None) -> str:
+    """Register + launch a background 'reset to main' job for a slot; return id."""
+    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "task_id": None, "slot": slot_root, "kind": "reset",
+        "status": "running", "started": NOW, "finished": None,
+        "current": None, "total": 0, "message": "", "repos": [],
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    th = _threading.Thread(
+        target=run_workspace_reset, args=(job, store_lock), daemon=True)
+    th.start()
+    return jid
+
+
+def alignment_target_for_ws_payload(slot: str, payload: dict) -> tuple[str, str] | None:
+    """Return (task_id, slot_root) if a workspace occupy assigns a code-review task."""
+    if payload.get("action", "occupy") != "occupy":
+        return None
+    if payload.get("type", "task") != "task":
+        return None
+    tid = (payload.get("task_id") or "").strip()
+    if not tid:
+        return None
+    t = find_task(load(), tid)
+    if not t or t.get("category") != "code-review":
+        return None
+    root = wm.normalize_slot(slot)
+    return (t["id"], root) if root else None
+
+
+def alignment_target_for_task_payload(ident: str, payload: dict) -> tuple[str, str] | None:
+    """Return (task_id, slot_root) if a task edit assigns a code-review task to a slot."""
+    ws = (payload.get("workspace") or "").strip()
+    if not ws:
+        return None
+    t = find_task(load(), ident)
+    if not t or t.get("category") != "code-review":
+        return None
+    root = wm.normalize_slot(ws)
+    return (t["id"], root) if root else None
+
+
 def _server_running() -> int | None:
     """Return the PID of a running server (per PID file), or None."""
     if not PID_FILE.exists():
@@ -2841,12 +5683,58 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 with lock:
                     wd = wm.load()
                     return self._send(200, json.dumps(
-                        {"tasks": _annotate_tasks(load()["tasks"], wd), "workspaces": wd},
+                        {"tasks": _annotate_tasks(load()["tasks"], wd),
+                         "workspaces": ws_ui_payload(wd)},
                         ensure_ascii=False))
+            if self.path == "/api/bugs":
+                with lock:
+                    return self._send(200, json.dumps(bug_payload(), ensure_ascii=False))
+            if self.path == "/api/overview":
+                with lock:
+                    return self._send(200, json.dumps(overview_payload(), ensure_ascii=False))
+            if self.path == "/api/prs":
+                with lock:
+                    return self._send(200, json.dumps(pr_payload(), ensure_ascii=False))
+            if self.path == "/api/raid":
+                with RAID_LOCK:
+                    return self._send(200, json.dumps(raid_payload(), ensure_ascii=False))
+            if self.path.startswith("/api/align/"):
+                jid = self.path[len("/api/align/"):]
+                with ALIGN_LOCK:
+                    job = ALIGN_JOBS.get(jid)
+                    body = json.dumps(job, ensure_ascii=False) if job else None
+                if body is None:
+                    return self._send(404, json.dumps({"error": "unknown job"}))
+                return self._send(200, body)
             return self._send(404, json.dumps({"error": "not found"}))
 
         def do_POST(self):
             from urllib.parse import unquote
+
+            # The PR scan shells out to `gh`; it takes no body and can run long.
+            if self.path == "/api/pr-scan":
+                if pm is None:
+                    return self._send(503, json.dumps({"error": "pr-monitor not installed"}))
+                if not PR_SCAN_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a PR scan is already running"}))
+                try:
+                    jid = start_pr_scan_job()
+                except Exception as e:
+                    PR_SCAN_LOCK.release()
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, "job": jid}))
+
+            # The bug scan hits the Jira REST API; also bodyless and slow.
+            if self.path == "/api/bug-scan":
+                if bm is None:
+                    return self._send(503, json.dumps({"error": "bug-monitor not installed"}))
+                with BUG_SCAN_LOCK:
+                    try:
+                        result = bm.portal_scan()
+                    except Exception as e:
+                        return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps(result, ensure_ascii=False))
+
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -2861,9 +5749,74 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         return self._send(400, json.dumps({"error": msg}))
                     wd = wm.load()
                     tasks = _annotate_tasks(load()["tasks"], wd)
+                    align = alignment_target_for_ws_payload(slot, payload)
+                resp = {"ok": True, "message": msg, "tasks": tasks,
+                        "workspaces": ws_ui_payload(wd)}
+                if align:
+                    resp["align_job"] = start_alignment_job(*align, store_lock=lock)
+                elif payload.get("action") == "free":
+                    root = wm.normalize_slot(slot)
+                    if root:
+                        resp["align_job"] = start_reset_job(root, store_lock=lock)
+                return self._send(200, json.dumps(resp, ensure_ascii=False))
+
+            if self.path.startswith("/api/bug/"):
+                if bm is None:
+                    return self._send(400, json.dumps({"error": "bug-monitor not installed"}))
+                key = unquote(self.path[len("/api/bug/"):])
+                with lock:
+                    ok, msg = bm.apply_bug_edit(key, payload)
+                    if not ok:
+                        return self._send(400, json.dumps({"error": msg}))
+                    bugs = bug_payload()
                 return self._send(200, json.dumps(
-                    {"ok": True, "message": msg, "tasks": tasks, "workspaces": wd},
-                    ensure_ascii=False))
+                    {"ok": True, "message": msg, "bugs": bugs}, ensure_ascii=False))
+
+            if self.path == "/api/raid-new":
+                if rd is None:
+                    return self._send(400, json.dumps({"error": "team-planner not installed"}))
+                with RAID_LOCK:
+                    ok, msg = rd.new_row(payload)
+                    if not ok:
+                        return self._send(400, json.dumps({"error": msg}))
+                    out = raid_payload()
+                return self._send(200, json.dumps(
+                    {"ok": True, "id": msg, "payload": out}, ensure_ascii=False))
+
+            # Dispatches a real CI build onto shared emulation hardware, so it
+            # is serialised and always reports which slot it took.
+            if self.path == "/api/pldm-test":
+                if pm is None:
+                    return self._send(503, json.dumps({"error": "pr-monitor not installed"}))
+                with PLDM_LOCK:
+                    feats = [f for f in pm.parse(pm.store_path().read_text(encoding="utf-8"))
+                             if f["id"] == payload.get("feature_id")]
+                    if not feats:
+                        return self._send(404, json.dumps(
+                            {"error": f"feature [{payload.get('feature_id')}] not found"}))
+                    jid, msg = start_pldm_job(feats[0], payload)
+                if not jid:
+                    if payload.get("dry") and msg.startswith("dry run OK"):
+                        return self._send(200, json.dumps(
+                            {"ok": True, "dry": True, "message": msg}, ensure_ascii=False))
+                    return self._send(400, json.dumps({"error": msg}))
+                return self._send(200, json.dumps(
+                    {"ok": True, "message": msg, "align_job": jid}, ensure_ascii=False))
+
+            if self.path.startswith("/api/raid/"):
+                if rd is None:
+                    return self._send(400, json.dumps({"error": "team-planner not installed"}))
+                rid = unquote(self.path[len("/api/raid/"):])
+                with RAID_LOCK:
+                    if payload.get("close"):
+                        ok, msg = rd.close_row(rid, str(payload["close"]))
+                    else:
+                        ok, msg = rd.apply_edit(rid, payload)
+                    if not ok:
+                        return self._send(400, json.dumps({"error": msg}))
+                    out = raid_payload()
+                return self._send(200, json.dumps(
+                    {"ok": True, "message": msg, "payload": out}, ensure_ascii=False))
 
             if not self.path.startswith("/api/task/"):
                 return self._send(404, json.dumps({"error": "not found"}))
@@ -2875,9 +5828,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(400, json.dumps({"error": msg}))
                 wd = wm.load()
                 tasks = _annotate_tasks(load()["tasks"], wd)
-            return self._send(200, json.dumps(
-                {"ok": True, "message": msg, "tasks": tasks, "workspaces": wd},
-                ensure_ascii=False))
+                align = alignment_target_for_task_payload(ident, payload)
+            resp = {"ok": True, "message": msg, "tasks": tasks,
+                    "workspaces": ws_ui_payload(wd)}
+            if align:
+                resp["align_job"] = start_alignment_job(*align, store_lock=lock)
+            return self._send(200, json.dumps(resp, ensure_ascii=False))
 
     class Server(ThreadingHTTPServer):
         # Avoid "Address already in use" on quick restarts (TIME_WAIT sockets).

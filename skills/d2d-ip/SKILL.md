@@ -45,11 +45,22 @@ D2D responsibilities by stage (per the proposed driver-functionality split):
 
 ## Document Catalog
 
+> **Project note (A2 / Atlantic2 vs A1 / Iridium):** `D2D Specification **Rev 2.0.0**.docx` is the
+> **A2 (Atlantic2)** revision; `D2D Specification Rev1.docx` is the A1/Iridium baseline. The two
+> revisions are **textually identical** (only figure/table caption numbering differs). **Per the
+> architect (Maxim Leshin, 2026-08-30): "We are keeping the D2D as is. The FW should be updated
+> only if the new AW IP requires a different configuration."** → **no A2 D2D design change, no D2D
+> initiatives**; D2D FW is carried over unless the new **AlphaWave (AW)** IP drop needs different
+> config. A2 D2D config per the A2 Overview: **12× UCIe 2.0 Standard Package, 768 GB/s per
+> direction**. (Any new-process PHY seen in RTL — e.g. the **N3 PCIe7 PHY** — is on the **SU/DMP**
+> scale-up path, not D2D.) For project context see the `atlantic2-prj` skill.
+
 ### D2D & UCIe Documents (`~/docs/D2D/`)
 
 | File | Size | Content |
 |------|------|---------|
-| `D2D Specification Rev 2.0.0.docx` | ~5.5MB | Internal Element D2D specification — protocol, PHY, registers, integration |
+| `D2D Specification Rev 2.0.0.docx` | ~5.5MB | **A2** internal Element D2D specification — protocol, PHY, registers, integration |
+| `D2D Specification Rev1.docx` | ~5.5MB | **A1/Iridium** baseline revision (near-identical content; diff for the A1→A2 delta) |
 | `ucie_1p1_with_legal_disclaimer_july_10th_2023.pdf` | ~7MB | UCIe 1.1 specification — industry standard for Universal Chiplet Interconnect Express (UCIe), relevant for D2D/Chiplet/Inter-die standards, protocol, and PHY |
 | `ucie_1p1.txt` | ~0.8MB | Searchable plain-text extraction of the UCIe 1.1 PDF (grep-friendly) |
 
