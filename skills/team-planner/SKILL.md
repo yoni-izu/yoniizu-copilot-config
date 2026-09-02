@@ -87,6 +87,32 @@ See [snapshot format](./references/snapshot-format.md).
 
 See [RAID reference](./references/raid.md).
 
+### `rd.py` — RAID reader/writer
+
+`raid.md` stays the source of truth and stays hand-editable, but `rd.py` (next to this file) gives it
+a scripted interface so neither you nor the portal has to re-serialise the whole file to change one
+field:
+
+```bash
+python3 ~/.copilot/skills/team-planner/rd.py list [--all]
+python3 ~/.copilot/skills/team-planner/rd.py show R-002
+python3 ~/.copilot/skills/team-planner/rd.py set R-002 --rag red --due 2026-09-15
+python3 ~/.copilot/skills/team-planner/rd.py new --type risk --title "…" --fw-owner Igal --p 3 --i 4
+python3 ~/.copilot/skills/team-planner/rd.py close R-002 --resolution "consumer matrix landed"
+python3 ~/.copilot/skills/team-planner/rd.py payload      # JSON for the Team Portal
+```
+
+`set` rewrites **only** the field lines it is given — every other line, including multi-line
+`Mitigation` blocks with sub-bullets, is preserved byte-for-byte. Changing `--p`/`--i` recomputes
+`Score`; `--rag` is explicit, and a new row defaults its RAG from the score
+(≥15 Red, ≥8 Orange, ≥4 Yellow, else Green). `new` allocates the next free ID for the type prefix
+(`R-`/`A-`/`I-`/`D-`) and appends a full block. `close` stamps `**Closed <today>** — <resolution>`
+into `Status`.
+
+Prefer `rd.py` over hand-editing `raid.md` when you are changing one field; hand-edit when you are
+rewriting narrative prose. The **RAID** section of the [`task-manager`](../task-manager/SKILL.md)
+portal is a UI over exactly these calls.
+
 ## Autonomy Rules
 
 | Action | Permission |
@@ -284,6 +310,12 @@ See [RAID reference](./references/raid.md).
    - **Success and Focus** (panel-success) — completed items this week, key focus areas
 
 **Item style:** `<subsystem>: <one-line description>`. Subsystems: PCIe, SE, D2D, Infra (or "All domains" for cross-cutting).
+
+**Content rules (lead preferences — do NOT violate):**
+- **Never mention sprints, sprint numbers, sprint windows, or milestone/sprint execution framing.** State the work and its status only.
+- **Never write a "Focus" / "focus area" line** (e.g. "power-on execution sprint", "this week's focus is…"). Report concrete items only — completed, in-progress-at-risk, or blocked. Despite the panel being named "Success and Focus", put only real completed/notable items in it.
+- For every Jira item referenced, verify its **PR status** (open / merged / closed) before classifying it — a story's real state is its PR, not just the Jira status.
+- Also scan the domain repos for **open PRs** and **PRs merged in the last week**, and surface only the *interesting* ones (skip trivial/chore/CI-only PRs).
 
 **Procedure:**
 1. Fetch current sprint tickets, compare to previous week's entry on the page.

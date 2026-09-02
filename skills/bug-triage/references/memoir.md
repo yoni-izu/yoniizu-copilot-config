@@ -81,13 +81,77 @@ _(none yet)_
     (`elp_main.c`) does `return;` on any error **without re-queuing**, so ONE transient skew permanently
     kills heartbeats → FW `hb_timer` fires → reset. Signature: `PSOC heartbeat sequence mismatch with EQ:
     N vs. N-1` / `PSOC_HEARTBEAT` timeout `-110`/`-5` then reset `-5`/`-16` (e.g. MODINFSDKSW-11763).
-  - *Cold-init handshake timeout (no dedicated anchor yet).* `MBOX_INIT` (opcode 511, **msg id 0** = first
-    message) or boot-status poll times out. `el_psoc_wait_for_boot_ready()` polls for
-    `EL_FW_BOOT_STS_DONE (0x2)`; **"component ready state 0x1" = boot stuck BELOW done (partial)**, not a
-    multi-component bitmask. Then `fw_channel_init("PSOC_MNG")` `MBOX_INIT` no-ack → `Failed to init FW
-    channel PSOC_MNG_0` → `-110` (e.g. MODINFSDKSW-11764, -12117, -12058). Mechanism (FW hang vs
-    timeout-too-short vs KMD bug) needs the **PSOC FW-side UART/console log** — the GH runner log is only
-    the host KMD view.
+  - *Cold-init handshake timeout — ANCHOR **IPSESW-308** (root cause CONFIRMED, `ip-se-firmware`).*
+    `MBOX_INIT` (opcode 511, **msg id 0** = first message) or boot-status poll times out.
+    `el_psoc_wait_for_boot_ready()` polls for `EL_FW_BOOT_STS_DONE (0x2)`; **"component ready state 0x1" =
+    boot stuck BELOW done (partial)**, not a multi-component bitmask. Then `fw_channel_init("PSOC_MNG")`
+    `MBOX_INIT` no-ack → `Failed to init FW channel PSOC_MNG_0` → `-110`. **Root cause (Lauterbach, Akshay
+    Bharad, 08-2026): the ARM (PSOC/SE) FW takes a Zephyr USAGE FAULT ("Illegal use of the EPSR" / unaligned
+    / PC=0) at boot — the UART/shell IRQ handler does `dev->api->fifo_read(...)`, reading a function pointer
+    out of the UART device struct that holds garbage (e.g. `0x12`) → jump to invalid PC. It is UART
+    device-struct MEMORY CORRUPTION, not a logic bug; coding-side (vector table, driver, args, thread) all
+    ruled out. Heisenbug ~1/3 boots — a spin-trap in `uart_callback()` masks it.** The ARM halt is why the
+    host KMD `MBOX_INIT` never acks (host log is only the downstream KMD view). **This overturns the old
+    "Palladium timing, not a defect" read** — it's a real ARM-FW defect, proven because the **HOST FW flavor
+    never shows it** and even a 360000 ms mailbox timeout still never acks.
+    - **FIX CONFIRMED — `project.iridium.sw.fw.infra` PR #1110 (merged 2026-08-24), `[IPSESW-308] set uart
+      prio same as rest of isrs`, one line in `boards/arm/a1/el_arm.dts`.** The real mechanism is now
+      authoritative: the **UART IRQ was left at priority `0x1` while every other ISR is `0`; when the UART
+      ISR preempts, it corrupts the stack** of whatever thread was running. So the *surface* fault is
+      RANDOM — it can be the USAGE-fault/jump-to-garbage in `el_se_link_init_tid` OR a Data-Access-Violation
+      MPU fault in a totally different thread (a clobbered stack-local pointer gets dereferenced). **Because
+      the fix is a blanket IRQ-priority change, it eliminates ALL of these manifestations at once — which
+      means you CANNOT tell a 308 repro from a distinct bug by the crash signature; the discriminator is the
+      FW image VERSION (does it carry #1110, i.e. built after 08-24 / > `1.684.0`?).** A crash on a pre-#1110
+      image with any stack-corruption shape is very likely 308; the same crash on a confirmed post-#1110
+      image is a NEW bug. The clean test is a re-run on a post-#1110 image, not more log archaeology.
+    - **Two sub-classes:** (1) crash from *remote programming in the SE thread* — **worked around by an
+      SE-LPBK pallad image** (`..._se_lpbk` passes; `..._isr3` / plain `_w_gmem` fail); (2) crash *in
+      execution* — still under debug.
+    - **Dup chain to know:** MODINFSDKSW **11764 → 12978 → 13013 → IPSESW-308**. Its component drifts
+      across the chain (`ip-pcie-firmware-ep` → `ip-psoc-firmware` → `ip-se-firmware`) — the real owner of
+      *this* facet is `ip-se-firmware` (the SE/UART FW).
+  - **CAUTION — host `MBOX_INIT -110` is a shared ENDPOINT with ≥2 distinct ARM causes. Do NOT dup on the
+    dmesg symptom alone; read the ARM `uart.log` + FW `manifest ver:` to disambiguate.** Verified split
+    (MODINFSDKSW-12649 vs the IPSESW-308 chain, both edk7-z3a, both `-110`):
+    - *(a) el_se Zephyr fault (IPSESW-308):* `uart.log` ends `ZEPHYR FATAL ERROR` in `el_se_link_init_tid`
+      → `Halting system` (UART device-struct corruption). Seen on FW `1.684.0-21082026-165020`.
+    - *(b) MNG CPU-comms MMU/DMA fault (12649, distinct):* `uart.log` boots FLA-RT/PrimeBoot/Management to
+      "boot DONE", then `el_mmu: page translation error VA:0xf3b9e000` + `el_dma_sei_isr` (DMA SEI d2h/h2d)
+      at MNG CPU-comms init, and **FW stays alive at the `mng` shell (no halt)**. Seen on FW
+      `1.682.0-17082026-204948`. Not the el_se crash; likely a different owner (MNG/CPU-comms + DMA/MMU).
+    - *(c) MBOX_RCV_WORKQ MPU fault (MODINFSDKSW-12117 bucket, third distinct cause, CONFIRMED via uart.log):*
+      ARM boots fine, then at **runtime** `<wrn> el_mng_comms: Heartbeat lost - no HB received within 5000 ms`
+      → `HARD FAULT` (escalation) → `MPU FAULT / Data Access Violation`, **MMFAR `0x60c0c000`**, **PC
+      `0x6034650a`** (LR `..0b`, r12 `0xf3be0018`, r3 `0xf0c040c4`, xpsr `0x21000000`), `ZEPHYR FATAL ERROR
+      19`, thread **`MBOX_RCV_WORKQ`**. This is a *post-boot* crash (unlike (a) cold-init), likely a
+      teardown/use-after-free race in the mailbox-RX workqueue triggered by the MNG heartbeat-loss path.
+      **REVISED with the #1110 finding: a Data-Access-Violation from a clobbered stack-local pointer is
+      exactly what the 308 UART-priority stack corruption produces in an arbitrary thread — so (c) may be a
+      308 manifestation, NOT a separate teardown UAF. Decide by the image version (pre/post #1110), not the
+      signature.** Decisive lesson: once the ARM MPU-faults, EVERY subsequent host reprobe fails at
+      (opcode 511, msg id 0) on `PSOC_MNG_0` with `-110` — identical to the IPSESW-308 cold-init host
+      symptom. One decisive run (33272705912, edk4-z3a, 08-30) showed all three host signatures back-to-back
+      on one device: heartbeat-mismatch `-5` (956) → the MPU fault → repeated `MBOX_INIT -110`.** So a host
+      `MBOX_INIT/PSOC_MNG_0 -110` is NOT proof of cold-init; only the ARM `uart.log` tells cold-init (a) from
+      a post-boot MPU-fault (c).
+    - **`EL_MBX - Error: ARM CPU device is NULL` prints in BOTH → it is NOT a discriminator.** The
+      discriminators are the *halt vs alive-at-shell* outcome and the MMU/DMA-SEI vs Zephyr-fatal line.
+    - **How to get the ARM log:** `gh api repos/Elmnt-Internal/ip.infra.sw.manifests/actions/runs/<run>/artifacts`
+      → find the `...pldm-<station>-logs` artifact → download `/zip` → untar → read `uart.log` (ARM console)
+      and `dmesg.log` (host KMD). The GH job/step logs are often empty for old sub-jobs; the **artifact** is
+      the reliable source. Note some runs ship an **empty `uart.log`** — those runs are *unclassifiable*, not
+      a match.
+    - **Outcome (MODINFSDKSW-12649):** stays **OPEN / distinct** — *not* merged into IPSESW-308. Its ARM
+      signature is a **MNG CPU-comms DMA/MMU fault**, root-caused in code: `mng_cpu_comms.c`
+      (`project.iridium.sw.fw.psoc_mng`) → `el_cpu_comms_start()` brings up the PQ/CQ/EQ mailbox; a comms
+      DMA hits an **unmapped VA `0xf3b9e000` (ASID 0, hop_num 5 leaf miss)** → `el_mmu` translation-error SEI
+      (`ip.mmu.sw.fw`) → `el_dma_sei_isr` resp_error (`ip.dma.sw.fw`, `el_dma_comms_set_user_attr` sets the
+      comms MMU-bypass/ASID). Owner = `ip-dma-firmware` + psoc_mng + `ip-mmu-firmware`, **not** `compute-kmd`
+      (12653 is only a Polaris idea-datapoint link — a KMD "don't block insmod" feature, NOT a root-cause dup).
+      Confirms the discipline: reading the ARM `uart.log` (not the shared `-110` dmesg) kept a distinct DMA/MMU
+      mapping bug from being buried under the el_se anchor. **Lesson also: don't trust a verbal "it was
+      closed" — verify status via the API before recording a close-out.**
   - **Decode discipline:** the exact log strings (500 s timeout, "component ready state") come from the KMD
     rev **baked into the FC image**, which can differ from the local `main` KMD tree — grep both, and cite
     which tree you read.
@@ -117,7 +181,40 @@ _(none yet)_
 - **Owner ≠ ticket component.** These tickets often land on `ip-psoc-firmware`, but the drain suppress-vs-notify policy is in **`ip.pcie.sw.fw.ep`** (`el_piw.c`); the one-shot arm is in **`ip.infra.sw.fw`** (`el_irq_mon.c`). C2C-cfg targets point at `ip.se.*`. Reassign accordingly.
 
 ### Scale-Up (C2C) / D2D
-_(none yet)_
+- **`test_d2d_pldm_single_chip_run` returns `False` on pldm-edk0-z3a = the `die_2_die_bw` qual test.
+  Decode the FAILURE at the sub-test level before calling it a dup of MODINFSDKSW-11910 — "same test,
+  same station, same FC tag" is NOT enough.** The test spawns one worker per die-pair; the real
+  verdict is in the per-worker result CSV `reports_Die_2_Die_Test/local/<w>/*_Die_2_Die_Test_*.csv`
+  (columns `sub_test_name,status,test-result,fail-threshold,warn-threshold`). Read THAT, not the
+  journal (`qual_journal_340.log` only says `Worker N reported failure`) and not the GH job log
+  (`--failed-only` mode prints only the journal path).
+  - **Distinguish the sub-signatures — they are different bugs:** (a) **hang-then-cancel** (11595:
+    die_2_die error then job hung ~3 h to the 300-min timeout, 0 summary) vs (b) **ran-to-completion
+    assertion-fail** (11910, and MODINFSDKSW-12719 run 32063981909). Within (b), decode WHICH metric
+    failed: a **BW-below-threshold** (`avg_bw` Failure) is a *performance* verdict, totally distinct
+    from a data error (all `*_error_count`/CE/UE metrics were `0/Success` in 12719 — no corruption,
+    no D2D CE/UE/fatal, no SEI in dmesg during the test window).
+  - **Confirmed 12719 signature (record it for comparison):** only 4 sub-tests fail, all
+    `vertical-avg_bw-lmem` (read+write) on the **two INNER die-pairs die1,die2 ≈ 275–284 GB/s** vs
+    fail-threshold **360**; the **EDGE die-pairs die0,die3 ≈ 400** pass. Horizontal/diagonal/all-gmem
+    pass everywhere. A clean ~30% inner-vs-edge vertical-lmem BW asymmetry on image
+    `2_18_0_2p0_1240` → either a real inner-die vertical D2D BW limit or an over-uniform qual
+    threshold. **This is NOT provably the same as 11910's D2D half — 11910's ticket has no per-op
+    breakdown.** To confirm/deny identity, pull 11910's run artifact CSVs and compare failing
+    sub-tests.
+  - **11910 was closed on an EDP-only fix.** Qual PR #342 (`project.iridium.prod.qual`) touched only
+    the EDP `--duration` switch + a plot decode — **never the D2D path**; the D2D failure was
+    separately masked by a test-reorder (Idan Pazi). So `EDP result: True` + `D2D result: False` on
+    the same image is expected, and the D2D BW assertion has been open the whole time. Reinforces
+    "Fixed ≠ gone while FC tag unchanged" — the merged fix wasn't even a FW/FC change.
+  - **Owner is the D2D qual/val side** (el-qual / val-d2d — Omri Zeneva / Idan Pazi / Tomer Mankita),
+    NOT `ip-d2d-firmware` (the auto-filed component is usually wrong here).
+  - **Artifact gotcha:** the station-log tarball keeps only SKELETON per-worker `qual.log`s
+    (session-start line only) AND a truncated in-test-dir dmesg (ends at test start) — but the
+    **result CSVs and per-op `qual_metrics/*_bw_result.json` DO survive** under
+    `reports_Die_2_Die_Test/local/<w>/`. Grep the CSVs for `Failure`; the top-level `dmesg.log`
+    (kernel-format `[Www Mon DD HH:MM:SS YYYY]` timestamps) covers the whole run for HW-error
+    correlation.
 
 ### RAS / Manageability
 _(none yet)_

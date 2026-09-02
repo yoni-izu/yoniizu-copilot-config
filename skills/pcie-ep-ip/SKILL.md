@@ -49,11 +49,19 @@ PCIe EP responsibilities by stage (per the proposed driver-functionality split):
 
 ## Document Catalog
 
+> **Project note (A2 / Atlantic2 vs A1 / Iridium):** `PCIe EP Specification **Rev 2.0.0**.docx` is
+> the **A2 (Atlantic2)** EP spec (a feature *superset* — some features are per-product). The
+> headline A2 delta is **PCIe Gen7**: **Gen7 ×4, 64 GB/s per direction**, PAM4 signaling (Gen6/7),
+> 256-byte **FLIT** mode, **Enhanced (custom) FEC + increased voltage swing**, credits fine-tuned
+> for 1 µs round-trip. A2 uses a **single PCIe EP shared among the 4 dies** for the host link.
+> The EP macro has its own **micro-controller** (ICCM/DCCM, PSOC mailbox) that answers FLR/hot
+> reset and can extend the PCIe capability list in SW. For project context see `atlantic2-prj`.
+
 ### Top-Level Documents (`~/docs/PCIe EP/`)
 
 | File | Content |
 |------|---------|
-| `PCIe EP Specification Rev 2.0.0.docx` | Internal Element EP specification (overall EP design) |
+| `PCIe EP Specification Rev 2.0.0.docx` | **A2** internal Element EP spec (overall EP design, feature superset; **Gen7**) |
 
 ### Controller Documents (`~/docs/PCIe EP/controller/`)
 

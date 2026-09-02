@@ -52,7 +52,20 @@ Scale Up (SU / C2C) responsibilities by stage (per the proposed driver-functiona
 | `DWC_pcie_ctl_reference.pdf` | 18845 | Complete register reference — all config space and DBI registers (DM variant) |
 | `DWC_pcie_ctl_user.pdf` | 356 | Integration guide, clocking, reset, bring-up sequences |
 | `DWC_pcie_ctl_relnotes.pdf` | 38 | Release notes, known issues, errata |
-| `PCIe C2C Rev 2.0.0.docx` | — | Internal Element C2C specification |
+| `PCIe C2C Rev 2.1.1.docx` | — | **A2 (Atlantic2)** internal Element C2C spec — 2nd-gen scale-up; **PCIe-Compliant Mode** + **Dual-Mode Port** (RP/EP), Gen7, FLIT/Non-FLIT |
+| `PCIe C2C Rev 2.0.0.docx` | — | Earlier A2 C2C revision |
+| `PCIe C2C.docx` | — | **A1/Iridium** baseline C2C spec (diff for the A1→A2 delta) |
+
+> **Project note (A2 / Atlantic2 vs A1 / Iridium):** the A2 C2C spec (`PCIe C2C Rev 2.1.1.docx`)
+> is the **2nd generation** scale-up interconnect and is **~2.5× larger** than the A1 baseline
+> (`PCIe C2C.docx`). The headline A2 delta is a **PCIe-Compliant Mode** built on a **Dual-Mode
+> (DM) PCIe controller**, statically configurable as **Root Port (RP) or Endpoint (EP)**, to
+> **interoperate with third-party PCIe devices (GPUs)**. Highlights: up to **Gen7 (128 GT/s)**,
+> FLIT + Non-FLIT modes, PCIe Base Spec Rev 7.0 compliance, ~100 ns/dir latency; Switched (EP
+> behind switch) + Switchless P2P (RP↔EP) topologies; PCIe Rail + Dragonfly topologies; ordering
+> models (compliant vs non-compliant), aggregation buffer, GPU producer/consumer support; RAS
+> (ECRC/LCRC/AER, SECDED ECC, poison/viral, automatic lane failover, multiple concurrent links).
+> For project context see `atlantic2-prj`.
 
 ### PHY Documents (`~/docs/PCIe EP/phy/`)
 

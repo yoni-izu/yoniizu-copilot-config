@@ -249,8 +249,88 @@ Update the cached PLDM job-queue result for a feature.
 ### 11. Auto-Cleanup
 
 During any `status`/`check` operation:
-- If all PRs in a feature are `merged`, the batch is done — automatically remove the feature entry from memory without asking.
-- Notify the user: "All PRs for **<feature>** are merged — removed from tracking."
+- If all PRs in a feature are `merged`, the batch is done — retire it without asking.
+- Retiring means **annotating the heading**, never deleting the entry:
+  `## [11] Guard SV driver Kconfig behind EL_SV (IPINFRASW-2003) — ✅ COMPLETE 3/3 MERGED
+  (2026-08-27, dropped from active tracking)`.
+  The memoir is a record first, so the notes, description and PR table all stay. A heading
+  matching `COMPLETE|DROPPED|ABANDONED` is what drops the feature out of active tracking, so
+  un-retiring is just deleting that suffix.
+- `pm.py refresh` does this automatically (see below), which is the normal path. Do it by hand
+  only when editing the memoir without a scan.
+- Notify the user: "All PRs for **<feature>** are merged — dropped from active tracking."
+
+## `pm.py` — the token-free status refresher
+
+`pm.py` (next to this file) does the mechanical half of `status`/`check` **without a model in
+the loop**: it parses the memoir, probes every tracked PR through the `gh` CLI in parallel, and
+writes the new value back into each row's `Status` cell. Everything else in the file — the
+memoir bullets, descriptions, PLDM lines — is left byte-for-byte alone.
+
+```bash
+python3 ~/.copilot/skills/pr-monitor/pm.py list            # what's tracked, from the store
+python3 ~/.copilot/skills/pr-monitor/pm.py refresh         # probe GitHub, update Status cells
+python3 ~/.copilot/skills/pr-monitor/pm.py refresh -f 4    # just feature 4
+python3 ~/.copilot/skills/pr-monitor/pm.py refresh --no-purge   # keep merged features active
+python3 ~/.copilot/skills/pr-monitor/pm.py purge -n        # what would be retired
+python3 ~/.copilot/skills/pr-monitor/pm.py payload         # JSON for the Team Portal
+```
+
+Per PR it runs `gh pr view` (state, mergeable, mergeStateStatus, reviewDecision) plus
+`gh pr checks` — **not** `statusCheckRollup`, because the rollup counts every superseded run
+left behind by repeated `/ci` re-fires and reports phantom failures. Status is derived with the
+same precedence as [Status Priority](#status-priority). Roughly 30 PRs settle in ~15s.
+
+Merge-queue membership comes from a **single batched GraphQL query** (`queue_states`) covering
+every tracked PR at once — ~2s for 27 PRs. `gh pr view --json` has no `isInMergeQueue` field, and
+a call per PR would have tripled the scan. The same query returns `autoMergeRequest`, so a PR
+armed with auto-merge shows `auto-merge` in the portal's Gate column. If the GraphQL call fails
+the scan carries on without queue information rather than aborting.
+
+The richer probe output (per-PR check counts, review decision, merge state, URL) is cached at
+`~/tasks/pr-monitor-cache.json` for the portal. The cache is used only while it is newer than
+the memoir; a manual edit to the memoir invalidates it.
+
+**Use `pm.py refresh` first** when the user asks for `status`/`check`. It is free and gives you
+the current state of every PR; spend model calls only on the follow-up work — `analyze` on a
+red PR, rebasing, or refreshing an in-flight PLDM job (which `pm.py` does not touch).
+
+After writing the fresh statuses, `refresh` applies [Auto-Cleanup](#11-auto-cleanup) itself: any
+feature whose PRs are now **all merged** gets its heading annotated `— ✅ COMPLETE N/N MERGED
+(<date>, dropped from active tracking)` and drops out of the active payload. Nothing is deleted,
+so the memoir survives and the annotation can simply be removed to bring a feature back. The
+retired features come back in `payload["purged"]` as `{id, name, total}` — report them to the
+user. Pass `--no-purge` to skip it, or run `pm.py purge -n` to preview.
+
+### In the Team Portal
+
+The [`task-manager`](../task-manager/SKILL.md) portal has a **PRs** section rendered from
+`pm.payload()`: a KPI band (blocked features, CI failing, needs rebase, changes requested,
+approved, merge queue, merged) and one card per feature with its progress bar, PR table and latest memoir
+note. Its **↻ Scan PRs** button POSTs `/api/pr-scan`, which starts `pm.refresh()` on a background
+thread server-side — so the user can re-check every PR from the browser at zero token cost. The scan
+streams into the same progress banner the workspace alignment uses: it POSTs, gets a job id back, and
+polls `/api/align/<job>` until done, showing `Scanning PRs (12/30) · Elmnt-Internal/ip.se.sw.fw #147`
+plus one colour-coded row per PR as each probe lands. `pm.refresh()` takes an optional
+`progress(done, total, feature, pr)` callback for exactly this; a second concurrent scan is refused
+with HTTP 409. The same scan retires
+fully-merged features, and the button reports it inline: `probed 30 PRs · retired 1: Guard SV
+driver Kconfig behind EL_SV (IPINFRASW-2003) (3/3)`. A card that is all-merged but not yet
+scanned is labelled *retires on the next scan*.
+
+Each card also carries a **▶ PLDM test** button that submits the whole feature to the
+[PLDM job queue](../pldm-job-queue/SKILL.md): it reserves a free workspace slot, checks it out
+to the feature's PR branches, refuses if anything is dirty or unpushed, runs
+`octl ws build --remote --target pldm`, and stamps the result back here via `pm.set_pldm()`.
+See [Submitting a feature to PLDM](../task-manager/SKILL.md#submitting-a-feature-to-pldm-from-the-portal).
+
+### `set_pldm(feature_id, state, details)`
+
+Surgically rewrites a feature's `- **PLDM Test:**` and `- **PLDM Details:**` lines, inserting
+them after the block's last field if it never carried them. Passing an empty `details` leaves
+the existing details line alone. Invalidates the cache so the next `payload()` re-reads the
+memoir. This is the only writer for those fields — `refresh()` deliberately touches PR Status
+cells only.
 
 ## Parsing PR References
 
@@ -270,20 +350,22 @@ A feature can be referenced by its **running ID** (`3`, `#3`) or by **name** (ca
 When multiple conditions apply, report the highest-priority status:
 1. `merged`
 2. `closed`
-3. `ci-fail`
-4. `changes-requested`
-5. `needs-rebase`
-6. `approved`
-7. `pending`
+3. `merge-queue` — GitHub has taken the PR into the merge queue. It is landing on its own, so it outranks everything below: nothing here is actionable.
+4. `ci-fail`
+5. `changes-requested`
+6. `needs-rebase`
+7. `approved`
+8. `pending`
 
 ## Rules
 
 - Always use the memory tool to read/write `/memories/pr-monitor-features.md`.
+- **Run `pm.py refresh` before a `status`/`check` pass** — it costs nothing and returns the true state of every PR. Reserve model calls for the interpretation and the follow-up actions.
 - Each feature has a stable running ID in its header (`## [N] <Feature Name>`); assign `max(existing)+1` on `log` and never renumber on `remove`.
-- Never delete a feature entry without user confirmation, **except** fully-merged batches, which are auto-removed during `status`/`check`.
+- Never delete a feature entry. Retiring a fully-merged batch is an automatic heading annotation, not a deletion, and `remove` should do the same unless the user explicitly asks for the text to go.
 - When checking status, fetch all PRs even if some have cached status — always get fresh data.
 - Use `gh` CLI as fallback if the GitHub tools don't return sufficient detail (e.g., for failure logs).
 - Present results as markdown tables for readability.
 - When a PR has unresolved review comments, mention the count and latest commenter.
 - For `pldm-test`, always delegate the actual job-queue submission to the [`pldm-job-queue`](../pldm-job-queue/SKILL.md) skill — do not re-implement the `octl` flow here. Track only the outcome (`PLDM Test` + `PLDM Details`) in the memory file.
-- The **PLDM Test** field is feature-level. It is set by `pldm-test` (submit) and refreshed by `pldm-status`; `status`/`check` also auto-refreshes any feature still `queued`/`running` so in-flight jobs settle without a manual `pldm-status`. Terminal results (`passed`/`failed`/`cancelled`) and `not-tested` features are not re-queried. When a fully-merged feature is auto-removed, its PLDM tracking is dropped with it.
+- The **PLDM Test** field is feature-level. It is set by `pldm-test` (submit) and refreshed by `pldm-status`; `status`/`check` also auto-refreshes any feature still `queued`/`running` so in-flight jobs settle without a manual `pldm-status`. Terminal results (`passed`/`failed`/`cancelled`) and `not-tested` features are not re-queried. When a fully-merged feature is retired, it stops being re-queried along with everything else on the entry.

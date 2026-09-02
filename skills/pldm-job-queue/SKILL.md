@@ -202,6 +202,22 @@ hardware status service). In the picker each is annotated:
 > is choosing an **image type that isn't the one currently loaded** on a job-queue
 > station.
 
+## Submitting from the Team Portal
+
+The [`task-manager`](../task-manager/SKILL.md) portal can drive this whole flow from a button.
+Each feature card in the **PRs** section has **▶ PLDM test**, which reserves a free workspace
+slot, checks it out to the feature's PR branches, verifies everything is committed and pushed,
+writes a tests-config to `~/tasks/pldm/<display-name>.yaml`, runs
+`octl ws build --remote --target pldm --from-file …`, and records the run URL on the
+[`pr-monitor`](../pr-monitor/SKILL.md) memoir. It refuses rather than disturbing an occupied
+slot or a dirty repo, and releases the slot when the job ends. Only the number-named slots
+(`one`…`six`) are offered — the other directories under the project root are scratch dirs, not
+buildable checkouts.
+
+Use it for the common case — "test this feature set as a batch". Drop to the CLI for local
+mode, multi-entry batches, custom `extra_flags`, or anything needing the TUI's live image
+availability list.
+
 ## Monitoring the Job
 
 ### GitHub Actions run

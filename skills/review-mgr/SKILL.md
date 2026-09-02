@@ -1,7 +1,7 @@
 ---
 name: review-mgr
-description: "Manage the incoming code-review queue end-to-end: discover PRs that need your review, log them, align the workspace to a review, batch auto-draft preliminary reviews of new tasks, scan blocked reviews for author activity, and close out a review pass. Use when: scan for PRs that need my review, find new review requests, add PRs to review, list/track my review queue, start/stop a review checkout, pre-review / auto-draft / review new PRs, finish a review pass, check if a blocked review bounced back, review queue status. For the actual act of reviewing a PR (drafting findings, the memoir, submitting), use the pr-review skill. For tracking your OWN submitted PRs, use pr-monitor."
-argument-hint: "Action (scan/add/list/start/pre-review/stop/done/status/check/blocked-scan/msg) and optional PR links or task id"
+description: "Manage the incoming code-review queue end-to-end: discover PRs that need your review, log them, align the workspace to a review, batch auto-draft preliminary reviews of new tasks, scan blocked reviews for author activity, and close out a review pass. Use when: scan for PRs that need my review, find new review requests, add PRs to review, list/track my review queue, start/stop a review checkout, checkout PR branches for a manual review without AI, pre-review / auto-draft / review new PRs, finish a review pass, check if a blocked review bounced back, review queue status. For the actual act of reviewing a PR (drafting findings, the memoir, submitting), use the pr-review skill. For tracking your OWN submitted PRs, use pr-monitor."
+argument-hint: "Action (scan/add/list/start[--manual]/pre-review/stop/done/status/check/blocked-scan/msg) and optional PR links or task id"
 ---
 
 # Review Manager
@@ -57,9 +57,23 @@ Find new review requests and let the user tick which to add.
 
 Do **not** auto-add without the tick step — discovery is assistive, the user curates.
 
-### `start <task-id-or-filter>` — align the workspace to a review
+### `start <task-id-or-filter> [--manual]` — align the workspace to a review
 
 Check the workspace's repos out to a review task's branches so you can review locally.
+
+> **`--manual` (no-AI) mode.** By default `start` auto-invokes the `pr-review` AI pass
+> (steps 8–9), which consumes credits. When the user wants to review the PR **themselves**
+> — "checkout for a manual review", "no AI review", "just align the workspace", "manual
+> review", "don't draft" — run `start --manual`: do the mechanical alignment and workspace
+> occupancy (steps 1–7) **only**, then **stop**. Skip the teammate-review fetch (step 8)
+> and the `pr-review` handoff (step 9) entirely so no credits are spent. Report the
+> checkout result and hand the workspace to the user for a manual review.
+>
+> The **task-manager dashboard does this automatically**: assigning a `code-review` task
+> to a workspace slot in the served dashboard (`tm.py serve`) runs the same manual
+> alignment server-side (checkout PR branches, everything else to `main`) as a background
+> job with a live progress/done banner — no AI, no credits. See the task-manager skill's
+> "Auto-alignment on code-review assignment" note.
 
 1. Read the store; pick target review tasks (matching task id, author, repo, or PR — or default: all non-merged with status `todo`/`in-progress`).
 2. For each PR entry, find the target repo path inside the workspace.
@@ -72,6 +86,10 @@ Check the workspace's repos out to a review task's branches so you can review lo
 5. **Record workspace occupancy.** Detect the workspace you are aligning (the `~/projects/<project>/<ws>` slot the repos live in). Before occupying it, check it is not already held by a *different* holder — a task **or** an ad-hoc hold (`tm.py workspaces`, backed by the [workspace-manager](../workspace-manager/SKILL.md) store). If free, claim it with `tm.py assign <id> <ws>` — this records the slot in `wm.py` and promotes `todo`→`in-progress`. If it is already held, don't clobber it: report the conflict and let the user decide (`--force` displaces the holder).
 6. Update the task: each selected PR entry `review_status: in-progress` if `pending`; append a note. Use `tm.py review-update <id> in-progress` or edit the store. (`assign` in step 5 already handled the task `status`.)
 7. Report: which repos switched to review branches, which to main, which were skipped (and why), and which workspace slot is now occupied.
+
+> **`--manual` stops here.** In no-AI mode, do **not** proceed to steps 8–9 — the workspace
+> is now aligned for the user's own manual review. Report the checkout summary and stop.
+
 8. **Check for existing HSI teammate reviews.** The whole HSI team now cross-reviews each other's PRs, so before drafting your own pass, pull what others already said. For each PR entry, run `gh pr view <pr> --json reviews,reviewThreads` (or `gh api /repos/<owner>/<repo>/pulls/<pr>/reviews` and `.../comments`) to fetch prior reviews and inline threads from other reviewers. Summarize per PR: who reviewed, their verdict (approved / changes-requested / commented), and the gist of their inline comments and any unresolved threads. **Feed this into the `pr-review` handoff** so your draft (a) doesn't duplicate points teammates already raised, (b) can agree with or push back on their findings, and (c) accounts for concerns the author may already be addressing. Skip resolved/outdated threads. Do **not** post anything — this is read-only context gathering.
 9. **Auto-invoke `pr-review local`** — starting a review always runs the review, never just aligns the workspace. Hand off to the **`pr-review`** skill in local workspace mode against the just-checked-out branches, passing along the teammate-review summary from step 8. Do **not** stop after the checkout; the checkout exists to be reviewed.
    - **Fresh vs. re-review is decided automatically** (never ask, never wait for a keyword). For each PR entry, look for a prior baseline in this order: (a) a `reviewed @ <repo>:<sha>` note in the task (recorded by `done`); (b) the head SHA in the most recent [drafts/](../pr-review/drafts/) file for that PR; (c) the `commit.oid` of your last submitted GitHub review. If **no** baseline exists → **fresh review** (full local diff against the merge-base). If a baseline exists and the current head differs → **re-review** (diff `baseline..new-head`, triage only what changed). If a baseline exists and the head is identical → tell the user there are no new changes since the last review and skip the heavy pass (offer a re-read only if asked).
@@ -155,3 +173,4 @@ Only fall back to `github-pull-request_issue_fetch` when you need the actual fil
 8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
 9. **`pre-review` is drafts-only.** The batch auto-draft pass produces local `pr-review` drafts and never writes to GitHub or transitions review status. It marks each processed task with the `initial auto review draft done` note so subsequent runs skip it; that note is the sole "already looked at" signal.
 10. **Consider teammate reviews.** The HSI team cross-reviews, so before drafting on any `start`/resume/`pre-review` pass, read the existing reviews and inline threads other reviewers left on the PR and factor them in — don't duplicate raised points, weigh their findings, and note concerns the author may already be handling. This is read-only; never post in response to a teammate's review without explicit approval.
+11. **`start --manual` is no-AI, no-credit.** Manual mode does the workspace alignment and occupancy (`start` steps 1–7) only, then stops — it never fetches teammate reviews (step 8) or hands off to `pr-review` (step 9), so it consumes no review credits. It exists purely to check the repos out to the PR branches (everything else to `main`) for the user to review by hand. Same safety guarantees apply: safe checkout only, never destructive git, skip and report dirty repos, don't clobber an occupied slot.

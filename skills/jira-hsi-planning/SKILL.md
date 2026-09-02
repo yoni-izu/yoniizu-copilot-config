@@ -492,6 +492,49 @@ Bug tickets have **project-specific required fields** beyond the standard summar
 
 ---
 
+### 11. Milestone Close-Out — End-of-Milestone Epic Carryover
+
+**Trigger:** User asks to close out a milestone, run milestone close-out, do the end-of-milestone epic handling, or "roll over MS`N` epics to MS`N+1`."
+
+**Purpose:** At the end of a milestone, bring every epic on that milestone into a clean state so planning/tracking stays accurate across milestones. Codifies the scrum-manager (Karin) rule + the sprint-carryover add-ons.
+
+> **Terminology:** `MSc` = the milestone being closed; `MSn` = the next (or user-specified "relevant") milestone. `LastSprint(MSc)` = the last sprint of `MSc`; `FirstSprint(MSn)` = the first sprint of `MSn`. Re-discover the live sprint set (`GET /rest/agile/1.0/board/823/sprint?state=active,future`) — do not trust a snapshot. **Only the currently *active/future* sprint is writable; *closed* sprints are immutable history and cannot be cleared.**
+
+**Procedure:**
+
+1. **Resolve milestones.** Ask for / confirm `MSc` and derive `MSn` (next milestone by name, or the user-supplied target). Look up each milestone's `customfield_10702` option id and its sprint ids.
+2. **Fetch epics on `MSc`:**
+   ```
+   "Team[Team]" = 705f36d3-e7b3-4b7e-a220-d28f31f013ab AND issuetype = Epic AND "SW Internal Milestone" = "<MSc value>" ORDER BY key ASC
+   ```
+3. **Fetch children** of every non-`Done` epic (`parent in (...)`), with `status`, `issuetype`, and `Sprint` (`customfield_10020`).
+4. **Classify each epic** by its children's *resolved* state (treat `Done`/`Closed` = complete; `In Review` = code-complete but **NOT** Done → counts as unfinished):
+
+   | State | Condition | Action |
+   |---|---|---|
+   | **Fully completed** | epic already `Done`, **or** ALL children resolved | Transition the epic → **Done** (no-op if already Done) |
+   | **Partially completed** | some children resolved, some not | **Create a new epic** on `MSn` (same project/component, summary `"<orig> - cntd"`), **move the unfinished children** to it (set `parent`), then transition the **original epic → Done** |
+   | **Not started** | NO child resolved | Set the epic's `customfield_10702` → `MSn` (children inherit via automation). No new epic. |
+   | **Childless epic** | 0 children | Edge case — treat as *not started* (re-milestone to `MSn`) and **flag for manual review** (also violates the ≥2-children hygiene rule). |
+
+5. **Sprint field handling on the carried/re-milestoned child stories** (apply per child):
+   - If the story is **`In Progress`/`In Review`** AND carries `LastSprint(MSc)` → set its active sprint to **`FirstSprint(MSn)`** (work is underway, flows into the next milestone's opening sprint).
+   - Else if the story carries an **active** `MSc` sprint → **clear** that sprint assignment.
+   - **Keep any `MSn` (or later) sprint already assigned** — do not wipe a story that already points at the next milestone's sprint.
+   - Closed `MSc` sprints are immutable → nothing to do; leave non-`MSc` sprints untouched.
+
+6. **Present the full plan** grouped as *Fully completed → Done* / *Partially → new epic + move + Done* / *Not started → re-milestone*, plus the per-child sprint actions and a *already-Done (no action)* list. Surface any childless-epic or ≥2-children-hygiene flags.
+7. **Confirm, then execute.** All writes are **human-confirmed** (create epic, reparent, re-milestone, transition, sprint edits).
+
+**Execution notes (learned gotchas):**
+- **Epic → Done transition** uses transition **id `61` ("Epic done")** across all HSI projects, and its screen **requires `resolution`** — pass `{"resolution": {"name": "Done"}}` in the transition `fields` (Components + Fix Versions are usually already set; if missing, the screen will demand them too).
+- **Epic *creation*** in these projects **requires `customfield_10334` (ASIC Project)** as an array, e.g. `[{"id": "10612"}]` (Iridium). Also set `components` and `customfield_10702` (milestone) on the new epic.
+- **Milestone** write: `customfield_10702` as an ARRAY `[{"id": "<id>"}]` (MS7=`11682`, MS8=`11683`).
+- **Sprint** write: `customfield_10020` = integer sprint id to set, or `null` to clear the active sprint.
+- **Reparent** a child: edit `{"parent": {"key": "<new-epic>"}}` (works for `Story` and `Attribute`).
+
+---
+
 ### GitHub Repos for PR Scanning
 
 These are the HSI FW repos to check for PRs:
