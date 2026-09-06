@@ -54,8 +54,20 @@ STEP_TIMEOUT=${VM_STEP_TIMEOUT:-600}
 GIT_SSH_BATCH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 GIT_BATCH="export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='$GIT_SSH_BATCH';"
 
-die() { echo "vmctl: $*" >&2; exit 1; }
-log() { echo "[vmctl] $*" >&2; }
+# ── pretty output ───────────────────────────────────────────────────────────
+# Colours only when attached to a terminal and NO_COLOR is unset; otherwise the
+# vars are empty so piped/redirected output stays clean.
+if [[ ( -t 1 || -t 2 ) && -z "${NO_COLOR:-}" ]]; then
+  _RST=$'\033[0m'; _B=$'\033[1m'; _D=$'\033[2m'
+  _RED=$'\033[31m'; _GRN=$'\033[32m'; _YLW=$'\033[33m'; _CYN=$'\033[36m'
+else
+  _RST= _B= _D= _RED= _GRN= _YLW= _CYN=
+fi
+
+log()  { echo "${_CYN}▸${_RST} $*" >&2; }
+ok()   { echo "${_GRN}✔${_RST} $*" >&2; }
+warn() { echo "${_YLW}▲${_RST} $*" >&2; }
+die()  { echo "${_RED}✖${_RST} ${_B}vmctl:${_RST} $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # VM IP discovery. Never hardcoded — always resolved from `octl vm list`.
@@ -145,7 +157,7 @@ cmd_mirror() {
   STEP_TIMEOUT=${VM_MIRROR_TIMEOUT:-1200} rlogin "$GIT_BATCH cd $parent && wip load $tag >/dev/null \
             && cd $ws && wip ws checkout && wip ws hard-reset --yes" \
       || die "remote align timed out or failed for $name"
-  log "mirror aligned: $name"
+  ok "mirror aligned: $name"
 }
 
 # ---------------------------------------------------------------------------
@@ -201,20 +213,45 @@ job_status() {  # $1=ws  $2=kind
   local tag; tag=$(ws_tag "$ws")
   local jd; jd=$(jobdir "$tag")
   local logf="$jd/$kind.log"
-  # RUNNING is claimed ONLY if the recorded PID is still alive. If the sentinel
-  # is missing AND the process is gone, the job was killed mid-work (OOM, manual
-  # kill, VM reboot) — report DIED instead of a forever-hanging RUNNING.
-  rlogin "pf=$jd/$kind.pid
+  local name; name=$(basename "$ws")
+  # RUNNING is claimed ONLY if the recorded PID is still alive; sentinel-absent
+  # + process-gone means the job was killed mid-work (OOM/kill/reboot) -> DIED.
+  local out
+  out=$(rlogin "pf=$jd/$kind.pid
 if [ ! -f $logf ]; then echo STATE=NONE; exit 0; fi
 if grep -q __VMCTL_DONE__ $logf; then
   echo STATE=DONE \$(grep -o 'rc=[0-9]*' $logf | tail -1)
 elif [ -f \"\$pf\" ] && kill -0 \"\$(cat \"\$pf\")\" 2>/dev/null; then
   echo STATE=RUNNING pid=\$(cat \"\$pf\")
 else
-  echo \"STATE=DIED (killed mid-work: no completion sentinel, process gone)\"
+  echo STATE=DIED
 fi
-echo -n 'ERRORS='; grep -cE 'error:|: FAILED|FAIL ' $logf 2>/dev/null || echo 0
-echo '----- tail -----'; grep -v __VMCTL_DONE__ $logf | tail -n 25"
+echo ERRORS=\$(grep -cE 'error:|: FAILED|FAIL ' $logf 2>/dev/null || true)
+echo __TAIL__
+grep -v __VMCTL_DONE__ $logf 2>/dev/null | tail -n 25") || true
+
+  local state; state=$(sed -n 's/^STATE=//p' <<<"$out" | head -1)
+  local key=${state%% *}; local extra=${state#"$key"}; extra=${extra# }
+  local errc; errc=$(sed -n 's/^ERRORS=//p' <<<"$out" | head -1)
+  local tail; tail=$(sed -n '/^__TAIL__$/,$p' <<<"$out" | tail -n +2)
+
+  local col label=$key
+  case "$key" in
+    DONE)    [[ "$extra" == rc=0 ]] && col=$_GRN || col=$_RED ;;
+    RUNNING) col=$_CYN ;;
+    DIED)    col=$_RED; extra="killed mid-work: no completion, process gone" ;;
+    NONE)    col=$_D;   extra="no job recorded" ;;
+    "")      col=$_YLW; label="UNREACHABLE"; extra="no status from VM" ;;
+    *)       col=$_YLW ;;
+  esac
+  echo "${col}${_B}●${_RST} ${_B}${kind}${_RST} @ ${name} — ${col}${_B}${label}${_RST}${extra:+ ${_D}(${extra})${_RST}}"
+  if [[ -n "$errc" && "$errc" -gt 0 && "$key" != NONE ]]; then
+    echo "  ${_YLW}▲ ${errc} error line(s) matched in log${_RST}"
+  fi
+  if [[ -n "$tail" ]]; then
+    echo "  ${_D}── last 25 log lines ──${_RST}"
+    sed "s/^/  ${_D}│${_RST} /" <<<"$tail"
+  fi
 }
 
 cmd_build() {
@@ -226,7 +263,7 @@ cmd_build() {
   local extra=""
   [[ ${#rest[@]} -gt 1 ]] && extra="${rest[*]:1}"
   start_job "$ws" build "octl ws build --parallel $extra" "$force" >/dev/null
-  log "build launched. Poll with: vmctl build-status $ws"
+  ok "build launched — poll with: ${_B}vmctl build-status $ws${_RST}"
 }
 cmd_build_status() { job_status "$(find_ws "${1:-}")" build; }
 
@@ -238,7 +275,7 @@ cmd_test() {
   done
   local ws; ws=$(find_ws "$ws_arg")
   start_job "$ws" test "octl ws test $a" "$force" >/dev/null
-  log "test launched. Poll with: vmctl test-status $ws"
+  ok "test launched — poll with: ${_B}vmctl test-status $ws${_RST}"
 }
 cmd_test_status() { job_status "$(find_ws "${1:-}")" test; }
 
@@ -259,7 +296,7 @@ cmd_pull_build() {
     "$(vm_ip):$ws/zephyr_apps/" "$ws/zephyr_apps/"
   # job logs
   mkdir -p "$jd"; _rsync_from "$(vm_ip):$jd/" "$jd/" 2>/dev/null || true
-  log "pull-build complete"
+  ok "pull-build complete"
 }
 
 cmd_pull_logs() {
@@ -270,7 +307,7 @@ cmd_pull_logs() {
     --include='*/' --include='build_logs/***' --include='*.log' --exclude='*' \
     "$(vm_ip):$ws/zephyr_apps/" "$ws/zephyr_apps/"
   mkdir -p "$jd"; _rsync_from "$(vm_ip):$jd/" "$jd/" 2>/dev/null || true
-  log "pull-logs complete"
+  ok "pull-logs complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -284,7 +321,7 @@ cmd_release() {
   rlogin "$GIT_BATCH cd $parent && ( wip load $tag >/dev/null 2>&1 || wip scan >/dev/null ) \
             && cd $ws && wip ws return \
             && octl ws sync"
-  log "release complete"
+  ok "release complete"
 }
 
 # ---------------------------------------------------------------------------
