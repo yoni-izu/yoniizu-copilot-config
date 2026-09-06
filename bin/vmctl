@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+#
+# vmctl — delegate FW workspace work to the EC2 VM mirror workspace.
+#
+# The VM keeps mirror workspaces at the EXACT same paths as local
+# (home dir is identical). Work is delegated by:
+#   1. pushing local dev branches to origin,
+#   2. aligning the remote mirror workspace to those exact branches,
+#   3. running builds/tests DETACHED on the VM (survive SSH hangups),
+#   4. pulling logs/binaries back so results look local.
+#
+# Every long-running remote job uses setsid+nohup and writes a PID +
+# log file under ~/.vm_ctl/jobs/<tag>/ on the VM, so status/pull work
+# from a fresh SSH connection with no persistent session required.
+#
+# All heavy lifting lives here (not in the model) to save tokens and to
+# let you run the whole flow by hand with zero AI involvement.
+#
+# Usage:
+#   vmctl ip                         Resolve & cache the VM private IP
+#   vmctl sh   '<cmd>' [ws]          Run a command in the remote ws root
+#   vmctl mirror         [ws]        Align remote mirror ws to local branches
+#   vmctl build          [ws] [args] Detached parallel full-workspace build
+#   vmctl build-status   [ws]        Poll the remote build
+#   vmctl test  '<args>' [ws]        Detached `octl ws test <args>`
+#   vmctl test-status    [ws]        Poll the remote test run
+#   vmctl pull-build     [ws]        rsync logs + binaries back (as if local)
+#   vmctl pull-logs      [ws]        rsync logs only (for analysis)
+#   vmctl release        [ws]        Return remote repos to baseline + sync
+#   vmctl wip <action> [ws|--wip]    Proxy any wip_/ws_ action to the VM
+#   vmctl status         [ws]        Alias of build-status
+#
+# Env overrides:
+#   VM_IP       Skip discovery, use this IP.
+#   VM_SSH_OPTS Extra ssh options (default sets ConnectTimeout + no host check).
+#
+set -euo pipefail
+
+CTL_DIR="$HOME/.vm_ctl"
+IP_CACHE="$CTL_DIR/ip"
+mkdir -p "$CTL_DIR"
+
+# BatchMode=yes    → never block on a password/host prompt; fail fast instead.
+# ServerAlive*     → drop a half-dead tunnel after ~4×15s rather than hang.
+SSH_OPTS=${VM_SSH_OPTS:-"-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"}
+
+# Upper bound (seconds) on any single interactive-less remote control command
+# so a stuck git fetch or a wedged tunnel aborts instead of hanging forever.
+STEP_TIMEOUT=${VM_STEP_TIMEOUT:-600}
+
+# Non-interactive git — the classic "mirror hangs" cause is git blocking on a
+# credential/host-key prompt with no tty. Force it to fail instead, both for the
+# local push and for the fetches the VM runs. Embedded verbatim in remote scripts.
+GIT_SSH_BATCH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+GIT_BATCH="export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='$GIT_SSH_BATCH';"
+
+die() { echo "vmctl: $*" >&2; exit 1; }
+log() { echo "[vmctl] $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# VM IP discovery. Never hardcoded — always resolved from `octl vm list`.
+# The result is cached in ~/.vm_ctl/ip, but the cache is self-validating: a
+# cached IP is only reused while it is still reachable, so spinning up a NEW VM
+# (new IP) or tearing down the old one auto-invalidates it. Force a refresh with
+# `vmctl ip --refresh` or override entirely with VM_IP=.
+# ---------------------------------------------------------------------------
+_discover_ip() {
+  # Prefer a RUNNING instance's private (10/172/192) IP.
+  octl vm list 2>/dev/null | grep -iE 'running' \
+    | grep -oE '(10|172|192)\.([0-9]{1,3}\.){2}[0-9]{1,3}' | head -1
+}
+
+vm_ip() {
+  [[ -n "${VM_IP:-}" ]] && { echo "$VM_IP"; return; }
+  [[ -n "${RESOLVED_IP:-}" ]] && { echo "$RESOLVED_IP"; return; }  # memoize per run
+  local ip=""
+  if [[ -s "$IP_CACHE" ]]; then
+    ip=$(cat "$IP_CACHE")
+    # reuse only if SSH port is open — a stale IP (deleted/replaced VM) fails.
+    # (EC2 blocks ICMP, so probe TCP/22 rather than ping.)
+    if timeout 2 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null; then
+      RESOLVED_IP=$ip; echo "$ip"; return
+    fi
+    log "cached VM IP $ip unreachable — rediscovering"
+  fi
+  ip=$(_discover_ip)
+  [[ -n "$ip" ]] || die "could not resolve a running VM IP from 'octl vm list' (set VM_IP=...)"
+  echo "$ip" > "$IP_CACHE"
+  RESOLVED_IP=$ip
+  echo "$ip"
+}
+
+# ssh into the VM with agent forwarding (needed for git over ssh on the VM).
+# Every call is bounded by STEP_TIMEOUT so a wedged remote command can never
+# hang the caller indefinitely (-k gives it 10s to die on SIGTERM before KILL).
+rsh() { timeout -k 10 "${STEP_TIMEOUT}" ssh -A $SSH_OPTS "$(vm_ip)" "$@"; }
+# Run a script inside a login shell (so octl / wip are on PATH).
+# The script is fed over stdin to avoid ANY quoting pitfalls on the remote.
+rlogin() { rsh "bash -l -s" <<<"$*"; }
+
+# ---------------------------------------------------------------------------
+# Workspace resolution. Home dir is identical local<->VM, so the local
+# absolute ws path IS the remote path.
+# ---------------------------------------------------------------------------
+find_ws() {
+  local d=${1:-$PWD}
+  d=$(cd "$d" && pwd)
+  while [[ "$d" != "/" ]]; do
+    [[ -d "$d/.repo" ]] && { echo "$d"; return; }
+    d=$(dirname "$d")
+  done
+  die "no octl workspace (.repo) found from ${1:-$PWD}"
+}
+
+ws_tag() { echo "$1" | sed "s#^$HOME/##; s#/#_#g"; }   # projects_iridium_one_fw
+jobdir()  { echo "$HOME/.vm_ctl/jobs/$1"; }             # remote & local paths match
+
+# ---------------------------------------------------------------------------
+# mirror — align remote mirror workspace to the exact local branches.
+# ---------------------------------------------------------------------------
+cmd_mirror() {
+  local ws; ws=$(find_ws "${1:-}")
+  local parent; parent=$(dirname "$ws")
+  local name; name=$(basename "$ws")
+  local tag; tag=$(ws_tag "$ws")
+
+  log "scanning + pushing local branches for $ws"
+  ( cd "$parent" && wip scan >/dev/null ) || die "local wip scan failed for $parent"
+  # Bound the network push and force git non-interactive so a credential/askpass
+  # prompt fails fast instead of hanging the whole mirror.
+  ( cd "$ws" && export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_BATCH" \
+      && timeout -k 10 "$STEP_TIMEOUT" wip ws push --yes ) \
+      || die "local 'wip ws push' timed out or failed (network/credentials?)"
+  ( cd "$ws" && wip save "$tag" >/dev/null ) || die "wip save failed for $ws"
+
+  log "copying branch map to VM"
+  rlogin "mkdir -p ~/.wip/saved"
+  timeout -k 10 "$STEP_TIMEOUT" scp $SSH_OPTS -q \
+      "$HOME/.wip/saved/$tag.wip" "$(vm_ip):$HOME/.wip/saved/$tag.wip" \
+      || die "scp of branch map to VM timed out or failed"
+
+  log "aligning remote mirror ($parent) to recorded branches"
+  # Fetches on the VM get the same non-interactive git treatment. A larger
+  # budget here (many repos may fetch) — override with VM_MIRROR_TIMEOUT.
+  STEP_TIMEOUT=${VM_MIRROR_TIMEOUT:-1200} rlogin "$GIT_BATCH cd $parent && wip load $tag >/dev/null \
+            && cd $ws && wip ws checkout && wip ws hard-reset --yes" \
+      || die "remote align timed out or failed for $name"
+  log "mirror aligned: $name"
+}
+
+# ---------------------------------------------------------------------------
+# Generic detached job runner (build/test). Survives SSH hangups.
+# ---------------------------------------------------------------------------
+start_job() {   # $1=ws  $2=kind (build|test)  $3=cmd
+  local ws=$1 kind=$2 cmd=$3
+  local tag; tag=$(ws_tag "$ws")
+  local jd; jd=$(jobdir "$tag")
+  local logf="$jd/$kind.log"
+  log "starting detached $kind on VM: $cmd"
+  # setsid+nohup detaches the wrapper; `trap '' HUP` sets SIGHUP to SIG_IGN which
+  # is INHERITED by the actual build/test child. `disown` keeps the exiting login
+  # shell from SIGHUP-racing it. CRITICAL: `cd` must be a SEPARATE statement — if
+  # the launch is written `cd $ws && setsid ... &`, the `&` backgrounds the whole
+  # `&&` compound as a subshell and the child dies instantly. Completion is
+  # tracked with a sentinel appended to the log.
+  rlogin "mkdir -p $jd
+cd $ws || exit 1
+setsid nohup bash -c 'trap \"\" HUP; { $cmd ; } ; echo __VMCTL_DONE__ rc=\$?' > $logf 2>&1 < /dev/null &
+disown 2>/dev/null || true
+echo launched: $ws"
+  echo "$logf"
+}
+
+job_status() {  # $1=ws  $2=kind
+  local ws=$1 kind=$2
+  local tag; tag=$(ws_tag "$ws")
+  local jd; jd=$(jobdir "$tag")
+  local logf="$jd/$kind.log"
+  rlogin "if [ ! -f $logf ]; then echo STATE=NONE; exit 0; fi
+if grep -q __VMCTL_DONE__ $logf; then echo STATE=DONE\ \$(grep -o 'rc=[0-9]*' $logf | tail -1); else echo STATE=RUNNING; fi
+echo -n 'ERRORS='; grep -cE 'error:|: FAILED|FAIL ' $logf 2>/dev/null || echo 0
+echo '----- tail -----'; grep -v __VMCTL_DONE__ $logf | tail -n 25"
+}
+
+cmd_build() {
+  local ws; ws=$(find_ws "${1:-}"); shift || true
+  local extra="${*:-}"
+  start_job "$ws" build "octl ws build --parallel $extra" >/dev/null
+  log "build launched. Poll with: vmctl build-status $ws"
+}
+cmd_build_status() { job_status "$(find_ws "${1:-}")" build; }
+
+cmd_test() {
+  local args=${1:?"usage: vmctl test '<octl ws test args>' [ws]"}
+  local ws; ws=$(find_ws "${2:-}")
+  start_job "$ws" test "octl ws test $args" >/dev/null
+  log "test launched. Poll with: vmctl test-status $ws"
+}
+cmd_test_status() { job_status "$(find_ws "${1:-}")" test; }
+
+# ---------------------------------------------------------------------------
+# pull results — rsync from VM to identical local path.
+# ---------------------------------------------------------------------------
+_rsync_from() { rsync -az -e "ssh -A $SSH_OPTS" "$@"; }
+
+cmd_pull_build() {
+  local ws; ws=$(find_ws "${1:-}")
+  local tag; tag=$(ws_tag "$ws"); local jd; jd=$(jobdir "$tag")
+  log "pulling binaries + logs for $ws"
+  rlogin "test -d $ws/build_artifacts" 2>/dev/null \
+    && _rsync_from "$(vm_ip):$ws/build_artifacts/" "$ws/build_artifacts/" || true
+  # per-app build outputs + logs
+  _rsync_from --prune-empty-dirs \
+    --include='*/' --include='build_logs/***' --include='build/***' --exclude='*' \
+    "$(vm_ip):$ws/zephyr_apps/" "$ws/zephyr_apps/"
+  # job logs
+  mkdir -p "$jd"; _rsync_from "$(vm_ip):$jd/" "$jd/" 2>/dev/null || true
+  log "pull-build complete"
+}
+
+cmd_pull_logs() {
+  local ws; ws=$(find_ws "${1:-}")
+  local tag; tag=$(ws_tag "$ws"); local jd; jd=$(jobdir "$tag")
+  log "pulling logs only for $ws"
+  _rsync_from --prune-empty-dirs \
+    --include='*/' --include='build_logs/***' --include='*.log' --exclude='*' \
+    "$(vm_ip):$ws/zephyr_apps/" "$ws/zephyr_apps/"
+  mkdir -p "$jd"; _rsync_from "$(vm_ip):$jd/" "$jd/" 2>/dev/null || true
+  log "pull-logs complete"
+}
+
+# ---------------------------------------------------------------------------
+# release — return remote repos to their manifest baseline and sync.
+# ---------------------------------------------------------------------------
+cmd_release() {
+  local ws; ws=$(find_ws "${1:-}")
+  local parent; parent=$(dirname "$ws")
+  local tag; tag=$(ws_tag "$ws")
+  log "releasing remote mirror: returning repos to baseline + sync"
+  rlogin "$GIT_BATCH cd $parent && ( wip load $tag >/dev/null 2>&1 || wip scan >/dev/null ) \
+            && cd $ws && wip ws return \
+            && octl ws sync"
+  log "release complete"
+}
+
+# ---------------------------------------------------------------------------
+# wip — proxy any wip_/ws_ action to the VM mirror.
+# ---------------------------------------------------------------------------
+cmd_wip() {
+  local action=${1:?"usage: vmctl wip <action> [ws|--wip]"}; shift || true
+  action=${action//_/-}   # accept legacy hard_reset / set_upstream / depends_on
+  local scope_ws=1; local target="${1:-}"
+  if [[ "$target" == "--wip" ]]; then scope_ws=0; target=""; fi
+  local ws; ws=$(find_ws "$target")
+  local parent; parent=$(dirname "$ws")
+  if [[ $scope_ws -eq 1 ]]; then
+    rlogin "$GIT_BATCH cd $parent && wip scan >/dev/null && cd $ws && wip ws $action --yes"
+  else
+    rlogin "$GIT_BATCH cd $parent && wip scan >/dev/null && wip all $action --yes"
+  fi
+}
+
+cmd_sh() {
+  local c=${1:?"usage: vmctl sh '<cmd>' [ws]"}
+  local ws; ws=$(find_ws "${2:-}")
+  rlogin "cd $ws && $c"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  local sub=${1:-}; shift || true
+  case "$sub" in
+    ip)            [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]] && rm -f "$IP_CACHE"; vm_ip ;;
+    sh)            cmd_sh "$@" ;;
+    mirror)        cmd_mirror "$@" ;;
+    build)         cmd_build "$@" ;;
+    build-status|status) cmd_build_status "$@" ;;
+    test)          cmd_test "$@" ;;
+    test-status)   cmd_test_status "$@" ;;
+    pull-build)    cmd_pull_build "$@" ;;
+    pull-logs)     cmd_pull_logs "$@" ;;
+    release)       cmd_release "$@" ;;
+    wip)           cmd_wip "$@" ;;
+    ""|-h|--help|help)
+      sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown subcommand: $sub (try: vmctl help)" ;;
+  esac
+}
+main "$@"
