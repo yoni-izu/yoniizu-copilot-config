@@ -20,9 +20,9 @@
 #   vmctl ip                         Resolve & cache the VM private IP
 #   vmctl sh   '<cmd>' [ws]          Run a command in the remote ws root
 #   vmctl mirror         [ws]        Align remote mirror ws to local branches
-#   vmctl build          [ws] [args] Detached parallel full-workspace build
+#   vmctl build   [ws] [args] [-f]   Detached parallel full-workspace build
 #   vmctl build-status   [ws]        Poll the remote build
-#   vmctl test  '<args>' [ws]        Detached `octl ws test <args>`
+#   vmctl test  '<args>' [ws] [-f]   Detached `octl ws test <args>`
 #   vmctl test-status    [ws]        Poll the remote test run
 #   vmctl pull-build     [ws]        rsync logs + binaries back (as if local)
 #   vmctl pull-logs      [ws]        rsync logs only (for analysis)
@@ -151,8 +151,8 @@ cmd_mirror() {
 # ---------------------------------------------------------------------------
 # Generic detached job runner (build/test). Survives SSH hangups.
 # ---------------------------------------------------------------------------
-start_job() {   # $1=ws  $2=kind (build|test)  $3=cmd
-  local ws=$1 kind=$2 cmd=$3
+start_job() {   # $1=ws  $2=kind (build|test)  $3=cmd  $4=force(0/1)
+  local ws=$1 kind=$2 cmd=$3 force=${4:-0}
   local tag; tag=$(ws_tag "$ws")
   local jd; jd=$(jobdir "$tag")
   local logf="$jd/$kind.log"
@@ -162,12 +162,37 @@ start_job() {   # $1=ws  $2=kind (build|test)  $3=cmd
   # shell from SIGHUP-racing it. CRITICAL: `cd` must be a SEPARATE statement — if
   # the launch is written `cd $ws && setsid ... &`, the `&` backgrounds the whole
   # `&&` compound as a subshell and the child dies instantly. Completion is
-  # tracked with a sentinel appended to the log.
-  rlogin "mkdir -p $jd
+  # tracked with a sentinel appended to the log; the launched PID (a setsid
+  # session leader, so PID == PGID) is recorded in <kind>.pid.
+  # GUARD: build and test share ONE working tree per workspace on the VM, so a
+  # second detached job (of EITHER kind) would corrupt the build. Refuse if any
+  # is still RUNNING; --force replaces it (kills the old process group first).
+  local out rc=0
+  out=$(rlogin "mkdir -p $jd
+running=
+for pf in $jd/*.pid; do
+  [ -e \"\$pf\" ] || continue
+  k=\$(basename \"\$pf\" .pid)
+  if kill -0 \"\$(cat \"\$pf\")\" 2>/dev/null && ! grep -q __VMCTL_DONE__ \"$jd/\$k.log\" 2>/dev/null; then running=\$k; break; fi
+done
+if [ -n \"\$running\" ]; then
+  if [ \"$force\" = 1 ]; then
+    for pf in $jd/*.pid; do [ -e \"\$pf\" ] && kill -TERM -\"\$(cat \"\$pf\")\" 2>/dev/null; done; true
+  else
+    echo __VMCTL_BUSY__ kind=\$running pid=\$(cat \"$jd/\$running.pid\" 2>/dev/null); exit 3
+  fi
+fi
 cd $ws || exit 1
 setsid nohup bash -c 'trap \"\" HUP; { $cmd ; } ; echo __VMCTL_DONE__ rc=\$?' > $logf 2>&1 < /dev/null &
+p=\$!
+echo \$p > $jd/$kind.pid
 disown 2>/dev/null || true
-echo launched: $ws"
+echo launched: $ws pid=\$p") || rc=$?
+  if [[ "$out" == *__VMCTL_BUSY__* ]]; then
+    local rk; rk=$(sed -n 's/.*kind=\([^ ]*\).*/\1/p' <<<"$out")
+    die "a ${rk:-build/test} job is already RUNNING in $(basename "$ws") — poll it (vmctl ${rk:-build}-status), or re-run with --force to replace it"
+  fi
+  [[ $rc -eq 0 ]] || die "failed to launch $kind on VM (rc=$rc)${out:+ — $out}"
   echo "$logf"
 }
 
@@ -183,17 +208,26 @@ echo '----- tail -----'; grep -v __VMCTL_DONE__ $logf | tail -n 25"
 }
 
 cmd_build() {
-  local ws; ws=$(find_ws "${1:-}"); shift || true
-  local extra="${*:-}"
-  start_job "$ws" build "octl ws build --parallel $extra" >/dev/null
+  local force=0 rest=()
+  for a in "$@"; do
+    case "$a" in --force|-f) force=1 ;; *) rest+=("$a") ;; esac
+  done
+  local ws; ws=$(find_ws "${rest[0]:-}")
+  local extra=""
+  [[ ${#rest[@]} -gt 1 ]] && extra="${rest[*]:1}"
+  start_job "$ws" build "octl ws build --parallel $extra" "$force" >/dev/null
   log "build launched. Poll with: vmctl build-status $ws"
 }
 cmd_build_status() { job_status "$(find_ws "${1:-}")" build; }
 
 cmd_test() {
-  local args=${1:?"usage: vmctl test '<octl ws test args>' [ws]"}
-  local ws; ws=$(find_ws "${2:-}")
-  start_job "$ws" test "octl ws test $args" >/dev/null
+  local a=${1:?"usage: vmctl test '<octl ws test args>' [ws] [--force]"}; shift || true
+  local force=0 ws_arg=""
+  for x in "$@"; do
+    case "$x" in --force|-f) force=1 ;; *) ws_arg="$x" ;; esac
+  done
+  local ws; ws=$(find_ws "$ws_arg")
+  start_job "$ws" test "octl ws test $a" "$force" >/dev/null
   log "test launched. Poll with: vmctl test-status $ws"
 }
 cmd_test_status() { job_status "$(find_ws "${1:-}")" test; }
