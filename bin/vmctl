@@ -201,8 +201,18 @@ job_status() {  # $1=ws  $2=kind
   local tag; tag=$(ws_tag "$ws")
   local jd; jd=$(jobdir "$tag")
   local logf="$jd/$kind.log"
-  rlogin "if [ ! -f $logf ]; then echo STATE=NONE; exit 0; fi
-if grep -q __VMCTL_DONE__ $logf; then echo STATE=DONE\ \$(grep -o 'rc=[0-9]*' $logf | tail -1); else echo STATE=RUNNING; fi
+  # RUNNING is claimed ONLY if the recorded PID is still alive. If the sentinel
+  # is missing AND the process is gone, the job was killed mid-work (OOM, manual
+  # kill, VM reboot) — report DIED instead of a forever-hanging RUNNING.
+  rlogin "pf=$jd/$kind.pid
+if [ ! -f $logf ]; then echo STATE=NONE; exit 0; fi
+if grep -q __VMCTL_DONE__ $logf; then
+  echo STATE=DONE \$(grep -o 'rc=[0-9]*' $logf | tail -1)
+elif [ -f \"\$pf\" ] && kill -0 \"\$(cat \"\$pf\")\" 2>/dev/null; then
+  echo STATE=RUNNING pid=\$(cat \"\$pf\")
+else
+  echo \"STATE=DIED (killed mid-work: no completion sentinel, process gone)\"
+fi
 echo -n 'ERRORS='; grep -cE 'error:|: FAILED|FAIL ' $logf 2>/dev/null || echo 0
 echo '----- tail -----'; grep -v __VMCTL_DONE__ $logf | tail -n 25"
 }
