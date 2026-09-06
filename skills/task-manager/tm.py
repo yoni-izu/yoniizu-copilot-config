@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import date, datetime
@@ -43,6 +44,13 @@ try:
     import rd  # noqa: E402
 except ImportError:
     rd = None
+
+# pjq.py (pldm-job-queue skill) tracks PLDM hardware jobs; zero-token gh polling.
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/pldm-job-queue"))
+try:
+    import pjq  # noqa: E402
+except ImportError:
+    pjq = None
 
 # ----------------------------------------------------------------------------
 # Constants & helpers
@@ -194,6 +202,14 @@ def pr_entries(t: dict) -> list[dict]:
 def pr_resolved(p: dict) -> bool:
     """A PR no longer needs review once it is merged or closed-without-merge."""
     return bool(p.get("merged") or p.get("closed"))
+
+
+def remove_pr_entry(t: dict, p: dict) -> None:
+    """Drop a single PR entry from a review task (list- or legacy single-based)."""
+    if t.get("reviews"):
+        t["reviews"] = [x for x in t["reviews"] if x is not p]
+    elif t.get("review") is p:
+        t.pop("review", None)
 
 
 # ----------------------------------------------------------------------------
@@ -938,6 +954,7 @@ def cmd_review_check(args: argparse.Namespace) -> int:
             continue
         prs = pr_entries(t)
         changed = False
+        closed_prs = []
         for p in prs:
             if pr_resolved(p):
                 continue
@@ -954,12 +971,23 @@ def cmd_review_check(args: argparse.Namespace) -> int:
                 changed = True
                 updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: merged")
             elif closed:
-                p["closed"] = True
-                append_note(t, f"{p['repo']}#{p['pr_number']}: closed without merge")
+                # Nothing to review on a closed-without-merge PR — drop it.
+                closed_prs.append(p)
+                append_note(t, f"{p['repo']}#{p['pr_number']}: closed without merge — removed")
                 changed = True
-                updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: closed")
+                updates.append(f"{t['id']} {p['repo']}#{p['pr_number']}: closed → removed")
+        for p in closed_prs:
+            remove_pr_entry(t, p)
         if changed:
             t["updated"] = TODAY
+            prs = pr_entries(t)
+            # Every PR was closed and removed — nothing left to review.
+            if not prs:
+                t["status"] = "cancelled"
+                release_task_slot(t)
+                append_note(t, "all PRs closed without merge — cancelled")
+                keep.append(t)
+                continue
             # Re-derive the task status from all PRs. The task only becomes done
             # once every PR has merged; otherwise it stays tracked (not purged).
             consolidated = consolidate_review_status(prs)
@@ -981,6 +1009,170 @@ def cmd_review_check(args: argparse.Namespace) -> int:
     if not updates and not completed:
         print("no changes")
     return 0
+
+
+# ----------------------------------------------------------------------------
+# Portal review scan (dashboard "Scan reviews" button)
+# ----------------------------------------------------------------------------
+# Now that the whole team reviews, a PR I own can move without me: someone else
+# approves it, comments, requests changes, or the author re-pushes. This probes
+# every open review PR through `gh` (pure REST, no model/tokens), maps the live
+# GitHub state to the per-PR review_status, and re-derives each task's status.
+# Uses the REST API (not GraphQL) — REST has a far larger, separate rate budget,
+# so scanning dozens of PRs won't exhaust the tiny GraphQL points quota.
+
+def _gh_api_raw(path: str) -> Any:
+    """`gh api <path>` → parsed JSON, raising a concise error on failure."""
+    out = subprocess.run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json", path],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr.strip() or "gh api failed").splitlines()[-1][:160])
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
+def _fetch_pr_review_state(owner: str, repo: str, num: int) -> tuple[dict, list]:
+    """Return (pr_object, reviews_list) for a PR via REST (2 cheap requests)."""
+    pr = _gh_api_raw(f"/repos/{owner}/{repo}/pulls/{num}")
+    if not isinstance(pr, dict):
+        raise RuntimeError("unexpected PR payload")
+    reviews = _gh_api_raw(f"/repos/{owner}/{repo}/pulls/{num}/reviews?per_page=100")
+    return pr, (reviews if isinstance(reviews, list) else [])
+
+
+def _derive_pr_review_status(p: dict, pr: dict, reviews: list) -> tuple[str, str]:
+    """Map a PR's live GitHub state to a per-PR review_status + human detail.
+
+    Returns (new_status, detail). ``new_status`` is one of merged / closed /
+    approved / changes-requested / commented, or the PR's existing status when
+    nothing observable changed. Decision is derived from the latest
+    state-changing review per user (GitHub's own rule): a standing
+    CHANGES_REQUESTED wins, else any APPROVED, else COMMENTED.
+    """
+    if pr.get("merged"):
+        return "merged", "merged"
+    if pr.get("state") == "closed":
+        return "closed", "closed without merge"
+
+    latest: dict[str, tuple[str, str]] = {}   # login -> (submitted_at, state)
+    commenters: set[str] = set()
+    for r in reviews:
+        login = (r.get("user") or {}).get("login")
+        state = r.get("state")
+        if not login:
+            continue
+        if state == "COMMENTED":
+            commenters.add(login)
+            continue
+        if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            sub = r.get("submitted_at") or ""
+            if login not in latest or sub >= latest[login][0]:
+                latest[login] = (sub, state)
+
+    approvers = sorted(u for u, (_, st) in latest.items() if st == "APPROVED")
+    changers = sorted(u for u, (_, st) in latest.items() if st == "CHANGES_REQUESTED")
+
+    if changers:
+        return "changes-requested", f"changes requested by {', '.join(changers)}"
+    if approvers:
+        return "approved", f"approved by {', '.join(approvers)}"
+    if commenters:
+        return "commented", f"commented by {', '.join(sorted(commenters))}"
+    return p.get("review_status") or "pending", "no change"
+
+
+def portal_review_scan(progress=None) -> dict:
+    """Re-probe every open review PR and update task statuses from live GitHub.
+
+    Returns a summary: scanned PR count, per-PR change lines, tasks that landed
+    (merged→done), and any fetch errors. Mutates and saves the task store.
+
+    ``progress`` (optional) is called as ``progress(i, total, task_id, label,
+    status, detail)`` — once with ``status=None`` when a PR is about to be
+    fetched, then once with the resolved status ("error"/"nochange"/the new
+    review status) — so a caller can stream a live banner.
+    """
+    d = load()
+    pairs = [(t, p) for t in d["tasks"]
+             if t.get("category") == "code-review"
+             and t.get("status") not in ("done", "cancelled")
+             for p in pr_entries(t) if not pr_resolved(p)]
+    total = len(pairs)
+    scanned = 0
+    changed: list[str] = []
+    completed: list[str] = []
+    cancelled: list[str] = []
+    removed: list[str] = []
+    errors: list[str] = []
+    touched: set[str] = set()
+    for t, p in pairs:
+        scanned += 1
+        label = f"{p['repo']}#{p['pr_number']}"
+        if progress:
+            progress(scanned, total, t["id"], label, None, "")
+        try:
+            pr, reviews = _fetch_pr_review_state(
+                p["owner"], p["repo"], p["pr_number"])
+        except Exception as e:
+            msg = str(e).splitlines()[-1][:120]
+            errors.append(f"{label}: {msg}")
+            if progress:
+                progress(scanned, total, t["id"], label, "error", msg)
+            continue
+        old = p.get("review_status")
+        new, detail = _derive_pr_review_status(p, pr, reviews)
+        if new == "merged":
+            p["merged"] = True
+            p["review_status"] = "merged"
+        elif new == "closed":
+            # A closed-without-merge PR has nothing left to review — drop it
+            # from the task entirely rather than leaving a resolved stub.
+            remove_pr_entry(t, p)
+            removed.append(f"{t['id']} {label}: {detail}")
+            append_note(t, f"review-scan: {label} closed without merge — removed")
+            touched.add(t["id"])
+            if progress:
+                progress(scanned, total, t["id"], label, new, detail)
+            continue
+        elif new != old:
+            p["review_status"] = new
+        else:
+            if progress:
+                progress(scanned, total, t["id"], label, "nochange", "no change")
+            continue  # nothing observable changed for this PR
+        changed.append(f"{t['id']} {label}: {detail}")
+        append_note(t, f"review-scan: {label} {detail}")
+        touched.add(t["id"])
+        if progress:
+            progress(scanned, total, t["id"], label, new, detail)
+    # Re-derive the task status for every task that had a PR change.
+    for t in d["tasks"]:
+        if t["id"] not in touched:
+            continue
+        prs = pr_entries(t)
+        t["updated"] = TODAY
+        # Every PR was closed and removed — nothing left to review, so the task
+        # is cancelled rather than reset to an empty "todo".
+        if not prs:
+            if t.get("status") not in ("done", "cancelled"):
+                t["status"] = "cancelled"
+                release_task_slot(t)
+                append_note(t, "review-scan: all PRs closed without merge — cancelled")
+                cancelled.append(t["id"])
+            continue
+        consolidated = consolidate_review_status(prs)
+        new_status = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
+        t["status"] = new_status
+        if new_status == "done":
+            t["completed"] = TODAY
+            release_task_slot(t)
+            completed.append(t["id"])
+        elif new_status in ("blocked", "todo"):
+            release_task_slot(t)
+    save(d)
+    return {"scanned": scanned, "changed": changed, "removed": removed,
+            "completed": completed, "cancelled": cancelled, "errors": errors}
 
 
 # ----------------------------------------------------------------------------
@@ -1849,9 +2041,19 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .ci.none { color:var(--muted); background:transparent; border:1px dashed var(--grid); font-weight:600; }
   .pldm { font-size:9.5px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
           padding:2px 8px; border-radius:4px; background:var(--track); color:var(--muted); }
+  .pldm-link { font-size:9.5px; font-weight:700; margin-left:6px; color:#118DFF;
+               text-decoration:none; white-space:nowrap; }
+  .pldm-link:hover { text-decoration:underline; }
   .pldm-btn { font-size:10px; font-weight:700; padding:3px 9px; border-radius:4px; cursor:pointer;
               border:1px solid var(--grid); background:var(--track); color:var(--fg); white-space:nowrap; }
   .pldm-btn:hover { border-color:#118DFF; color:#118DFF; }
+  .ci-btn { font-size:10px; font-weight:700; padding:2px 8px; border-radius:4px; cursor:pointer;
+            border:1px solid var(--grid); background:var(--track); color:var(--fg); white-space:nowrap; }
+  .ci-btn:hover { border-color:#118DFF; color:#118DFF; }
+  .ci-btn.bad { border-color:#D64550; color:#D64550; }
+  .ci-btn.bad:hover { background:#D64550; color:#fff; }
+  .ci-btn:disabled { opacity:.55; cursor:default; }
+  .ci-note { font-size:11px; color:var(--muted); margin:4px 0 2px; }
   .pldm-box { margin-top:10px; padding:11px 13px; border:1px solid var(--grid);
               border-radius:6px; background:var(--track); }
   .pldm-form { display:grid; grid-template-columns:repeat(3,1fr); gap:9px 13px; }
@@ -1868,6 +2070,19 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .pldm-act .cancel { background:transparent; color:var(--muted); }
   .pldm-note { font-size:11px; color:var(--muted); }
   .pldm-prog { font-size:11.5px; margin-bottom:7px; }
+  /* --- PLDM job queue section --- */
+  #pq-tbl { table-layout:fixed; }
+  #pq-tbl td { vertical-align:middle; }
+  .pq-stage { display:flex; align-items:center; gap:3px; font-size:10px; color:var(--muted); }
+  .pq-stage i { width:9px; height:5px; border-radius:2px; background:var(--track); }
+  .pq-stage i.on { background:var(--pk); }
+  .pq-stage span { margin-left:5px; text-transform:uppercase; letter-spacing:.05em; font-weight:700; }
+  tr.pq-detail td { padding:8px 12px 12px; background:var(--track); font-size:11px; }
+  tr.pq-detail summary { cursor:pointer; font-weight:700; }
+  tr.pq-detail summary span { font-weight:400; color:var(--muted); }
+  tr.pq-detail pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-word;
+                     font-size:10.5px; line-height:1.45; color:var(--muted); max-height:180px; overflow:auto; }
+  .pq-step { margin-top:4px; color:var(--muted); }
   .pldm-prog .ok { color:#1AAB40; } .pldm-prog .bad { color:#D64550; }
   .pl-row { font-size:11px; padding:2px 0; border-top:1px solid var(--grid); }
   .pl-row span { color:var(--muted); }
@@ -2212,6 +2427,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="toolbar">
+      <button id="review-scan" class="btn" style="display:none;" title="Re-probe every open review PR through the gh CLI — approvals, comments, change-requests, re-pushes, merges — and update each task's status. No model, no tokens.">↻ Scan reviews</button>
+      <span class="ro-note" id="review-scan-note" style="display:none;"></span>
       <div class="grp" style="flex-direction:row; align-items:center; gap:8px;">
         <span class="lbl" style="color:var(--muted);font-size:11px;">Columns</span>
         <div class="dd" id="dd-cols">
@@ -2314,6 +2531,30 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <div id="pr-list"></div>
   </div><!-- /sec-prs -->
 
+  <div id="sec-pldmq" style="display:none;">
+    <div class="rpt-head">
+      <div>
+        <h2>PLDM job queue</h2>
+        <p class="sub" id="pq-asof"></p>
+      </div>
+      <div class="slicer">
+        <a class="chip" id="pq-portal" target="_blank" rel="noopener">Queue portal &#8599;</a>
+        <button id="pq-scan" class="btn primary" title="Follow every tracked job through the gh CLI: build run, queue row, execution run, and the failure evidence. No model, no tokens.">&#8635; Scan queue</button>
+        <span id="pq-scan-note" class="ro-note"></span>
+      </div>
+    </div>
+    <div class="kpis" id="pq-kpis"></div>
+    <table id="pq-tbl">
+      <thead><tr>
+        <th style="width:20%;">Job</th><th style="width:14%;">Feature</th>
+        <th style="width:12%;">Image</th><th style="width:16%;">Stage</th>
+        <th style="width:10%;">Status</th><th style="width:12%;">EDK</th>
+        <th style="width:8%;">Age</th><th style="width:8%;">Links</th>
+      </tr></thead>
+      <tbody id="pq-body"></tbody>
+    </table>
+  </div><!-- /sec-pldmq -->
+
   <div id="sec-raid" style="display:none;">
     <div class="rpt-head">
       <div>
@@ -2350,6 +2591,7 @@ let BUGS = __BUGDATA__;
 let OVERVIEW = __OVDATA__;
 let PRS = __PRDATA__;
 let RAID = __RAIDDATA__;
+let PLDMQ = __PLDMQDATA__;
 let SERVED = false;
 const JIRA_BASE = "https://elementlabs.atlassian.net/browse/";
 const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled"];
@@ -2470,26 +2712,38 @@ function renderAlign(job){
   const running=job.status==="running";
   const reset=job.kind==="reset";
   const prScan=job.kind==="pr-scan";
+  const sync=job.kind==="sync";
+  const revScan=job.kind==="review-scan";
   spin.style.display=running?"inline-block":"none";
   if(running){
     const prog=job.total?` (${job.repos.length}/${job.total})`:"";
     if(prScan){
       title.textContent=`Scanning PRs${prog}`+(job.current?" · "+job.current:"");
+    }else if(revScan){
+      const rp=job.total?` (${job.scanned||0}/${job.total})`:"";
+      title.textContent=`Scanning reviews${rp}`+(job.current?" · "+esc(job.current):"");
+    }else if(sync){
+      title.textContent=`Syncing ${esc(job.slot)}${prog}${job.current?" · "+esc(job.current):""}`;
     }else{
       const verb=reset?"Resetting":"Aligning";
       title.textContent=`${verb} ${esc(job.slot)}${prog}${job.current?" · "+esc(job.current):""}`;
     }
   }else if(job.status==="error"){
-    const what=prScan?"PR scan":(reset?"Reset":"Alignment");
+    const what=prScan?"PR scan":(revScan?"Review scan":(sync?"Sync":(reset?"Reset":"Alignment")));
     title.innerHTML=`<span style="color:#f87171">✕ ${what} failed</span>`;
   }else{
     const done=prScan?`✓ Probed ${job.repos.length} PRs`
-      :(reset?`✓ ${esc(job.slot)} reset to main`:`✓ Aligned ${esc(job.slot)}`);
+      :(revScan?`✓ Checked ${job.total||job.scanned||0} review PR(s)`
+      :(sync?`✓ ${esc(job.slot)} synced`
+      :(reset?`✓ ${esc(job.slot)} reset to main`:`✓ Aligned ${esc(job.slot)}`)));
     title.innerHTML=`<span style="color:#4ade80">${done}</span>`;
   }
   const rows=(job.repos||[]).map(alignRepoRow).join("");
   const msg=job.message?`<div style="margin-top:6px;color:#cbd5e1">${esc(job.message)}</div>`:"";
-  body.innerHTML=rows+msg;
+  const output=job.output?`<pre style="margin-top:8px;max-height:220px;overflow:auto;` +
+    `background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:8px;` +
+    `font-size:11px;line-height:1.4;white-space:pre-wrap;color:#94a3b8">${esc(job.output)}</pre>`:"";
+  body.innerHTML=rows+msg+output;
   if(running) body.scrollTop=body.scrollHeight;
 }
 async function pollAlign(jobId,label){
@@ -2591,10 +2845,9 @@ function applyFilters(){
 
   return TASKS.filter(t=>{
     if(activeTab!=="all" && t.category!==activeTab) return false;
-    // Merged code-review tasks are "done" but stay visible in the review section
-    // so the terminal `merged` status is trackable (until all PRs land they were open).
-    const keepMerged = t.category==="code-review" && consolidateReviewStatus(prs(t))==="merged";
-    if(hideDone && (t.status==="done"||t.status==="cancelled") && !keepMerged) return false;
+    // "Hide done/cancelled" hides every finished task, merged review records
+    // included; uncheck it to see the merged code-review history.
+    if(hideDone && (t.status==="done"||t.status==="cancelled")) return false;
     if(st.length && !st.includes(t.status)) return false;
     if(cat.length && !cat.includes(t.category)) return false;
     if(pri.length && !pri.includes(t.priority)) return false;
@@ -2826,6 +3079,12 @@ function selectTab(tab){
       .forEach(cb=>{ cb.checked=false; });
     updateDdLabel("reviewstatus"); updateDdLabel("author");
   }
+  // The review-scan button (gh probe) only applies to code-review, served only.
+  const rvScan=document.getElementById("review-scan");
+  const rvScanNote=document.getElementById("review-scan-note");
+  const showScan = tab==="code-review" && SERVED;
+  if(rvScan) rvScan.style.display = showScan ? "" : "none";
+  if(rvScanNote && !showScan){ rvScanNote.style.display="none"; rvScanNote.textContent=""; }
   applyTabPreset(tab);
   render();
 }
@@ -2851,6 +3110,16 @@ async function wsSlotPost(slot, payload, msgEl){
     buildFilters(); buildTabs(); render();
     if(data.align_job) pollAlign(data.align_job);
   }catch(err){ if(msgEl) msgEl.textContent="Network error: "+err; }
+}
+
+async function wsSyncSlot(slot){
+  if(!SERVED) return;
+  try{
+    const res=await fetch("/api/ws-sync/"+encodeURIComponent(slot),{method:"POST"});
+    const data=await res.json();
+    if(!res.ok){ alert("Sync failed: "+(data.error||res.status)); return; }
+    if(data.align_job) pollAlign(data.align_job, `Syncing ${slot}…`);
+  }catch(err){ alert("Network error: "+err); }
 }
 
 function wsTaskCard(t, holder){
@@ -2915,6 +3184,7 @@ function wsCard(s){
     if(occ){
       ctlHtml=`<div class="ws-actions">
         <button class="link ws-free" data-slot="${esc(s.slot)}">Set free</button>
+        <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
         <span class="ws-msg"></span></div>`;
     }else{
       const cand=activeTaskList().filter(t=>t.workspace!==s.slot);
@@ -2928,6 +3198,9 @@ function wsCard(s){
           <input type="text" class="ws-adhoc-label" placeholder="…or an ad-hoc purpose (e.g. monitor PRs)">
           <select class="ws-adhoc-tag">${WS_ADHOC_TAGS.map(g=>`<option value="${g}">${g}</option>`).join("")}</select>
           <button class="ws-occupy-adhoc">Hold</button>
+        </div>
+        <div class="ws-occ-row">
+          <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
         </div>
         <span class="ws-msg"></span></div>`;
     }
@@ -2972,6 +3245,7 @@ function renderWorkspaces(){
     const msg=b.closest(".ws-actions").querySelector(".ws-msg");
     wsSlotPost(b.dataset.slot,{action:"free"},msg);
   }));
+  box.querySelectorAll(".ws-sync").forEach(b=>b.addEventListener("click",()=>wsSyncSlot(b.dataset.slot)));
   box.querySelectorAll(".ws-occupy-task").forEach(b=>b.addEventListener("click",()=>{
     const wrap=b.closest(".ws-occupy-box");
     const sel=wrap.querySelector(".ws-pick"); const msg=wrap.querySelector(".ws-msg");
@@ -3187,6 +3461,40 @@ async function scanBugs(){
   }
 }
 document.getElementById("bug-scan").addEventListener("click",scanBugs);
+
+// Server-side gh probe of every open review PR — approvals, comments,
+// change-requests, re-pushes, merges — then re-derive each task status.
+// Runs as a background job with a live progress banner (pollAlign).
+async function scanReviews(){
+  const btn=document.getElementById("review-scan"), note=document.getElementById("review-scan-note");
+  if(!SERVED){ note.style.display=""; note.textContent="Run tm.py serve to scan."; return; }
+  btn.disabled=true; btn.innerHTML='<span class="spin">↻</span> Scanning…';
+  note.style.display=""; note.textContent="probing PRs via gh…";
+  try{
+    const r=await fetch("/api/review-scan",{method:"POST"});
+    const data=await r.json();
+    if(!r.ok||data.error) throw new Error(data.error||"scan failed");
+    const job=await pollAlign(data.align_job,"Scanning reviews…");
+    // Pull the freshly-updated task store back into the table.
+    try{
+      const tr=await fetch("/api/tasks",{cache:"no-store"});
+      const td=await tr.json();
+      if(td.tasks){ TASKS=td.tasks; if(td.workspaces) WORKSPACES=td.workspaces;
+        buildFilters(); buildTabs(); render(); }
+    }catch(_){}
+    const res=(job&&job.result)||{};
+    const bits=[(res.scanned||0)+" PR(s) checked"];
+    if((res.changed||[]).length) bits.push("<b>"+res.changed.length+" changed</b>");
+    if((res.completed||[]).length) bits.push(res.completed.length+" merged→done");
+    if((res.errors||[]).length) bits.push('<span class="stale-note">'+res.errors.length+" error(s)</span>");
+    note.innerHTML=bits.join(" · ");
+  }catch(e){
+    note.innerHTML='<span class="stale-note">Scan failed: '+esc(e.message)+'</span>';
+  }finally{
+    btn.disabled=false; btn.textContent="↻ Scan reviews";
+  }
+}
+document.getElementById("review-scan").addEventListener("click",scanReviews);
 
 function bugFilters(){
   const q=(document.getElementById("bq").value||"").toLowerCase().trim();
@@ -3730,7 +4038,7 @@ function ovCloseTime(months){
       .slice().sort((a,b)=>a-b);
     const mean=vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : 0;
     out.push({label:MONTH_ABBR[d.getMonth()], v:Math.round(mean*10)/10, n:vals.length,
-              sub:vals.length?vals.length+" closed":"", 
+              sub:vals.length?vals.length+" closed":"",
               median:vals.length?vals[Math.floor(vals.length/2)]:0});
   }
   return out;
@@ -4073,6 +4381,7 @@ const SECTIONS=[
   {id:"work",     label:"My Work",  ready:true},
   {id:"bugs",     label:"Bugs",     ready:true},
   {id:"prs",      label:"PRs",      ready:true},
+  {id:"pldmq",    label:"PLDM",     ready:true},
   {id:"raid",     label:"RAID",     ready:true},
   {id:"team",     label:"Team",     ready:false},
 ];
@@ -4085,6 +4394,7 @@ function sectionCount(id){
   if(id==="work") return TASKS.filter(t=>!["done","cancelled"].includes(t.status)).length;
   if(id==="bugs") return bugList().filter(b=>bugNeedsAttention(b)).length;
   if(id==="prs") return (PRS.features||[]).filter(f=>(f.blocked||[]).length).length;
+  if(id==="pldmq") return (PLDMQ.jobs||[]).filter(j=>j.active).length;
   if(id==="raid") return ((RAID.counts||{}).hot)||0;
   return 0;
 }
@@ -4097,6 +4407,7 @@ function buildSections(){
     const title = s.id==="bugs" ? "Bugs needing attention (stalled, untriaged, or unassigned)"
                 : s.id==="work" ? "Active tasks"
                 : s.id==="prs" ? "My outgoing feature PRs that are blocked (CI, review or rebase)"
+                : s.id==="pldmq" ? "PLDM hardware jobs still building, queued or running"
                 : s.id==="raid" ? "Open RAID rows at Red or Orange"
                 : s.id==="overview" ? "Things demanding attention right now (bugs + hot RAID)"
                 : "Team task monitoring — not built yet";
@@ -4118,6 +4429,7 @@ function selectSection(id){
   if(id==="bugs"){ buildBugFilters(); buildBugTabs(); selectBugTab(bugTab); }
   else if(id==="work"){ render(); }
   else if(id==="prs"){ renderPrs(); }
+  else if(id==="pldmq"){ renderPldmq(); }
   else if(id==="raid"){ renderRaid(); }
   else if(id==="overview"){ renderOverview(); }
 }
@@ -4142,6 +4454,31 @@ const PR_STATUS_COLOR={merged:"#1AAB40", "merge-queue":"#118DFF", approved:"#197
   closed:"#6B7280"};
 const PLDM_COLOR={passed:"#1AAB40", failed:"#D64550", running:"#118DFF",
   queued:"#D9B300", cancelled:"#9B9B9B"};
+
+// PLDM Job Queue live dashboard (Grafana). Deep-linked to the iridium project,
+// last 2 days — enough to spot the run you just dispatched by user/display name.
+const GRAFANA_PLDM="https://grafana.elmnt.local/d/pldm-job-queue-v1/pldm-job-queue"
+  +"?orgId=1&from=now-2d&to=now&timezone=browser&var-project=iridium"
+  +"&var-artifact=All&var-image_type=All&var-status=All&refresh=30s";
+// The submit flow stamps the dispatched GitHub Actions run URL into pldm_details;
+// pull it back out so the badge can deep-link to that specific CI run, not a portal.
+function pldmRunUrl(det){
+  const m=(det||"").match(/https:\/\/github\.com\/\S+\/actions\/runs\/\d+/);
+  return m?m[0]:"";
+}
+function pldmBadge(f){
+  if(!f.pldm||f.pldm==="not-tested") return '<span class="pldm">PLDM untested</span>';
+  const col=PLDM_COLOR[f.pldm]||PBI.grey;
+  const badge='<span class="pldm" style="background:'+col+';color:#fff;" title="'
+    +esc(f.pldm_details||"")+'">PLDM '+esc(f.pldm)+'</span>';
+  const url=pldmRunUrl(f.pldm_details);
+  const links=[];
+  if(url) links.push('<a class="pldm-link" href="'+esc(url)
+    +'" target="_blank" rel="noopener" title="'+esc(f.pldm_details||"")+'">\u2197 CI run</a>');
+  links.push('<a class="pldm-link" href="'+GRAFANA_PLDM
+    +'" target="_blank" rel="noopener" title="PLDM Job Queue live dashboard (Grafana)">\U0001F4CA Grafana</a>');
+  return badge+links.join("");
+}
 
 function renderPrs(){
   const feats=PRS.features||[], counts=PRS.counts||{};
@@ -4201,8 +4538,14 @@ function prFeature(f){
       :p.auto_merge?"auto-merge"
       :(p.merge_state==="BEHIND"||p.merge_state==="DIRTY")?(p.merge_state||"").toLowerCase()
       :(p.review||"").toLowerCase().replace(/_/g," ")||"\u2014";
+    // A `/ci` comment is the only way CI runs here, so every open PR gets a
+    // one-click re-run. Merged/closed PRs can't be re-triggered.
+    const canCi=SERVED&&p.status!=="merged"&&p.status!=="closed";
+    const ciBtn=canCi
+      ? ' <button class="ci-btn" data-ci-one="'+f.id+'" data-ci-num="'+p.number+'" '
+        +'title="Post a /ci comment to (re-)run CI on this PR">\u21bb ci</button>' : "";
     return '<tr><td><a href="'+esc(p.url||"#")+'" target="_blank" rel="noopener" title="'+esc(p.title||"")+'">'
-      +esc(p.repo)+' #'+p.number+'</a></td>'
+      +esc(p.repo)+' #'+p.number+'</a>'+ciBtn+'</td>'
       +'<td title="'+esc(p.title||"")+'">'+esc(p.title||"")+'</td>'
       +'<td>'+ci+'</td>'
       +'<td class="chk">'+detail+'</td>'
@@ -4212,21 +4555,29 @@ function prFeature(f){
   const pct=f.total?100*f.merged/f.total:0;
   const note=f.last_note
     ? '<div class="note"><b>'+esc(f.last_note.date)+'</b> \u2014 '+esc(f.last_note.text)+'</div>' : "";
-  const pldm=f.pldm&&f.pldm!=="not-tested"
-    ? '<span class="pldm" style="background:'+(PLDM_COLOR[f.pldm]||PBI.grey)+';color:#fff;">PLDM '+esc(f.pldm)+'</span>'
-    : '<span class="pldm">PLDM untested</span>';
+  const pldm=pldmBadge(f);
   const testable=SERVED&&f.prs.some(p=>p.status!=="closed");
   const btn=testable
     ? '<button class="pldm-btn" data-pldm="'+f.id+'" title="Grab a free workspace slot, '
       +'check it out to this feature\'s PR branches, and dispatch a remote PLDM build">'
       +'\u25b6 PLDM test</button>' : "";
+  // Feature-level CI re-runs: one for every open PR, one for only the failing.
+  const openCi=f.prs.filter(p=>p.status!=="merged"&&p.status!=="closed").length;
+  const failCi=f.prs.filter(p=>p.status==="ci-fail").length;
+  const ciAll=SERVED&&openCi
+    ? '<button class="ci-btn" data-ci-all="'+f.id+'" title="Post /ci on all '+openCi
+      +' open PR(s) of this feature">\u21bb CI all ('+openCi+')</button>' : "";
+  const ciFail=SERVED&&failCi
+    ? '<button class="ci-btn bad" data-ci-fail="'+f.id+'" title="Post /ci only on the '+failCi
+      +' failing PR(s)">\u21bb CI failed ('+failCi+')</button>' : "";
   return '<div class="prf" style="--fk:'+c+'">'
     +'<header><span class="fid">['+f.id+']</span><h3>'+esc(f.name)+'</h3>'
-    +btn+pldm+'<span class="st" style="--sk:'+c+'">'+esc(complete?"complete":f.worst)+'</span></header>'
+    +ciAll+ciFail+btn+pldm+'<span class="st" style="--sk:'+c+'">'+esc(complete?"complete":f.worst)+'</span></header>'
     +(f.description?'<p class="desc">'+esc(f.description)+'</p>':"")
     +'<div class="prog"><i style="width:'+pct.toFixed(0)+'%"></i></div>'
     +'<div class="ro-note">'+f.merged+' of '+f.total+' merged'
     +(complete?' \u2014 retires on the next scan':'')+'</div>'
+    +'<div class="ci-note" id="ci-note-'+f.id+'"></div>'
     +'<table class="pr-tbl"><thead><tr><th style="width:23%">Repo / PR</th><th style="width:31%">Title</th>'
     +'<th style="width:10%">CI</th><th style="width:10%">Checks</th>'
     +'<th style="width:12%">Gate</th><th style="width:14%">Status</th>'
@@ -4345,6 +4696,44 @@ document.addEventListener("click",e=>{
   else if(t.dataset.cancel) togglePldm(parseInt(t.dataset.cancel,10));
 });
 
+// CI only ever fires on a `/ci` comment here, so these buttons post exactly that
+// — for one PR, every open PR, or only the failing PRs of a feature.
+async function rerunCi(id,scope,number,btn){
+  const note=document.getElementById("ci-note-"+id);
+  const label=scope==="one"?("PR #"+number):(scope==="failed"?"failed PRs":"all open PRs");
+  if(!SERVED){ if(note) note.textContent="Serve the portal to re-run CI"; return; }
+  const was=btn?btn.textContent:"";
+  if(btn) btn.disabled=true;
+  if(note) note.textContent="posting /ci to "+label+"\u2026";
+  const body={feature_id:id,scope:scope};
+  if(number!=null) body.number=number;
+  try{
+    const r=await fetch("/api/pr-ci",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok||j.error) throw new Error(j.error||"post failed");
+    const fails=(j.results||[]).filter(x=>!x.ok);
+    let msg="/ci posted to "+j.posted+" PR"+(j.posted===1?"":"s");
+    if(j.failed) msg+=" \u00b7 "+j.failed+" failed: "
+      +fails.map(x=>esc(x.repo)+" #"+x.number+" ("+esc(x.detail||"error")+")").join(", ");
+    if(note) note.innerHTML=msg;
+  }catch(err){
+    if(note) note.textContent="Failed: "+err.message;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent=was; }
+  }
+}
+document.addEventListener("click",e=>{
+  const t=e.target.closest("[data-ci-one],[data-ci-all],[data-ci-fail]");
+  if(!t) return;
+  if(t.dataset.ciOne!=null)
+    rerunCi(parseInt(t.dataset.ciOne,10),"one",parseInt(t.dataset.ciNum,10),t);
+  else if(t.dataset.ciAll!=null)
+    rerunCi(parseInt(t.dataset.ciAll,10),"all",null,t);
+  else if(t.dataset.ciFail!=null)
+    rerunCi(parseInt(t.dataset.ciFail,10),"failed",null,t);
+});
+
 // The scan runs `gh` server-side — no model call, so it is free to hammer.
 async function scanPrs(){
   const btn=document.getElementById("pr-scan"), note=document.getElementById("pr-scan-note");
@@ -4374,6 +4763,97 @@ document.getElementById("pr-scan").addEventListener("click",scanPrs);
 // ---------------- RAID ----------------
 const kpi=o=>'<div class="kpi" style="--k:'+o.c+'"><div class="l">'+esc(o.label)+'</div>'
   +'<div class="n">'+o.n+'</div><div class="s">'+(o.sub||"")+'</div></div>';
+
+/* ===== PLDM job queue section ===== */
+const PQ_STATUS_COLOR={passed:"#1AAB40", failed:"#D64550", running:"#118DFF",
+  queued:"#D9B300", building:"#197278", cancelled:"#9B9B9B", error:"#E66C37",
+  pending:"#9B9B9B"};
+// The stage is the useful progress signal: a job sits in `queued` for hours
+// waiting for an EDK, which is normal and must not read as a stall.
+const PQ_STAGES=["dispatching","building","queued","running","done"];
+
+function pqStageBar(j){
+  const i=Math.max(0,PQ_STAGES.indexOf(j.stage));
+  const c=PQ_STATUS_COLOR[j.status]||PBI.grey;
+  return '<div class="pq-stage" title="'+esc(j.note||"")+'">'
+    +PQ_STAGES.map((s,k)=>'<i class="'+(k<=i?"on":"")+'" style="--pk:'+c+'" title="'+esc(s)+'"></i>').join("")
+    +'<span>'+esc(j.stage)+'</span></div>';
+}
+
+function renderPldmq(){
+  const jobs=PLDMQ.jobs||[], counts=PLDMQ.counts||{};
+  const n=s=>counts[s]||0;
+  const active=jobs.filter(j=>j.active);
+  document.getElementById("pq-portal").href=PLDMQ.portal||"#";
+  document.getElementById("pq-asof").innerHTML=
+    jobs.length+" tracked job"+(jobs.length===1?"":"s")+" \u00b7 "+active.length+" in flight \u00b7 "
+    +(PLDMQ.last_scan?"scanned <b>"+esc(PLDMQ.last_scan)+"</b>":"<b>never scanned</b>")
+    +(PLDMQ.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(PLDMQ.error)+'</span>':"");
+
+  document.getElementById("pq-kpis").innerHTML=[
+    kpi({c:active.length?PBI.blue:PBI.grey, label:"In flight", n:active.length,
+         sub:"of "+jobs.length+" tracked"}),
+    kpi({c:n("building")?PBI.teal:PBI.grey, label:"Building", n:n("building"), sub:"CI build"}),
+    kpi({c:n("queued")?PBI.gold:PBI.grey, label:"Queued", n:n("queued"), sub:"waiting for an EDK"}),
+    kpi({c:n("running")?PBI.blue:PBI.grey, label:"Running", n:n("running"), sub:"on hardware"}),
+    kpi({c:PBI.green, label:"Passed", n:n("passed"), sub:"clean runs"}),
+    kpi({c:(n("failed")+n("error"))?PBI.red:PBI.grey, label:"Failed", n:n("failed")+n("error"),
+         sub:n("error")?n("error")+" never reached HW":"on hardware"}),
+  ].join("");
+
+  document.getElementById("pq-body").innerHTML=jobs.length
+    ? jobs.map(pqRow).join("")
+    : '<tr><td colspan="8"><div class="empty">No PLDM jobs tracked. '
+      +'Submit one from a feature card in PRs, or with <code>pjq.py submit</code>.</div></td></tr>';
+}
+
+function pqRow(j){
+  const c=PQ_STATUS_COLOR[j.status]||PBI.grey;
+  const res=j.result||{};
+  const links=[
+    j.dispatch_url?'<a href="'+esc(j.dispatch_url)+'" target="_blank" rel="noopener" title="CI build run">build</a>':"",
+    j.exec_url?'<a href="'+esc(j.exec_url)+'" target="_blank" rel="noopener" title="Hardware execution run">run</a>':"",
+  ].filter(Boolean).join(" \u00b7 ")||"\u2014";
+  const age=j.age_h>=24?Math.round(j.age_h/24)+"d":j.age_h+"h";
+  let detail="";
+  if(res.summary||(res.lines||[]).length){
+    const n=(res.lines||[]).length;
+    detail='<tr class="pq-detail"><td colspan="8"><details>'
+      +'<summary>'+(res.summary?esc(res.summary):"failure evidence")
+      +' <span>('+n+' log line'+(n===1?"":"s")+')</span></summary>'
+      +((res.failed_steps||[]).length?'<div class="pq-step">failed step: '
+        +esc(res.failed_steps.join(", "))+'</div>':"")
+      +'<pre>'+esc((res.lines||[]).join("\n"))+'</pre></details></td></tr>';
+  }
+  return '<tr class="task"><td title="'+esc(j.note||"")+'"><b>'+esc(j.display_name)+'</b></td>'
+    +'<td>'+esc(j.feature||"\u2014")+'</td>'
+    +'<td>'+esc(j.image_type||"\u2014")+'</td>'
+    +'<td>'+pqStageBar(j)+'</td>'
+    +'<td><span class="st" style="--sk:'+c+'">'+esc(j.status)+'</span></td>'
+    +'<td>'+esc(j.edk||(j.queue_job_id?"queue #"+j.queue_job_id:"\u2014"))+'</td>'
+    +'<td>'+esc(age)+'</td><td>'+links+'</td></tr>'+detail;
+}
+
+// Follows each job through gh server-side; like the PR scan, it costs nothing.
+async function scanPldmq(){
+  const btn=document.getElementById("pq-scan"), note=document.getElementById("pq-scan-note");
+  if(!SERVED){ note.textContent="Serve the portal to scan"; return; }
+  btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Scanning\u2026';
+  note.textContent="following jobs through GitHub\u2026";
+  try{
+    const r=await fetch("/api/pldm-scan",{method:"POST"});
+    const j=await r.json();
+    if(!r.ok||j.error) throw new Error(j.error||"scan failed");
+    PLDMQ=j; renderPldmq(); buildSections();
+    note.textContent="probed "+(j.scanned||0)+" active job(s)";
+  }catch(e){
+    note.textContent="Scan failed: "+e.message;
+  }finally{
+    btn.disabled=false; btn.innerHTML="\u21bb Scan queue";
+  }
+}
+document.getElementById("pq-scan").addEventListener("click",scanPldmq);
+
 const RAG_COLOR={red:PBI.red, orange:PBI.orange, yellow:PBI.gold, green:PBI.green};
 const RAID_TYPES=[["risk","Risk"],["assumption","Assumption"],["issue","Issue"],["dependency","Dependency"]];
 let raidOpenRow=null;
@@ -4787,6 +5267,16 @@ def raid_payload() -> dict:
         return {"rows": [], "owners": [], "counts": {}, "path": "", "error": str(e)}
 
 
+def pldmq_payload() -> dict:
+    """Tracked PLDM jobs from pjq.py. Read-only; scanning is a separate POST."""
+    if pjq is None:
+        return {"jobs": [], "counts": {}, "portal": "", "error": "pjq unavailable"}
+    try:
+        return pjq.payload()
+    except Exception as e:
+        return {"jobs": [], "counts": {}, "portal": "", "error": str(e)}
+
+
 WS_SLOT_NAMES = ["one", "two", "three", "four", "five", "six"]
 
 
@@ -4817,6 +5307,7 @@ def render_dashboard_html(tasks: list[dict]) -> str:
     ovpayload = json.dumps(overview_payload(), ensure_ascii=False).replace("</", "<\\/")
     prpayload = json.dumps(pr_payload(), ensure_ascii=False).replace("</", "<\\/")
     raidpayload = json.dumps(raid_payload(), ensure_ascii=False).replace("</", "<\\/")
+    pldmqpayload = json.dumps(pldmq_payload(), ensure_ascii=False).replace("</", "<\\/")
     return (DASHBOARD_TEMPLATE
             .replace("__DATA__", payload)
             .replace("__WSDATA__", wspayload)
@@ -4824,6 +5315,7 @@ def render_dashboard_html(tasks: list[dict]) -> str:
             .replace("__OVDATA__", ovpayload)
             .replace("__PRDATA__", prpayload)
             .replace("__RAIDDATA__", raidpayload)
+            .replace("__PLDMQDATA__", pldmqpayload)
             .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
@@ -5051,11 +5543,20 @@ ALIGN_LOCK = _threading.Lock()
 # Serialises the PR scan so a double-click can't launch two gh storms.
 PR_SCAN_LOCK = _threading.Lock()
 
+# Serialises `/ci` comment posting so a double-click can't double-fire CI.
+PR_CI_LOCK = _threading.Lock()
+
 # Same for the Jira mirror refresh.
 BUG_SCAN_LOCK = _threading.Lock()
 
+# Serialises the review scan (gh probe of every open review PR).
+REVIEW_SCAN_LOCK = _threading.Lock()
+
 # raid.md is a plain file with no locking of its own.
 RAID_LOCK = _threading.Lock()
+
+# Serialises the PLDM queue scan (gh probe of every active tracked job).
+PLDMQ_SCAN_LOCK = _threading.Lock()
 
 
 def _git(repo_dir: Path, *args: str, timeout: int = 180) -> subprocess.CompletedProcess:
@@ -5063,6 +5564,26 @@ def _git(repo_dir: Path, *args: str, timeout: int = 180) -> subprocess.Completed
         ["git", "-C", str(repo_dir), *args],
         capture_output=True, text=True, timeout=timeout, check=False,
     )
+
+
+def _wip_snapshot(ws_dir: Path, name: str) -> bool:
+    """Best-effort: scan the aligned workspace and save a named `wip` snapshot.
+
+    Lets a later re-align restore the exact composite state with a single
+    `wip load <name> && wip all checkout` instead of re-querying gh / the
+    manifest. Silently no-ops if the `wip` CLI isn't installed.
+    """
+    wip = shutil.which("wip")
+    if not wip:
+        return False
+    try:
+        subprocess.run([wip, "scan"], cwd=str(ws_dir),
+                       capture_output=True, text=True, timeout=120, check=False)
+        r = subprocess.run([wip, "save", name], cwd=str(ws_dir),
+                           capture_output=True, text=True, timeout=60, check=False)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # owner/repo out of any GitHub remote (git@…:o/r.git, ssh://…/o/r.git, https://…/o/r).
@@ -5125,10 +5646,210 @@ def _checkout_pr_branch(repo_dir: Path, branch: str, pr_number: int | None) -> t
     return False, (r.stderr.strip() or "checkout failed").splitlines()[-1]
 
 
+def _checkout_default_record(repo_dir: Path) -> dict | None:
+    """Checkout a repo to its default branch; return a job record, or None if
+    it's already there (nothing to report).
+    """
+    key = _worktree_remote_key(repo_dir)
+    label = f"{key[0]}/{key[1]}" if key else repo_dir.name
+    default = _repo_default_branch(repo_dir)
+    cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
+    if cur == default:
+        return None
+    if _is_dirty(repo_dir):
+        return {"name": label, "role": "default", "action": "skipped-dirty",
+                "detail": f"on {cur}, uncommitted changes — left as-is"}
+    r = _git(repo_dir, "checkout", default, timeout=60)
+    ok = r.returncode == 0
+    return {"name": label, "role": "default",
+            "action": "checked-out" if ok else "error",
+            "detail": (f"{cur} → {default}" if ok
+                       else (r.stderr.strip() or "checkout failed").splitlines()[-1])}
+
+
+def _try_snapshot_restore(ws_dir: Path, worktrees: list, pr_by_repo: dict,
+                          name: str, upd, add_repo):
+    """Re-align a slot from a saved `wip` snapshot instead of re-querying gh.
+
+    Mirrors the review-mgr `start` snapshot fast path so the dashboard uses the
+    same `wip` tool as the skills: if a `review-<task-id>` snapshot exists (saved
+    by a prior alignment) and the slot is clean, restore the whole composite
+    state with `wip load <name> && wip all checkout`. Returns the set of matched
+    review-repo keys when it handled the alignment, or ``None`` to fall back to
+    the per-PR checkout loop (no `wip`, no snapshot, or any dirty repo).
+    """
+    wip = shutil.which("wip")
+    snap = Path(os.path.expanduser(f"~/.wip/saved/{name}.wip"))
+    if not wip or not snap.is_file():
+        return None
+    if any(_is_dirty(w) for w in worktrees):
+        return None  # let the careful loop report skipped-dirty repos
+    upd(current=f"restoring snapshot {name}")
+    try:
+        lr = subprocess.run([wip, "load", name], cwd=str(ws_dir),
+                            capture_output=True, text=True, timeout=60, check=False)
+        if lr.returncode != 0:
+            return None
+        subprocess.run([wip, "all", "checkout"], cwd=str(ws_dir),
+                       capture_output=True, text=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    seen = set()
+    for repo_dir in worktrees:
+        key = _worktree_remote_key(repo_dir)
+        cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD",
+                   timeout=15).stdout.strip()
+        pr = pr_by_repo.get(key) if key else None
+        if pr:
+            seen.add(key)
+            exp = pr.get("branch") or ""
+            ok = bool(exp) and cur == exp
+            add_repo({"name": pr.get("repo") or f"{key[0]}/{key[1]}",
+                      "role": "review",
+                      "action": "checked-out" if ok else "error",
+                      "detail": (f"on {cur} (snapshot)" if ok
+                                 else f"expected {exp}, on {cur}")})
+        else:
+            if not key or cur == "HEAD":
+                continue
+            default = _repo_default_branch(repo_dir)
+            if cur == default:
+                continue
+            add_repo({"name": f"{key[0]}/{key[1]}", "role": "default",
+                      "action": "checked-out", "detail": f"on {cur} (snapshot)"})
+    return seen
+
+
+def _octl_bin() -> str:
+    """Resolve the `octl` executable. systemd user services don't inherit the
+    interactive shell's PATH, so `~/.local/bin` (its usual home) is checked
+    explicitly rather than relying on a bare `"octl"` lookup.
+    """
+    found = shutil.which("octl")
+    if found:
+        return found
+    local = os.path.expanduser("~/.local/bin/octl")
+    return local if os.path.isfile(local) else "octl"
+
+
+def _octl_ws_roots(ws_dir: Path) -> list[Path]:
+    """All repo-tool workspace roots directly under a project slot.
+
+    A slot (e.g. ``~/projects/iridium/two``) can hold *several* independent
+    octl/west checkouts side by side (``two/fw``, ``two/kmd``, ``two/elpci``,
+    ...), each with its own `.repo` — every one of them needs its own
+    `octl ws sync`, not just the first one found.
+    """
+    if (ws_dir / ".repo").is_dir():
+        return [ws_dir]
+    roots = []
+    if ws_dir.is_dir():
+        for child in sorted(ws_dir.iterdir()):
+            if child.is_dir() and (child / ".repo").is_dir():
+                roots.append(child)
+    return roots or [ws_dir]
+
+
+def _octl_ws_root(ws_dir: Path) -> Path:
+    """The primary repo-tool workspace root under a slot (prefers `fw`).
+
+    Used for actions scoped to one checkout (e.g. the PLDM build, which
+    targets the firmware tree specifically) rather than every root.
+    """
+    roots = _octl_ws_roots(ws_dir)
+    for r in roots:
+        if r.name == "fw":
+            return r
+    return roots[0]
+
+
+def _find_ssh_auth_sock() -> str | None:
+    """Locate an ssh-agent socket that actually has an identity loaded.
+
+    The dashboard runs as a systemd user service, whose `SSH_AUTH_SOCK` may
+    point at an empty gpg-agent emulation while the user's real, key-bearing
+    agent lives at a per-login `/tmp/ssh-*/agent.*` path. Probe every candidate
+    with `ssh-add -l` and return the first one that reports a key, so git auth
+    works without the user pre-loading anything into a specific agent.
+    """
+    import glob
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    candidates = []
+    if os.environ.get("SSH_AUTH_SOCK"):
+        candidates.append(os.environ["SSH_AUTH_SOCK"])
+    candidates += sorted(glob.glob("/tmp/ssh-*/agent.*"), reverse=True)
+    candidates += [f"{xdg}/ssh-agent.socket", f"{xdg}/keyring/ssh",
+                   f"{xdg}/gnupg/S.gpg-agent.ssh"]
+    seen = set()
+    for sock in candidates:
+        if sock in seen or not os.path.exists(sock):
+            continue
+        seen.add(sock)
+        try:
+            r = subprocess.run(["ssh-add", "-l"], env=dict(os.environ, SSH_AUTH_SOCK=sock),
+                               capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return sock
+    return None
+
+
+def _sync_octl_roots(ws_dir: Path, upd, add_repo) -> tuple[int, int, str]:
+    """Run `octl ws sync` in every repo-tool root under a slot, one at a time,
+    reporting each directory to the job as it starts and finishes so the UI
+    banner can narrate progress instead of going silent for the whole batch.
+
+    Returns (ok_count, total_roots, combined output across all roots).
+    """
+    roots = _octl_ws_roots(ws_dir)
+    ok_n = 0
+    chunks = []
+    # Without a usable SSH agent, git falls back to the identity file and
+    # blocks on a passphrase prompt with no tty to answer it — BatchMode
+    # turns that into an immediate failure instead of a multi-minute hang.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+               GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10")
+    # Point git at whichever agent actually holds a key (the service's own
+    # SSH_AUTH_SOCK is often an empty gpg-agent emulation).
+    sock = _find_ssh_auth_sock()
+    if sock:
+        env["SSH_AUTH_SOCK"] = sock
+    for i, root in enumerate(roots, 1):
+        label = str(root.relative_to(ws_dir)) if root != ws_dir else "."
+        upd(current=f"octl ws sync · {label} ({i}/{len(roots)})")
+        try:
+            r = subprocess.run([_octl_bin(), "ws", "sync"], cwd=str(root), env=env,
+                                capture_output=True, text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            add_repo({"name": label, "role": "sync", "action": "error",
+                      "detail": f"failed to run: {e}"})
+            chunks.append(f"== {label} ==\n{e}")
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        chunks.append(f"== {label} ==\n{out}")
+        if r.returncode == 0:
+            ok_n += 1
+            add_repo({"name": label, "role": "sync", "action": "checked-out",
+                      "detail": "synced"})
+        else:
+            tail = [ln for ln in out.splitlines() if ln.strip()][-1:] or ["see output"]
+            add_repo({"name": label, "role": "sync", "action": "error",
+                      "detail": f"exited {r.returncode}: {tail[0][:150]}"})
+    return ok_n, len(roots), "\n".join(chunks)[-8000:]
+
+
+
 def run_workspace_alignment(job: dict, store_lock=None) -> None:
     """Background worker: align a workspace slot for a code-review task.
 
     Updates ``job`` in place (guarded by ALIGN_LOCK) so the UI can poll progress.
+
+    If any review-branch checkout errors out, the whole slot is reverted: every
+    repo is switched back to its default branch and the occupy is undone — a
+    broken checkout must never squat a slot that looks assigned but isn't
+    actually on the reviewer's branches.
     """
     def upd(**kw):
         with ALIGN_LOCK:
@@ -5156,48 +5877,55 @@ def run_workspace_alignment(job: dict, store_lock=None) -> None:
     # name — this is a repo/west workspace where dir names differ from repo names.
     worktrees = _discover_worktrees(ws_dir)
     upd(total=len(worktrees))
-    seen_review: set[tuple[str, str]] = set()
     left_alone = 0
 
-    for repo_dir in worktrees:
-        key = _worktree_remote_key(repo_dir)
-        try:
-            upd(current=str(repo_dir.relative_to(ws_dir)))
-        except ValueError:
-            upd(current=repo_dir.name)
-        pr = pr_by_repo.get(key) if key else None
-        label = pr.get("repo") if pr else (f"{key[0]}/{key[1]}" if key else repo_dir.name)
-        if pr:
-            seen_review.add(key)
-            if _is_dirty(repo_dir):
-                add_repo({"name": label, "role": "review", "action": "skipped-dirty",
-                          "detail": "uncommitted changes — left as-is"})
+    # Fast path: restore the composite state from a prior `wip` snapshot rather
+    # than re-checking out every PR branch via gh. Falls back to the per-repo
+    # loop below when no snapshot/wip is available or the slot is dirty.
+    seen_review = _try_snapshot_restore(
+        ws_dir, worktrees, pr_by_repo, f"review-{job['task_id']}", upd, add_repo)
+
+    if seen_review is None:
+        seen_review = set()
+        for repo_dir in worktrees:
+            key = _worktree_remote_key(repo_dir)
+            try:
+                upd(current=str(repo_dir.relative_to(ws_dir)))
+            except ValueError:
+                upd(current=repo_dir.name)
+            pr = pr_by_repo.get(key) if key else None
+            label = pr.get("repo") if pr else (f"{key[0]}/{key[1]}" if key else repo_dir.name)
+            if pr:
+                seen_review.add(key)
+                if _is_dirty(repo_dir):
+                    add_repo({"name": label, "role": "review", "action": "skipped-dirty",
+                              "detail": "uncommitted changes — left as-is"})
+                    continue
+                ok, detail = _checkout_pr_branch(
+                    repo_dir, pr.get("branch") or "", pr.get("pr_number"))
+                add_repo({"name": label, "role": "review",
+                          "action": "checked-out" if ok else "error", "detail": detail})
                 continue
-            ok, detail = _checkout_pr_branch(
-                repo_dir, pr.get("branch") or "", pr.get("pr_number"))
-            add_repo({"name": label, "role": "review",
-                      "action": "checked-out" if ok else "error", "detail": detail})
-            continue
-        # Non-PR repo → switch to default branch, but never disturb a
-        # manifest-pinned (detached HEAD) checkout — leave it as the manifest set it.
-        cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
-        if not key or cur == "HEAD":
-            left_alone += 1
-            continue
-        default = _repo_default_branch(repo_dir)
-        if cur == default:
-            left_alone += 1
-            continue
-        if _is_dirty(repo_dir):
-            add_repo({"name": label, "role": "default", "action": "skipped-dirty",
-                      "detail": f"on {cur}, uncommitted changes — left as-is"})
-            continue
-        r = _git(repo_dir, "checkout", default, timeout=60)
-        ok = r.returncode == 0
-        add_repo({"name": label, "role": "default",
-                  "action": "checked-out" if ok else "error",
-                  "detail": (f"{cur} → {default}" if ok
-                             else (r.stderr.strip() or "checkout failed").splitlines()[-1])})
+            # Non-PR repo → switch to default branch, but never disturb a
+            # manifest-pinned (detached HEAD) checkout — leave it as the manifest set it.
+            cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
+            if not key or cur == "HEAD":
+                left_alone += 1
+                continue
+            default = _repo_default_branch(repo_dir)
+            if cur == default:
+                left_alone += 1
+                continue
+            if _is_dirty(repo_dir):
+                add_repo({"name": label, "role": "default", "action": "skipped-dirty",
+                          "detail": f"on {cur}, uncommitted changes — left as-is"})
+                continue
+            r = _git(repo_dir, "checkout", default, timeout=60)
+            ok = r.returncode == 0
+            add_repo({"name": label, "role": "default",
+                      "action": "checked-out" if ok else "error",
+                      "detail": (f"{cur} → {default}" if ok
+                                 else (r.stderr.strip() or "checkout failed").splitlines()[-1])})
 
     # Report review repos the task references but that aren't in the workspace.
     for key, pr in pr_by_repo.items():
@@ -5205,6 +5933,36 @@ def run_workspace_alignment(job: dict, store_lock=None) -> None:
             add_repo({"name": pr.get("repo") or f"{key[0]}/{key[1]}",
                       "role": "review", "action": "not-found",
                       "detail": "repo not present in this workspace"})
+
+    review_checkout_failed = any(
+        r["role"] == "review" and r["action"] == "error" for r in job["repos"])
+
+    if review_checkout_failed:
+        upd(current="reverting — checkout failed")
+        for repo_dir in worktrees:
+            rec = _checkout_default_record(repo_dir)
+            if rec is not None:
+                add_repo(rec)
+        wm.release(job["slot"])
+        errors = sum(1 for r in job["repos"]
+                     if r["role"] == "review" and r["action"] == "error")
+        msg = (f"{errors} branch checkout(s) failed — reverted to main and "
+               f"released {job['slot']}")
+        upd(status="error", current=None, finished=NOW, message=msg)
+        note = f"dashboard: workspace {job['slot']} checkout failed — reverted, slot released"
+        if store_lock is not None:
+            store_lock.acquire()
+        try:
+            d2 = load()
+            t2 = find_task(d2, job["task_id"])
+            if t2:
+                append_note(t2, note)
+                t2["updated"] = TODAY
+                save(d2)
+        finally:
+            if store_lock is not None:
+                store_lock.release()
+        return
 
     errors = sum(1 for r in job["repos"] if r["action"] in ("error", "not-found"))
     dirty = sum(1 for r in job["repos"] if r["action"] == "skipped-dirty")
@@ -5217,6 +5975,10 @@ def run_workspace_alignment(job: dict, store_lock=None) -> None:
     if errors:
         msg += f", {errors} problem(s)"
     upd(status="done", current=None, finished=NOW, message=msg)
+
+    # Snapshot the aligned composite state (best-effort) so re-aligning this
+    # task later is a single cheap `wip load review-<id> && wip all checkout`.
+    _wip_snapshot(ws_dir, f"review-{job['task_id']}")
 
     # Record the outcome on the task (best-effort, guarded by the store lock).
     note = f"dashboard: workspace {job['slot']} aligned for manual review — {msg}"
@@ -5261,23 +6023,11 @@ def run_workspace_reset(job: dict, store_lock=None) -> None:
             upd(current=str(repo_dir.relative_to(ws_dir)))
         except ValueError:
             upd(current=repo_dir.name)
-        key = _worktree_remote_key(repo_dir)
-        label = f"{key[0]}/{key[1]}" if key else repo_dir.name
-        default = _repo_default_branch(repo_dir)
-        cur = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", timeout=15).stdout.strip()
-        if cur == default:
+        rec = _checkout_default_record(repo_dir)
+        if rec is None:
             left_alone += 1
-            continue
-        if _is_dirty(repo_dir):
-            add_repo({"name": label, "role": "default", "action": "skipped-dirty",
-                      "detail": f"on {cur}, uncommitted changes — left as-is"})
-            continue
-        r = _git(repo_dir, "checkout", default, timeout=60)
-        ok = r.returncode == 0
-        add_repo({"name": label, "role": "default",
-                  "action": "checked-out" if ok else "error",
-                  "detail": (f"{cur} → {default}" if ok
-                             else (r.stderr.strip() or "checkout failed").splitlines()[-1])})
+        else:
+            add_repo(rec)
 
     dirty = sum(1 for r in job["repos"] if r["action"] == "skipped-dirty")
     errs = sum(1 for r in job["repos"] if r["action"] == "error")
@@ -5289,7 +6039,13 @@ def run_workspace_reset(job: dict, store_lock=None) -> None:
         msg += f", {dirty} skipped (dirty)"
     if errs:
         msg += f", {errs} problem(s)"
-    upd(status="done", current=None, finished=NOW, message=msg)
+
+    # Once every repo is back on main, bring the workspace up to date so the
+    # freed slot isn't left stale for whoever grabs it next.
+    sync_ok_n, sync_total, sync_output = _sync_octl_roots(ws_dir, upd, add_repo)
+    msg += f", synced {sync_ok_n}/{sync_total}"
+    upd(status="done" if sync_ok_n == sync_total else "error", current=None,
+        finished=NOW, message=msg, output=sync_output)
 
 
 # ----------------------------------------------------------------------------
@@ -5401,9 +6157,9 @@ def run_pldm_submit(job: dict) -> None:
 
     try:
         r = subprocess.run(
-            ["octl", "ws", "build", "--remote", "--target", "pldm",
+            [_octl_bin(), "ws", "build", "--remote", "--target", "pldm",
              "--from-file", str(cfg)],
-            cwd=str(ws_dir), capture_output=True, text=True,
+            cwd=str(_octl_ws_root(ws_dir)), capture_output=True, text=True,
             timeout=PLDM_DISPATCH_TIMEOUT, check=False)
     except (OSError, subprocess.TimeoutExpired) as e:
         return fail(f"octl dispatch failed: {e}")
@@ -5558,6 +6314,77 @@ def start_pr_scan_job() -> str:
     return jid
 
 
+# gh review state → (banner icon, tone) for each streamed review-scan row.
+REVIEW_SCAN_ICONS = {
+    "approved": ("\u2713", "ok"), "merged": ("\u2713", "ok"),
+    "commented": ("\U0001f4ac", "warn"),
+    "waiting-for-re-review": ("\u21bb", "warn"),
+    "changes-requested": ("\u2715", "bad"), "closed": ("\u2715", "bad"),
+    "error": ("\u26a0", "bad"),
+}
+
+
+def run_review_scan(job: dict) -> None:
+    """Background worker: gh-probe every open review PR, streaming one row per
+    changed/errored PR into the job so the UI banner can narrate progress.
+
+    Releases REVIEW_SCAN_LOCK (acquired by the request handler) when done.
+    """
+    def upd(**kw):
+        with ALIGN_LOCK:
+            job.update(kw)
+
+    def add_repo(rec):
+        with ALIGN_LOCK:
+            job["repos"].append(rec)
+
+    def progress(i, total, tid, label, status, detail):
+        if status is None:                       # about to fetch this PR
+            upd(current=f"{label} ({i}/{total})", total=total, scanned=i)
+            return
+        if status == "nochange":
+            return
+        icon, tone = REVIEW_SCAN_ICONS.get(status, ("\u00b7", "warn"))
+        add_repo({"name": f"{tid} {label}", "action": status,
+                  "icon": icon, "tone": tone, "detail": detail})
+
+    try:
+        result = portal_review_scan(progress=progress)
+    except Exception as e:
+        upd(status="error", finished=NOW, current=None, message=str(e))
+        return
+    finally:
+        REVIEW_SCAN_LOCK.release()
+
+    parts = [f"{result['scanned']} PR(s) checked"]
+    if result["changed"]:
+        parts.append(f"{len(result['changed'])} changed")
+    if result.get("removed"):
+        parts.append(f"{len(result['removed'])} closed→removed")
+    if result["completed"]:
+        parts.append(f"{len(result['completed'])} merged→done")
+    if result.get("cancelled"):
+        parts.append(f"{len(result['cancelled'])} emptied→cancelled")
+    if result["errors"]:
+        parts.append(f"{len(result['errors'])} error(s)")
+    upd(status="done", finished=NOW, current=None, result=result,
+        message=" \u00b7 ".join(parts))
+
+
+def start_review_scan_job() -> str:
+    """Register + launch a background review scan; return its id."""
+    jid = f"revscan-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "kind": "review-scan", "slot": "reviews",
+        "status": "running", "started": NOW, "finished": None,
+        "current": None, "total": 0, "scanned": 0, "message": "", "repos": [],
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    _threading.Thread(target=run_review_scan, args=(job,), daemon=True).start()
+    return jid
+
+
 def start_alignment_job(task_id: str, slot_root: str, store_lock=None) -> str:
     """Register + launch a background alignment job; return its id."""
     jid = f"align-{int(datetime.now().timestamp() * 1000)}"
@@ -5586,6 +6413,43 @@ def start_reset_job(slot_root: str, store_lock=None) -> str:
         ALIGN_JOBS[jid] = job
     th = _threading.Thread(
         target=run_workspace_reset, args=(job, store_lock), daemon=True)
+    th.start()
+    return jid
+
+
+def run_workspace_sync(job: dict) -> None:
+    """Background worker: run `octl ws sync` in a slot on demand, whether it's
+    occupied or free — a manual refresh independent of occupy/release.
+    """
+    def upd(**kw):
+        with ALIGN_LOCK:
+            job.update(kw)
+
+    def add_repo(rec):
+        with ALIGN_LOCK:
+            job["repos"].append(rec)
+
+    ws_dir = PROJECTS_ROOT / DEFAULT_PROJECT / job["slot"]
+    if not ws_dir.is_dir():
+        upd(status="error", message=f"workspace dir not found: {ws_dir}", finished=NOW)
+        return
+    upd(total=len(_octl_ws_roots(ws_dir)))
+    ok_n, total, output = _sync_octl_roots(ws_dir, upd, add_repo)
+    upd(status="done" if ok_n == total else "error", current=None, finished=NOW,
+        message=f"{ok_n}/{total} synced", output=output)
+
+
+def start_sync_job(slot_root: str) -> str:
+    """Register + launch a background manual sync job for a slot; return id."""
+    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
+    job = {
+        "id": jid, "task_id": None, "slot": slot_root, "kind": "sync",
+        "status": "running", "started": NOW, "finished": None,
+        "current": None, "total": 0, "message": "", "repos": [],
+    }
+    with ALIGN_LOCK:
+        ALIGN_JOBS[jid] = job
+    th = _threading.Thread(target=run_workspace_sync, args=(job,), daemon=True)
     th.start()
     return jid
 
@@ -5698,6 +6562,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if self.path == "/api/raid":
                 with RAID_LOCK:
                     return self._send(200, json.dumps(raid_payload(), ensure_ascii=False))
+            if self.path == "/api/pldm-jobs":
+                return self._send(200, json.dumps(pldmq_payload(), ensure_ascii=False))
             if self.path.startswith("/api/align/"):
                 jid = self.path[len("/api/align/"):]
                 with ALIGN_LOCK:
@@ -5735,11 +6601,52 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
 
+            # The review scan probes every open review PR through gh (bodyless,
+            # slow-ish). Runs as a background job that streams progress into
+            # ALIGN_JOBS so the UI can show a live banner; the worker mutates the
+            # task store and releases REVIEW_SCAN_LOCK when done.
+            if self.path == "/api/review-scan":
+                if not REVIEW_SCAN_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps(
+                        {"error": "a review scan is already running"}))
+                try:
+                    jid = start_review_scan_job()
+                except Exception as e:
+                    REVIEW_SCAN_LOCK.release()
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, "align_job": jid}))
+
+            # The PLDM queue scan follows every active tracked job through the
+            # gh CLI (bodyless, slow-ish, zero tokens). It returns the refreshed
+            # payload directly so the section can re-render in place.
+            if self.path == "/api/pldm-scan":
+                if pjq is None:
+                    return self._send(503, json.dumps({"error": "pldm-job-queue not installed"}))
+                if not PLDMQ_SCAN_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a PLDM scan is already running"}))
+                try:
+                    result = pjq.portal_scan()
+                except Exception as e:
+                    return self._send(500, json.dumps({"error": str(e)}))
+                finally:
+                    PLDMQ_SCAN_LOCK.release()
+                return self._send(200, json.dumps(result, ensure_ascii=False))
+
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._send(400, json.dumps({"error": "invalid JSON"}))
+
+            # Manual `octl ws sync`, independent of occupy/free — usable on an
+            # occupied or a free slot alike.
+            if self.path.startswith("/api/ws-sync/"):
+                slot = unquote(self.path[len("/api/ws-sync/"):])
+                root = wm.normalize_slot(slot)
+                if not root:
+                    return self._send(400, json.dumps({"error": f"invalid slot: {slot!r}"}))
+                return self._send(200, json.dumps(
+                    {"ok": True, "align_job": start_sync_job(root)}, ensure_ascii=False))
 
             if self.path.startswith("/api/workspace/"):
                 slot = unquote(self.path[len("/api/workspace/"):])
@@ -5803,7 +6710,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, json.dumps(
                     {"ok": True, "message": msg, "align_job": jid}, ensure_ascii=False))
 
-            if self.path.startswith("/api/raid/"):
+            # Posts a `/ci` comment on one, all, or only-failed PRs of a feature
+            # to (re-)trigger CI. Serialised so a double-click can't double-fire.
+            if self.path == "/api/pr-ci":
+                if pm is None:
+                    return self._send(503, json.dumps({"error": "pr-monitor not installed"}))
+                with PR_CI_LOCK:
+                    res = pm.trigger_ci(payload.get("feature_id"),
+                                        scope=payload.get("scope", "all"),
+                                        number=payload.get("number"))
+                if res.get("error"):
+                    code = 404 if "not found" in res["error"] else 400
+                    return self._send(code, json.dumps(res, ensure_ascii=False))
+                return self._send(200, json.dumps({"ok": True, **res}, ensure_ascii=False))
+
                 if rd is None:
                     return self._send(400, json.dumps({"error": "team-planner not installed"}))
                 rid = unquote(self.path[len("/api/raid/"):])

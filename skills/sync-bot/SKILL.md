@@ -74,7 +74,7 @@ Each row is one chore. `id` is stable (used in state + `skip`). "Action" is the 
 
 ¹ "RW" chores update a local cache/log inside their owning skill (review-task statuses, PR status column, `staff-updates.md`, the `~/tasks/bugs.json` Jira mirror). None of them post to GitHub/Jira/Confluence. **Sync-Bot never writes to a remote system** — see Principles.
 
-² `ws-sync` mutates the **local working tree** (stash/checkout/pull-rebase/artifact download) but performs **no remote writes** — no push, no force, no reset. It snapshots state first (`wip_save`) so any interruption is recoverable. See "Scripted chores" below.
+² `ws-sync` mutates the **local working tree** (stash/checkout/pull-rebase/artifact download) but performs **no remote writes** — no push, no force, no reset. It snapshots state first (`wip save`) so any interruption is recoverable. See "Scripted chores" below.
 
 ## Scripted chores
 
@@ -82,12 +82,12 @@ Some chores are too mechanical to spend tokens narrating turn-by-turn. These run
 
 ### `ws-sync` — `./sync_all_workspaces.sh [project] [--no-artifacts] [--dry-run]`
 
-Syncs every initialized workspace under `~/projects/<project>/` (default `iridium`) to the latest base code, preserving local work. Per run it: (1) `wip_scan` + `wip_save` a recoverable snapshot, (2) stashes uncommitted changes in **all** repos on any branch, (3) returns every repo to its base/upstream branch, (4) runs `octl ws sync` + `octl artifacts download` per workspace, (5) restores the original branches, (6) pops only the stashes it created (matched by message). It never pushes, force-pushes, or hard-resets.
+Syncs every initialized workspace under `~/projects/<project>/` (default `iridium`) to the latest base code, preserving local work. Per run it: (1) `wip scan` + `wip save` a recoverable snapshot, (2) stashes uncommitted changes in **all** repos on any branch, (3) returns every repo to its base/upstream branch, (4) runs `octl ws sync` + `octl artifacts download` per workspace, (5) restores the original branches, (6) pops only the stashes it created (matched by message). It never pushes, force-pushes, or hard-resets.
 
 **How Sync-Bot runs it:**
 1. Invoke `~/.copilot/skills/sync-bot/sync_all_workspaces.sh <project>` (omit project ⇒ `iridium`). For a no-op preview use `--dry-run`; to skip artifact download use `--no-artifacts`.
 2. **Do not** stream the script's full output. Capture it and surface only the final `SUMMARY` block (workspaces synced, repos stashed, saved-state name, any FAILED workspaces / POP CONFLICTS, OK vs ATTENTION-NEEDED).
-3. Exit `0` ⇒ clean (digest row `synced N/N · M stashed`). Exit `1` ⇒ ATTENTION: name the failed workspaces / pop-conflict repos and surface the printed recovery line (`wip_load <save> && wip_checkout`).
+3. Exit `0` ⇒ clean (digest row `synced N/N · M stashed`). Exit `1` ⇒ ATTENTION: name the failed workspaces / pop-conflict repos and surface the printed recovery line (`wip load <save> && wip all checkout`).
 4. The chore is RW-local only; never escalate it to a remote action. If the user wants to push restored dev branches afterward, that's a separate explicit `wip-workspace` step.
 
 State: record `last_run`/`last_result` for `ws-sync` like any chore. Because it's `slow`, the `due` preset and ordering (Workflow 1, step 3) naturally place it after the fast personal-queue chores.

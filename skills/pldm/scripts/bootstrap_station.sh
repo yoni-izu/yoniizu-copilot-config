@@ -7,7 +7,8 @@
 #   ./bootstrap_station.sh pldm-edk0-z2a
 #
 # <host> is anything ssh can reach (hostname or user@host). On first run it copies:
-#   ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, ~/wip_funcs.sh, ~/.bash_aliases, ~/my_funcs.sh
+#   ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, ~/bin/wip (+ completion),
+#   ~/wip_funcs.sh, ~/.bash_aliases, ~/my_funcs.sh
 # Only files that exist locally are copied. Re-run with --force to refresh.
 
 set -euo pipefail
@@ -39,8 +40,8 @@ fi
 
 echo "[$HOST] bootstrapping..."
 
-# --- ensure remote ~/.ssh exists with correct perms ------------------------
-ssh "$HOST" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+# --- ensure remote ~/.ssh and ~/bin exist with correct perms ---------------
+ssh "$HOST" 'mkdir -p ~/.ssh ~/bin/completions && chmod 700 ~/.ssh'
 
 # --- copy files that exist locally -----------------------------------------
 copy_if_present() {
@@ -59,6 +60,8 @@ copy_if_present "$HOME/.ssh/id_ed25519.pub"  '~/.ssh/id_ed25519.pub' 644
 copy_if_present "$HOME/wip_funcs.sh"         '~/wip_funcs.sh'
 copy_if_present "$HOME/.bash_aliases"        '~/.bash_aliases'
 copy_if_present "$HOME/my_funcs.sh"          '~/my_funcs.sh'
+copy_if_present "$HOME/bin/wip"              '~/bin/wip'                   755
+copy_if_present "$HOME/bin/completions/wip.bash" '~/bin/completions/wip.bash'
 
 # --- make ~/.bashrc source the helpers (idempotent) ------------------------
 ssh "$HOST" 'bash -s' <<'REMOTE'
@@ -67,6 +70,10 @@ for f in wip_funcs.sh my_funcs.sh; do
   line="[ -f ~/$f ] && source ~/$f"
   grep -qxF "$line" ~/.bashrc || echo "$line" >> ~/.bashrc
 done
+# ensure ~/bin (holds the `wip` CLI) is on PATH + load its completion
+grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+wipcomp='[ -f ~/bin/completions/wip.bash ] && source ~/bin/completions/wip.bash'
+grep -qxF "$wipcomp" ~/.bashrc || echo "$wipcomp" >> ~/.bashrc
 # .bash_aliases is sourced by default ~/.bashrc on most distros; ensure it is.
 line='[ -f ~/.bash_aliases ] && source ~/.bash_aliases'
 grep -qF '.bash_aliases' ~/.bashrc || echo "$line" >> ~/.bashrc

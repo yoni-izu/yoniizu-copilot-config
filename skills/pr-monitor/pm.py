@@ -351,6 +351,54 @@ def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
     return True, f"[{feat_id}] PLDM Test: {state}"
 
 
+def post_ci(owner: str, repo: str, number: int) -> tuple[bool, str]:
+    """Post a ``/ci`` comment on one PR to (re-)trigger its CI pipeline.
+
+    CI here only fires on a ``/ci`` comment — never on push or reopen — so this
+    is the single supported way to (re-)run it.
+    """
+    return _gh(["pr", "comment", str(number), "--repo", f"{owner}/{repo}",
+                "--body", "/ci"])
+
+
+def trigger_ci(feat_id: int, scope: str = "all",
+               number: int | None = None) -> dict:
+    """(Re-)run CI on a feature's PRs by posting ``/ci`` comments.
+
+    scope:
+      ``all``    — every open PR (skips merged/closed);
+      ``failed`` — only PRs whose status is ``ci-fail``;
+      ``one``    — just the PR matching ``number``.
+
+    Returns a per-PR result list plus posted/failed tallies, or ``{"error": …}``.
+    """
+    pl = payload()
+    if pl.get("error"):
+        return {"error": pl["error"]}
+    feat = next((f for f in pl.get("features", []) if f["id"] == feat_id), None)
+    if feat is None:
+        return {"error": f"feature [{feat_id}] not found"}
+    prs = feat["prs"]
+    if scope == "one":
+        prs = [p for p in prs if p["number"] == number]
+        if not prs:
+            return {"error": f"PR #{number} not in feature [{feat_id}]"}
+    elif scope == "failed":
+        prs = [p for p in prs if p.get("status") == "ci-fail"]
+    else:
+        prs = [p for p in prs if p.get("status") not in ("merged", "closed")]
+
+    results, posted, failed = [], 0, 0
+    for p in prs:
+        ok, out = post_ci(p["owner"], p["repo"], p["number"])
+        posted += ok
+        failed += not ok
+        results.append({"repo": p["repo"], "number": p["number"], "ok": ok,
+                        "detail": (out.splitlines()[-1][:160] if out else "")})
+    return {"feature_id": feat_id, "scope": scope, "posted": posted,
+            "failed": failed, "results": results}
+
+
 def _patch_cache_pldm(feat_id: int, state: str, details: str) -> None:
     """Mirror a PLDM stamp into the cache and re-stamp its mtime.
 
