@@ -1,0 +1,751 @@
+#!/bin/bash
+#
+# wip — multi-repo workspace git helper (actions as args)
+#
+# Ports the ws_*/wip_* shell functions from ~/wip_funcs.sh into a standalone
+# executable. State is persisted on disk instead of in shell arrays:
+#
+#   <wip_root>/.wip/state      auto-written by `wip scan`; found by walking up
+#                              from $PWD (like git finds .git)
+#   ~/.wip/saved/<name>.wip    explicit snapshots (wip save/load/list)
+#
+# Two scopes for every git action:
+#   wip ws  <action>    current workspace only   (was ws_*)
+#   wip all <action>    every workspace in root  (was wip_*)
+#
+set -u
+
+manifest_repo="ip.infra.sw.manifests"
+saved_dir="$HOME/.wip/saved"
+config_file="$HOME/.wip/config"
+
+declare -A wip_info          # "ws:repo" -> "path:branch"
+declare -A ws_upstream_info  # "ws"      -> upstream branch
+wip_root=""
+wip_mode=""                  # explicit per-root mode (empty = inherit global default)
+FORCE_MIRROR=no              # allow push while in mirror mode
+
+# ---- colors (only on a TTY) ------------------------------------------------
+if [[ -t 1 ]]; then
+	C_TITLE=$'\033[1;36m'; C_CMD=$'\033[1;32m'; C_ARG=$'\033[0;33m'
+	C_SEC=$'\033[1;35m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
+	C_DEV=$'\033[1;33m'; C_DIM=$'\033[2m'
+else
+	C_TITLE=""; C_CMD=""; C_ARG=""; C_SEC=""; C_ERR=""; C_OFF=""
+	C_DEV=""; C_DIM=""
+fi
+
+die() { echo -e "${C_ERR}error:${C_OFF} $*" >&2; exit 1; }
+
+# ---- action metadata -------------------------------------------------------
+# canonical (hyphenated) action name -> human verb used in progress lines
+declare -A action_strs=(
+	[checkout]="Checking out"
+	[push]="Pushing"
+	[pull]="Pulling"
+	[align]="Aligning"
+	[set-upstream]="Setting upstream"
+	[stash]="Stashing"
+	[pop]="Popping"
+	[diff]="Diffing"
+	[return]="Returning to upstream"
+	[hard-reset]="Hard resetting"
+	[depends-on]="Listing dependencies for"
+)
+
+is_action() { [[ -n "${action_strs[$1]:-}" ]]; }
+is_destructive() { [[ "$1" == "hard-reset" || "$1" == "push" ]]; }
+
+# ---- working mode ----------------------------------------------------------
+# author : local is the source of truth — push work up (align rebases on main).
+# mirror : remote is the source of truth — pull latest down (align resets to it).
+# Machine-wide default lives in ~/.wip/config (default_mode=...); absent = mirror,
+# so every freshly-deployed machine defaults to mirror and only the dev box opts
+# into author by writing default_mode=author there.
+global_default_mode() {
+	local m=""
+	[[ -f "$config_file" ]] && m=$(sed -n 's/^[[:space:]]*default_mode[[:space:]]*=[[:space:]]*//p' "$config_file" | head -1)
+	case "$m" in author|mirror) echo "$m" ;; *) echo "mirror" ;; esac
+}
+
+# Effective mode for the current root: explicit state mode wins, else global.
+effective_mode() {
+	if [[ "$wip_mode" == author || "$wip_mode" == mirror ]]; then echo "$wip_mode"
+	else global_default_mode; fi
+}
+
+# ===========================================================================
+# state file (reuses the legacy .wip format: WIP_INFO / WS_UPSTREAM_INFO)
+# ===========================================================================
+write_state() {
+	local file=$1
+	mkdir -p "$(dirname "$file")"
+	{
+		echo "# WIP_INFO"
+		for k in "${!wip_info[@]}"; do echo "$k=${wip_info[$k]}"; done
+		echo "# WS_UPSTREAM_INFO"
+		for k in "${!ws_upstream_info[@]}"; do echo "$k=${ws_upstream_info[$k]}"; done
+		# only persist an explicit mode; unset = inherit the global default
+		if [[ -n "$wip_mode" ]]; then
+			echo "# MODE"
+			echo "mode=$wip_mode"
+		fi
+	} > "$file"
+}
+
+read_state() {
+	local file=$1 section="" line k v
+	wip_info=(); ws_upstream_info=(); wip_mode=""
+	while IFS= read -r line; do
+		case "$line" in
+			"# WIP_INFO") section=wip ;;
+			"# WS_UPSTREAM_INFO") section=up ;;
+			"# MODE") section=mode ;;
+			\#*|"") : ;;
+			*)
+				k=${line%%=*}; v=${line#*=}
+				if [[ $section == wip ]]; then wip_info[$k]="$v"
+				elif [[ $section == up ]]; then ws_upstream_info[$k]="$v"
+				elif [[ $section == mode && $k == mode ]]; then wip_mode="$v"; fi
+				;;
+		esac
+	done < "$file"
+}
+
+# Walk up from $PWD to find the nearest .wip/state; sets wip_root + loads state.
+# Returns non-zero (no exit) when none is found.
+locate_root() {
+	local dir="$PWD"
+	while [[ "$dir" != "/" ]]; do
+		if [[ -f "$dir/.wip/state" ]]; then
+			wip_root="$dir"
+			read_state "$dir/.wip/state"
+			return 0
+		fi
+		dir=$(dirname "$dir")
+	done
+	return 1
+}
+
+find_root() {
+	locate_root || die "no scanned WIP dir found above $PWD — run 'wip scan' first"
+}
+
+# Current workspace = first path component below wip_root.
+current_ws() {
+	local rel=${PWD#"$wip_root"/}
+	[[ "$rel" == "$PWD" || -z "$rel" ]] && return 1
+	echo "${rel%%/*}"
+}
+
+# ===========================================================================
+# scanning (ports ws_scan / wip_scan)
+# ===========================================================================
+scan_workspace() {
+	# $1 = absolute path to a workspace dir. Populates wip_info/ws_upstream_info.
+	local ws_dir=$1 ws_name meta project manifest_file manifest_revision manifest_path
+	ws_name=$(basename "$ws_dir")
+	meta="$ws_dir/.repo/metadata.json"
+	[[ -f "$meta" ]] || { echo "  skip $ws_name (no .repo/metadata.json)"; return 1; }
+
+	manifest_file=$(grep '"manifest"' "$meta" | head -1 | sed 's/.*"manifest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+	manifest_revision=$(grep '"manifest_revision"' "$meta" | head -1 | sed 's/.*"manifest_revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+	manifest_path="$ws_dir/.repo/manifests/$manifest_file"
+
+	if [[ ! -f "$manifest_path" ]]; then
+		local fname; fname=$(basename "$manifest_file")
+		if [[ -n "$manifest_revision" ]]; then
+			manifest_path=$(find "$ws_dir/.repo/manifests" -path "*/$manifest_revision/$fname" -type f 2>/dev/null | head -1)
+		fi
+		if [[ -z "$manifest_path" || ! -f "$manifest_path" ]]; then
+			manifest_path=$(find "$ws_dir/.repo/manifests" -name "$fname" -type f 2>/dev/null | head -1)
+		fi
+		[[ -f "$manifest_path" ]] || { echo "  skip $ws_name (manifest $fname not found)"; return 1; }
+	fi
+
+	local upstream
+	upstream=$(grep '<default' "$manifest_path" | sed -n 's/.*revision="\([^"]*\)".*/\1/p')
+	[[ -z "$upstream" ]] && upstream="main"
+	ws_upstream_info[$ws_name]="$upstream"
+
+	local line repo path branch
+	while IFS= read -r line; do
+		[[ $line =~ \<project[[:space:]] ]] || continue
+		repo=$(echo "$line" | sed -n 's/.*name="\([^"]*\)".*/\1/p')
+		path=$(echo "$line" | sed -n 's/.*path="\([^"]*\)".*/\1/p')
+		if [[ -d "$ws_dir/$path/.git" ]]; then
+			branch=$(git -C "$ws_dir/$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$upstream")
+		else
+			branch="$upstream"
+		fi
+		wip_info[$ws_name:$repo]="$path:$branch"
+	done < "$manifest_path"
+	echo "  scanned $ws_name ($upstream)"
+}
+
+cmd_scan() {
+	# args: [snapshot] [--mode author|mirror]
+	local snapshot="" set_mode=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--mode) shift; set_mode=${1:-}
+				[[ "$set_mode" == author || "$set_mode" == mirror ]] || die "usage: wip scan [snapshot] [--mode author|mirror]" ;;
+			--mode=*) set_mode=${1#*=}
+				[[ "$set_mode" == author || "$set_mode" == mirror ]] || die "usage: wip scan [snapshot] [--mode author|mirror]" ;;
+			*) snapshot=$1 ;;
+		esac
+		shift
+	done
+	if [[ -n "$snapshot" ]]; then
+		local src="$saved_dir/${snapshot}.wip"
+		[[ -f "$src" ]] || die "no saved snapshot: $snapshot"
+		read_state "$src"
+		wip_root="$PWD"
+		[[ -n "$set_mode" ]] && wip_mode="$set_mode"
+		write_state "$wip_root/.wip/state"
+		echo "loaded snapshot '$snapshot' into $wip_root/.wip/state (mode: $(effective_mode))"
+		return
+	fi
+	wip_root="$PWD"
+	echo "Scanning WIP dir: $(basename "$wip_root")"
+	wip_info=(); ws_upstream_info=(); wip_mode=""
+	[[ -n "$set_mode" ]] && wip_mode="$set_mode"
+	local d
+	for d in "$wip_root"/*/; do
+		[[ -d "$d/.repo" ]] && scan_workspace "${d%/}"
+	done
+	write_state "$wip_root/.wip/state"
+	echo "State written to $wip_root/.wip/state (${#wip_info[@]} repos, ${#ws_upstream_info[@]} workspaces, mode: $(effective_mode))"
+}
+
+# Show or set the working mode for the current WIP root.
+cmd_mode() {
+	local want=${1:-}
+	find_root
+	if [[ -z "$want" ]]; then
+		local eff; eff=$(effective_mode)
+		if [[ -n "$wip_mode" ]]; then
+			echo "mode: $eff (explicit, pinned in .wip/state)"
+		else
+			echo "mode: $eff (inherited from $config_file default; global default_mode=$(global_default_mode))"
+		fi
+		return
+	fi
+	case "$want" in
+		author|mirror) wip_mode="$want"; write_state "$wip_root/.wip/state"
+			echo "mode set to '$want' for $wip_root" ;;
+		default) wip_mode=""; write_state "$wip_root/.wip/state"
+			echo "mode reset to inherit global default ($(global_default_mode)) for $wip_root" ;;
+		*) die "usage: wip mode [author|mirror|default]" ;;
+	esac
+}
+
+# ===========================================================================
+# per-repo action (ports _perform_repo_action)
+# ===========================================================================
+perform_repo_action() {
+	local key=$1 action=$2
+	local ws_name=${key%%:*} repo_name=${key#*:}
+	local upstream=${ws_upstream_info[$ws_name]:-main}
+	local path=${wip_info[$key]%%:*} branch=${wip_info[$key]#*:}
+	local repo_path="$wip_root/$ws_name/$path"
+	[[ -d "$repo_path" ]] || return 0
+
+	# base = workspace default revision (manifests repo always main)
+	local base=$upstream
+	[[ "$repo_name" == "$manifest_repo" ]] && base="main"
+
+	# align/track target depends on the working mode:
+	#   author  -> always origin/<base>       (rebase dev work onto latest main)
+	#   mirror  -> origin/<dev-branch> if under dev, else origin/<base>
+	#              (snap each repo to the latest remote version)
+	local mode; mode=$(effective_mode)
+	local sync_ref=$base
+	if [[ "$mode" == mirror && "$branch" != "$base" && "$branch" != "main" ]]; then
+		sync_ref="$branch"
+	fi
+
+	if [[ "$branch" != "$upstream" || "$action" == "checkout" ]]; then
+		echo "${action_strs[$action]} repo: $repo_name, for branch: $branch"
+	fi
+
+	pushd "$repo_path" >/dev/null || return 0
+	case "$action" in
+	checkout)
+		if [[ "$branch" == "$upstream" ]]; then
+			[[ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" == "$upstream" ]] && { popd >/dev/null; return; }
+		fi
+		if ! git rev-parse --verify "$branch" >/dev/null 2>&1; then
+			echo "Branch $branch not found locally, fetching from origin..."
+			git fetch origin "$branch:$branch" 2>&1 | grep -v "^From"
+		fi
+		git checkout "$branch"
+		;;
+	push)       [[ "$branch" == "$upstream" || "$branch" == "main" ]] || git push -f origin "$branch" ;;
+	pull)       [[ "$branch" == "$upstream" || "$branch" == "main" ]] || git pull ;;
+	align)
+		git fetch origin
+		if [[ "$mode" == mirror ]]; then
+			# get the exact latest remote version of sync_ref
+			if ! git rev-parse --verify "$sync_ref" >/dev/null 2>&1; then
+				git fetch origin "$sync_ref:$sync_ref" 2>&1 | grep -v "^From"
+			fi
+			git checkout "$sync_ref"
+			git reset --hard "origin/$sync_ref"
+		else
+			[[ "$branch" == "$base" || "$branch" == "main" ]] || git rebase "origin/$base"
+		fi
+		;;
+	set-upstream) [[ "$branch" == "$base" || "$branch" == "main" ]] || git branch --set-upstream-to="origin/$sync_ref" "$branch" ;;
+	stash)      [[ "$branch" == "$upstream" || "$branch" == "main" ]] || git stash ;;
+	pop)        [[ "$branch" == "$upstream" || "$branch" == "main" ]] || git stash pop ;;
+	diff)
+		[[ "$branch" == "$upstream" || "$branch" == "main" ]] && { popd >/dev/null; return; }
+		local ddir="$wip_root/$ws_name/diff"; mkdir -p "$ddir"
+		git diff "origin/$base" --output "$ddir/${repo_name//./_}_diff.patch"
+		;;
+	return)
+		if ! git rev-parse --verify "$base" >/dev/null 2>&1; then
+			git fetch origin "$base:$base" 2>&1 | grep -v "^From"
+		fi
+		git checkout "$base"
+		;;
+	hard-reset)
+		[[ "$branch" == "$upstream" || "$branch" == "main" ]] && { popd >/dev/null; return; }
+		git fetch origin
+		if ! git rev-parse --verify "$branch" >/dev/null 2>&1; then
+			git fetch origin "$branch:$branch" 2>&1 | grep -v "^From"
+		fi
+		git checkout "$branch"; git reset --hard "origin/$branch"
+		;;
+	esac
+	popd >/dev/null
+}
+
+# ===========================================================================
+# depends-on (ports wip_depends_on / ws_depends_on)
+# ===========================================================================
+cmd_depends_on() {
+	local scope=$1  # ws | all
+	local target_ws=""
+	if [[ "$scope" == "ws" ]]; then
+		target_ws=$(current_ws) || die "not inside a workspace under $wip_root"
+	fi
+	echo -n "DEPENDS_ON: "
+	local key repo_name branch ws_name upstream
+	for key in "${!wip_info[@]}"; do
+		ws_name=${key%%:*}; repo_name=${key#*:}
+		branch=${wip_info[$key]#*:}
+		if [[ "$scope" == "ws" ]]; then
+			[[ "$ws_name" == "$target_ws" ]] || continue
+			upstream=${ws_upstream_info[$ws_name]}
+			[[ "$branch" == "$upstream" || "$branch" == "main" ]] && continue
+		else
+			# whole WIP dir: only dev/* branches
+			[[ "$branch" == dev/* ]] || continue
+		fi
+		echo -n "$repo_name:$branch,"
+	done
+	echo ""
+}
+
+# ===========================================================================
+# scoped git-action dispatch
+# ===========================================================================
+run_action() {
+	local scope=$1 action=$2 assume_yes=$3
+	find_root
+	local mode; mode=$(effective_mode)
+
+	if [[ "$action" == "depends-on" ]]; then
+		cmd_depends_on "$scope"; return
+	fi
+
+	# mirror workspaces track the remote — pushing from one is almost always a
+	# mistake; require an explicit override.
+	if [[ "$action" == "push" && "$mode" == mirror && "$FORCE_MIRROR" != yes ]]; then
+		die "push is disabled in 'mirror' mode (this root tracks remote). Use --force-mirror to override, or 'wip mode author'."
+	fi
+
+	# align in mirror mode does 'reset --hard' onto the remote -> destructive.
+	local destructive=no
+	if is_destructive "$action" || { [[ "$action" == align && "$mode" == mirror ]]; }; then
+		destructive=yes
+	fi
+	if [[ "$destructive" == yes && "$assume_yes" != yes ]]; then
+		if [[ -t 0 ]]; then
+			local ans verb="$action"
+			[[ "$action" == align && "$mode" == mirror ]] && verb="align (mirror: reset --hard to remote)"
+			read -r -p "$(echo -e "${C_ERR}$verb${C_OFF} is destructive on scope '$scope'. Continue? [y/N] ")" ans
+			[[ "$ans" == [yY]* ]] || die "aborted"
+		else
+			die "$action is destructive in '$mode' mode; pass --yes to confirm"
+		fi
+	fi
+
+	local target_ws=""
+	if [[ "$scope" == "ws" ]]; then
+		target_ws=$(current_ws) || die "not inside a workspace under $wip_root"
+	fi
+
+	echo "------------------------------------------------------------"
+	if [[ "$scope" == "ws" ]]; then
+		echo "${action_strs[$action]} workspace: $target_ws  [mode: $mode]"
+	else
+		echo "${action_strs[$action]} WIP dir: $(basename "$wip_root")  [mode: $mode]"
+	fi
+	local key
+	for key in "${!wip_info[@]}"; do
+		[[ "$scope" == "ws" && "${key%%:*}" != "$target_ws" ]] && continue
+		perform_repo_action "$key" "$action"
+	done
+	echo "------------------------------------------------------------"
+}
+
+# ===========================================================================
+# snapshots
+# ===========================================================================
+cmd_save() {
+	local name=${1:-}; [[ -n "$name" ]] || die "usage: wip save <name>"
+	find_root
+	mkdir -p "$saved_dir"
+	write_state "$saved_dir/${name}.wip"
+	echo "saved snapshot -> $saved_dir/${name}.wip"
+}
+
+cmd_load() {
+	local name=${1:-}; [[ -n "$name" ]] || die "usage: wip load <name>"
+	local src="$saved_dir/${name}.wip"
+	[[ -f "$src" ]] || die "no saved snapshot: $name"
+	# Restore into the nearest WIP root, or seed one at $PWD if none exists yet.
+	locate_root || wip_root="$PWD"
+	read_state "$src"
+	write_state "$wip_root/.wip/state"
+	echo "loaded '$name' into $wip_root/.wip/state (${#wip_info[@]} repos)"
+}
+
+cmd_list() {
+	[[ -d "$saved_dir" ]] || { echo "no saved snapshots in $saved_dir"; return; }
+	local f files=("$saved_dir"/*.wip)
+	[[ -e "${files[0]}" ]] || { echo "no saved snapshots in $saved_dir"; return; }
+	echo "Saved snapshots in $saved_dir:"
+	echo "------------------------------------------------------------"
+	ls -t "$saved_dir"/*.wip 2>/dev/null | while read -r f; do
+		printf "  %-24s (%s)\n" "$(basename "$f" .wip)" "$(stat -c %y "$f" 2>/dev/null | cut -d. -f1)"
+	done
+	echo "------------------------------------------------------------"
+}
+
+cmd_status() {
+	find_root
+	echo "WIP root: $wip_root"
+	echo "Mode: $(effective_mode)$([[ -n "$wip_mode" ]] && echo ' (explicit)' || echo ' (global default)')"
+	echo "Workspaces:"
+	local k; for k in "${!ws_upstream_info[@]}"; do echo "  $k (upstream: ${ws_upstream_info[$k]})"; done
+	echo "Repos:"
+	for k in "${!wip_info[@]}"; do echo "  $k -> ${wip_info[$k]}"; done
+}
+
+# Human-friendly view of the scan: repos grouped by workspace, with repos on a
+# development branch (not on their upstream/main) highlighted.
+cmd_info() {
+	find_root
+	local mode; mode=$(effective_mode)
+	echo -e "${C_TITLE}WIP root:${C_OFF} $wip_root   ${C_DIM}[mode: $mode]${C_OFF}"
+	local dev_total=0 repo_total=0 ws
+	while IFS= read -r ws; do
+		local upstream=${ws_upstream_info[$ws]}
+		echo -e "${C_SEC}$ws${C_OFF} ${C_DIM}(upstream: $upstream)${C_OFF}"
+		local dev_in_ws=0 key
+		while IFS= read -r key; do
+			local repo=${key#*:}
+			local path=${wip_info[$key]%%:*} branch=${wip_info[$key]#*:}
+			local eff=$upstream
+			[[ "$repo" == "$manifest_repo" ]] && eff="main"
+			repo_total=$((repo_total + 1))
+			if [[ "$branch" != "$eff" ]]; then
+				dev_in_ws=$((dev_in_ws + 1)); dev_total=$((dev_total + 1))
+				printf "  ${C_DEV}* %-45s %s${C_OFF}\n" "$repo" "$branch"
+			else
+				printf "    ${C_DIM}%-45s %s${C_OFF}\n" "$repo" "$branch"
+			fi
+		done < <(for k in "${!wip_info[@]}"; do [[ ${k%%:*} == "$ws" ]] && echo "$k"; done | sort -t: -k2)
+		[[ $dev_in_ws -eq 0 ]] && echo -e "    ${C_DIM}(all repos on upstream)${C_OFF}"
+	done < <(printf '%s\n' "${!ws_upstream_info[@]}" | sort)
+	echo "------------------------------------------------------------"
+	echo -e "${C_DEV}*${C_OFF} = on a development branch (not on upstream/main)"
+	echo "$dev_total of $repo_total repo(s) on development branches."
+}
+
+# Run an arbitrary command in every repo (optionally scoped to current ws).
+cmd_forall() {
+	local scope=all
+	if [[ "${1:-}" == ws || "${1:-}" == all ]]; then scope=$1; shift; fi
+	local cmd="$*"
+	[[ -n "$cmd" ]] || die "usage: wip forall [ws|all] <command>"
+	find_root
+	local target_ws=""
+	[[ "$scope" == ws ]] && { target_ws=$(current_ws) || die "not inside a workspace under $wip_root"; }
+	local key ws_name path rp
+	for key in "${!wip_info[@]}"; do
+		ws_name=${key%%:*}
+		[[ "$scope" == ws && "$ws_name" != "$target_ws" ]] && continue
+		path=${wip_info[$key]%%:*}
+		rp="$wip_root/$ws_name/$path"
+		[[ -d "$rp" ]] || continue
+		echo "== $key =="
+		( cd "$rp" && eval "$cmd" )
+	done
+}
+
+# ===========================================================================
+# help
+# ===========================================================================
+help_action() {
+	local a=$1
+	is_action "$a" || { echo "No detailed help for '$a'. Run 'wip help'."; return; }
+	echo -e "${C_TITLE}wip <ws|all> $a${C_OFF} — ${action_strs[$a]}"
+	echo
+	# only advertise flags an action actually accepts
+	local fl=""
+	case "$a" in
+		push)              fl=" ${C_ARG}[--yes] [--force-mirror]${C_OFF}" ;;
+		hard-reset)        fl=" ${C_ARG}[--yes]${C_OFF}" ;;
+		align)             fl=" ${C_ARG}[--yes]${C_OFF}" ;;  # --yes needed in mirror mode
+	esac
+	echo -e "${C_SEC}Usage${C_OFF}"
+	echo -e "  ${C_CMD}wip $a${C_OFF}$fl          (current workspace — 'ws' scope)"
+	echo -e "  ${C_CMD}wip ws $a${C_OFF}$fl       (current workspace)"
+	echo -e "  ${C_CMD}wip all $a${C_OFF}$fl      (every workspace in the WIP root)"
+	echo
+	echo -e "${C_SEC}What it does${C_OFF}"
+	case "$a" in
+	checkout)
+		cat <<EOF
+  For each repo, check out the branch recorded in .wip/state.
+    • Repos whose recorded branch equals the workspace upstream are skipped if
+      already on that upstream (no needless checkout).
+    • If the recorded branch is missing locally, it is fetched from origin
+      first (git fetch origin <branch>:<branch>), then checked out.
+  This is the inverse of 'return' — it restores your dev branches after a
+  'return' or on a freshly synced mirror. Non-destructive.
+EOF
+		;;
+	push)
+		cat <<EOF
+  Force-push (git push -f origin <branch>) each repo that is on a NON-upstream
+  branch. Repos on the workspace upstream or on 'main' are skipped.
+    • Force-push is used so rebased/amended dev branches update cleanly.
+  Only valid in ${C_CMD}author${C_OFF} mode. In ${C_CMD}mirror${C_OFF} mode push is disabled (the root tracks
+  the remote) unless you pass --force-mirror.
+  DESTRUCTIVE — overwrites the remote branch history. Requires --yes (or -y)
+  to run non-interactively; otherwise you are prompted to confirm.
+EOF
+		;;
+	pull)
+		cat <<EOF
+  Run 'git pull' in each repo that is on a non-upstream branch (repos on the
+  upstream or 'main' are skipped). Brings dev branches up to date with their
+  tracked remote. Uses each branch's configured tracking ref — run
+  'set-upstream' first if a branch has no upstream configured.
+EOF
+		;;
+	align)
+		cat <<EOF
+  Bring each repo in line with the remote — behaviour depends on the mode:
+
+  ${C_CMD}author${C_OFF} mode (local is source of truth):
+      git fetch origin && git rebase origin/<base>
+    Replays your local commits on top of the latest base (usually 'main'),
+    producing a ready-to-merge branch. Repos on base/'main' are skipped.
+    The manifests repo ($manifest_repo) rebases onto origin/main.
+
+  ${C_CMD}mirror${C_OFF} mode (remote is source of truth):
+      git fetch origin && git checkout <ref> && git reset --hard origin/<ref>
+    where <ref> = the repo's dev branch if under development, else <base>.
+    Snaps every repo to the EXACT latest remote version. DESTRUCTIVE (discards
+    local commits/edits) — requires --yes to run non-interactively.
+EOF
+		;;
+	set-upstream)
+		cat <<EOF
+  Set each dev branch's tracking upstream (git branch --set-upstream-to):
+    • ${C_CMD}author${C_OFF} mode -> origin/<base> (usually origin/main), so 'git status'
+      shows how far ahead of base your branch is.
+    • ${C_CMD}mirror${C_OFF} mode -> origin/<dev-branch>, so a plain 'git pull' fetches the
+      latest remote work for that branch.
+  The manifests repo ($manifest_repo) uses origin/main. Repos on base/'main'
+  are left as-is. Non-destructive — only changes tracking metadata.
+EOF
+		;;
+	stash)
+		cat <<EOF
+  Run 'git stash' in each repo on a non-upstream branch, shelving uncommitted
+  local changes so the tree is clean (e.g. before an align or checkout).
+  Repos on the upstream or 'main' are skipped. Restore later with 'pop'.
+EOF
+		;;
+	pop)
+		cat <<EOF
+  Run 'git stash pop' in each repo on a non-upstream branch, re-applying the
+  most recently stashed changes. The inverse of 'stash'. Repos on the upstream
+  or 'main' are skipped. Fails per repo if there is nothing stashed or a
+  conflict occurs on apply.
+EOF
+		;;
+	diff)
+		cat <<EOF
+  For each non-upstream repo, write its diff against the upstream to a patch:
+      git diff origin/<upstream> --output <workspace>/diff/<repo>_diff.patch
+  Dots in the repo name become underscores in the filename. Repos on the
+  upstream or 'main' are skipped. Produces a per-repo patch set you can review
+  or apply elsewhere. Non-destructive.
+EOF
+		;;
+	return)
+		cat <<EOF
+  Check every repo back to its upstream branch (the inverse of 'checkout'):
+      git checkout <upstream>
+  If the upstream branch is missing locally it is fetched from origin first.
+  The manifests repo ($manifest_repo) returns to main. Use this to drop back
+  to a clean upstream baseline; your dev branches remain in the local repo and
+  can be restored with 'checkout'. Non-destructive to committed work.
+EOF
+		;;
+	hard-reset)
+		cat <<EOF
+  For each non-upstream repo: fetch origin, check out the recorded branch
+  (fetching it if missing), then:
+      git reset --hard origin/<branch>
+  This discards ALL local commits and uncommitted changes on that branch,
+  making it byte-identical to the remote. Repos on the upstream or 'main' are
+  skipped. DESTRUCTIVE — unpushed work is lost. Requires --yes (or -y) to run
+  non-interactively; otherwise you are prompted to confirm.
+EOF
+		;;
+	depends-on)
+		cat <<EOF
+  Print a single 'DEPENDS_ON: repo:branch,...' line for use in a PR body so the
+  CI dependency resolver builds against your other in-flight branches.
+    • ws scope  — the CURRENT workspace's non-upstream (and non-main) branches.
+    • all scope — every dev/* branch across the whole WIP root.
+  Read-only — prints to stdout, changes nothing.
+EOF
+		;;
+	esac
+}
+
+cmd_help() {
+	if [[ -n "${1:-}" ]]; then help_action "$1"; return; fi
+	cat <<EOF
+${C_TITLE}wip — multi-repo workspace git helper${C_OFF}
+
+Every git action takes a scope:
+  ${C_CMD}wip ws${C_OFF}  <action>   act on the CURRENT workspace   (was ws_*)
+  ${C_CMD}wip all${C_OFF} <action>   act on ALL workspaces in root  (was wip_*)
+A bare '${C_CMD}wip <action>${C_OFF}' defaults to 'ws' scope.
+
+${C_SEC}Discovery / state${C_OFF}
+  ${C_CMD}wip scan${C_OFF} [${C_ARG}snapshot${C_OFF}] [${C_ARG}--mode author|mirror${C_OFF}]
+                       Scan \$PWD as WIP root -> writes .wip/state
+                       (or restore a named snapshot into it).
+  ${C_CMD}wip mode${C_OFF} [${C_ARG}author|mirror|default${C_OFF}]  Show or pin this root's working mode.
+  ${C_CMD}wip status${C_OFF}          Show the scanned root, workspaces and repos.
+  ${C_CMD}wip info${C_OFF}            List scan results; highlight repos on dev branches.
+  ${C_CMD}wip save${C_OFF} ${C_ARG}<name>${C_OFF}     Save current state to ~/.wip/saved/<name>.wip.
+  ${C_CMD}wip load${C_OFF} ${C_ARG}<name>${C_OFF}     Restore a snapshot into the WIP root's state.
+  ${C_CMD}wip list${C_OFF}            List saved snapshots.
+  ${C_CMD}wip forall${C_OFF} [${C_ARG}ws|all${C_OFF}] ${C_ARG}<cmd>${C_OFF}  Run <cmd> in every repo (default all).
+
+${C_SEC}Working modes${C_OFF} (per WIP root; drives align / set-upstream / push)
+  ${C_CMD}author${C_OFF}   Local is the source of truth. align rebases dev branches onto
+           origin/main; then push a ready-to-merge branch. (dev box)
+  ${C_CMD}mirror${C_OFF}   Remote is the source of truth. align resets each repo hard to
+           the latest remote (origin/<dev-branch> or origin/main); push is
+           disabled. (VM / Palladium / any consumer machine)
+  Machine default comes from ${C_ARG}~/.wip/config${C_OFF} (default_mode=...); if absent the
+  default is ${C_CMD}mirror${C_OFF}, so only the dev box opts into author.
+
+${C_SEC}Actions${C_OFF} (each: 'wip ws <action>' or 'wip all <action>')
+  ${C_CMD}checkout${C_OFF}      Check out recorded branch (fetch if missing).
+  ${C_CMD}push${C_OFF}          Force-push non-upstream branches.   ${C_ARG}[--yes]${C_OFF} ${C_DIM}(author only)${C_OFF}
+  ${C_CMD}pull${C_OFF}          git pull non-upstream branches.
+  ${C_CMD}align${C_OFF}         author: rebase onto origin/main; mirror: reset --hard to remote.
+  ${C_CMD}set-upstream${C_OFF}  author: track origin/main; mirror: track origin/<dev-branch>.
+  ${C_CMD}stash${C_OFF} / ${C_CMD}pop${C_OFF}  Stash / restore local changes.
+  ${C_CMD}diff${C_OFF}          Write per-repo diff to <ws>/diff/*.patch.
+  ${C_CMD}return${C_OFF}        Check repos back to upstream branch.
+  ${C_CMD}hard-reset${C_OFF}    reset --hard to origin.             ${C_ARG}[--yes]${C_OFF}
+  ${C_CMD}depends-on${C_OFF}    Print a DEPENDS_ON: line.
+
+${C_SEC}Flags${C_OFF}
+  ${C_ARG}--yes${C_OFF}, ${C_ARG}-y${C_OFF}       Skip the confirmation prompt for destructive actions
+                   (incl. 'align' in mirror mode).
+  ${C_ARG}--force-mirror${C_OFF}   Allow 'push' while in mirror mode.
+
+Run '${C_CMD}wip help${C_OFF} ${C_ARG}<action>${C_OFF}' (or '${C_CMD}wip <action> --help${C_OFF}') for a detailed
+description of any action (e.g. 'wip help hard-reset', 'wip set-upstream --help').
+
+State layout:
+  <wip_root>/.wip/state       auto-written by scan; found by walking up from \$PWD
+  ~/.wip/saved/<name>.wip     explicit snapshots
+  ~/.wip/config               machine default (default_mode=author|mirror)
+EOF
+}
+
+# ===========================================================================
+# argument dispatch
+# ===========================================================================
+main() {
+	local assume_yes=no want_help=no args=()
+	# pull out --yes/-y, --help/-h and --force-mirror anywhere
+	local a
+	for a in "$@"; do
+		case "$a" in
+			--yes|-y) assume_yes=yes ;;
+			--help|-h) want_help=yes ;;
+			--force-mirror) FORCE_MIRROR=yes ;;
+			*) args+=("$a") ;;
+		esac
+	done
+	set -- "${args[@]}"
+
+	local cmd=${1:-help}; shift || true
+
+	# `wip <action> --help` / `wip ws <action> --help` -> detailed action help
+	if [[ "$want_help" == yes ]]; then
+		if [[ "$cmd" == ws || "$cmd" == all ]] && is_action "${1:-}"; then
+			help_action "$1"; return
+		elif is_action "$cmd"; then
+			help_action "$cmd"; return
+		fi
+		cmd_help "${1:-}"; return
+	fi
+
+	case "$cmd" in
+		scan)        cmd_scan "$@" ;;
+		mode)        cmd_mode "${1:-}" ;;
+		save)        cmd_save "${1:-}" ;;
+		load)        cmd_load "${1:-}" ;;
+		list)        cmd_list ;;
+		status)      cmd_status ;;
+		info)        cmd_info ;;
+		forall)      cmd_forall "$@" ;;
+		help|-h|--help) cmd_help "${1:-}" ;;
+		ws|all)
+			local action=${1:-}; [[ -n "$action" ]] || die "usage: wip $cmd <action>"
+			is_action "$action" || die "unknown action: $action (see 'wip help')"
+			run_action "$cmd" "$action" "$assume_yes"
+			;;
+		*)
+			# bare action -> default ws scope
+			if is_action "$cmd"; then
+				run_action ws "$cmd" "$assume_yes"
+			else
+				die "unknown command: $cmd (see 'wip help')"
+			fi
+			;;
+	esac
+}
+
+main "$@"
