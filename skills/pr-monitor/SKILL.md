@@ -128,6 +128,7 @@ Checkout the local workspace repos to the PR branches for a tracked feature, pul
 3. Read the **Branch** column directly from the memory file — branch names are already cached from the `log` command. No GitHub fetch needed.
 4. Find the workspace manifest XML (`.repo/manifests/` directory) to map repo names to local paths via `<project name="..." path="...">` entries.
 5. **Check workspace occupancy first.** The [workspace-manager](../workspace-manager/SKILL.md) store (`~/tasks/workspaces.json`) is the single source of truth for which workspace slots are in use. Determine the target workspace slot (from `{WORKSPACE_ROOT}`) and run `python3 ~/.copilot/skills/task-manager/tm.py workspaces` (or `python3 ~/.copilot/skills/workspace-manager/wm.py status <slot>`). If that slot is already held — by an active task (a review or another feature) **or** an ad-hoc hold — **warn the user before clobbering it** — checking out feature branches over a live review/dev workspace loses their context. Let the user confirm or pick a different workspace.
+5b. **Fast path (token savings).** Whole-workspace checkouts go through the [wip-workspace](../wip-workspace/SKILL.md) CLI. If a `feat-<feature-id>` snapshot already exists from a prior `checkout`, restore the whole set in one cheap op — `cd {WORKSPACE_ROOT} && wip load feat-<feature-id> && wip all checkout` — then skip to the summary (step 8). Only fall through to the per-repo loop below the first time (no snapshot yet).
 6. For each repo **with a PR branch**, fetch, checkout, and pull to ensure it's synced to the latest state:
    ```bash
    cd {WORKSPACE_ROOT}/{LOCAL_PATH} && git fetch origin {BRANCH} && git checkout {BRANCH} && git pull origin {BRANCH}
@@ -137,6 +138,11 @@ Checkout the local workspace repos to the PR branches for a tracked feature, pul
    cd {WORKSPACE_ROOT}/{LOCAL_PATH} && git checkout main && git pull origin main
    ```
    This ensures the entire workspace is in a consistent state — feature branches where needed, clean `main` everywhere else.
+7b. **Snapshot the aligned workspace (token savings).** Record and save the composite state so re-checking-out this feature later is a single cheap command instead of the per-repo loop above:
+   ```bash
+   cd {WORKSPACE_ROOT} && wip scan && wip save feat-<feature-id>
+   ```
+   Restore later with `wip load feat-<feature-id> && wip all checkout`; return the workspace to base with `wip all return`. When a feature is removed (`remove`), delete its snapshot: `rm -f ~/.wip/saved/feat-<feature-id>.wip`.
 8. Present a summary table:
    | Repo | Local Path | Branch | Status |
    |------|-----------|--------|--------|

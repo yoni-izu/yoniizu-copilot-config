@@ -75,22 +75,34 @@ else
 fi
 ```
 
-**Bootstrap** — copy SSH keypair, `wip_funcs.sh`, aliases, and `my_funcs.sh`, then drop the
-marker. Use the helper script:
+**Bootstrap** — copy SSH keypair, the `wip` CLI, `wip_funcs.sh`, aliases, and `my_funcs.sh`,
+then drop the marker. Use the helper script:
 ```bash
 ./scripts/bootstrap_station.sh <host>     # e.g. ./scripts/bootstrap_station.sh pldm-edk0-z2a
 ```
 
 What it copies (only the items present locally):
 - `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub` → host `~/.ssh/` (private key kept at `600`)
+- `~/bin/wip` (+ `~/bin/completions/wip.bash`) → host `~/bin/` (the `wip` CLI, `755`)
 - `~/wip_funcs.sh` → host `~/wip_funcs.sh`
 - `~/.bash_aliases` → host `~/.bash_aliases`
 - `~/my_funcs.sh` → host `~/my_funcs.sh`
 
-The script also ensures `~/.bashrc` on the host sources `wip_funcs.sh` and `my_funcs.sh`
-(idempotent), then writes `~/.palladium_bootstrapped` so subsequent connects skip the copy.
+The script also ensures `~/.bashrc` on the host puts `~/bin` on `PATH`, loads the
+`wip` completion, and sources `wip_funcs.sh` and `my_funcs.sh` (idempotent), then
+writes `~/.palladium_bootstrapped` so subsequent connects skip the copy.
 
 > The same bootstrap applies to a VNC station shell and an EDK host — run it once per host.
+
+**Multi-repo git ops on a station use the `wip` CLI.** For any workspace git
+operation on a station (scan/checkout/push/return/hard-reset/…), use `wip`
+(e.g. `wip all return`, `wip ws checkout`) — not the legacy `wip_funcs.sh`
+functions. `bootstrap_station.sh` installs `wip`, but a host bootstrapped before
+this tool existed may lack it. If `wip` is `command not found` on a station,
+deploy it standalone (no full re-bootstrap needed):
+```bash
+~/bin/wip-deploy <host>     # e.g. ~/bin/wip-deploy pldm-edk0-z2a
+```
 > Re-run with `--force` to refresh the copied files.
 
 ## 2. Power Cycle Sequence

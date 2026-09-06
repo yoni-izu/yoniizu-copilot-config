@@ -55,6 +55,27 @@ For each repo, fetch, checkout, and pull the PR branch:
 cd {WORKSPACE_ROOT}/{LOCAL_PATH} && git fetch origin {BRANCH} && git checkout {BRANCH} && git pull origin {BRANCH}
 ```
 
+### 5b. Snapshot the aligned workspace (token savings)
+
+Whole-workspace checkouts should go through the [wip-workspace](../wip-workspace/SKILL.md)
+CLI so re-aligning the same PR set later costs **one** cheap command instead of
+re-parsing the manifest and re-querying `gh`. Once the repos are on their PR
+branches, record and snapshot the state:
+
+```bash
+cd {WORKSPACE_ROOT}
+wip scan                    # record the current branch of every repo
+wip save prset-<name>       # snapshot -> ~/.wip/saved/prset-<name>.wip
+```
+
+To restore this exact set later (no `gh`, no manifest parse, no per-repo loop):
+
+```bash
+wip load prset-<name> && wip all checkout
+```
+
+Return the whole workspace to its clean base branch with `wip all return`.
+
 ### 6. Report results
 
 Present a summary table:

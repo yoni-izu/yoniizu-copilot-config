@@ -34,7 +34,7 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `add-review <url> [<url>...] [-t TITLE] [-d DESC] [-p PRI] [--complexity X] [--cost N] [--jira K]` | Create a review task from one or more PR URLs | Fetches title/author/branch/stats via `gh`. Auto-estimates complexity. Multiple URLs → one multi-PR task. |
 | `list-reviews` | List active review tasks | Hides done/cancelled and all-merged tasks. |
 | `review-update <id> <review_status> [--pr N]` | Manual review-status update | Applies to all PR entries unless `--pr`. Auto-derives task status; the task is only `done` once **every** PR is `merged` (no purge — merged tasks persist as a record). |
-| `review-check` | Poll GitHub, mark merged/closed PRs, mark fully-merged tasks `done` | Skips done/cancelled. Re-derives status; a task becomes `done` only when every PR has merged. |
+| `review-check` | Poll GitHub, mark merged PRs, drop closed PRs, mark fully-merged tasks `done` | Skips done/cancelled. A PR closed-without-merge is **removed from the task entirely**; a task left with no PRs is `cancelled`. Re-derives status; a task becomes `done` only when every PR has merged. |
 | `review-msg <id>` | Print a templated review-request message | |
 | `blocked-scan [--update] [--json]` | Check every `blocked` review task for author activity | For each PR: counts commits since `submitted_at`, groups thread replies, flags pushback (`won't fix`, `by design`, `next step`…) and addressed markers (`done`, `fixed`…). Compact output (~2–3 KB). `--update` auto-flips PRs with new commits to `waiting-for-re-review` and moves the task back to `todo`. |
 
@@ -78,11 +78,13 @@ Check the workspace's repos out to a review task's branches so you can review lo
 1. Read the store; pick target review tasks (matching task id, author, repo, or PR — or default: all non-merged with status `todo`/`in-progress`).
 2. For each PR entry, find the target repo path inside the workspace.
 3. **Branch checkout (safe):**
-   - `git fetch origin <branch>` then `git checkout <branch>`.
+   - **Fast path (token savings):** if a `review-<task-id>` snapshot already exists from a prior `start`, don't re-query `gh` or re-parse the manifest — just restore it via the [wip-workspace](../wip-workspace/SKILL.md) CLI: `cd <wip_root> && wip load review-<task-id> && wip all checkout` (this fetches missing/updated branches automatically), then skip to step 5.
+   - **First time (no snapshot):** `git fetch origin <branch>` then `git checkout <branch>`.
    - If the remote ref is missing (renamed/force-pushed), fall back to `git fetch origin pull/<pr>/head:<branch>` then `git checkout <branch>`.
    - **Never** create local `pr-NNN` branches — always use the real `reviews[].branch` name.
    - **Never** use destructive resets. If a repo has local changes and checkout is blocked, leave it and report it.
-4. Switch all other workspace repos to their default branch (`main`) so the workspace reflects only the review context.
+4. Switch all other workspace repos to their default branch (`main`) so the workspace reflects only the review context. *(First-time path only — the snapshot restore in step 3 already reproduces this composite state.)*
+4b. **Snapshot the alignment (token savings).** On the first-time path, once the workspace reflects the review context (PR repos on their branches, everything else on `main`), record and save it so every later re-align of this task is a single cheap op: `cd <wip_root> && wip scan && wip save review-<task-id>` (see [wip-workspace](../wip-workspace/SKILL.md)). `done` removes the snapshot.
 5. **Record workspace occupancy.** Detect the workspace you are aligning (the `~/projects/<project>/<ws>` slot the repos live in). Before occupying it, check it is not already held by a *different* holder — a task **or** an ad-hoc hold (`tm.py workspaces`, backed by the [workspace-manager](../workspace-manager/SKILL.md) store). If free, claim it with `tm.py assign <id> <ws>` — this records the slot in `wm.py` and promotes `todo`→`in-progress`. If it is already held, don't clobber it: report the conflict and let the user decide (`--force` displaces the holder).
 6. Update the task: each selected PR entry `review_status: in-progress` if `pending`; append a note. Use `tm.py review-update <id> in-progress` or edit the store. (`assign` in step 5 already handled the task `status`.)
 7. Report: which repos switched to review branches, which to main, which were skipped (and why), and which workspace slot is now occupied.
@@ -104,24 +106,24 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
 
 1. **Select the new tasks.** Read the store; pick every active review task (status `todo`/`in-progress`, not done/cancelled) whose notes do **not** already contain the `initial auto review draft done` marker. These are the never-looked-at tasks. If none qualify, report "no new review tasks to pre-review" and stop. List the selected tasks (ids + PR counts) before starting.
 2. **Process one task at a time**, in order. For each task:
-   a. **Align the workspace** using the `start` mechanics: for each PR entry, `git fetch origin <branch>` then `git checkout <branch>` (fall back to `git fetch origin pull/<pr>/head:<branch>` on a missing ref); switch every other workspace repo to its default branch (`main`). Never create `pr-NNN` branches, never use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
+   a. **Align the workspace** using the `start` mechanics. Prefer the snapshot fast path: if a `review-<task-id>` snapshot exists, `cd <wip_root> && wip load review-<task-id> && wip all checkout`. Otherwise per-PR checkout — for each PR entry, `git fetch origin <branch>` then `git checkout <branch>` (fall back to `git fetch origin pull/<pr>/head:<branch>` on a missing ref); switch every other workspace repo to its default branch (`main`); then snapshot it with `wip scan && wip save review-<task-id>` for next time. Never create `pr-NNN` branches, never use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
    b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. First pull any existing reviews and inline threads left by HSI teammates (`gh pr view <pr> --json reviews,reviewThreads`) and feed that summary into the draft so it doesn't duplicate what others already raised. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
    c. **Mark the task** by appending the note `initial auto review draft done` (with the date) via `tm.py`. Do **not** change `review_status` — this is a preliminary pass, not an actual review; leave the task's status untouched so the user's own review flow (`start` → `pr-review`) still runs normally.
    d. Move to the next task.
-3. **Return to a clean state.** After the last task, run the `stop` mechanics: switch every workspace repo back to its default branch (skip and report dirty repos; never force).
+3. **Return to a clean state.** After the last task, run the `stop` mechanics: switch every workspace repo back to its default branch via `cd <wip_root> && wip all return` (skip and report dirty repos; never force).
 4. **Report** a summary: which tasks were drafted, where each draft lives, which tasks/repos were skipped (and why), and confirm the workspace is back on default branches.
 
 Guarantees: drafts only (no GitHub writes), no destructive git, and no review-status transitions — the user still reviews each PR themselves later, now with a head start.
 
 ### `stop`
 
-Switch every workspace repo back to its default branch. Skip (don't force) dirty repos and report them. Don't change task status unless asked. **Release the workspace slot** you were occupying so the store reflects that you stopped working there: `tm.py release <id>` (frees the slot in `wm.py`, leaves `status` untouched).
+Switch every workspace repo back to its default branch via the [wip-workspace](../wip-workspace/SKILL.md) CLI: `cd <wip_root> && wip all return`. Skip (don't force) dirty repos and report them. Don't change task status unless asked. **Release the workspace slot** you were occupying so the store reflects that you stopped working there: `tm.py release <id>` (frees the slot in `wm.py`, leaves `status` untouched).
 
 ### `done <task-id> [outcome]` — close out a review pass
 
 Combined `stop` + status update.
 
-1. Switch all workspace repos to default branch (skip dirty ones; never force).
+1. Switch all workspace repos to default branch via `cd <wip_root> && wip all return` (skip dirty ones; never force). Remove the task's snapshot now that the review is closing: `rm -f ~/.wip/saved/review-<task-id>.wip`.
 2. Set `review_status` on the relevant PR entries to the outcome (`commented`, `changes-requested`, `approved`, …). If unspecified, keep current.
 3. Derive task status:
    - **All** PR entries `merged` → task `done`, clear `workspace`, set `completed`.

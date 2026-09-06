@@ -324,6 +324,13 @@ portal is a UI over exactly these calls.
 4. **Show to lead for review** before updating the page.
 5. On approval, prepend the new entry to the existing page body via `updateConfluencePage`.
 
+**Publishing procedure (verified 2026-09-06):**
+- Fetch page `757335732` with the native body and version before writing. The page body is large; never send only the new entry, because `updateConfluencePage` replaces the entire body and would erase prior weekly entries.
+- Prefer `updateConfluencePage` when the complete existing body can be passed through the MCP tool. Preserve the existing title and prepend the approved entry.
+- If the MCP wrapper cannot accept the full body, use the authenticated Confluence REST fallback from the terminal: `GET /wiki/rest/api/content/757335732?expand=body.storage,version`, prepend the entry to `body.storage.value`, then `PUT /wiki/rest/api/content/757335732` with the existing title/type, `body.storage.representation = "storage"`, and `version.number + 1`. Credentials are read from `.netrc`; do not print or expose them.
+- Before writing, refuse to publish if the page body already contains the entry's date (`datetime="YYYY-MM-DD"`) to avoid duplicate weekly entries.
+- After writing, read the page back and verify the new date, at least one distinctive Jira key, and the incremented version. Report the published page version.
+
 ### 18. Day-Off Request Log
 
 **Trigger:** "day off", "time off", "PTO", "vacation request", "log day off for [name]", "[name] asked for day off"

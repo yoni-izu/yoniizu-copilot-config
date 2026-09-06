@@ -1,6 +1,6 @@
 ---
 name: pldm-job-queue
-description: "Schedule and run hardware tests on Palladium (PLDM) EDK machines via the PLDM Job Queue, to test PRs and newly developed features. Use when: test a PR on PLDM, run a feature on Palladium, octl ws build --remote --target pldm, octl ws build --local --target pldm, remote build pldm, local build pldm, submit/monitor/cancel a pldm job, image type availability, tests-config yaml, artifacts_only_manifest.xml, insert_pldm_job.yaml, remote_build.yaml, PLDM job queue portal, from-file pldm, pldm batch, pldm display name."
+description: "Schedule and run hardware tests on Palladium (PLDM) EDK machines via the PLDM Job Queue, to test PRs and newly developed features. Use when: test a PR on PLDM, run a feature on Palladium, octl ws build --remote --target pldm, octl ws build --local --target pldm, remote build pldm, local build pldm, submit/monitor/cancel a pldm job, check my pldm job status, scan pldm jobs, why did my pldm job fail, image type availability, tests-config yaml, artifacts_only_manifest.xml, insert_pldm_job.yaml, remote_build.yaml, PLDM job queue portal, portal PLDM section, from-file pldm, pldm batch, pldm display name, pjq.py."
 argument-hint: "What to test on PLDM (a pushed PR branch → remote mode, or local uncommitted changes → local mode) plus image type / group / timeout"
 ---
 
@@ -28,6 +28,49 @@ pool of PLDM stations without manually grabbing a station. Use it to validate
   against locally-built artifacts, no remote build).
 - User asks about EDK image types, submitting / monitoring / cancelling a PLDM
   job, or reusing a tests-config YAML.
+- User asks **"how are my PLDM jobs doing"** / wants a status refresh → run
+  `pjq.py scan`, never read raw logs by hand.
+
+## Automation — `pjq.py`
+
+`~/.copilot/skills/pldm-job-queue/pjq.py` is the default entry point. It owns the
+tracker at `~/tasks/pldm-jobs.json`, wraps `octl` for dispatch, and does all
+status polling and log triage with plain `gh` calls — so a status refresh costs
+**zero tokens**. Prefer it over driving `octl` and reading Actions logs manually.
+
+```bash
+P=~/.copilot/skills/pldm-job-queue/pjq.py
+
+python3 $P submit --name <display> --image 1die_w_gmem --from-file <yaml> [--local]
+python3 $P track <run-url-or-id> --name <display>   # adopt a run dispatched elsewhere
+python3 $P discover [-H <hours>]                     # adopt jobs you posted via octl
+python3 $P scan                                      # refresh every non-terminal job
+python3 $P list                                     # one line per job
+python3 $P show <id>                                # details + extracted failure evidence
+python3 $P analyze <id>                             # re-harvest logs for one job
+python3 $P bind <id> --queue-row <n> --exec-run <url>
+python3 $P cancel <id> / forget <id> / prune --days 14
+python3 $P payload                                  # JSON the portal renders
+python3 $P images                                   # known image types
+```
+
+Each job carries a **stage** (`dispatching → building → queued → running → done`)
+and a **status** (`pending`/`passed`/`failed`/`error`/`cancelled`). `scan` walks
+the CI run, the queue row and the execution run, advances the stage, and on
+failure stores the extracted evidence — so `show` gives you the reason without
+re-reading the log.
+
+**Discovering jobs you posted outside this tool.** The retool queue itself is not
+reachable token-free, and its GitHub runs are owned by a bot — so there is no
+direct "list my queue jobs" API. Instead `discover` mines `~/.octl.log`, which
+records every `octl ws build --target pldm` dispatch you make (workspace, mode,
+timestamp). Jobs posted from a terminal therefore still show up in the tracker
+and the portal; each deep-links to the Portal for live status, and once you
+`bind` its queue row, `scan` follows it through like any other job. `portal_scan`
+(the ↻ Scan queue button) runs **discover + scan** in one click.
+
+Report from `list`/`show` output. Only open the Actions log yourself if `analyze`
+comes back with no evidence.
 
 ## Pick the Right Mode
 
@@ -217,6 +260,15 @@ buildable checkouts.
 Use it for the common case — "test this feature set as a batch". Drop to the CLI for local
 mode, multi-entry batches, custom `extra_flags`, or anything needing the TUI's live image
 availability list.
+
+### Portal — PLDM section
+
+The portal's **PLDM** section renders `pjq.py payload` — one row per tracked job with its
+stage, status, elapsed time, and failure evidence. **Scan** calls `pjq.py portal_scan`
+server-side (discover + refresh) and costs no tokens: it first adopts any PLDM job you
+dispatched via `octl` (mined from `~/.octl.log`), then follows every job through GitHub.
+Jobs submitted from a feature card are tracked automatically. The badge counts jobs that
+are still building, queued or running.
 
 ## Monitoring the Job
 

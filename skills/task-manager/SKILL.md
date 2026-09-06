@@ -139,6 +139,11 @@ opposed to the incoming review queue that lives under My Work.
   is disabled on a static dashboard file; it needs `serve`.
 - **▶ PLDM test** on each feature card submits the whole feature to the
   [PLDM job queue](../pldm-job-queue/SKILL.md) — see below.
+- **↻ ci** on each PR row, and feature-level **↻ CI all** / **↻ CI failed** buttons, POST
+  `/api/pr-ci`, which runs `pm.trigger_ci()` server-side to post a `/ci` comment on the PR(s)
+  via `gh pr comment` — the only way CI runs here. *all* covers every open PR (skips
+  merged/closed); *failed* covers only `ci-fail` PRs. Results (posted / failed per PR) land in
+  the card's `ci-note`. Serialised by `PR_CI_LOCK`; needs `serve`.
 
 ### Submitting a feature to PLDM from the portal
 
@@ -271,6 +276,12 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
 
 Only `category: "code-review"` tasks may have `review` / `reviews`; other categories must not.
 
+**Closed PRs are dropped, not stubbed.** When a scan (portal **Scan reviews** or CLI
+`review-check`) finds a PR closed **without** merge, that PR entry is removed from the task's
+`reviews` list entirely — there is nothing left to review. A task left with **no** remaining
+PRs is transitioned to `cancelled` (its workspace freed), since a merged PR keeps the record
+but a closed one leaves no work behind.
+
 #### Consolidated review status (one status per task)
 
 Each PR carries its own **per-PR** `review_status` (granular, PR-scoped):
@@ -350,6 +361,17 @@ either the **Workspace State** tab's *Occupy with a task* control or the task ed
 - It is **non-destructive**: dirty repos are skipped and reported, never reset. Repos the
   task references but that aren't present in the workspace are reported as *not-found*.
 - On completion it appends a `workspace <slot> aligned for manual review` note to the task.
+- **It snapshots the aligned composite state** via the [wip-workspace](../wip-workspace/SKILL.md)
+  CLI (`wip scan` + `wip save review-<task-id>`, best-effort) so re-aligning the same task
+  later — after a `stop`/free, or a re-review — is a single cheap `wip load review-<id> &&
+  wip all checkout` instead of re-querying `gh` and re-parsing the manifest. Maximum token
+  savings on repeat checkouts.
+- **It reuses that snapshot automatically on the next alignment:** if a `review-<task-id>`
+  snapshot already exists and the slot is clean, the align job **restores the whole
+  composite state through `wip`** (`wip load` + `wip all checkout`) instead of walking every
+  PR branch through `gh` — the same fast path as review-mgr `start`. It still repopulates the
+  live per-repo banner from the restored git state, and falls back to the careful per-PR
+  checkout loop whenever `wip`/the snapshot is missing or any repo is dirty.
 - Only `code-review` tasks trigger this; assigning any other category just occupies the slot.
 - Alignment never touches GitHub and never runs an AI review — it is purely the local
   checkout so you can review by hand.
