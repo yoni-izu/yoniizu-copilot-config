@@ -24,6 +24,7 @@ the source documents.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| **PRSTn to PSOC masked by default (eFuse)** — PRSTn into PSOC does not propagate unless the fuse mask is changed. ROM bring-up swaps PRSTn source→PSOC (`BOOT_AND_RST_TOP_0.PRST_SELECT_SOURCE` 0xdac, a1 `0x100000000019dac`=0); **after the swap the PRSTn is effectively masked**, so any PRSTn toggle *after* the source swap is dead. Meaningful PRSTn toggle must happen **before** the source is swapped to PSOC. | [prstn-psoc-fuse-masked.md](prstn-psoc-fuse-masked.md) | prstn, perst, psoc, fuse, efuse, masked, prst_select_source, boot_and_rst_top, rom bring-up, reset source, link training, gpio37 | Reported by owner (Yoni) — authoritative | 2026-09-08 |
 | Reset Domains (component × reset type) | [reset-domains.md](reset-domains.md) | reset, reset domains, warm, por, wdt, flr, hot, piw, pcie ep, psoc, muc | Verified from spec | 2026-06-11 |
 
 ## Topic File Template
