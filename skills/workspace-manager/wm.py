@@ -33,7 +33,7 @@ TASKS_STORE = Path(os.path.expanduser("~/tasks/tasks.json"))
 PROJECTS_ROOT = Path(os.path.expanduser("~/projects"))
 DEFAULT_PROJECT = "iridium"
 
-ADHOC_TAGS = ["monitor", "debug", "experiment", "other"]
+ADHOC_TAGS = ["monitor", "debug", "development", "experiment", "other"]
 HOLDER_TYPES = ["task", "adhoc"]
 
 TODAY = date.today().isoformat()
@@ -44,7 +44,7 @@ TODAY = date.today().isoformat()
 # ----------------------------------------------------------------------------
 
 def _empty() -> dict:
-    return {"version": 1, "slots": {}}
+    return {"version": 1, "slots": {}, "tracked": {}, "groups": []}
 
 
 def load() -> dict:
@@ -57,6 +57,8 @@ def load() -> dict:
         return _empty()
     d.setdefault("version", 1)
     d.setdefault("slots", {})
+    d.setdefault("tracked", {})
+    d.setdefault("groups", [])
     return d
 
 
@@ -96,6 +98,218 @@ def canonical_slots(project: str | None = None) -> list[str]:
     except OSError:
         slots = []
     return slots or ["one", "two", "three", "four", "five", "six"]
+
+
+# ----------------------------------------------------------------------------
+# Tracked roster + groups
+# ----------------------------------------------------------------------------
+# Which workspaces the dashboard shows is a user-editable roster, not a scan of
+# the project dir: a slot may live anywhere on disk, and a directory that merely
+# exists isn't necessarily one you want tracked.
+
+# Seeded into an empty store so an existing install keeps the roster it had.
+_SEED_TRACKED = (
+    [{"slot": s, "badge": str(i + 1), "rev": "main"}
+     for i, s in enumerate(["one", "two", "three", "four", "five", "six"])]
+    + [{"slot": "a1_power_on", "badge": "A1", "rev": "a1_power_on",
+        "label": "A1 Power-On"}]
+    + [{"slot": f"a1_power_on_{n:03d}", "badge": f"A1\u00b7{n}",
+        "rev": "a1_power_on", "label": f"A1 Power-On {n:03d}"}
+       for n in (2, 3, 4)]
+)
+
+
+def _seed_tracked() -> dict:
+    out = {}
+    for rec in _SEED_TRACKED:
+        slot = rec["slot"]
+        out[slot] = {
+            "path": str(PROJECTS_ROOT / DEFAULT_PROJECT / slot),
+            "label": rec.get("label") or slot,
+            "badge": rec["badge"],
+            "rev": rec.get("rev", "main"),
+            "group": "",
+            "order": len(out),
+        }
+    return out
+
+
+def tracked(d: dict | None = None, persist: bool = True) -> dict:
+    """Roster of tracked workspaces: ``slot -> record``. Seeds on first use."""
+    own = d if d is not None else load()
+    if not own.get("tracked"):
+        own["tracked"] = _seed_tracked()
+        if persist and d is None:
+            save(own)
+    return own["tracked"]
+
+
+def roster(d: dict | None = None) -> list[dict]:
+    """Tracked workspaces as an ordered list of UI-ready records."""
+    own = d if d is not None else load()
+    recs = tracked(own, persist=d is None)
+    out = []
+    for slot, rec in recs.items():
+        out.append({
+            "slot": slot,
+            "path": rec.get("path") or str(PROJECTS_ROOT / DEFAULT_PROJECT / slot),
+            "label": rec.get("label") or slot,
+            "badge": rec.get("badge") or slot[:2].upper(),
+            "rev": rec.get("rev") or "main",
+            "group": rec.get("group") or "",
+            "order": rec.get("order", 0),
+            "exists": Path(os.path.expanduser(
+                rec.get("path") or str(PROJECTS_ROOT / DEFAULT_PROJECT / slot))).is_dir(),
+        })
+    out.sort(key=lambda r: (r["order"], r["slot"]))
+    return out
+
+
+def slot_path(slot: str, d: dict | None = None) -> Path:
+    """On-disk directory for a slot — the tracked path, else the project dir."""
+    root = normalize_slot(slot) or ""
+    rec = tracked(d if d is not None else load(), persist=False).get(root)
+    if rec and rec.get("path"):
+        return Path(os.path.expanduser(rec["path"]))
+    return PROJECTS_ROOT / DEFAULT_PROJECT / root
+
+
+def track(path: str, label: str | None = None, rev: str | None = None,
+          group: str | None = None, badge: str | None = None):
+    """Add a workspace directory to the tracked roster. ``(ok, msg, slot)``."""
+    raw = (path or "").strip()
+    if not raw:
+        return False, "a workspace path is required", None
+    p = Path(os.path.expanduser(raw)).resolve()
+    if not p.is_dir():
+        return False, f"not a directory: {p}", None
+    slot = p.name
+    d = load()
+    recs = tracked(d, persist=False)
+    if slot in recs:
+        return False, f"'{slot}' is already tracked ({recs[slot].get('path')})", None
+    if group and not get_group(group, d):
+        return False, f"unknown group: {group}", None
+    recs[slot] = {
+        "path": str(p),
+        "label": (label or "").strip() or slot,
+        "badge": (badge or "").strip() or slot[:2].upper(),
+        "rev": (rev or "").strip() or "main",
+        "group": group or "",
+        "order": max((r.get("order", 0) for r in recs.values()), default=-1) + 1,
+    }
+    save(d)
+    return True, f"tracking '{slot}' ({p})", slot
+
+
+def untrack(slot: str):
+    """Drop a workspace from the roster. Refuses while it is held."""
+    root = normalize_slot(slot)
+    if not root:
+        return False, f"invalid slot: {slot!r}"
+    d = load()
+    recs = tracked(d, persist=False)
+    if root not in recs:
+        return False, f"'{root}' is not tracked"
+    if get_holder(root, d):
+        return False, (f"'{root}' is held by {_holder_label(get_holder(root, d))}"
+                       " \u2014 free it first")
+    recs.pop(root)
+    save(d)
+    return True, f"stopped tracking '{root}'"
+
+
+def set_slot_fields(slot: str, fields: dict):
+    """Update roster metadata (``group``/``label``/``rev``/``badge``) for a slot."""
+    root = normalize_slot(slot)
+    if not root:
+        return False, f"invalid slot: {slot!r}"
+    d = load()
+    recs = tracked(d, persist=False)
+    rec = recs.get(root)
+    if rec is None:
+        return False, f"'{root}' is not tracked"
+    if "group" in fields:
+        gid = (fields.get("group") or "").strip()
+        if gid and not get_group(gid, d):
+            return False, f"unknown group: {gid}"
+        rec["group"] = gid
+    for key in ("label", "rev", "badge"):
+        if key in fields:
+            val = (fields.get(key) or "").strip()
+            rec[key] = val or (root if key == "label" else rec.get(key, ""))
+    save(d)
+    return True, f"updated '{root}'"
+
+
+# --- groups -----------------------------------------------------------------
+
+GROUP_COLORS = ["#2563eb", "#a855f7", "#16a34a", "#f59e0b", "#ef4444", "#0891b2"]
+
+
+def groups(d: dict | None = None) -> list[dict]:
+    own = d if d is not None else load()
+    return own.get("groups", [])
+
+
+def get_group(gid: str, d: dict | None = None) -> dict | None:
+    return next((g for g in groups(d) if g["id"] == gid), None)
+
+
+def _group_id(name: str, existing: set) -> str:
+    base = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-") or "group"
+    gid, n = base, 2
+    while gid in existing:
+        gid, n = f"{base}-{n}", n + 1
+    return gid
+
+
+def add_group(name: str, color: str | None = None):
+    name = (name or "").strip()
+    if not name:
+        return False, "a group name is required", None
+    d = load()
+    gs = d.setdefault("groups", [])
+    if any(g["name"].lower() == name.lower() for g in gs):
+        return False, f"a group named '{name}' already exists", None
+    gid = _group_id(name, {g["id"] for g in gs})
+    gs.append({"id": gid, "name": name,
+               "color": (color or "").strip() or GROUP_COLORS[len(gs) % len(GROUP_COLORS)]})
+    save(d)
+    return True, f"group '{name}' added", gid
+
+
+def edit_group(gid: str, name: str | None = None, color: str | None = None):
+    d = load()
+    g = get_group(gid, d)
+    if not g:
+        return False, f"unknown group: {gid}"
+    if name is not None:
+        new = name.strip()
+        if not new:
+            return False, "a group name is required"
+        if any(o["id"] != gid and o["name"].lower() == new.lower() for o in groups(d)):
+            return False, f"a group named '{new}' already exists"
+        g["name"] = new
+    if color is not None and color.strip():
+        g["color"] = color.strip()
+    save(d)
+    return True, f"group '{g['name']}' updated"
+
+
+def delete_group(gid: str):
+    """Remove a group; its workspaces fall back to ungrouped."""
+    d = load()
+    g = get_group(gid, d)
+    if not g:
+        return False, f"unknown group: {gid}"
+    d["groups"] = [o for o in groups(d) if o["id"] != gid]
+    for rec in tracked(d, persist=False).values():
+        if rec.get("group") == gid:
+            rec["group"] = ""
+    save(d)
+    return True, f"group '{g['name']}' deleted"
+
 
 
 def slot_from_cwd(cwd: str | None = None) -> str | None:
