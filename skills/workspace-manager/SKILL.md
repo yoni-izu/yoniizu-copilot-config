@@ -37,7 +37,7 @@ Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
 | `list [--project NAME]` | Show every slot and its holder | Default project: `iridium`. Slots come from the project dir plus any occupied slot. |
 | `status <slot>` | Show one slot's holder | Normalizes sub-paths (`one/fw` → `one`). |
 | `occupy <slot> --task T-NNN [--detail PATH] [--force]` | Give a slot to a task | Refuses a busy slot unless `--force` (which displaces the holder). |
-| `occupy <slot> --label "purpose" [--tag TAG] [--force]` | Grab a slot for an **ad-hoc** purpose | `--tag` ∈ `monitor`, `debug`, `experiment`, `other` (default `other`). |
+| `occupy <slot> --label "purpose" [--tag TAG] [--force]` | Grab a slot for an **ad-hoc** purpose | `--tag` ∈ `monitor`, `debug`, `development`, `experiment`, `other` (default `other`). |
 | `release <slot>` / `free <slot>` | Free a slot | No-op if already free. |
 | `whereami [--cwd PATH]` | Report the slot for the current (or given) directory | Resolves `~/projects/<project>/<slot>/...`. |
 | `migrate [--keep-fields]` | One-time import of legacy per-task `workspace` holds | Moves active holds into this store and strips `workspace`/`workspace_since` from `tasks.json` (unless `--keep-fields`). |
@@ -101,7 +101,7 @@ Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
    - reviewing a PR → `"AER PR review (T-123)"` / `"PCIe middleware PR review"`
    - debugging a ticket → `"AER completion-timeout debug (IRIDIUM-1234)"`
    - an experiment → `"bisect LTSSM regression (experiment)"`
-   Pick the `--tag` that fits (`monitor`/`debug`/`experiment`/`other`).
+   Pick the `--tag` that fits (`monitor`/`debug`/`development`/`experiment`/`other`).
 
 ## Dashboard
 
