@@ -119,31 +119,27 @@ After the build completes (or fails), summarize:
 - ✅ Success: app name, platform, variant
 - ❌ Failure: show the relevant error lines from the output
 
-## proj_infra (Post-Build) Dependencies
+## Focused proj_infra Image Builds
 
 `project.iridium.sw.fw.infra` (proj_infra) regenerates the SPI image and other
-post-build artifacts. Its post-build scripts now **depend on `ip/d2d` and
-`ip/pcie/phy` being built**.
+post-build artifacts. For a flash-image request, do not build every firmware
+application individually. Use the dependency-aware proj_infra build:
 
-- **Complete build** (`octl ws build` with no project) — no change needed; it
-  builds everything including `ip/d2d` and `ip/pcie/phy`.
-- **Manual / individual app builds** — you must build `ip/d2d` and
-  `ip/pcie/phy` **once** before building proj_infra:
-  ```bash
-  cd <ws_root> && octl ws build ip/d2d
-  cd <ws_root> && octl ws build ip/pcie/phy
-  ```
-  After these are built once, when you change an individual app you can rebuild
-  just that app and then build proj_infra directly — no need to rebuild `ip/d2d`
-  or `ip/pcie/phy` again. Example flow:
-  ```bash
-  cd <ws_root> && octl ws build                                   # once: build all components
-  cd <ws_root> && octl ws build ip/d2d                            # once: proj_infra dep
-  cd <ws_root> && octl ws build ip/pcie/phy                       # once: proj_infra dep
-  # ... modify some mng app code ...
-  cd <ws_root> && octl ws build project.iridium.sw.fw.psoc_mng   # rebuild changed app
-  cd <ws_root> && octl ws build project.iridium.sw.fw.infra      # rebuild proj_infra (SPI image etc.)
-  ```
+```bash
+cd <ws_root> && octl ws build project.iridium.sw.fw.infra --with-deps --parallel
+```
+
+`--with-deps` brings in the required dependency projects, and `--parallel`
+keeps the build concurrent. This is the preferred focused image-build path,
+including platform/variant selection supplied by the workspace build setup.
+
+Use an individual application command only when the user explicitly asks to
+build or validate that application, for example:
+
+```bash
+cd <ws_root> && octl ws build project.iridium.sw.fw.psoc_mng \
+  --args "platform=arm variant=asic_single_die is_test=false"
+```
 
 > **Clean + sync required after post-build script updates.** The proj_infra
 > post-build scripts were recently updated. After syncing, **clean and sync the
@@ -160,22 +156,24 @@ multi-project build, or "build everything". **Prompt the user first** — do not
 delegate unilaterally. Ask: *"Full workspace build — want me to run it on the VM
 mirror workspace instead? It's much faster."*
 
-### Use the `vm-delegate` skill / `vmctl` — do not hand-roll SSH
+### Use the `vm-delegate` skill / `mctl` — do not hand-roll SSH
 
-The entire delegation flow is encoded in `~/bin/vmctl` (see the **`vm-delegate`**
-skill). It handles VM discovery, `ssh -A`, `bash -lc`, branch alignment,
-detached (hangup-proof) builds, and pulling results back. Do **not** reconstruct
-the raw `ssh`/`nohup`/`rsync` commands here.
+The entire delegation flow is encoded in `~/bin/mctl` (formerly `vmctl`; see the
+**`vm-delegate`** skill). It handles target/VM discovery, `ssh -A`, login-shell
+exec, home-relative path mapping, branch alignment, detached (hangup-proof)
+builds, and pulling results back. It targets any machine (a VM or a lab desktop)
+via `-t <target>`. Do **not** reconstruct the raw `ssh`/`nohup`/`rsync` commands
+here.
 
 ```bash
 cd <ws_root>
-vmctl mirror         # push local dev branches + align the VM mirror workspace
-vmctl build          # detached parallel `octl ws build --parallel`
-vmctl build-status   # poll (STATE=RUNNING/DONE, ERRORS=, log tail)
-vmctl pull-build     # rsync binaries + logs back to the identical local path
+mctl mirror         # push local dev branches + align the mirror workspace
+mctl build          # detached parallel `octl ws build --parallel`
+mctl build-status   # poll (STATE=RUNNING/DONE, ERRORS=, log tail)
+mctl pull-build     # rsync binaries + logs back to the local path
 ```
 
-Poll `vmctl build-status` between turns (never `sleep`-loop). For the full
+Poll `mctl build-status` between turns (never `sleep`-loop). For the full
 deduplicated error list after completion, use the `vm-delegate` skill's grep
 recipe. The remaining sections below (build-abort behaviour, proving a failure
 is pre-existing, known false failures) apply to **both** local and VM builds.
