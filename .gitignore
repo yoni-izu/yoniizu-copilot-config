@@ -23,3 +23,12 @@ __pycache__/
 
 # PR review drafts — local working notes, never commit
 skills/pr-review/drafts/
+
+# Plugin-managed / client state
+.cache/
+installed-plugins/
+installed-plugins.lock
+instructions/
+el-plugins-state.json
+open-sessions-state.json
+sidebar-sessions-state/
