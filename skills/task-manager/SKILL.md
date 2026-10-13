@@ -31,15 +31,20 @@ a single page with a top-level section nav:
 | Section | Data source | Owning skill | State |
 |---------|-------------|--------------|-------|
 | **Overview** | all of the below + `~/team-planner/` | `task-manager` (aggregator) | live, **landing section** |
-| **My Work** | `~/tasks/tasks.json` + `~/tasks/workspaces.json` | `task-manager` / `workspace-manager` | live |
+| **My Work** | `~/tasks/tasks.json` | `task-manager` | live |
+| **Workspaces** | `~/tasks/workspaces.json` | `workspace-manager` | live |
 | **Bugs** | `~/tasks/bugs.json` | `bug-monitor` | live |
 | **PRs** | `/memories/pr-monitor-features.md` | `pr-monitor` | live |
+| **PLDM** | the PLDM job queue | `pldm-job-queue` | live |
+| **VM jobs** | `~/.mctl/joblog.jsonl` + `jobstate.json` + `vmstate.json` | `vm-delegate` | live |
 | **RAID** | `~/team-planner/raid.md` | `team-planner` | live |
 | **Team** | — | (future) team task monitoring | placeholder, disabled |
 
 The section badge counts are *attention* counts, not totals: **Overview** shows bugs needing
-attention plus hot RAID rows, **My Work** shows active tasks, **Bugs** shows open bugs that
-are stalled, untriaged, or unassigned, **PRs** shows features with at least one blocked PR, and
+attention plus hot RAID rows, **My Work** shows active tasks, **Workspaces** shows occupied
+slots, **Bugs** shows open bugs that
+are stalled, untriaged, or unassigned, **PRs** shows features with at least one blocked PR,
+**VM jobs** shows jobs running right now, and
 **RAID** shows open rows at Red or Orange.
 
 Each section keeps its own tab strip, filters, sort and expandable detail rows. Switching
@@ -175,6 +180,29 @@ whenever testing this endpoint; the normal path really does start a CI build.
 Endpoints: `GET /api/prs`, `POST /api/pr-scan` and `POST /api/pldm-test` (serialised by
 `PLDM_LOCK`). Without the `pr-monitor` skill the section renders empty and the scans return 503.
 
+### VM jobs section
+
+A read-only view over [`vm-delegate`](../vm-delegate/SKILL.md)'s delegation history, driven by
+`vd.py`: an EC2 power strip (state dot, lease countdown, Start/Stop), the job running right now,
+KPI counts, and the full history table.
+
+- **Refresh status** (`POST /api/vm-refresh`) is a **background job**, polled through
+  `/api/align/<id>` like the PR scan, and it streams one row per target into the align banner.
+  It is not inline for a reason: one unreachable target costs a 90 s ssh timeout and `octl vm
+  list` revalidates SSO, so the old inline version routinely outlived the browser's fetch — the
+  section then never re-rendered and the whole tab looked broken while the probe was succeeding
+  on the server.
+- **Check VM status** (`POST /api/vm-machines`) re-reads only `octl vm list`; **Sync logs**
+  (`POST /api/vm-sync`) only rsyncs the remote job logs. Both are narrower than a full refresh.
+- The **Log** column opens the mirrored log (`POST /api/vm-log`); for a *running* job it opens a
+  **live tail** (`POST /api/vm-tail`) that re-polls every 5 s with **Follow** on. Each poll is
+  one `tail -n` over ssh — no websocket, nothing to tear down but a `setInterval`. Neither
+  endpoint takes `VM_REFRESH_LOCK`: reading a log must never be blocked by an in-flight probe.
+- The header and the power strip print how **stale** each reading is (`refresh_age_h`,
+  `machines_age_h`). Without that, a day-old `stopped` is indistinguishable from a live one.
+
+Without the `vm-delegate` skill the section renders empty and the scans return 503.
+
 ### RAID section
 
 A full editor over [`team-planner`](../team-planner/SKILL.md)'s `~/team-planner/raid.md`, driven
@@ -201,8 +229,8 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 |------------|---------|-------|
 | `add <title> [-c CAT] [-p PRI] [--complexity X] [--cost N] [--jira K] [--context S] [--workspace W] [--no-workspace] [--backlog] [--cwd PATH]` | Add a non-review task | Auto-detects workspace from cwd unless `--no-workspace`. Reports if workspace is occupied. |
 | `list [--status S] [--category C] [--priority P] [--json]` | List tasks | Default hides `done`/`cancelled`. Sorts by priority then category. Shows a "Feature" column (first sentence of `description`, falls back to title with leading `Review:` stripped). Prints summary + workspace map. |
-| `dashboard [-o PATH]` | Generate a self-contained, read-only **Team Portal** HTML file | Embeds the live stores into one offline HTML file (default `~/tasks/dashboard.html`): the **My Work** section (search, status/category/priority chip filters, complexity/workspace dropdowns, option tick-boxes, column toggles, sortable headers, stats, expandable detail, plus a **Workspace State** tab) and the **Bugs** section (bug tabs, signal/owner/priority/component/family filters, stats, expandable bug detail, Families view). Re-run to refresh. |
-| `serve [--port N] [--stop] [--status]` | Serve an **editable** Team Portal on `127.0.0.1` | Same UI as `dashboard` but generated live per request and editable. **My Work:** status/priority/category/complexity/cost/workspace/review-status + append-note, posted to `/api/task/<id>`; the **Workspace State** tab occupies each slot with a **task** *or* an **ad-hoc purpose**, posted to `/api/workspace/<slot>` and applied through `wm.py`; for code-review tasks the editor exposes a **Review status** picker, and **assigning a code-review task to a slot auto-triggers a manual-review alignment** (see below). **Bugs:** the triage editor posts to `/api/bug/<KEY>` and is applied through `bm.py` (local fields only, never Jira). Binds localhost only; writes `~/tasks/.dashboard.pid`; refuses to double-start (the PID file is global — one instance regardless of port). Run-once via the systemd user unit `~/.config/systemd/user/task-dashboard.service`. |
+| `dashboard [-o PATH]` | Generate a self-contained, read-only **Team Portal** HTML file | Embeds the live stores into one offline HTML file (default `~/tasks/dashboard.html`): the **My Work** section (search, status/category/priority chip filters, complexity/workspace dropdowns, option tick-boxes, column toggles, sortable headers, stats, expandable detail), the **Workspaces** section, and the **Bugs** section (bug tabs, signal/owner/priority/component/family filters, stats, expandable bug detail, Families view). Re-run to refresh. |
+| `serve [--port N] [--stop] [--status]` | Serve an **editable** Team Portal on `127.0.0.1` | Same UI as `dashboard` but generated live per request and editable. **My Work:** status/priority/category/complexity/cost/workspace/review-status + append-note, posted to `/api/task/<id>`; the **Workspaces** section occupies each slot with a **task** *or* an **ad-hoc purpose**, posted to `/api/workspace/<slot>` and applied through `wm.py`; for code-review tasks the editor exposes a **Review status** picker, and **assigning a code-review task to a slot auto-triggers a manual-review alignment** (see below). **Bugs:** the triage editor posts to `/api/bug/<KEY>` and is applied through `bm.py` (local fields only, never Jira). Binds localhost only; writes `~/tasks/.dashboard.pid`; refuses to double-start (the PID file is global — one instance regardless of port). Run-once via the systemd user unit `~/.config/systemd/user/task-dashboard.service`. |
 | `workspaces [--project NAME]` | Show workspace slot occupancy (tasks **and** ad-hoc holds) | Default project: `iridium`. Delegates to `wm.py`. |
 | `update <id> <status> [-n NOTE]` | Set arbitrary status | `id` matches `T-NNN` or unique title substring. |
 | `done <id> [-n NOTE]` / `block <id>` / `cancel <id>` | Status shortcuts | `done`/`cancel` auto-clear workspace and set `completed`. |
@@ -332,9 +360,12 @@ The `serve` subcommand backs the **editable** Team Portal. The static
 `dashboard` output is read-only; editing only activates when the page is loaded
 from the running server (it probes `/health` and `/api/tasks`).
 
-- **Restart after upgrading `tm.py`, `wm.py` or `bm.py`.** The server holds the
-  page template and the imported modules in memory. `serve --stop` then start again
-  (or `systemctl --user restart task-dashboard`).
+- **Restart after upgrading `tm.py` or a skill module** (`pm.py`, `wm.py`, `bm.py`,
+  `rd.py`, `pjq.py`, `vd.py`). The server holds the page template and the imported
+  modules in memory. `serve --stop` then start again (or
+  `systemctl --user restart task-dashboard`).
+- **No restart for `assets/portal.css` / `assets/portal.js`** — they are read off
+  disk per request and cache-busted by mtime. Just reload the page.
 - **Open the served URL, not the file.** Editing is enabled only at
   `http://127.0.0.1:8787` (the served page). Opening `~/tasks/dashboard.html`
   directly (or any `file://` path) shows a **read-only** badge by design.
@@ -346,10 +377,34 @@ from the running server (it probes `/health` and `/api/tasks`).
   running with no active session, run `sudo loginctl enable-linger $USER` once
   (needs polkit/sudo, so it is not done automatically).
 
+### Front-end layout
+
+The client is three files, not one:
+
+| File | Holds |
+|------|-------|
+| `tm.py` | the Python CLI/server and `DASHBOARD_TEMPLATE` (markup only) |
+| `assets/portal.css` | every style, built on a small token set |
+| `assets/portal.js` | every behaviour, ~3k lines |
+
+`tm.py` passes data in a single `window.__PORTAL__` bootstrap object
+(`boot_payload()`); `serve` links the assets from `/assets/…`, while
+`tm.py dashboard` inlines them so the static export still works over `file://`.
+
+Styling rules worth keeping:
+
+- Use the tokens — `--r-xs/sm/md/lg/pill` for radii, `--ok/--warn/--danger/--info`
+  (plus their `-soft` tints) for state. Do not re-introduce raw hex or raw pixels.
+- There are exactly **three button families**: *action* (`.btn` and friends),
+  *micro* (`.ci-btn`, `.pldm-btn`) and *ghost* (icon-only, e.g. `.pr-x`). A new
+  button joins one of the grouped selectors; it does not get a bespoke rule.
+- Validate edits with `node --check assets/portal.js` and a `{`/`}` count on the CSS.
+
+
 ### Auto-alignment on code-review assignment (manual-review checkout)
 
 When you assign a **`code-review`** task to a workspace slot from the served dashboard —
-either the **Workspace State** tab's *Occupy with a task* control or the task editor's
+either the **Workspaces** section's *Occupy with a task* control or the task editor's
 **workspace** field — the server automatically aligns that workspace for a **manual
 (no-AI, no-credit) review**, the dashboard equivalent of review-mgr `start --manual`:
 
@@ -402,7 +457,7 @@ The CLI is dumb on purpose. For these branches, fall back to direct file edits:
 8. `jira` is optional — populate when the user mentions one or when `add-review` extracts it from a PR title.
 9. **Workspace uniqueness:** At most one holder (task or ad-hoc) per workspace slot. The [workspace-manager](../workspace-manager/SKILL.md) enforces this on `assign`/occupy (refuses unless `--force`) and `add` defaults to `backlog` if the target slot is occupied.
 10. **Workspace auto-release on done/cancelled:** `tm.py` calls `wm.release_task` so the slot frees when a task is finished.
-11. **Workspace occupancy lives in the workspace-manager store**, not on the task. `tm.py` never hand-edits occupancy — it delegates to `wm.py` (`occupy_task`/`release_task`) through one path, so the **Workspace State** dashboard tab and other skills (review-mgr, pr-monitor) all read one truth. A slot can be held by a task **or** an ad-hoc purpose (see the workspace-manager skill).
+11. **Workspace occupancy lives in the workspace-manager store**, not on the task. `tm.py` never hand-edits occupancy — it delegates to `wm.py` (`occupy_task`/`release_task`) through one path, so the **Workspaces** dashboard section and other skills (review-mgr, pr-monitor) all read one truth. A slot can be held by a task **or** an ad-hoc purpose (see the workspace-manager skill).
 12. **Workspace auto-assignment on add:** When called from inside `~/projects/<project>/<ws>/...`, the CLI auto-assigns that slot if free (via `wm.py`); otherwise it parks the task in `backlog`. Pass `--cwd` to override the detected path or `--no-workspace` to disable.
 13. **Code-review tasks** carry review-only fields (`reviews[]`) and their own lifecycle, branch-capture, and multi-PR invariants (all enforced by the `tm.py` review subcommands). A review task is kept until **every** PR merges (only then is it `done`/`merged`); merged tasks persist as a record rather than being purged. These are documented and driven by the **review-mgr** skill — see `~/.copilot/skills/review-mgr/SKILL.md`.
 14. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo in the workspace; a second same-repo PR is unreachable and causes reviewer confusion. When `add-review` receives multiple URLs, verify no two target the same repo — if they do, split into separate tasks.
