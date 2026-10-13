@@ -3,5 +3,17 @@
     "https://elementlabs.atlassian.net",
     "https://mcp.atlassian.com",
     "https://raw.githubusercontent.com"
-  ]
+  ],
+  "extraKnownMarketplaces": {
+    "ai-toolkit": {
+      "source": {
+        "source": "github",
+        "repo": "Elmnt-Internal/module.infra.ai_group.toolkit"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "github@ai-toolkit": true,
+    "fw-soc@ai-toolkit": true
+  }
 }
