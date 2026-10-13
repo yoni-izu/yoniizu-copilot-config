@@ -236,14 +236,43 @@ which is what the resolver consumes:
 
 ```bash
 python3 ~/.copilot/skills/vm-delegate/vd.py list       # history + resolved status
-python3 ~/.copilot/skills/vm-delegate/vd.py refresh    # probe each live target
-python3 ~/.copilot/skills/vm-delegate/vd.py sync       # mirror every job log locally
+python3 ~/.copilot/skills/vm-delegate/vd.py targets    # per-target freshness + last error
+python3 ~/.copilot/skills/vm-delegate/vd.py refresh [target]  # probe + mirror logs
+python3 ~/.copilot/skills/vm-delegate/vd.py sync    [target]  # mirror job logs only
 python3 ~/.copilot/skills/vm-delegate/vd.py log  <target> <tag> [kind]  # stored log
 python3 ~/.copilot/skills/vm-delegate/vd.py tail <target> <tag> [kind]  # live log
 python3 ~/.copilot/skills/vm-delegate/vd.py payload    # JSON for the portal
 python3 ~/.copilot/skills/vm-delegate/vd.py vms        # EC2 power state
 python3 ~/.copilot/skills/vm-delegate/vd.py start|stop <instance-id>
 ```
+
+### Refresh one machine, not the fleet
+
+`refresh` and `sync` both take an optional target name, and that is not a
+convenience: **an unreachable target costs a 90 s ssh timeout**, so with two
+dead lab desktops registered a fleet refresh runs for minutes while
+`vd.py refresh vm` returns in about four seconds. Ask for the machine you care
+about.
+
+Scoping is honest about what it did *not* check. Each target carries its own
+`checked` timestamp in `jobstate.json`, surfaced per target in the payload's
+`target_state`, so refreshing one machine never makes the rest look freshly
+read; and per-target errors are merged rather than replaced, so a VM-only
+refresh does not erase the knowledge that `dsk61` was unreachable.
+
+```
+$ vd.py targets
+vm         running    jobs=16  running=0   checked        11s ago  ok
+dsk61      -          jobs=0   running=0   checked     3m 10s ago  ⚠ jobs-probe failed (rc=255)
+```
+
+Scoped to a target with no EC2 instance behind it, the `octl vm list` call is
+skipped too — it revalidates SSO and tells you nothing about a bare-metal lab
+desktop.
+
+The target name is validated against the registered target list before it
+reaches a shell, so an unknown or crafted name is refused outright rather than
+escaped.
 
 ### Log retention — the remote clobbers, so mirror first
 
@@ -295,13 +324,18 @@ running job highlighted below it, then the full history.
 | Control | Endpoint | What it costs |
 | --- | --- | --- |
 | **Refresh status** | `POST /api/vm-refresh` → background job, polled via `/api/align/<id>` | one ssh probe + one log rsync per target, plus `octl vm list` |
+| **↻ on a machine card / target chip** | same endpoint with `{"target": "<name>"}` | one ssh probe + one rsync, that target only |
 | **Check VM status** | `POST /api/vm-machines` → `vd.portal_machines()` | `octl vm list` only — no ssh |
-| **Sync logs** | `POST /api/vm-sync` → `vd.portal_sync()` | one rsync per target — no probe, no octl |
+| **Sync logs** | `POST /api/vm-sync` → `vd.portal_sync()`, scoped by the target filter | one rsync per target — no probe, no octl |
 | **Log ▸ open** | `POST /api/vm-log` → `vd.portal_log()` | reads the local mirror (falls back to the remote) |
 | **Log ▸ tail** | `POST /api/vm-tail` → `vd.portal_tail()`, re-polled every 5 s | one `tail -n` ssh per poll |
 
-Neither costs a model token. Two design points worth keeping:
+Neither costs a model token. Three design points worth keeping:
 
+- **Refresh is scoped by default where it matters.** Every EC2 card and every
+  bare-metal target chip carries its own `↻`, and the toolbar button follows the
+  target filter (it relabels to *Refresh vm*). Each chip also shows its own
+  age — refreshing one machine must not make the others look checked.
 - **Refresh is a background job, not an inline request.** One unreachable target
   costs a 90 s ssh timeout and `octl vm list` revalidates SSO, so the inline
   version regularly outlived the browser's patience: the fetch gave up, the

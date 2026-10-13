@@ -15,6 +15,18 @@ This module adds the missing half:
 no model involved — and binds each probe row to the NEWEST logged job for that
 (target, tag, kind). Older logged jobs for the same slot can never be resolved
 again (their log is gone), so they settle as ``superseded``.
+
+Every entry point that walks the fleet takes an optional target name, so a
+single machine can be refreshed on its own. That matters because one unreachable
+target costs a 90 s ssh timeout: asking only the VM returns in a second, while a
+fleet refresh waits for every dead lab desktop.
+
+    vd.py list                 history + resolved status
+    vd.py targets              per-target freshness, job counts and last error
+    vd.py refresh [target]     probe + mirror logs (one target, or all)
+    vd.py sync    [target]     mirror logs only
+    vd.py log|tail <target> <tag> [kind]
+    vd.py vms | start <id> | stop <id>
 """
 
 from __future__ import annotations
@@ -339,6 +351,9 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
         pending |= {d.name for d in pulled.iterdir() if d.is_dir()}
     if only:
         pending &= {only}
+        if not pending:
+            return {"probed": 0, "targets": [], "errors": {},
+                    "error": f"unknown target: {only}"}
 
     probed: dict[str, dict] = {}
     for t in sorted(pending):
@@ -430,7 +445,17 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
 
     state["jobs"] = jstate
     state["last_refresh"] = now
-    state["errors"] = errors
+    # A single-target refresh must not erase what we know about the others, nor
+    # claim the whole fleet was just checked. Errors are merged per target and
+    # every target carries its own timestamp.
+    prev_errors = dict(state.get("errors") or {})
+    for t in probed:
+        prev_errors.pop(t, None)
+    prev_errors.update(errors)
+    state["errors"] = prev_errors
+    seen_at = dict(state.get("checked") or {})
+    seen_at.update({t: now for t in probed})
+    state["checked"] = seen_at
     _write_state(state)
     return {"probed": len(probed), "targets": sorted(probed), "errors": errors}
 
@@ -621,6 +646,7 @@ def payload() -> dict:
         rows = jobs()
     except Exception as e:                                   # noqa: BLE001
         return {"jobs": [], "running": [], "counts": {}, "targets": [],
+                "target_state": [],
                 "machines": [], "machines_checked": "", "machines_age_h": "",
                 "logs_held": 0, "last_refresh": "", "refresh_age_h": "",
                 "log": str(JOBLOG), "error": str(e)}
@@ -636,11 +662,34 @@ def payload() -> dict:
     checked = vms.get("checked") or ""
     last = state.get("last_refresh") or ""
     root = MCTL_DIR / "jobs"
+
+    # Per-target freshness. `last_refresh` is fleet-wide and goes stale the
+    # moment one target is refreshed on its own, so each target also carries
+    # when IT was last asked -- otherwise a single-target refresh makes the
+    # whole fleet look freshly checked.
+    seen_at = state.get("checked") or {}
+    machine_of = {m["target"]: m for m in (vms.get("machines") or []) if m.get("target")}
+    tgts = []
+    for name in targets():
+        at = seen_at.get(name) or ""
+        m = machine_of.get(name)
+        tgts.append({
+            "name": name,
+            "checked": at,
+            "age_h": _human_dur(now - _epoch(at)) if at else "",
+            "error": errs.get(name, ""),
+            "jobs": sum(1 for r in rows if r["target"] == name),
+            "running": sum(1 for r in rows if r["target"] == name and r["status"] == "running"),
+            "instance": (m or {}).get("id", ""),
+            "state": (m or {}).get("state", ""),
+        })
+
     return {
         "jobs": rows,
         "running": [r for r in rows if r["status"] == "running"],
         "counts": counts,
-        "targets": targets(),
+        "targets": [t["name"] for t in tgts],
+        "target_state": tgts,
         "machines": vms.get("machines") or [],
         "machines_checked": checked,
         # How stale each half of the view is. Without this a day-old "stopped"
@@ -655,12 +704,35 @@ def payload() -> dict:
     }
 
 
-def portal_refresh() -> dict:
-    """Probe every target, mirror its logs, and re-read the EC2 power state."""
-    res = refresh()
-    machines(force=True)
+def is_target(name: str) -> bool:
+    return bool(name) and name in targets()
+
+
+def has_instance(name: str) -> bool:
+    """True when an mctl target is backed by an EC2 instance we can power-query."""
+    ip = (MCTL_DIR / f"{name}.ip")
+    if not ip.exists():
+        return False
+    want = ip.read_text(encoding="utf-8").strip()
+    cached = machines()
+    return any(m.get("ip") == want for m in cached.get("machines") or [])
+
+
+def portal_refresh(only: str | None = None) -> dict:
+    """Probe target(s), mirror their logs, and re-read the EC2 power state.
+
+    Scoped to one target, the EC2 query is skipped unless that target is
+    actually backed by an instance -- asking `octl vm list` costs an SSO
+    revalidation and tells you nothing about a bare-metal lab desktop.
+    """
+    if only and not is_target(only):
+        return {"error": f"unknown target: {only}"}
+    res = refresh(only)
+    if not only or has_instance(only):
+        machines(force=True)
     out = payload()
     out["probed"] = res["probed"]
+    out["scope"] = only or ""
     return out
 
 
@@ -708,11 +780,14 @@ def portal_tail(target: str, tag: str, kind: str, lines: int = 200) -> dict:
     return out
 
 
-def portal_sync() -> dict:
-    """Mirror every target's job logs locally, without probing or touching EC2."""
-    results = [sync_logs(t) for t in targets()]
+def portal_sync(only: str | None = None) -> dict:
+    """Mirror job logs locally, without probing or touching EC2."""
+    if only and not is_target(only):
+        return {"error": f"unknown target: {only}"}
+    results = [sync_logs(t) for t in ([only] if only else targets())]
     out = payload()
     out["synced"] = results
+    out["scope"] = only or ""
     bad = [r for r in results if r.get("error")]
     if bad:
         out["sync_error"] = "; ".join(f"{r['target']}: {r['error']}" for r in bad)
@@ -728,10 +803,21 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 0
     if cmd == "refresh":
-        res = refresh(argv[2] if len(argv) > 2 else None)
+        only = argv[2] if len(argv) > 2 else None
+        if only and not is_target(only):
+            print(f"[vd] unknown target: {only} (have: {', '.join(targets())})",
+                  file=sys.stderr)
+            return 1
+        res = refresh(only)
         print(f"[vd] probed {res['probed']} target(s): {', '.join(res['targets']) or '-'}")
         for t, e in (res["errors"] or {}).items():
             print(f"[vd] {t}: {e}", file=sys.stderr)
+        return 0
+    if cmd == "targets":
+        for t in payload()["target_state"]:
+            flag = f"\u26a0 {t['error']}" if t["error"] else "ok"
+            print(f"{t['name']:10} {t['state'] or '-':10} jobs={t['jobs']:<3} "
+                  f"running={t['running']:<3} checked {t['age_h'] or 'never':>10} ago  {flag}")
         return 0
     if cmd in ("vms", "machines"):
         st = machines(force=True)
