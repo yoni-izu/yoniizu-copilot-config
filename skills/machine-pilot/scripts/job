@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# job — run LOCAL commands DETACHED so they survive SSH hangups, VPN drops,
+# terminal timeouts, VS Code reloads and agent-session restarts.
+#
+# Same mental model as `bmcjob` (BMC-side) and `mctl` (VM-side): launch returns
+# immediately with a TAG; progress is polled, never streamed. Nothing the agent
+# runs should be able to die just because the client went away.
+#
+#   job run [-t TAG] '<cmd>'   launch detached, print TAG (returns at once)
+#   job status [TAG]           RUNNING / DONE rc=N / missing
+#   job log TAG [N]            last N lines (default 40)
+#   job wait TAG [SECS]        poll until done (default 60s), then print tail
+#   job list                   all known jobs, newest first
+#   job kill TAG               TERM the whole process group
+#   job clean [DAYS]           drop finished jobs older than DAYS (default 7)
+#
+# Job state lives in ~/.jobs/<TAG>/: cmd.sh, log, pid, rc, started.
+set -uo pipefail
+
+JOBS_ROOT="${JOB_ROOT:-$HOME/.jobs}"
+
+die() { echo "job: $*" >&2; exit 1; }
+
+# A job is running if the PID is alive AND it has not recorded an exit code.
+is_running() {
+	local jd=$1 pid
+	[[ -f "$jd/pid" ]] || return 1
+	[[ -f "$jd/rc" ]] && return 1
+	pid=$(cat "$jd/pid" 2>/dev/null) || return 1
+	[[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_run() {
+	local tag=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		-t | --tag)
+			tag=${2:-}
+			shift 2
+			;;
+		--)
+			shift
+			break
+			;;
+		*) break ;;
+		esac
+	done
+	[[ $# -gt 0 ]] || die "run needs a command"
+	local script="$*"
+	[[ -n "$tag" ]] || tag="job-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+	local jd="$JOBS_ROOT/$tag"
+
+	if [[ -d "$jd" ]] && is_running "$jd"; then
+		die "'$tag' is already RUNNING (pid $(cat "$jd/pid")) — poll it, 'job kill $tag', or pick another tag"
+	fi
+
+	mkdir -p "$jd" || die "cannot create $jd"
+	rm -f "$jd/rc"
+	printf '%s\n' "$script" >"$jd/cmd.sh"
+	date -u +%Y-%m-%dT%H:%M:%SZ >"$jd/started"
+
+	# setsid+nohup makes the child a session leader detached from this terminal;
+	# `trap "" HUP` is inherited so it also survives the parent going away.
+	# stdin is /dev/null so a stray prompt can never block it. The command is
+	# read from a file, which sidesteps all nested-quoting hazards.
+	setsid nohup bash -c \
+		'trap "" HUP; bash "$0/cmd.sh"; rc=$?; printf "%s\n" "$rc" > "$0/rc"; echo "__JOB_DONE__ rc=$rc"' \
+		"$jd" >"$jd/log" 2>&1 </dev/null &
+	local p=$!
+	echo "$p" >"$jd/pid"
+	disown 2>/dev/null || true
+
+	echo "$tag"
+}
+
+cmd_status() {
+	local tag=${1:-}
+	[[ -n "$tag" ]] || {
+		cmd_list
+		return
+	}
+	local jd="$JOBS_ROOT/$tag"
+	[[ -d "$jd" ]] || die "no such job: $tag"
+	if is_running "$jd"; then
+		echo "$tag RUNNING pid=$(cat "$jd/pid" 2>/dev/null) since=$(cat "$jd/started" 2>/dev/null) log=$(wc -c <"$jd/log" 2>/dev/null)B"
+	elif [[ -f "$jd/rc" ]]; then
+		echo "$tag DONE rc=$(cat "$jd/rc") since=$(cat "$jd/started" 2>/dev/null) log=$(wc -c <"$jd/log" 2>/dev/null)B"
+	else
+		echo "$tag DIED (no exit code recorded — killed or host rebooted)"
+	fi
+}
+
+cmd_log() {
+	local tag=${1:-} n=${2:-40}
+	[[ -n "$tag" ]] || die "log needs a TAG"
+	local jd="$JOBS_ROOT/$tag"
+	[[ -f "$jd/log" ]] || die "no log for: $tag"
+	tail -n "$n" "$jd/log"
+}
+
+cmd_wait() {
+	local tag=${1:-} secs=${2:-60}
+	[[ -n "$tag" ]] || die "wait needs a TAG"
+	local jd="$JOBS_ROOT/$tag"
+	[[ -d "$jd" ]] || die "no such job: $tag"
+	local i=0
+	while ((i < secs)); do
+		is_running "$jd" || break
+		sleep 2
+		i=$((i + 2))
+	done
+	cmd_status "$tag"
+	echo "--- log tail ---"
+	tail -n 40 "$jd/log" 2>/dev/null
+	# Non-zero exit only means "still running", so callers can loop.
+	is_running "$jd" && return 2
+	return 0
+}
+
+cmd_list() {
+	[[ -d "$JOBS_ROOT" ]] || {
+		echo "(no jobs)"
+		return
+	}
+	local jd
+	for jd in $(ls -1dt "$JOBS_ROOT"/*/ 2>/dev/null); do
+		cmd_status "$(basename "$jd")"
+	done
+}
+
+cmd_kill() {
+	local tag=${1:-}
+	[[ -n "$tag" ]] || die "kill needs a TAG"
+	local jd="$JOBS_ROOT/$tag" pid
+	[[ -f "$jd/pid" ]] || die "no pid for: $tag"
+	pid=$(cat "$jd/pid")
+	# Negative PID targets the whole process group (setsid made it a leader).
+	kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+	echo "killed $tag (pid $pid)"
+}
+
+cmd_clean() {
+	local days=${1:-7} jd
+	[[ -d "$JOBS_ROOT" ]] || return 0
+	for jd in "$JOBS_ROOT"/*/; do
+		[[ -d "$jd" ]] || continue
+		is_running "$jd" && continue
+		if [[ -z $(find "$jd" -maxdepth 0 -mtime -"$days" 2>/dev/null) ]]; then
+			rm -rf "$jd" && echo "removed $(basename "$jd")"
+		fi
+	done
+}
+
+case "${1:-}" in
+run)
+	shift
+	cmd_run "$@"
+	;;
+status)
+	shift
+	cmd_status "$@"
+	;;
+log)
+	shift
+	cmd_log "$@"
+	;;
+wait)
+	shift
+	cmd_wait "$@"
+	;;
+list)
+	shift
+	cmd_list "$@"
+	;;
+kill)
+	shift
+	cmd_kill "$@"
+	;;
+clean)
+	shift
+	cmd_clean "$@"
+	;;
+*)
+	sed -n '2,18p' "$0" | sed 's/^# \?//'
+	exit 1
+	;;
+esac

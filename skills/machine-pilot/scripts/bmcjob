@@ -1,0 +1,77 @@
+#!/bin/bash
+# bmcjob — run commands DETACHED on the BMC so they survive SSH hangups and VPN
+# drops. Same model as the local `job` and `mctl`: launch returns immediately
+# with a TAG; you poll it. Long bmccli operations (device reset can exceed 120s)
+# MUST go through this, or a dropped client leaves you unable to see the result.
+#
+#   bmcjob run <TAG> '<cmd>'   launch detached, return at once
+#   bmcjob status [TAG]        RUNNING / DONE rc=N
+#   bmcjob log TAG [N]         last N lines (default 40)
+#   bmcjob wait TAG [SECS]     poll until done (default 60s)
+#   bmcjob list                all jobs
+#
+# State in /var/lib/bmcjobs/<TAG>/ (persistent; NOT /tmp, which is tmpfs and is
+# reaped out from under long-lived jobs).
+set -uo pipefail
+
+ROOT=/var/lib/bmcjobs
+
+is_running() {
+	local jd=$1 pid
+	[ -f "$jd/pid" ] || return 1
+	[ -f "$jd/rc" ] && return 1
+	pid=$(cat "$jd/pid" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+case "${1:-}" in
+run)
+	TAG=${2:?need TAG}
+	shift 2
+	CMD="$*"
+	jd="$ROOT/$TAG"
+	mkdir -p "$jd"
+	rm -f "$jd/rc"
+	printf '%s\n' "$CMD" >"$jd/cmd.sh"
+	date -u +%Y-%m-%dT%H:%M:%SZ >"$jd/started"
+	setsid nohup bash -c \
+		'trap "" HUP; bash "$0/cmd.sh"; rc=$?; printf "%s\n" "$rc" > "$0/rc"; echo "__BMCJOB_DONE__ rc=$rc"' \
+		"$jd" >"$jd/log" 2>&1 </dev/null &
+	echo $! >"$jd/pid"
+	disown 2>/dev/null || true
+	echo "$TAG"
+	;;
+status)
+	if [ -n "${2:-}" ]; then
+		jd="$ROOT/$2"
+		if is_running "$jd"; then echo "$2 RUNNING pid=$(cat "$jd/pid")"; else echo "$2 DONE rc=$(cat "$jd/rc" 2>/dev/null || echo '?')"; fi
+	else
+		for jd in "$ROOT"/*/; do
+			[ -d "$jd" ] || continue
+			t=$(basename "$jd")
+			if is_running "$jd"; then echo "$t RUNNING"; else echo "$t DONE rc=$(cat "$jd/rc" 2>/dev/null || echo '?')"; fi
+		done
+	fi
+	;;
+log) tail -n "${3:-40}" "$ROOT/${2:?need TAG}/log" 2>/dev/null ;;
+wait)
+	TAG=${2:?need TAG}
+	SECS=${3:-60}
+	jd="$ROOT/$TAG"
+	i=0
+	while [ "$i" -lt "$SECS" ]; do
+		is_running "$jd" || break
+		sleep 3
+		i=$((i + 3))
+	done
+	if is_running "$jd"; then echo "$TAG STILL_RUNNING"; else echo "$TAG DONE rc=$(cat "$jd/rc" 2>/dev/null)"; fi
+	tail -n 30 "$jd/log" 2>/dev/null
+	;;
+list)
+	ls -1t "$ROOT" 2>/dev/null
+	;;
+*)
+	echo "usage: bmcjob run <TAG> '<cmd>' | status [TAG] | log TAG [N] | wait TAG [SECS] | list" >&2
+	exit 1
+	;;
+esac
