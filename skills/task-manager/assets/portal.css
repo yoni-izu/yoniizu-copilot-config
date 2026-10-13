@@ -145,18 +145,22 @@
   .pldm-act .cancel { background:transparent; color:var(--muted); }
 
   /* micro — inline with a table row or a card header */
-  .ci-btn, .pldm-btn, .vm-log {
+  .ci-btn, .pldm-btn, .vm-log, .vm-trf {
     display:inline-flex; align-items:center; gap:5px; padding:var(--ctl-pad-sm);
     border:1px solid var(--border); border-radius:var(--r-sm); background:var(--bg);
     color:var(--text); font:inherit; font-size:10.5px; font-weight:700;
     line-height:1.3; white-space:nowrap; cursor:pointer;
     transition:background .12s, border-color .12s, color .12s;
   }
-  .ci-btn:hover:not(:disabled), .pldm-btn:hover:not(:disabled), .vm-log:hover:not(:disabled) {
+  .ci-btn:hover:not(:disabled), .pldm-btn:hover:not(:disabled),
+  .vm-log:hover:not(:disabled), .vm-trf:hover:not(:disabled) {
     border-color:var(--accent); color:var(--accent); background:var(--accent-soft);
   }
-  .ci-btn:disabled, .pldm-btn:disabled, .vm-log:disabled { opacity:.5; cursor:not-allowed; }
+  .ci-btn:disabled, .pldm-btn:disabled, .vm-log:disabled, .vm-trf:disabled {
+    opacity:.5; cursor:not-allowed;
+  }
   .vm-log.live { color:var(--info); border-color:rgba(17,141,255,.45); background:var(--info-soft); }
+  .vm-trf { padding:2px 7px; font-size:12px; }
 
   /* ghost — icon only, no chrome until hovered */
   .pr-x, .prf-untrack, .prf-toggle, .ws-gtoggle, .ws-mini {
@@ -476,6 +480,16 @@
   .vm-pw.start:hover:not(:disabled) { background:var(--ok-soft); border-color:var(--ok); color:var(--ok); }
   .vm-mage { font-size:10.5px; color:var(--muted); margin:-6px 0 14px; }
   .vm-mage.old { color:var(--warn); }
+  .vm-m-act { flex:none; display:flex; align-items:center; gap:6px; }
+  /* Targets with no instance behind them still age and still need probing. */
+  .vm-tstrip { display:flex; flex-wrap:wrap; gap:8px; margin:-4px 0 14px; }
+  .vm-t { display:inline-flex; align-items:center; gap:7px; padding:4px 8px;
+          border:1px solid var(--border); border-radius:var(--r-sm);
+          background:var(--bg); font-size:11px; }
+  .vm-t.bad { border-color:rgba(214,69,80,.4); }
+  .vm-t-age { font-size:10.5px; color:var(--muted); }
+  .vm-t-age.old { color:var(--warn); }
+  .vm-t-err { color:var(--danger); }
   .vm-age { font-size:10px; color:var(--muted); }
   .vm-age.old { color:var(--warn); font-weight:700; }
   .vm-logcell { white-space:normal; }

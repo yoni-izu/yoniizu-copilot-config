@@ -192,8 +192,15 @@ KPI counts, and the full history table.
   list` revalidates SSO, so the old inline version routinely outlived the browser's fetch — the
   section then never re-rendered and the whole tab looked broken while the probe was succeeding
   on the server.
+- **Refresh one machine** with the `↻` on its EC2 card, or on its chip in the bare-metal target
+  strip; the toolbar button follows the target filter and relabels to *Refresh vm*. Same
+  endpoint with `{"target": "<name>"}`. This is the difference between ~4 s and minutes: a
+  fleet refresh waits out the ssh timeout of every dead lab desktop. Each card and chip shows
+  its **own** age, because a scoped refresh must not make the untouched targets look fresh —
+  and `octl vm list` is skipped entirely for a target with no instance behind it.
 - **Check VM status** (`POST /api/vm-machines`) re-reads only `octl vm list`; **Sync logs**
-  (`POST /api/vm-sync`) only rsyncs the remote job logs. Both are narrower than a full refresh.
+  (`POST /api/vm-sync`) only rsyncs the remote job logs, also scoped by the target filter. Both
+  are narrower than a full refresh.
 - The **Log** column opens the mirrored log (`POST /api/vm-log`); for a *running* job it opens a
   **live tail** (`POST /api/vm-tail`) that re-polls every 5 s with **Follow** on. Each poll is
   one `tail -n` over ssh — no websocket, nothing to tear down but a `setInterval`. Neither

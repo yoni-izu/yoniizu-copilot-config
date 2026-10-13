@@ -2684,10 +2684,19 @@ function renderVmlog(){
   const running=VMLOG.running||[];
 
   const sel=document.getElementById("vm-target");
-  const tgts=[...new Set(all.map(j=>j.target))].sort();
+  // Every REGISTERED target, not just the ones with history: picking one is how
+  // you scope the refresh, and a target you have never run anything on is
+  // exactly the one whose reachability you want to test.
+  const tgts=[...new Set([...(VMLOG.targets||[]), ...all.map(j=>j.target)])].sort();
   sel.innerHTML='<option value="">All targets</option>'
     +tgts.map(t=>'<option value="'+esc(t)+'"'+(t===vmTarget?" selected":"")+'>'+esc(t)
       +' ('+all.filter(j=>j.target===t).length+')</option>').join("");
+  const rbtn=document.getElementById("vm-refresh");
+  rbtn.innerHTML=vmTarget?"\u21bb Refresh "+esc(vmTarget):"\u21bb Refresh status";
+  rbtn.title=vmTarget
+    ? "Probe "+vmTarget+" only \u2014 one ssh round trip. Clear the target filter to ask every machine."
+    : "Ask every target for the state of its job dirs, mirror its logs, and re-read the EC2 power "
+      +"state. One ssh round trip per machine plus an octl call. Pick a target above to scope it.";
 
   document.getElementById("vm-asof").innerHTML=
     all.length+" delegated job"+(all.length===1?"":"s")+" \u00b7 "+running.length+" running \u00b7 "
@@ -2736,9 +2745,11 @@ function vmStale(h){ return /\d+\s*h/.test(h||""); }
 function renderVmMachines(){
   const ms=VMLOG.machines||[];
   const box=document.getElementById("vm-machines");
+  const strip=vmTargetStrip();
   if(!ms.length){
     box.innerHTML='<div class="vm-idle">No EC2 instance visible. Hit <b>Check VM status</b> to '
-      +'query <code>octl vm list</code> \u2014 it revalidates SSO, so it takes a moment.</div>';
+      +'query <code>octl vm list</code> \u2014 it revalidates SSO, so it takes a moment.</div>'+strip;
+    vmBindTargetRefresh(box);
     return;
   }
   const stale=vmStale(VMLOG.machines_age_h);
@@ -2746,9 +2757,35 @@ function renderVmMachines(){
     +'<div class="vm-mage'+(stale?" old":"")+'">'
     +(stale?"\u26a0 ":"")+"power state read "+esc(VMLOG.machines_checked||"?")
     +(VMLOG.machines_age_h?" \u00b7 "+esc(VMLOG.machines_age_h)+" ago":"")
-    +(stale?" \u2014 hit <b>Check VM status</b>, this is history":"")+'</div>';
+    +(stale?" \u2014 hit <b>Check VM status</b>, this is history":"")+'</div>'+strip;
   box.querySelectorAll(".vm-pw").forEach(b=>b.addEventListener("click",()=>
     vmPower(b.dataset.action, b.dataset.id, b)));
+  vmBindTargetRefresh(box);
+}
+// Targets with no EC2 instance behind them (lab desktops, NUCs) get no machine
+// card, but they are still probed and still go stale — so they get their own
+// row with the same per-target refresh.
+function vmTargetStrip(){
+  const ts=(VMLOG.target_state||[]).filter(t=>!t.instance);
+  if(!ts.length) return "";
+  return '<div class="vm-tstrip">'+ts.map(t=>
+    '<span class="vm-t'+(t.error?" bad":"")+'" title="'+esc(t.error||"reachable")+'">'
+    +'<b>'+esc(t.name)+'</b>'
+    +'<span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
+    +(t.checked?esc(t.age_h)+" ago":"never")+'</span>'
+    +(t.error?'<span class="vm-t-err">\u26a0</span>':"")
+    +vmTargetBtn(t.name)+'</span>').join("")+'</div>';
+}
+// One ↻ per target. Scoping matters because an unreachable host costs a 90 s
+// ssh timeout, so "just the VM" returns in seconds where the fleet takes minutes.
+function vmTargetBtn(name){
+  return '<button class="vm-trf" data-target="'+esc(name)+'"'
+    +' title="Probe '+esc(name)+' only \u2014 one ssh round trip, no octl, no other target">'
+    +'\u21bb</button>';
+}
+function vmBindTargetRefresh(box){
+  box.querySelectorAll(".vm-trf").forEach(b=>b.addEventListener("click",()=>
+    refreshVmlog(b.dataset.target)));
 }
 function vmMachine(m){
   const on=m.state==="running", busy=["pending","stopping","shutting-down"].includes(m.state);
@@ -2756,6 +2793,13 @@ function vmMachine(m){
   const lease=m.lease_left_h
     ? '<span class="vm-lease'+(m.lease_left<=0?" bad":"")+'">lease '+esc(m.lease_left_h)
       +(m.lease_left>0?" left":"")+'</span>' : "";
+  const t=(VMLOG.target_state||[]).find(x=>x.name===m.target);
+  const probe=t
+    ? '<div class="vm-m-sub"><span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
+      +(t.checked?"jobs probed "+esc(t.age_h)+" ago":"jobs never probed")+'</span>'
+      +(t.running?' \u00b7 <b>'+t.running+' running</b>':"")
+      +(t.error?' \u00b7 <span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':"")+'</div>'
+    : "";
   return '<div class="vm-m"><div class="vm-m-l">'
     +'<h4><span class="vm-dot '+esc(m.state)+'"></span>'+esc(m.name)
     +'<span class="vm-m-st">'+esc(m.state)+'</span></h4>'
@@ -2763,10 +2807,12 @@ function vmMachine(m){
     +(m.target?' \u00b7 target <b>'+esc(m.target)+'</b>':"")
     +(m.desc?' \u00b7 '+esc(m.desc):"")+'</div>'
     +(lease?'<div class="vm-m-sub">'+lease+'</div>':"")
-    +'</div>'
+    +probe
+    +'</div><div class="vm-m-act">'
+    +(m.target?vmTargetBtn(m.target):"")
     +'<button class="vm-pw '+act+'" data-action="'+act+'" data-id="'+esc(m.id)+'"'
     +(busy?" disabled":"")+' title="octl vm '+act+' '+esc(m.id)+'">'
-    +(busy?esc(m.state):(on?"\u25a0 Stop":"\u25b6 Start"))+'</button></div>';
+    +(busy?esc(m.state):(on?"\u25a0 Stop":"\u25b6 Start"))+'</button></div></div>';
 }
 async function vmPower(action,id,btn){
   const note=document.getElementById("vm-refresh-note");
@@ -2889,34 +2935,48 @@ document.getElementById("vm-log-follow").addEventListener("change",e=>{
 // background job and polled through the align banner: an unreachable target
 // costs a 90 s ssh timeout, which used to outlive the browser's patience and
 // leave the section frozen on stale data.
-async function refreshVmlog(){
-  const btn=document.getElementById("vm-refresh"), note=document.getElementById("vm-refresh-note");
+async function refreshVmlog(only){
+  const btn=only?null:document.getElementById("vm-refresh");
+  const note=document.getElementById("vm-refresh-note");
   if(!SERVED){ note.textContent="Serve the portal to refresh"; return; }
-  btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Probing\u2026';
-  note.textContent="asking each target for its job dirs\u2026";
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Probing\u2026'; }
+  document.querySelectorAll(".vm-trf").forEach(b=>{
+    b.disabled=true; if(b.dataset.target===only) b.innerHTML='<span class="spin">\u21bb</span>';
+  });
+  note.textContent=only?("asking "+only+" for its job dirs\u2026")
+                       :"asking each target for its job dirs\u2026";
   try{
-    const r=await fetch("/api/vm-refresh",{method:"POST"});
+    const r=await fetch("/api/vm-refresh",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(only?{target:only}:{})});
     const j=await r.json();
     if(!r.ok||!j.job) throw new Error(j.error||"refresh failed");
-    const done=await pollAlign(j.job,"Probing delegation targets\u2026");
+    const done=await pollAlign(j.job, only?("Probing "+only+"\u2026"):"Probing delegation targets\u2026");
     if(done&&done.result){ VMLOG=done.result; renderVmlog(); buildSections(); }
     note.textContent=(done&&done.message)||"probe finished";
   }catch(e){
     note.textContent="Refresh failed: "+e.message;
   }finally{
-    btn.disabled=false; btn.innerHTML="\u21bb Refresh status";
+    if(btn){ btn.disabled=false; btn.innerHTML="\u21bb Refresh status"; }
+    document.querySelectorAll(".vm-trf").forEach(b=>{ b.disabled=false; b.innerHTML="\u21bb"; });
   }
 }
-document.getElementById("vm-refresh").addEventListener("click",refreshVmlog);
+// The toolbar button honours the target filter: picking a target in the
+// dropdown and hitting Refresh asks only that machine, which is seconds rather
+// than the minutes a fleet probe costs with an unreachable host in it.
+document.getElementById("vm-refresh").addEventListener("click",()=>refreshVmlog(vmTarget||null));
 // Mirror the remote job logs locally so an old one stays openable. The target
 // keeps exactly one log per (workspace, kind) and clobbers it on the next run.
 async function syncVmLogs(){
   const btn=document.getElementById("vm-sync"), note=document.getElementById("vm-refresh-note");
   if(!SERVED){ note.textContent="Serve the portal to sync logs"; return; }
+  const only=vmTarget||null;
   btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Syncing\u2026';
-  note.textContent="rsyncing job logs from every target\u2026";
+  note.textContent="rsyncing job logs from "+(only||"every target")+"\u2026";
   try{
-    const r=await fetch("/api/vm-sync",{method:"POST"});
+    const r=await fetch("/api/vm-sync",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(only?{target:only}:{})});
     const j=await r.json();
     if(!r.ok||(j.error&&!j.jobs)) throw new Error(j.error||"sync failed");
     VMLOG=j; renderVmlog();
