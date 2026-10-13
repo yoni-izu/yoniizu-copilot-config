@@ -3447,7 +3447,7 @@ def start_pr_scan_job() -> str:
 
 
 def run_vm_refresh(job: dict) -> None:
-    """Probe every target, mirror its logs, re-read EC2 — on a worker thread.
+    """Probe target(s), mirror their logs, re-read EC2 — on a worker thread.
 
     This used to be done inline in the request handler. One unreachable target
     costs a 90 s ssh timeout and `octl vm list` revalidates SSO, so the whole
@@ -3456,17 +3456,18 @@ def run_vm_refresh(job: dict) -> None:
     succeeding on the server. Streaming it as a job fixes that AND lets the
     banner show which target is being asked.
     """
+    only = job.get("target") or None
     try:
         names = []
         try:
-            names = vd.targets()
+            names = [only] if only else vd.targets()
         except Exception:                                      # noqa: BLE001
             pass
         with ALIGN_LOCK:
             job["total"] = len(names) + 1
-            job["current"] = "probing targets"
+            job["current"] = f"probing {only}" if only else "probing targets"
         try:
-            res = vd.refresh()
+            res = vd.refresh(only)
         except Exception as e:                                 # noqa: BLE001
             with ALIGN_LOCK:
                 job.update(status="error", finished=NOW, current=None, message=str(e))
@@ -3482,12 +3483,21 @@ def run_vm_refresh(job: dict) -> None:
                     "detail": bad or "job dirs read \u00b7 logs mirrored locally",
                 })
             job["current"] = "octl vm list"
-        try:
-            vd.machines(force=True)
-        except Exception as e:                                 # noqa: BLE001
-            with ALIGN_LOCK:
-                job["repos"].append({"name": "octl vm list", "action": "failed",
-                                     "icon": "\u26a0", "tone": "bad", "detail": str(e)})
+        # Scoped to a bare-metal target there is no instance to ask about, and
+        # `octl vm list` costs an SSO revalidation — skip it.
+        want_ec2 = True
+        if only:
+            try:
+                want_ec2 = vd.has_instance(only)
+            except Exception:                                  # noqa: BLE001
+                want_ec2 = False
+        if want_ec2:
+            try:
+                vd.machines(force=True)
+            except Exception as e:                             # noqa: BLE001
+                with ALIGN_LOCK:
+                    job["repos"].append({"name": "octl vm list", "action": "failed",
+                                         "icon": "\u26a0", "tone": "bad", "detail": str(e)})
         payload = vmlog_payload()
         with ALIGN_LOCK:
             job["current"] = None
@@ -3495,7 +3505,8 @@ def run_vm_refresh(job: dict) -> None:
             job["status"] = "done"
             job["result"] = payload
             live = len(payload.get("running") or [])
-            parts = [f"probed {res.get('probed', 0)} target(s)",
+            scope = f"{only} only" if only else f"{res.get('probed', 0)} target(s)"
+            parts = [f"probed {scope}",
                      f"{payload.get('logs_held', 0)} log(s) held locally"]
             if live:
                 parts.append(f"{live} job(s) running")
@@ -3506,11 +3517,12 @@ def run_vm_refresh(job: dict) -> None:
         VM_REFRESH_LOCK.release()
 
 
-def start_vm_refresh_job() -> str:
+def start_vm_refresh_job(target: str | None = None) -> str:
     """Register + launch a background VM probe; return its id."""
     jid = f"vmrefresh-{int(datetime.now().timestamp() * 1000)}"
     job = {
-        "id": jid, "kind": "vm-refresh", "slot": "VM jobs",
+        "id": jid, "kind": "vm-refresh", "slot": f"VM jobs \u00b7 {target}" if target else "VM jobs",
+        "target": target or "",
         "status": "running", "started": NOW, "finished": None,
         "current": None, "total": 0, "message": "", "repos": [],
     }
@@ -3805,38 +3817,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "job": jid}))
 
-            # The VM delegation probe is one ssh round trip per target plus an
-            # `octl vm list`, so it is dispatched as a background job and polled
-            # through /api/align/<id> like the PR scan. Running it inline made
-            # the browser give up on a slow or unreachable target.
-            if self.path == "/api/vm-refresh":
-                if vd is None:
-                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
-                if not VM_REFRESH_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps({"error": "a VM refresh is already running"}))
-                try:
-                    jid = start_vm_refresh_job()
-                except Exception as e:
-                    VM_REFRESH_LOCK.release()
-                    return self._send(500, json.dumps({"error": str(e)}))
-                return self._send(200, json.dumps({"ok": True, "job": jid}))
-
-            # Mirror every target's job logs locally without probing or asking
-            # octl anything. The remote keeps one log per slot and overwrites it
-            # on the next run, so this is what makes an old log openable at all.
-            if self.path == "/api/vm-sync":
-                if vd is None:
-                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
-                if not VM_REFRESH_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps({"error": "a VM operation is already running"}))
-                try:
-                    result = vd.portal_sync()
-                except Exception as e:
-                    return self._send(500, json.dumps({"error": str(e)}))
-                finally:
-                    VM_REFRESH_LOCK.release()
-                return self._send(200, json.dumps(result, ensure_ascii=False))
-
             # Re-read just the EC2 power state (`octl vm list`), no ssh probe.
             if self.path == "/api/vm-machines":
                 if vd is None:
@@ -3931,6 +3911,48 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(400, json.dumps({"error": f"invalid slot: {slot!r}"}))
                 return self._send(200, json.dumps(
                     {"ok": True, "align_job": start_sync_job(root)}, ensure_ascii=False))
+
+            # The VM delegation probe is one ssh round trip per target plus an
+            # `octl vm list`, so it is dispatched as a background job and polled
+            # through /api/align/<id> like the PR scan. Running it inline made
+            # the browser give up on a slow or unreachable target.
+            #
+            # An optional {"target": "<name>"} scopes it to one machine. That is
+            # not a nicety: an unreachable lab desktop costs a 90 s ssh timeout,
+            # so a fleet refresh is minutes while "just the VM" is seconds.
+            if self.path == "/api/vm-refresh":
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                only = str(payload.get("target") or "") or None
+                if only and not vd.is_target(only):
+                    return self._send(400, json.dumps({"error": f"unknown target: {only}"}))
+                if not VM_REFRESH_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a VM refresh is already running"}))
+                try:
+                    jid = start_vm_refresh_job(only)
+                except Exception as e:
+                    VM_REFRESH_LOCK.release()
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, "job": jid}))
+
+            # Mirror job logs locally without probing or asking octl anything.
+            # The remote keeps one log per slot and overwrites it on the next
+            # run, so this is what makes an old log openable at all.
+            if self.path == "/api/vm-sync":
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                only = str(payload.get("target") or "") or None
+                if not VM_REFRESH_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a VM operation is already running"}))
+                try:
+                    result = vd.portal_sync(only)
+                except Exception as e:
+                    return self._send(500, json.dumps({"error": str(e)}))
+                finally:
+                    VM_REFRESH_LOCK.release()
+                if "jobs" not in result:
+                    return self._send(400, json.dumps(result, ensure_ascii=False))
+                return self._send(200, json.dumps(result, ensure_ascii=False))
 
             # EC2 power control for a delegation target (`octl vm start|stop`).
             if self.path == "/api/vm-power":
