@@ -47,6 +47,16 @@ _Symptom → root cause → fix. Grouped by theme/IP. Add entries as they're con
 _(none yet)_
 
 ### PCIe EP / PHY
+
+- **Precise data-bus fault during a register dump: decode BFAR's offset and access
+  permissions before calling it a hole.** A1 PEP core `+0x10` (BFAR `0xf0440010`)
+  is the implemented write-only `INTR_SEI_INJECT` CSR (`__SW_ACCESS=1`), so a linear
+  hexdump reads an illegal address despite a valid devicetree window. Enumerate
+  reviewed readable offsets and reject unlisted offsets in the owning driver
+  before MMIO; do not probe holes or attempt to continue after hard faults.
+  Check generated array-level attributes when elements lack their own metadata.
+  CSR evidence and an actual-helper/MMIO-spy host test verified the rejection;
+  silicon retest remains required. See PCIe knowledge `diagnostic-csr-read-safety.md`.
 - **"device not appearing" (no `208b` on the bus) ≠ "device did not become operational" (probe timeout) —
   they are different failure *stages* with different owners. Do not lump them.**
   - *Device ABSENT* — log shows **`Detected Simulator device`** then `no PCI device with vendor 208b was
@@ -171,6 +181,33 @@ _(none yet)_
   (`2_18_0_2p0_1240`), the latent bug is still baked in and regressions keep reproducing — weeks later,
   across stations. For the manager, the honest status is "fix identified, pending a rebuilt FC image," and
   the real close-out is a re-run on a newer FC tag, not per-station re-triage.
+
+### PCIe EP — ARM-FW "EP device not ready" / `-ENODEV` spam during boot
+- **Symptom cluster on Palladium + `CONFIG_EL_PCIE_EP` (e.g. 1-die GMEM PLDM):** `el_pcie_ep: EP device
+  not ready` (`-ENODEV`/`-19`) fired by THREE consumers together — `el_vme_runtime_gate: Failed to get
+  PCIe revision ID, assuming VME not available`, `el_pcie_ep: Failed to warm PCIe EP device-info cache:
+  -19`, and `dwc_ep_ras_des: EP device not ready` → `Failed to enable RAS DES`. Fail-soft (all
+  `LOG_WRN`), boot completes, but VME is wrongly gated off + RAS-DES counters + revision cache never set.
+- **Root cause = a `device_is_ready()`-gated public accessor called before the device is ready-marked.**
+  Anchor **IPPCIESW-668**, regressor **`f2a02ed` `[IPPCIESW-443]` (ip.pcie.sw.fw.ep, merged 2026-09-08)**.
+  It rerouted the init-time revision warm from a DIRECT child call
+  `dwc_ep_ctl_get_revision_id(DEV_CFG(dev)->ep_ctl_device,…)` to the gated wrapper
+  `el_pcie_ep_get_dev_info_impl(dev,…)` → `el_pcie_ep_get_ep_ctl_device(dev)` which checks
+  `device_is_ready(dev)` (parent) AND `device_is_ready(ep_ctl)`. It also retargeted the VME gate from the
+  ungated cached `get_revision_id` to the gated `get_dev_info`, and added RAS-DES `dwc_ep_ctl_ec_enable`
+  (gates on ep_ctl readiness) into `el_pcie_ep_post_bring_up_cfg`.
+- **KEY Zephyr fact:** `device_is_ready(self)` is **false during a device's own init fn** (`state->initialized`
+  is set only after init returns). So any gated PUBLIC-API wrapper called from within `*_init` /
+  bring-up / post_bring_up self-`-ENODEV`s every boot. Direct child-device register access
+  (`DEV_CFG(dev)->ep_ctl_device`) is immune — it doesn't consult the readiness flag.
+- **Lesson / always-check:** never call a `device_is_ready`-gated PUBLIC API from inside init or from a
+  runtime gate that runs before the target device is ready. Keep the gate on external entry points only;
+  use direct/internal helpers on the init/bring-up path. "1-die GMEM" here was just the tested image — the
+  VME-gate PCIe path is `CONFIG_EL_PALLADIUM && CONFIG_EL_PCIE_EP` only (ASIC returns true), so it looks
+  image-specific but is generic to Palladium PCIe-EP builds.
+- **Do NOT confuse with the host-side family:** this is ARM-FW `el_pcie_ep` init, NOT the host dmesg
+  "device did not become operational" / MBOX family. Same 1-die GMEM image can carry BOTH (host-side is
+  **IPPSOCSW-1156**, MMU_CACHE_INVALIDATION mailbox timeout, distinct owner/stage — not a dup).
 
 ### PCIe EP — MNG-port SEI drain ("Drain activated due to timeout", SLVERR)
 - **Decode the drained address first — it names the register and pins whether it's a known benign case.** MNG-port drain `addr_h` is tied 0, so the log's low-32 address decodes directly against a1 `project_bases.h` (base low + offset). Confirmed anchors: `0x19da8` = `BOOT_AND_RST_TOP.RST_MISC.RESET_IN_PROCESS` (MNG); `0x53501c` = `MNG_SE_TOP_7_C2C_CFG_SPACE_C2C_CORE_0 + 0x1c` (C2C/scale-up core config-space).
