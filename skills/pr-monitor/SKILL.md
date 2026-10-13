@@ -280,6 +280,11 @@ python3 ~/.copilot/skills/pr-monitor/pm.py refresh -f 4    # just feature 4
 python3 ~/.copilot/skills/pr-monitor/pm.py refresh --no-purge   # keep merged features active
 python3 ~/.copilot/skills/pr-monitor/pm.py purge -n        # what would be retired
 python3 ~/.copilot/skills/pr-monitor/pm.py payload         # JSON for the Team Portal
+
+pm.py add-feature NAME [-d DESC] [-p REF ...]   # log a new feature
+pm.py add-pr 4 <url|owner/repo#123>             # track one more PR on feature 4
+pm.py rm-pr 4 286 [--repo ip.pcie.sw.fw.ep]     # stop tracking one PR
+pm.py drop-feature 4                            # retire a feature from active tracking
 ```
 
 Per PR it runs `gh pr view` (state, mergeable, mergeStateStatus, reviewDecision) plus
@@ -324,6 +329,15 @@ fully-merged features, and the button reports it inline: `probed 30 PRs · retir
 driver Kconfig behind EL_SV (IPINFRASW-2003) (3/3)`. A card that is all-merged but not yet
 scanned is labelled *retires on the next scan*.
 
+Tracking is editable from the browser too. The toolbar's **＋ Track feature** opens a dialog for a
+name, an optional description and a list of PR refs (one per line, URL or `owner/repo#123`); each
+card header carries **＋ PR** to track another PR on that feature and a trailing **✕** to drop the
+whole feature; each PR row reveals a **✕** on hover to untrack that one PR. They POST
+`/api/feature-track`, `/api/pr-track`, `/api/feature-untrack` and `/api/pr-untrack`, which call the
+mutators below and return the refreshed payload. Nothing on GitHub is touched — only this memoir.
+Because a running scan rewrites the file wholesale, these endpoints take the scan lock and answer
+HTTP 409 (*a PR scan is running*) rather than racing it.
+
 Each card also carries a **▶ PLDM test** button that submits the whole feature to the
 [PLDM job queue](../pldm-job-queue/SKILL.md): it reserves a free workspace slot, checks it out
 to the feature's PR branches, refuses if anything is dirty or unpushed, runs
@@ -337,6 +351,27 @@ them after the block's last field if it never carried them. Passing an empty `de
 the existing details line alone. Invalidates the cache so the next `payload()` re-reads the
 memoir. This is the only writer for those fields — `refresh()` deliberately touches PR Status
 cells only.
+
+### Editing what's tracked
+
+Four mutators let the memoir be edited without a model rewriting it — exposed both as CLI
+subcommands and as portal buttons:
+
+| Function | Does | Does **not** |
+|---|---|---|
+| `add_feature(name, description, refs)` | Appends a `## [N]` block with `Logged`, optional `Description`, and an empty PR table; `N = max(id) + 1`. Then `add_pr`s each ref. Returns `(ok, msg, fid)`. | Touch existing blocks |
+| `add_pr(feat_id, ref, …)` | Parses a PR URL or `owner/repo#123`, looks the PR up with `gh` to fill Branch/Title/Status, and inserts the row. Creates the `- **PRs:**` bullet and table header only if they are missing. | Add a duplicate `(owner, repo, number)`, or add a PR `gh` cannot see |
+| `remove_pr(feat_id, number, repo="")` | Deletes that one table row. | Guess when `#N` appears twice — it asks for `--repo` |
+| `drop_feature(feat_id)` | Annotates the heading `— 🚫 DROPPED (<date>, dropped from active tracking)` so it falls out of the active payload. | Delete anything — remove the annotation to bring it back |
+
+Each one rewrites the memoir and then calls `_sync_cache()`, which re-parses the file **and
+carries over every still-tracked PR's probe detail** (check counts, review decision, merge state,
+`last_scan`) from the old cache. Without that step the write would make the memoir newer than the
+cache, `payload()` would fall back to a bare parse, and the portal would silently lose all the
+rich columns until the next scan.
+
+PR titles are run through `_cell()`, which collapses whitespace and maps `|` to `/` — a literal
+pipe would split the markdown row.
 
 ## Parsing PR References
 
@@ -366,6 +401,14 @@ When multiple conditions apply, report the highest-priority status:
 ## Rules
 
 - Always use the memory tool to read/write `/memories/pr-monitor-features.md`.
+- **When hand-editing the memoir, never re-emit the whole body.** Use a targeted
+  `str_replace`/`insert`. Appending a rebuilt copy duplicates every feature, and the
+  portal then renders each one twice. `parse()` now collapses exact `(id, name)`
+  repeats so the corruption is invisible, but the file still has to be repaired.
+- **Re-read the file immediately before allocating an ID.** `max(existing)+1` must be
+  taken over the *whole* current file; two features sharing an `## [N]` makes every
+  `pm.py` write refuse with `feature [N] appears 2 times — renumber one before editing it`,
+  because picking the first block would silently corrupt the wrong feature.
 - **Run `pm.py refresh` before a `status`/`check` pass** — it costs nothing and returns the true state of every PR. Reserve model calls for the interpretation and the follow-up actions.
 - Each feature has a stable running ID in its header (`## [N] <Feature Name>`); assign `max(existing)+1` on `log` and never renumber on `remove`.
 - Never delete a feature entry. Retiring a fully-merged batch is an automatic heading annotation, not a deletion, and `remove` should do the same unless the user explicitly asks for the text to go.

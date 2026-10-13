@@ -8,6 +8,10 @@ Status column back, and exposes a JSON payload for the Team Portal.
 
     pm.py list                 # what is tracked right now
     pm.py refresh [-f ID]      # hit GitHub, update the Status column
+    pm.py add-feature NAME [-d DESC] [-p REF ...]
+    pm.py add-pr ID REF        # REF = PR URL or owner/repo#123
+    pm.py rm-pr ID NUMBER      # stop tracking one PR
+    pm.py drop-feature ID      # retire a feature from active tracking
     pm.py payload              # JSON for the portal
 """
 
@@ -107,7 +111,29 @@ def parse(text: str) -> list[dict]:
         f["notes"].sort(key=lambda n: n["date"], reverse=True)
         f["last_note"] = f["notes"][0] if f["notes"] else None
         f["notes"] = f["notes"][:6]
-    return feats
+    return _dedupe(feats)
+
+
+def _dedupe(feats: list[dict]) -> list[dict]:
+    """Drop blocks that are the same feature written twice.
+
+    A memoir edited by both this script and the memory tool can end up with the
+    whole body appended a second time; without this every duplicated feature
+    renders twice in the portal. Only exact ``(id, name)`` repeats are collapsed
+    — two *different* features that collide on an id are both real, and
+    ``_spans`` refuses to write to either until one is renumbered.
+    """
+    out, seen = [], {}
+    for f in feats:
+        key = (f["id"], f["name"])
+        prev = seen.get(key)
+        if prev is None:
+            seen[key] = f
+            out.append(f)
+        elif len(f["prs"]) + len(f["notes"]) > len(prev["prs"]) + len(prev["notes"]):
+            out[out.index(prev)] = f      # keep whichever copy carries more
+            seen[key] = f
+    return out
 
 
 # --- live refresh via gh (no tokens, no model) -------------------------------
@@ -256,6 +282,11 @@ def refresh(only: int | None = None, workers: int = 8,
     payload = _payload(feats)
     payload["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     payload["scanned"] = len(jobs)
+    # A PR gh could not reach keeps its previous status, so a silent failure
+    # looks exactly like "nothing changed" — count them and say so.
+    payload["failed"] = [{"repo": pr["repo"], "number": pr["number"],
+                          "error": pr["error"]}
+                         for _, pr in jobs if pr.get("error")]
     payload["purged"] = [{"id": f["id"], "name": f["name"], "total": len(f["prs"])}
                          for f in done]
     CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -302,6 +333,35 @@ def _write_back(text: str, feats: list[dict]) -> str:
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
+def _spans(lines: list[str], feat_id: int) -> list[tuple[int, int]]:
+    """Every ``[start, end)`` block carrying ``feat_id`` — normally one."""
+    bounds = [i for i, line in enumerate(lines) if FEAT_RE.match(line)]
+    hits = []
+    for n, i in enumerate(bounds):
+        if int(FEAT_RE.match(lines[i]).group(1)) == feat_id:
+            hits.append((i, bounds[n + 1] if n + 1 < len(bounds) else len(lines)))
+    return hits
+
+
+def _span(lines: list[str], feat_id: int) -> tuple[int, int] | None:
+    """Line range ``[start, end)`` of one feature block in the memoir.
+
+    ``None`` when the id is missing *or* ambiguous: editing the first of two
+    blocks that share an id silently corrupts the wrong feature, so callers
+    report the collision instead.
+    """
+    hits = _spans(lines, feat_id)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _no_span(lines: list[str], feat_id: int) -> str:
+    n = len(_spans(lines, feat_id))
+    if n > 1:
+        return (f"feature [{feat_id}] appears {n} times \u2014 renumber one "
+                "before editing it")
+    return f"feature [{feat_id}] not found"
+
+
 def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
     """Stamp a feature's PLDM Test/Details fields in the memoir.
 
@@ -315,20 +375,10 @@ def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
         return False, f"invalid PLDM state: {state}"
     lines = p.read_text(encoding="utf-8").splitlines()
 
-    start = end = None
-    for i, line in enumerate(lines):
-        m = FEAT_RE.match(line)
-        if not m:
-            continue
-        if start is not None:
-            end = i
-            break
-        if int(m.group(1)) == feat_id:
-            start = i
-    if start is None:
-        return False, f"feature [{feat_id}] not found"
-    if end is None:
-        end = len(lines)
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    start, end = span
 
     want = {"pldm test": f"- **PLDM Test:** {state}"}
     if details:
@@ -349,6 +399,206 @@ def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     _patch_cache_pldm(feat_id, state, details)
     return True, f"[{feat_id}] PLDM Test: {state}"
+
+
+# --- store mutations (track / untrack PRs and features) ----------------------
+
+TABLE_HEAD = ["  | Owner | Repo | PR# | Branch | Title | Status |",
+              "  |-------|------|-----|--------|-------|--------|"]
+PR_REF_RE = re.compile(r"(?:https?://github\.com/)?([\w.-]+)/([\w.-]+?)"
+                       r"(?:/pull/|/|#)(\d+)")
+
+
+def parse_pr_ref(ref: str) -> tuple[str, str, int] | None:
+    """Accept a PR URL, ``owner/repo#123`` or ``owner/repo/123``."""
+    m = PR_REF_RE.search((ref or "").strip())
+    return (m.group(1), m.group(2), int(m.group(3))) if m else None
+
+
+def _cell(s: str) -> str:
+    """Rows are pipe-delimited, so a literal pipe would split the row in two."""
+    return re.sub(r"\s+", " ", (s or "").replace("|", "/")).strip()
+
+
+def _pr_row(owner: str, repo: str, number: int, branch: str, title: str,
+            status: str) -> str:
+    return (f"  | {_cell(owner)} | {_cell(repo)} | {number} | {_cell(branch)} | "
+            f"{_cell(title)} | {_cell(status) or 'pending'} |")
+
+
+def _sync_cache() -> None:
+    """Rebuild the cache from the just-edited memoir, keeping probe detail.
+
+    Writing the memoir makes it newer than the cache, which would make
+    ``payload()`` fall back to a bare parse and drop every probed field until
+    the next scan. Re-derive the features from the memoir and carry over the
+    checks/gate data of every PR that is still tracked.
+    """
+    p = store_path()
+    if p is None or not CACHE.exists():
+        return
+    try:
+        cached = json.loads(CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        CACHE.unlink(missing_ok=True)
+        return
+    probed = {(pr["owner"], pr["repo"], pr["number"]): pr
+              for f in cached.get("features", []) for pr in f.get("prs", [])}
+    feats = parse(p.read_text(encoding="utf-8"))
+    for f in feats:
+        for i, pr in enumerate(f["prs"]):
+            old = probed.get((pr["owner"], pr["repo"], pr["number"]))
+            if old:
+                # The memoir wins, but only where it actually says something.
+                f["prs"][i] = {**old, **{k: v for k, v in pr.items() if v}}
+    out = _payload(feats)
+    out["last_scan"] = cached.get("last_scan")
+    CACHE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def add_pr(feat_id: int, ref: str, branch: str = "", title: str = "",
+           status: str = "pending", lookup: bool = True) -> tuple[bool, str]:
+    """Add one PR row to a feature's table, opening the table if it has none.
+
+    ``ref`` is a PR URL or ``owner/repo#123``. With ``lookup`` the branch, title
+    and merged/closed state come from ``gh``, so the row lands carrying the same
+    detail a scan would have written.
+    """
+    p = store_path()
+    if p is None:
+        return False, "pr-monitor store not found"
+    parsed = parse_pr_ref(ref)
+    if not parsed:
+        return False, f"could not read a PR reference from {ref!r}"
+    owner, repo, number = parsed
+    lines = p.read_text(encoding="utf-8").splitlines()
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    start, end = span
+
+    rows = [i for i in range(start, end) if ROW_RE.match(lines[i])]
+    for i in rows:
+        m = ROW_RE.match(lines[i])
+        if (m.group(2), m.group(3), int(m.group(4))) == (owner, repo, number):
+            return False, f"{repo}#{number} is already on feature [{feat_id}]"
+
+    if lookup:
+        ok, raw = _gh(["pr", "view", str(number), "--repo", f"{owner}/{repo}",
+                       "--json", "headRefName,title,state"])
+        if not ok:
+            return False, f"gh could not see {owner}/{repo}#{number}"
+        try:
+            v = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, f"bad gh json for {owner}/{repo}#{number}"
+        branch = branch or v.get("headRefName") or ""
+        title = title or v.get("title") or ""
+        if (v.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            status = v["state"].lower()
+
+    row = _pr_row(owner, repo, number, branch, title, status)
+    if rows:
+        lines.insert(rows[-1] + 1, row)
+    else:
+        # Empty or absent table: find what is already there and add only the
+        # missing scaffolding. NOTE_RE is checked first because a dated note
+        # also matches FIELD_RE, and the table belongs with the fields.
+        anchor, has_bullet, has_table = start, False, False
+        for i in range(start + 1, end):
+            if NOTE_RE.match(lines[i]):
+                continue
+            fld = FIELD_RE.match(lines[i])
+            if lines[i].strip().startswith("|"):
+                anchor, has_table = i, True
+            elif fld:
+                anchor = i
+                has_bullet |= fld.group(1).strip().lower() == "prs"
+        block = ([] if has_bullet else ["- **PRs:**"]) \
+            + ([] if has_table else TABLE_HEAD) + [row]
+        lines[anchor + 1:anchor + 1] = block
+
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _sync_cache()
+    return True, f"[{feat_id}] + {repo}#{number}"
+
+
+def remove_pr(feat_id: int, number: int, repo: str = "") -> tuple[bool, str]:
+    """Drop one PR row from a feature. Nothing else in the memoir moves."""
+    p = store_path()
+    if p is None:
+        return False, "pr-monitor store not found"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    hits = []
+    for i in range(*span):
+        m = ROW_RE.match(lines[i])
+        if m and int(m.group(4)) == number and (not repo or m.group(3) == repo):
+            hits.append(i)
+    if not hits:
+        return False, f"PR #{number} is not on feature [{feat_id}]"
+    if len(hits) > 1:
+        return False, f"#{number} is ambiguous on [{feat_id}] \u2014 name the repo"
+    gone = ROW_RE.match(lines[hits[0]]).group(3)
+    del lines[hits[0]]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _sync_cache()
+    return True, f"[{feat_id}] \u2212 {gone}#{number}"
+
+
+def add_feature(name: str, description: str = "", refs: list[str] | None = None,
+                lookup: bool = True) -> tuple[bool, str, int | None]:
+    """Open a new feature block at the end of the memoir and fill its table."""
+    p = store_path()
+    if p is None:
+        return False, "pr-monitor store not found", None
+    name = _cell(name)
+    if not name:
+        return False, "a feature name is required", None
+    text = p.read_text(encoding="utf-8")
+    ids = [int(m.group(1)) for m in map(FEAT_RE.match, text.splitlines()) if m]
+    fid = max(ids, default=0) + 1
+    block = [f"## [{fid}] {name}",
+             f"- **Logged:** {datetime.now().strftime('%Y-%m-%d')}"]
+    if description:
+        block.append(f"- **Description:** {_cell(description)}")
+    block += ["- **PRs:**"] + TABLE_HEAD
+    p.write_text(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n",
+                 encoding="utf-8")
+
+    added, bad = 0, []
+    for ref in refs or []:
+        ok, msg = add_pr(fid, ref, lookup=lookup)
+        added += ok
+        if not ok:
+            bad.append(msg)
+    _sync_cache()
+    note = f"[{fid}] {name} \u2014 {added} PR(s)"
+    return True, (note + " \u00b7 " + "; ".join(bad) if bad else note), fid
+
+
+def drop_feature(feat_id: int) -> tuple[bool, str]:
+    """Retire a feature by annotating its heading, the same shape ``purge``
+    writes. Nothing is deleted — ARCHIVED_RE just stops it reaching the payload."""
+    p = store_path()
+    if p is None:
+        return False, "pr-monitor store not found"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    name = FEAT_RE.match(lines[span[0]]).group(2)
+    if ARCHIVED_RE.search(name):
+        return False, f"feature [{feat_id}] is already retired"
+    lines[span[0]] = (f"## [{feat_id}] {name} \u2014 \U0001f6ab DROPPED "
+                      f"({datetime.now().strftime('%Y-%m-%d')}, "
+                      "dropped from active tracking)")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _sync_cache()
+    return True, f"[{feat_id}] {name} \u2014 dropped from tracking"
+
 
 
 def post_ci(owner: str, repo: str, number: int) -> tuple[bool, str]:
@@ -478,7 +728,14 @@ def payload() -> dict:
             return base
         if p.stat().st_mtime <= CACHE.stat().st_mtime + 2:
             return cached
-        base["last_scan"] = cached.get("last_scan")
+        # The memoir was edited behind our back (the memory tool also writes
+        # it). Fold the hand-edit in rather than serving a cache that can never
+        # catch up, and keep the probe detail the bare parse does not have.
+        _sync_cache()
+        try:
+            return json.loads(CACHE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            base["last_scan"] = cached.get("last_scan")
     return base
 
 
@@ -518,11 +775,38 @@ def main(argv: list[str] | None = None) -> int:
                    help="keep fully-merged features in active tracking")
     g = sub.add_parser("purge", help="retire features whose PRs are all merged")
     g.add_argument("-n", "--dry-run", action="store_true")
+    ap_ = sub.add_parser("add-pr", help="track one more PR on a feature")
+    ap_.add_argument("feature", type=int)
+    ap_.add_argument("ref", help="PR URL or owner/repo#123")
+    ap_.add_argument("--no-lookup", action="store_true",
+                     help="don't ask gh for the branch and title")
+    rp = sub.add_parser("rm-pr", help="stop tracking one PR of a feature")
+    rp.add_argument("feature", type=int)
+    rp.add_argument("number", type=int)
+    rp.add_argument("--repo", default="", help="disambiguate a repeated PR number")
+    af = sub.add_parser("add-feature", help="open a new tracked feature")
+    af.add_argument("name")
+    af.add_argument("-d", "--description", default="")
+    af.add_argument("-p", "--pr", action="append", default=[],
+                    help="PR URL or owner/repo#123 (repeatable)")
+    df = sub.add_parser("drop-feature", help="retire a feature from tracking")
+    df.add_argument("feature", type=int)
     sub.add_parser("payload", help="emit the portal JSON")
     a = ap.parse_args(argv)
 
     if a.cmd == "list":
         _print(payload())
+    elif a.cmd in ("add-pr", "rm-pr", "add-feature", "drop-feature"):
+        if a.cmd == "add-pr":
+            ok, msg = add_pr(a.feature, a.ref, lookup=not a.no_lookup)
+        elif a.cmd == "rm-pr":
+            ok, msg = remove_pr(a.feature, a.number, a.repo)
+        elif a.cmd == "drop-feature":
+            ok, msg = drop_feature(a.feature)
+        else:
+            ok, msg, _ = add_feature(a.name, a.description, a.pr)
+        print(f"[pm] {msg}")
+        return 0 if ok else 1
     elif a.cmd == "refresh":
         pl = refresh(a.feature, do_purge=not a.no_purge)
         _print(pl)
