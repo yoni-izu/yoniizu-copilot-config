@@ -1,14 +1,53 @@
 # PCIe6 PHY CPU run/ack — multi-PHY parallel bring-up + timeout state contract
 
-- **Recorded:** 2026-06-30
-- **Status:** Verified from FW driver (`ip.pcie.sw.fw.ep`#254, heads `b06b236`/`84582c1`)
-- **Tags:** phy cpu, cpu_run_req, cpu_run_ack, ppw_ctrl_cpu_ind, phy fw load, multi-phy, parallel bring-up, timeout, etimedout, k_busy_wait, vtable, el_pcie_phy
+- **Recorded:** 2026-06-30 (updated 2026-09-15: **ACK is not latched — poll REQ==0**, RTL-verified)
+- **Status:** Verified from FW driver (`ip.pcie.sw.fw.ep`#254, heads `b06b236`/`84582c1`);
+  ready-poll condition CORRECTED against Iridium (A1) RTL `ppw_misc.v`.
+- **Tags:** phy cpu, cpu_run_req, cpu_run_ack, ppw_ctrl_cpu_ind, phy fw load, multi-phy, parallel bring-up, timeout, etimedout, k_busy_wait, vtable, el_pcie_phy, el_ppw_ctrl, auto-clear, req-goes-low
 
 ## Scope / Question
 How should multi-PHY CPU start be sequenced for shortest aggregate wait, and what is the
-correct register-state contract on `CPU_RUN_ACK` timeout?
+correct register-state contract on ready-poll timeout? **And: what is the correct register
+to poll to see the PHY CPU is running?**
 
-## Findings
+## CORRECTION (2026-09-15) — poll `CPU_RUN_REQ.REQ == 0`, NOT `CPU_IND.CPU_RUN_ACK`
+
+The original driver (and this note's first revision) polled `PPW_CTRL_CPU_IND.CPU_RUN_ACK`
+to become all-ones. **That is wrong / racy.** Net-level proof from Iridium (A1) RTL
+`ip.pcie.rtl@iridium ppw_macro/rtl/ppw_misc.v`:
+
+- `cpu_ind_cpu_run_ack_wr = 1'b1`, `cpu_ind_cpu_run_ack_wr_data = cpu_run_ack` — the CSR
+  `CPU_IND.CPU_RUN_ACK` field is **continuously loaded with the live `cpu_run_ack` net**,
+  i.e. it is **not latched/sticky**. `cpu_run_ack` is a transient acknowledge pulse; once the
+  CPU is steadily running it drops back to 0, so `CPU_IND.CPU_RUN_ACK` reads **0 again**.
+  Polling it for all-ones is a race — you usually miss the pulse and then time out on a CPU
+  that is actually running.
+- `cpu_run_req_req_wr = |cpu_run_ack | <fw_copy_fsm pulse>` and
+  `cpu_run_req_req_wr_data = ... : (cfg_cpu_run_req & ~cpu_run_ack)` — HW **auto-clears the
+  REQ bit** for each macro when its `cpu_run_ack` asserts. This is a stored register value
+  that stays 0 (until SW re-requests). Matches header attr
+  `PPW_CTRL_CPU_RUN_REQ__REQ_HW_ACCESS = 0x2` (REQ field is HW-writable).
+- Broadcast bit: `cpu_run_req_req_broadcast_wr = (cpu_run_ack == all-ones)`, wr_data `1'b0`
+  → `REQ_BROADCAST` auto-clears only when **all** PHYs ack.
+
+**Correct ready condition:** after `cpu_run_set` writes `PPW_CTRL_CPU_RUN_REQ.REQ` (mask
+`0x6`), poll **`(read(PPW_CTRL_CPU_RUN_REQ) & REQ_MSK) == 0`**. REQ going low is the stable
+HW indication that the PHY CPU acknowledged and is running. Fixed in `el_ppw_ctrl.c`
+(`el_ppw_ctrl_fw_ready_poll`) under IPPCIESW-488.
+
+The SE C2C path (`ip.se.sw.fw dmp_ctrl.c`, `DMP_CTRL` block) is **identical** and was fixed
+the same way: `ip.se.rtl@iridium dmp_macro/rtl/dmp_misc.v` has the same
+`cpu_run_req_req_wr_data = cfg_cpu_run_req & ~cpu_run_ack` auto-clear and the same live
+non-latched `cpu_ind_cpu_run_ack_wr_data = cpu_run_ack` mirror. SE additionally sets
+`DMP_CTRL_PHY_CTRL.CPU_RUN_REQ_INT_BYPASS` (release FW directly, no external run-req
+handshake) — but the PHY CPU still emits `cpu_run_ack`, which drives the same REQ auto-clear,
+so the REQ==0 condition holds. SE `REQ_MSK = 0x1` (PHY_NUM_MACROS=1) vs EP `0x6` (2 macros).
+
+Register layout note: `CPU_RUN_REQ` (off `0xc`) holds `REQ_BROADCAST`[0] + `REQ`[2:1];
+`CPU_IND` (off `0x10`, RO to SW) holds `CPU_RUN_ACK`[1:0] + `CPU_SYS_HALT`[3:2]. They are
+**separate registers** — the first revision below conflated them.
+
+## Findings (original 2026-06-30 — ACK-poll parts superseded by the correction above)
 
 ### Register / fields
 - `PPW_CTRL_CPU_IND` is the PHY's CPU-control register on the SNPS PCIe6 PHY.
@@ -66,3 +105,21 @@ abstraction (`el_pcie_phy`) must preserve the split.
   `include/el_pcie_phy.h` (`struct el_pcie_phy_driver_api`),
   `drivers/el_pcie_ep/el_pcie_ep_phy.c` (`el_pcie_ep_do_phy_fw_load`)
   (PR #254 / `IPPCIESW-396`)
+- FW (current, IPPCIESW-488): `drivers/el_ppw_ctrl/el_ppw_ctrl.c`
+  (`el_ppw_ctrl_cpu_run_set`, `el_ppw_ctrl_fw_ready_poll`).
+- SE FW (current): `Elmnt-Internal/ip.se.sw.fw` `drivers/dmp_ctrl/dmp_ctrl.c`
+  (`dmp_ctrl_cpu_run_set`, `dmp_ctrl_fw_ready_poll`) — same REQ==0 fix.
+- RTL (correction proof): `Elmnt-Internal/ip.pcie.rtl@iridium`
+  `ppw_macro/rtl/ppw_misc.v` — `cpu_run_req_req_wr` / `cpu_run_req_req_wr_data`
+  (`cfg_cpu_run_req & ~cpu_run_ack` auto-clear), `cpu_ind_cpu_run_ack_wr`/`_wr_data`
+  (live, non-latched mirror of `cpu_run_ack`); `cpu_run_req_req_broadcast_wr`.
+- SE RTL (correction proof): `Elmnt-Internal/ip.se.rtl@iridium`
+  `dmp_macro/rtl/dmp_misc.v` — same `cfg_cpu_run_req & ~cpu_run_ack` auto-clear and
+  live `cpu_ind_cpu_run_ack_wr_data = cpu_run_ack` mirror; `cfg_cpu_run_req_int_bypass`.
+- Regmap: `ppw_ctrl_regs.h` / `ppw_ctrl_regs_attr.h` (pcie v1 / Iridium):
+  `PPW_CTRL_CPU_RUN_REQ` off `0xc` (`REQ_MSK 0x6`, `REQ_HW_ACCESS 0x2`),
+  `PPW_CTRL_CPU_IND` off `0x10` (`CPU_RUN_ACK_MSK 0x3`, RO to SW).
+- Micro-arch (A1): `ip.pcie.rtl` `ppw_macro/misc/PPW_MACRO_Micro_Architecture.md`
+  §3.9 ("on `cpu_run_ack` assertion: auto-clears the corresponding bit").
+  NOTE: A2 (`..._A2.md` §3.9) drops the whole handshake — `CPU_RUN_REQ`/`CPU_IND`
+  no longer exist in A2 `csr_ppw_ctrl`; this note is A1/Iridium-specific.
