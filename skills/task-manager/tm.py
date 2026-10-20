@@ -3517,6 +3517,30 @@ def run_vm_refresh(job: dict) -> None:
         VM_REFRESH_LOCK.release()
 
 
+# The VM tab is refreshed by hand, so a reading can sit unconfirmed for as long
+# as nobody clicks. That is tolerable for a settled job and wrong for a live
+# one, and it is what let a single failed probe leave "running" rows on screen
+# for days. The watchdog re-probes ONLY targets holding an unconfirmed job, so
+# an idle fleet costs nothing and a watched job stays honest on its own.
+VM_WATCHDOG_EVERY = 60           # seconds between sweeps; vd decides what is due
+
+
+def run_vm_watchdog(stop: _threading.Event) -> None:
+    """Background self-heal loop: re-probe targets with unconfirmed jobs."""
+    while not stop.wait(VM_WATCHDOG_EVERY):
+        if vd is None:
+            continue
+        # Never contend with a user-initiated refresh: skip this tick instead.
+        if not VM_REFRESH_LOCK.acquire(blocking=False):
+            continue
+        try:
+            vd.watchdog()
+        except Exception:                                      # noqa: BLE001
+            pass                 # a sweep that fails must not kill the loop
+        finally:
+            VM_REFRESH_LOCK.release()
+
+
 def start_vm_refresh_job(target: str | None = None) -> str:
     """Register + launch a background VM probe; return its id."""
     jid = f"vmrefresh-{int(datetime.now().timestamp() * 1000)}"
@@ -3893,11 +3917,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 target = str(payload.get("target") or "")
                 tag = str(payload.get("tag") or "")
                 kind = str(payload.get("kind") or "build")
+                # The job id is what binds a log to the run that produced it.
+                # Without it the slot's single log file is served to whichever
+                # job asks, so a re-run of the same workspace shows the previous
+                # run's output.
+                job_id = str(payload.get("id") or "")
                 try:
                     if self.path == "/api/vm-tail":
-                        result = vd.portal_tail(target, tag, kind, payload.get("lines") or 200)
+                        result = vd.portal_tail(target, tag, kind,
+                                                payload.get("lines") or 200, job_id)
                     else:
-                        result = vd.portal_log(target, tag, kind)
+                        result = vd.portal_log(target, tag, kind, job_id)
                 except Exception as e:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
@@ -4171,6 +4201,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     stop = threading.Event()
     worker = threading.Thread(target=httpd.serve_forever, daemon=True)
     worker.start()
+
+    # Keeps VM job statuses honest without a click: see run_vm_watchdog.
+    if vd is not None:
+        threading.Thread(target=run_vm_watchdog, args=(stop,), daemon=True).start()
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     print(f"[tm] serving editable dashboard at http://127.0.0.1:{args.port} (Ctrl-C to stop)")

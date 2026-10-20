@@ -25,7 +25,7 @@ Use the **workspace** regmap, `sim/simulator/simulator_specs/pep_ctrl_regs.h`:
 | `LTSSM_LOGGER_ENTRY_TIMESTAMP` | `0x84` | 32-bit timestamp of selected entry |
 | `LTSSM_LOGGER_ENTRY_DATA` | `0x88` | `LTSSM_STATE` `[5:0]` (msk `0x3f`), `LTSSM_STATE_REASON` `[13:6]` (msk `0x3fc0`, **size 8**) |
 | `LTSSM_LOGGER_STATE_MASK_0 / _1` | `0x8c` / `0x90` | 64 bits total, one per LTSSM state `0x00–0x3F` |
-| `LTSSM_LOGGER_CNT_THR` | `0x94` | count threshold; 0 disables |
+| `LTSSM_LOGGER_CNT_THR` | `0x94` | consecutive-transition suppression threshold; current combined FW API rejects 0 (not a disable encoding) |
 
 Readout is an **indexed viewport**: write the slot to `RD`, then read
 `ENTRY_TIMESTAMP` + `ENTRY_DATA`. That selector is shared mutable HW state — it needs
@@ -74,9 +74,10 @@ So `STATE_MASK_{0,1}` + `CNT_THR` together form a **flap/thrash stop-trigger**: 
 once the link bounces N times in a row within this set of states." Programming a mask expecting
 a filtered log instead yields a full unfiltered log that silently halts early.
 
-This also means the **manageability spec's LTSSM-logger command (0x50) description of the mask
-as a capture filter needs the same correction** — the misunderstanding originates upstream of
-the driver, not in it.
+The replacement **Device Manageability Specification received 2026-10-19 18:10**
+corrects command 0x50 to these suppression semantics (tables 9-58/9-61), including
+default mask 0 and mandatory rejection of threshold 0. The previous capture-filter
+contract finding is superseded.
 
 ### Entry contents
 
@@ -94,32 +95,48 @@ the driver, not in it.
 
 - Kconfig: `DWC_EP_CTL_LTSSM_LOGGER` (default n) and `DWC_EP_CTL_SHELL` (depends on `SHELL`,
   default n), both inside the `if DWC_EP_CTL` block in `drivers/snps_ep_ctl/Kconfig`.
-- Five vtable ops, gated by `IF_ENABLED(CONFIG_DWC_EP_CTL_LTSSM_LOGGER, (...))`:
-  `ltssm_logger_en`, `_reset`, `_get_status`, `_set_config`, `_read_all`.
+- Six vtable ops at EP #442, gated by `IF_ENABLED(CONFIG_DWC_EP_CTL_LTSSM_LOGGER, (...))`:
+  `ltssm_logger_en`, `_reset`, `_get_status`, `_set_config`, `_read_all`, `_read_next`.
 - `drivers/el_pcie_ep/el_pcie_ep.c` adds thin forwarders that resolve the child EP-ctl device.
-- The five ops **deliberately skip** `dwc_ep_ctl_owned_check()`: the logger is passive and its
+- The logger ops **deliberately skip** `dwc_ep_ctl_owned_check()`: the logger is passive and its
   most valuable capture is the one taken *after* a link drop, when the EP is typically still
   host-owned. Note the knock-on: `dwc_ep_ctl_owned_check()` is also the only NULL-`dev` guard,
   so skipping it means the inline syscall wrapper dereferences `api` directly — the ops need
   their own `if (!api)` guard (precedent: `telemetry_read`).
-- `set_config` returns `-EBUSY` while `EN` is set; it writes `STATE_MASK_0/1` + `CNT_THR` and
-  preserves the `RESET` bit. "Running" = `enabled && !(halt_on_full && full)`
+- At EP #442, `set_config` returns `-EBUSY` while running; it writes `STATE_MASK_0/1` + `CNT_THR`,
+  explicitly clears `RESET` in the control value, and clears EN after a halt-on-full stop.
+  "Running" = `enabled && !(halt_on_full && full)`
   (`keep_recent` in FW == `!HALT_ON_FULL_EN` in HW — note the inversion).
 
-### Duplicated transition table (EP vs SE/DM) — already drifted
+### Duplicated transition table (EP vs SE/DM) — current parity
 
 The LTSSM `(prev_state, reason) → next_state` table exists **twice**:
 
 | | file | symbol | rows |
 |---|---|---|---|
 | EP | `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ctl.c` | `g_ltssm_transitions[]` | 88 |
-| SE/DM | `fw/ip/se/drivers/snps_dm_ctl/dwc_dm_ctl.c` | `dm_ltssm_transitions[]` (+ `dwc_dm_ctl_ltssm_map_next_state()`) | 87 |
+| SE/DM | `fw/ip/se/drivers/snps_dm_ctl/dwc_dm_ctl.c` | `dm_ltssm_transitions[]` (+ `dwc_dm_ctl_ltssm_map_next_state()`) | 88 |
 
-They have already diverged in row count and in enum spelling
-(`LTSSM_CFG_LINKWD_ACCEPT`/`LTSSM_POLL_COMPLIANCE` in DM vs `LTSSM_CFG_LINKWD_AC`/`LTSSM_POLL_COMPL`
-in EP). The EP copy also contains a duplicate key — `{LTSSM_DETECT_QUIET, 0x0u, ...}` appears twice,
-making the second row unreachable. This table describes the *protocol*, not either controller, and
-belongs in a shared location.
+At EP #442 `bf8a83bd` and SE #247 `a1abc587` (2026-10-19), the two tables
+have 88 identical ordered rows and unique keys. Prior drift/duplicate-key claims
+must not be carried forward onto these revisions.
+
+### Current management-contract gaps
+
+See [the RAS/manageability contract audit](../../ras-manageability/knowledge/ltssm-logger-contract.md).
+The 2026-10-19 18:10 replacement spec explicitly permits software-only consumption:
+hardware has no read pointer and entries cannot be invalidated (table 9-68).
+Both count-query helpers still fetch a previously consumed entry and may reset the cursor,
+contrary to explicit count-query requirements. SE additionally does this from Start
+and Configure. Filter and zero-threshold definitions now agree with the drivers.
+The revised mapping also requires BUSY for Read next while keep-most-recent is running;
+both driver read_next paths lack that gate. Do not expose these unchanged APIs as fully
+spec-aligned PLDM services.
+
+Rechecked 2026-10-20 at EP #442 `35997898` and SE #247 `487074f0`.
+The incremental changes only remove comments/documentation and relocate status
+declarations; both open behaviors above remain unchanged. See the RAS contract
+entry for current source anchors.
 
 ## Sources
 
@@ -131,5 +148,5 @@ belongs in a shared location.
   `include/dwc_ep_ctl_api.h`, `drivers/el_pcie_ep/el_pcie_ep.c`, `drivers/snps_ep_ctl/Kconfig`
 - FW (duplicate table): `fw/ip/se/drivers/snps_dm_ctl/dwc_dm_ctl.c`
 - Locking precedent: `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ras_des.c`
-- Spec: Device Manageability — LTSSM logger command `0x50` (mask description needs correction)
+- Spec: Device Manageability, replacement received 2026-10-19 18:10 — LTSSM logger command `0x50`, tables 9-58..9-71; current contract linked above
 - Review: `Elmnt-Internal/ip.pcie.sw.fw.ep` PR #346 @ `cfe33b18`, review `5408638551`

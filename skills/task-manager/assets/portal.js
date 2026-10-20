@@ -11,6 +11,16 @@ let PRS = BOOT.prs || {};
 let RAID = BOOT.raid || {};
 let PLDMQ = BOOT.pldmq || {};
 let VMLOG = BOOT.vmlog || {};
+// Offset between this browser's clock and the server's, measured ONCE when a
+// payload arrives. It must never be recomputed per tick: Date.now()-now_ts
+// grows exactly as fast as the clock, so using it live cancels the elapsed
+// time out and freezes the counter.
+let vmSkewSec = (VMLOG && VMLOG.now_ts) ? (Date.now()/1000 - VMLOG.now_ts) : 0;
+function vmAdoptPayload(d){
+  if(d && d.now_ts) vmSkewSec = Date.now()/1000 - d.now_ts;
+  VMLOG = d;
+  return d;
+}
 let SERVED = false;
 const JIRA_BASE = "https://elementlabs.atlassian.net/browse/";
 const STATUS_ORDER = ["in-progress","blocked","todo","backlog","done","cancelled"];
@@ -2042,6 +2052,9 @@ function selectSection(id){
   else if(id==="vm"){ renderVmlog(); }
   else if(id==="raid"){ renderRaid(); }
   else if(id==="overview"){ renderOverview(); }
+  // Leaving the VM section stops its stopwatch and its poll; renderVmlog()
+  // restarts both on the way back in.
+  if(id!=="vm") vmTimersStop();
 }
 
 // ---- refresh: reload entry values in place, keeping filters/tab/sort/columns ----
@@ -2647,8 +2660,29 @@ const VM_STATUS_TITLE={
   died:"the process vanished without writing a completion marker",
   superseded:"a newer run overwrote this log on the target",
   gone:"no log left on the target (cleaned, or it never started)",
-  unknown:"never refreshed \u2014 hit Refresh status",
+  unknown:"not confirmed by the target \u2014 never probed, or the last reading "
+         +"aged out. Hit Refresh status",
 };
+// A status is only true as of the moment the target confirmed it. Anything the
+// server marked `stale` has not been reconfirmed since, so it is shown as a
+// READING WITH AN AGE, never as current fact -- an unreachable target used to
+// leave day-old "running" rows looking live.
+function vmVerified(j){
+  if(!j.checked) return '<span class="vm-unver">never verified</span>';
+  const txt=(j.verified_age_h||"")+" ago";
+  return j.stale
+    ? '<span class="vm-unver">\u26a0 unverified '+esc(txt)+'</span>'
+    : '<span class="vm-ver">verified '+esc(txt)+'</span>';
+}
+function vmStaleTitle(j){
+  if(!j.stale) return "";
+  const was=j.demoted_from
+    ? "last seen "+j.demoted_from+", but nothing has confirmed that since "
+      +(j.checked||"?")+" \u2014 it has most likely finished or died while the "
+      +"target was unreachable"
+    : "not reconfirmed since "+(j.checked||"?");
+  return was+(j.note?" \u2014 "+j.note:"");
+}
 let vmTarget="";
 function vmJobs(){
   let js=(VMLOG.jobs||[]).slice();
@@ -2660,9 +2694,23 @@ function vmJobs(){
   }
   return js;
 }
+// The elapsed figure on a live card ticks in the browser, so it must be anchored
+// to an ABSOLUTE start and corrected for any clock skew against the server --
+// and it may only tick while the server still reports the job as confirmed
+// running. vmLivePoll() below is what guarantees the second half.
+function vmSkew(){
+  return vmSkewSec;
+}
+function vmElapsedText(secs){
+  const s=Math.max(0, Math.floor(secs));
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60;
+  return h ? h+"h "+String(m).padStart(2,"0")+"m "+String(ss).padStart(2,"0")+"s"
+           : (m ? m+"m "+String(ss).padStart(2,"0")+"s" : ss+"s");
+}
 function vmLiveCard(j){
-  const mins=Math.floor((j.duration||0)/60), secs=(j.duration||0)%60;
-  const el=mins?mins+"m "+String(secs).padStart(2,"0")+"s":secs+"s";
+  const el=j.started_ts
+    ? vmElapsedText(Date.now()/1000 - vmSkew() - j.started_ts)
+    : vmElapsedText(j.duration||0);
   return '<div class="vm-live"><div class="vm-live-l">'
     +'<div class="vm-live-t"><span class="spin">\u21bb</span> Running now \u00b7 '+esc(j.target)
     +' \u00b7 '+esc(j.kind)+'</div>'
@@ -2674,10 +2722,11 @@ function vmLiveCard(j){
     +(j.errors?' \u00b7 <b style="color:'+PBI.red+'">'+j.errors+' error line(s)</b>':"")+'</div>'
     +(j.last_line?'<span class="vm-tail">'+esc(j.last_line)+'</span>':"")
     +'<button class="vm-log live" data-target="'+esc(j.target)+'" data-tag="'+esc(j.tag)+'"'
-    +' data-kind="'+esc(j.kind)+'" data-live="1"'
+    +' data-kind="'+esc(j.kind)+'" data-live="1" data-id="'+esc(j.id)+'"'
     +' title="Open a live tail of this job\u2019s log over ssh">'
     +'<span class="spin">\u21bb</span> Tail the live log</button>'
-    +'</div><div class="vm-live-r"><b>'+esc(el)+'</b>elapsed</div></div>';
+    +'</div><div class="vm-live-r"><b class="vm-el" data-start="'+(j.started_ts||0)+'">'
+    +esc(el)+'</b>elapsed</div></div>';
 }
 function renderVmlog(){
   const all=VMLOG.jobs||[], counts=VMLOG.counts||{}, n=s=>counts[s]||0;
@@ -2698,13 +2747,25 @@ function renderVmlog(){
     : "Ask every target for the state of its job dirs, mirror its logs, and re-read the EC2 power "
       +"state. One ssh round trip per machine plus an octl call. Pick a target above to scope it.";
 
+  // "probed" must mean VERIFIED. When a probe is attempted but every target
+  // refuses, the view is NOT fresh -- saying so is the whole fix: the portal
+  // used to report a failed sweep as a successful one and present untouched
+  // day-old verdicts as current.
+  const stale=VMLOG.stale_n||0, unreach=VMLOG.unreachable||[];
+  const attemptLate=VMLOG.last_attempt&&VMLOG.last_attempt>VMLOG.last_refresh;
   document.getElementById("vm-asof").innerHTML=
     all.length+" delegated job"+(all.length===1?"":"s")+" \u00b7 "+running.length+" running \u00b7 "
     +(VMLOG.last_refresh
-      ? "probed <b>"+esc(VMLOG.last_refresh)+"</b>"
+      ? "verified <b>"+esc(VMLOG.last_refresh)+"</b>"
         +(VMLOG.refresh_age_h?' <span class="vm-age'+(vmStale(VMLOG.refresh_age_h)?" old":"")
           +'">'+esc(VMLOG.refresh_age_h)+" ago</span>":"")
-      : "<b>never probed</b>")
+      : "<b>never verified</b>")
+    +(attemptLate?' \u00b7 <span class="vm-unver">last probe attempt '+esc(VMLOG.attempt_age_h||"")
+      +" ago got no answer</span>":"")
+    +(stale?' \u00b7 <span class="vm-unver">\u26a0 '+stale+" unverified reading"
+      +(stale===1?"":"s")+'</span>':"")
+    +(unreach.length?' \u00b7 <span class="vm-unver">unreachable: '+esc(unreach.join(", "))
+      +'</span>':"")
     +" \u00b7 "+(VMLOG.logs_held||0)+" log(s) held locally"
     +(VMLOG.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(VMLOG.error)+'</span>':"");
 
@@ -2732,11 +2793,73 @@ function renderVmlog(){
     : '<tr><td colspan="8"><div class="empty">No delegated jobs recorded yet. '
       +'Every <code>mctl build</code> / <code>mctl test</code> lands here.</div></td></tr>';
   vmBindLogs();
+  vmTimersSync();
 }
+// --- live elapsed -------------------------------------------------------
+// Two timers, with different jobs:
+//   vmTickTimer  repaints the elapsed figure every second (pure arithmetic,
+//                no network) so the card reads like a stopwatch;
+//   vmLiveTimer  re-reads /api/vm-jobs so the ticking STOPS when the job does.
+// The second one is not optional. A counter that keeps climbing is a strong
+// claim that the job is alive, and /api/vm-jobs is a local file read -- it
+// never probes a target -- so polling it while something runs costs nothing.
+let vmTickTimer=null, vmLiveTimer=null;
+const VM_LIVE_POLL_MS=15000;
+
+function vmTick(){
+  const els=document.querySelectorAll(".vm-el[data-start]");
+  if(!els.length){ vmTimersStop(); return; }
+  const skew=vmSkew(), now=Date.now()/1000;
+  els.forEach(e=>{
+    const t0=parseFloat(e.dataset.start||"0");
+    if(t0>0) e.textContent=vmElapsedText(now-skew-t0);
+  });
+}
+function vmTimersStop(){
+  if(vmTickTimer){ clearInterval(vmTickTimer); vmTickTimer=null; }
+  if(vmLiveTimer){ clearInterval(vmLiveTimer); vmLiveTimer=null; }
+}
+// Cheap change detector, so a poll that learned nothing does not blow away the
+// section (and with it any selection the user is holding).
+function vmSignature(d){
+  return (d&&d.jobs?d.jobs:[]).map(j=>j.id+":"+j.status+":"+j.checked+":"+j.lines
+    +":"+j.stale).join("|")+"#"+((d&&d.last_refresh)||"");
+}
+async function vmLivePoll(){
+  if(!SERVED||activeSection!=="vm"){ return; }
+  try{
+    const r=await fetch("/api/vm-jobs",{cache:"no-store"});
+    if(!r.ok) return;
+    const j=await r.json();
+    const changed=vmSignature(j)!==vmSignature(VMLOG);
+    vmAdoptPayload(j);
+    if(changed){ renderVmlog(); buildSections(); }
+    else if(!(VMLOG.running||[]).length) vmTimersStop();
+  }catch(e){ /* a failed poll must not kill the view; the next tick retries */ }
+}
+// Started only when the server says something is CONFIRMED running -- the
+// payload's `running` already excludes readings that have gone unverified.
+function vmTimersSync(){
+  // Only while the VM section is actually on screen: a stopwatch nobody can see
+  // is just a timer that keeps the laptop awake.
+  const live=(VMLOG.running||[]).length>0&&activeSection==="vm";
+  if(document.hidden){ vmTimersStop(); return; }
+  if(live&&!vmTickTimer) vmTickTimer=setInterval(vmTick,1000);
+  if(live&&!vmLiveTimer) vmLiveTimer=setInterval(vmLivePoll,VM_LIVE_POLL_MS);
+  if(!live) vmTimersStop();
+}
+// A hidden tab need not tick or poll. Coming back recomputes from the absolute
+// start, so the figure is correct immediately rather than resuming where it
+// was paused.
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden){ vmTimersStop(); return; }
+  if(activeSection==="vm"){ vmTick(); vmTimersSync(); vmLivePoll(); }
+});
 // Every "open / tail" control, in the table and on the live cards alike.
 function vmBindLogs(){
   document.querySelectorAll(".vm-log").forEach(b=>b.addEventListener("click",()=>
-    vmLogOpen(b.dataset.target, b.dataset.tag, b.dataset.kind, b.dataset.live==="1")));
+    vmLogOpen(b.dataset.target, b.dataset.tag, b.dataset.kind, b.dataset.live==="1",
+              b.dataset.id||"")));
 }
 // A reading older than an hour is history, not status. Saying so is the whole
 // point: a day-old "stopped" that looked live is why the VM seemed unusable.
@@ -2826,7 +2949,7 @@ async function vmPower(action,id,btn){
       headers:{"Content-Type":"application/json"}, body:JSON.stringify({action,id})});
     const j=await r.json();
     if(!r.ok||(j.error&&!j.machines)) throw new Error(j.error||(action+" failed"));
-    VMLOG=j; renderVmlog(); buildSections();
+    vmAdoptPayload(j); renderVmlog(); buildSections();
     note.textContent=action+" requested \u00b7 state follows in a minute";
   }catch(e){
     note.textContent=action+" failed: "+e.message;
@@ -2838,7 +2961,9 @@ function vmRow(j){
   const rc=(j.rc===null||j.rc===undefined)?"":" rc="+j.rc;
   const tail=j.last_line&&j.status!=="running"
     ? '<span class="vm-tail" title="'+esc(j.last_line)+'">'+esc(j.last_line)+'</span>':"";
-  return '<tr class="task'+(j.status==="running"?" on":"")+'">'
+  const title=(VM_STATUS_TITLE[j.status]||"")+(j.note?" \u2014 "+j.note:"")
+    +(j.stale?" \u2014 "+vmStaleTitle(j):"");
+  return '<tr class="task'+(j.status==="running"?" on":"")+(j.stale?" vm-stale":"")+'">'
     +'<td title="'+esc(j.dest||"")+'">'+esc(j.target)+'</td>'
     +'<td>'+esc(j.kind)+'</td>'
     +'<td class="vm-ws"><b>'+esc(j.ws_label||j.tag)+'</b>'
@@ -2847,26 +2972,47 @@ function vmRow(j){
       :'<span class="muted" title="This job predates the dispatch log, so the command was '
        +'never recorded. Jobs delegated from now on carry it.">not recorded</span>')+'</td>'
     +'<td>'+esc(j.started||"\u2014")+'</td>'
-    +'<td>'+esc(j.duration_h||"\u2014")+'</td>'
-    +'<td title="'+esc((VM_STATUS_TITLE[j.status]||"")+(j.note?" \u2014 "+j.note:""))+'">'
-      +'<span class="vm-st '+esc(j.status)+'" style="--sk:'+c+'">'+esc(j.status)+esc(rc)+'</span>'+tail+'</td>'
+    // A confirmed-running row ticks with the live card, so the two cannot
+    // disagree; anything else shows its settled (or last-verified) duration.
+    +'<td>'+((j.status==="running"&&!j.stale&&j.started_ts)
+      ? '<span class="vm-el" data-start="'+j.started_ts+'">'
+        +esc(vmElapsedText(Date.now()/1000-vmSkew()-j.started_ts))+'</span>'
+      : esc(j.duration_h||"\u2014"))+'</td>'
+    +'<td title="'+esc(title)+'">'
+      +'<span class="vm-st '+esc(j.status)+'" style="--sk:'+c+'">'+esc(j.status)+esc(rc)+'</span>'
+      +'<span class="vm-verline">'+vmVerified(j)+'</span>'+tail+'</td>'
     +'<td class="vm-logcell">'+vmLogLink(j)+'</td></tr>';
 }
-// The Log cell. A running job gets a live tail, a settled one the stored copy.
-// Either way the click opens the same panel; only the polling differs.
+// The Log cell. The remote keeps ONE log per (workspace, kind), so "a log
+// exists" never implies "this run's log exists": `has_log` is now server-side
+// provenance (the stored copy's pid matches this dispatch). A job that still
+// owns its slot is tailed live; an older run can only be opened if its output
+// was mirrored before a successor overwrote it.
 function vmLogLink(j){
-  const live=j.status==="running";
+  const live=j.status==="running"&&j.owns_slot!==false;
+  // Openable when this run's output is still reachable: mirrored here with
+  // matching provenance, or still the slot's current log on the target.
+  const canOpen=j.has_log||j.owns_slot!==false;
   const meta=(j.lines?j.lines+" ln":"")
     +(j.errors?' <b style="color:'+PBI.red+'">'+j.errors+'\u2715</b>':"");
-  if(!live&&!j.has_log){
-    return '<span class="muted" title="No local copy held. Hit Sync logs \u2014 the target '
-      +'keeps only the newest log per workspace and overwrites it on the next run.">'
-      +(meta||"\u2014")+'</span>';
+  if(!live&&!canOpen){
+    const lost=j.owns_slot===false
+      ? "A later run in the same workspace overwrote "+j.kind+".log on the target, and "
+        +"this run's output was never mirrored here"
+        +(j.log_pid?" (the stored copy belongs to pid "+j.log_pid+")":"")+"."
+      : "No copy of this run held. Hit Sync logs \u2014 the target keeps only the newest "
+        +"log per workspace and overwrites it on the next run.";
+    return '<span class="muted" title="'+esc(lost)+'">'+(meta||"\u2014")+'</span>';
   }
+  // Not yet probed but still the slot's owner: the remote log IS this run's.
+  const what=live?"Tail this log live over ssh"
+    :(j.has_log?"Open this run\u2019s stored log ("+Math.round((j.log_bytes||0)/1024)+" KB"
+        +(j.log_at?", mirrored "+j.log_at:"")+")"
+      :"Read this run\u2019s log from the target \u2014 nothing is mirrored here yet");
   return '<button class="vm-log'+(live?" live":"")+'" data-target="'+esc(j.target)+'"'
     +' data-tag="'+esc(j.tag)+'" data-kind="'+esc(j.kind)+'" data-live="'+(live?1:0)+'"'
-    +' title="'+(live?"Tail this log live over ssh":"Open the stored log ("
-      +Math.round((j.log_bytes||0)/1024)+" KB)")+'">'
+    +' data-id="'+esc(j.id)+'"'
+    +' title="'+esc(what)+'">'
     +(live?'<span class="spin">\u21bb</span> tail':'\u2317 open')+'</button>'
     +(meta?'<span class="vm-logmeta">'+meta+'</span>':"");
 }
@@ -2881,9 +3027,9 @@ function vmLogClose(){
   vmLogStop(); vmLogCur=null;
   document.getElementById("vm-logpane").style.display="none";
 }
-async function vmLogOpen(target,tag,kind,live){
+async function vmLogOpen(target,tag,kind,live,id){
   vmLogStop();
-  vmLogCur={target,tag,kind,live};
+  vmLogCur={target,tag,kind,live,id:id||""};
   const pane=document.getElementById("vm-logpane");
   const follow=document.getElementById("vm-log-follow");
   pane.style.display="block";
@@ -2898,14 +3044,14 @@ async function vmLogOpen(target,tag,kind,live){
 }
 async function vmLogPoll(){
   if(!vmLogCur) return;
-  const {target,tag,kind,live}=vmLogCur;
+  const {target,tag,kind,live,id}=vmLogCur;
   const body=document.getElementById("vm-log-body");
   const sub=document.getElementById("vm-log-sub");
   if(!SERVED){ sub.textContent="Serve the portal to read logs"; return; }
   try{
     const r=await fetch(live?"/api/vm-tail":"/api/vm-log",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({target,tag,kind,lines:400})});
+      body:JSON.stringify({target,tag,kind,id:id||"",lines:400})});
     const j=await r.json();
     if(!r.ok||j.error) throw new Error(j.error||"could not read the log");
     // Only repaint when the text actually moved, so selecting a line inside a
@@ -2916,10 +3062,12 @@ async function vmLogPoll(){
       if(atEnd||live) body.scrollTop=body.scrollHeight;
     }
     sub.textContent=live
-      ? "live \u00b7 "+esc(j.source||"")+" \u00b7 updated "+esc(j.at||"")
+      ? "live \u00b7 "+(j.source||"")+" \u00b7 updated "+(j.at||"")
       : (j.truncated?"last "+Math.round((j.text||"").length/1024)+" KB of ":"")
-        +Math.round((j.bytes||0)/1024)+" KB \u00b7 "+esc(j.source||"")
-        +(j.mtime?" \u00b7 "+esc(j.mtime):"");
+        +Math.round((j.bytes||0)/1024)+" KB \u00b7 "+(j.source||"")
+        +(j.provenance?" \u00b7 "+j.provenance:"")
+        +(j.log_pid?" \u00b7 pid "+j.log_pid:"")
+        +(j.mtime?" \u00b7 "+j.mtime:"");
   }catch(e){
     sub.textContent="failed: "+e.message;
     vmLogStop();
@@ -2952,7 +3100,7 @@ async function refreshVmlog(only){
     const j=await r.json();
     if(!r.ok||!j.job) throw new Error(j.error||"refresh failed");
     const done=await pollAlign(j.job, only?("Probing "+only+"\u2026"):"Probing delegation targets\u2026");
-    if(done&&done.result){ VMLOG=done.result; renderVmlog(); buildSections(); }
+    if(done&&done.result){ vmAdoptPayload(done.result); renderVmlog(); buildSections(); }
     note.textContent=(done&&done.message)||"probe finished";
   }catch(e){
     note.textContent="Refresh failed: "+e.message;
@@ -2979,7 +3127,7 @@ async function syncVmLogs(){
       body:JSON.stringify(only?{target:only}:{})});
     const j=await r.json();
     if(!r.ok||(j.error&&!j.jobs)) throw new Error(j.error||"sync failed");
-    VMLOG=j; renderVmlog();
+    vmAdoptPayload(j); renderVmlog();
     note.textContent=(j.logs_held||0)+" log(s) held locally"
       +(j.sync_error?" \u00b7 \u26a0 "+j.sync_error:"");
   }catch(e){
@@ -2999,7 +3147,7 @@ async function checkVms(){
     const r=await fetch("/api/vm-machines",{method:"POST"});
     const j=await r.json();
     if(!r.ok||(j.error&&!j.machines)) throw new Error(j.error||"check failed");
-    VMLOG=j; renderVmlog();
+    vmAdoptPayload(j); renderVmlog();
     const ms=j.machines||[], up=ms.filter(m=>m.state==="running").length;
     note.textContent=ms.length+" instance(s) \u00b7 "+up+" running \u00b7 "+esc(j.machines_checked||"");
   }catch(e){
@@ -3212,7 +3360,7 @@ async function refreshData(){
       // section kept rendering whatever was in the page's boot payload, which
       // is why a finished job never stopped looking "running".
       const rv=await fetch("/api/vm-jobs",{cache:"no-store"});
-      if(rv.ok) VMLOG=await rv.json();
+      if(rv.ok) vmAdoptPayload(await rv.json());
     }
     const fstate=captureFilterState();   // preserve active filter selections
     buildFilters();                       // rebuild options (may include new values)

@@ -44,7 +44,13 @@ argument-hint: 'Ask a question about RAS design, manageability protocol, error h
 | File | Content |
 |------|---------|
 | `RAS Specification.docx` | RAS architecture: error classification, detection, correction, containment, viral/poison, ECC, error logging, crash dump, RAS engine, datapath protection, SoC guidelines, IP-specific RAS (PCIe, NIC, HBM, D2D, MMU, GPU) |
-| `Device Manageability Specification.docx` | Full manageability spec: PLDM/MCTP/SPDM protocols, SPI communication, streaming boot, mailbox protocol, device initialization, flashless mode, power/thermal loop, telemetry attributes, margin tools, FW update, platform manageability, OEM commands |
+| `A1 Manageability Specification.docx` | A1/customer-facing manageability baseline, version 0.6 (September 2026): A1 platform/reset/FW-update flows, PLDM/MCTP over SPI, streaming boot, device initialization, flashless mode, power/thermal, telemetry, and A1-supported OEM commands. Prefer this source for A1/customer contracts. |
+| `Device Manageability Specification.docx` | Broader internal working spec: generic protocol background plus internal/future features, including SPDM, DSP0267 FW update, extended OEM memory/DMA/PCIe commands, diagnostics, and next-project material. Use when the A1 spec does not cover the topic; do not assume these additions are supported by A1. |
+
+The A1 document currently contains unaccepted tracked changes and unresolved review artifacts.
+When extracting it programmatically, use the effective final-markup view (include `w:ins`, exclude
+`w:del`) rather than relying only on `python-docx` paragraph text. See
+`knowledge/a1-manageability-v0p6-document-status.md` for the known caveats and source precedence.
 
 ## Key Domain Knowledge
 
@@ -291,16 +297,19 @@ for t_idx, table in enumerate(doc.tables):
 | Error log structure, crash dump, SRAM/HBM errors | RAS Specification |
 | RAS per-IP (PCIe, NIC, HBM, D2D, MMU, GPU) | RAS Specification |
 | SoC RAS guidelines, data path protection | RAS Specification |
-| PLDM, MCTP, SPDM protocol details | Device Manageability Specification |
-| SPI communication, mailbox, command set | Device Manageability Specification |
-| Streaming boot, flashless mode | Device Manageability Specification |
-| Device initialization, configuration | Device Manageability Specification |
-| Power/thermal loop, throttling, TDP/EDP | Device Manageability Specification |
-| Telemetry attributes, health monitoring | Device Manageability Specification |
+| A1 PLDM/MCTP protocol details | A1 Manageability Specification |
+| Generic protocol background or SPDM | Device Manageability Specification |
+| A1 SPI communication, mailbox, command set | A1 Manageability Specification |
+| A1 streaming boot, flashless mode | A1 Manageability Specification |
+| A1 device initialization, configuration | A1 Manageability Specification |
+| A1 power/thermal loop, throttling, TDP/EDP | A1 Manageability Specification |
+| A1 telemetry attributes, health monitoring | A1 Manageability Specification |
 | FW update (DSP0267) | Device Manageability Specification |
-| Margin tools | Device Manageability Specification |
-| Platform manageability, Module Alert# | Device Manageability Specification |
-| OEM PLDM commands | Device Manageability Specification |
+| A1 platform/reset/FW-update flows | A1 Manageability Specification |
+| A1 margin tools | A1 Manageability Specification |
+| A1 platform manageability, Module Alert# | A1 Manageability Specification |
+| A1-supported OEM PLDM commands | A1 Manageability Specification |
+| Extended/internal/future OEM commands | Device Manageability Specification |
 | FW responsibilities (cross-cutting) | Both documents |
 
 ### Step 3: Extract and Answer

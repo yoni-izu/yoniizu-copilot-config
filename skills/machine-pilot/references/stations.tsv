@@ -4,9 +4,11 @@ dsk61	yoni.izutskiver@sa-dsk61-csr	bench?	bmc-sa-dsk61-csr	?	1x208b@03:00.0; no 
 dsk70	yoni.izutskiver@sa-dsk70-csr	bench?	bmc-sa-dsk70-csr	?	1x208b@03:00.0; SAT-allocated	2026-10-04
 nuc74	yoni.izutskiver@sa-nuc74-csr	nuc	-	/dev/ttyACM0	ttyACM0=MCP1 ttyACM1=MCP2 FTDI=ttyUSB0-9; serves bench TBD	2026-10-04
 srv17	yoni.izutskiver@sa-srv17-csr	tray	bmc-sa-els17-csr	bmc:2200-2207	7/8 after reboot; mixes 208b+1d0f; BDFs change per boot; srv BMC bmc-sa-srv17-csr; SAT-allocated	2026-10-04
-srv26	yoni.izutskiver@sa-srv26-csr	tray	?	bmc:2200-2207	2/8 208b @5e 66	2026-10-04
+srv26	yoni.izutskiver@sa-srv26-csr	tray	bmc-sa-els26-csr	bmc:2200-2207	8/8 64G x8 drv=atl (2026-10-14, was 2/8); 5x1d0f+3x208b; nuc=sa-nuc39-csr	2026-10-14
 srv25	yoni.izutskiver@sa-srv25-csr	tray	bmc-sa-els25-csr	bmc:2200-2207	0/8 at probe; BMC host key changed	2026-10-04
 els35	yoni.izutskiver@sa-srv17-csr	tray	bmc-sa-els35-csr	bmc:2200-2207	bmc-sa-els35-csr=192.168.177.222 hostname els100; BMC pw auth only (sshpass -e); uart 2200-2207 live-only; /usr/bin/bmccli present	2026-10-04
 eab39	?	bench	bmc-sa-eab39-csr	?	S-board BMC; host TBD; BMC host key changed	2026-10-04
 srv15	yoni.izutskiver@sa-srv15-csr	tray	bmc-sa-els15-csr	bmc:2200-2207	8/8 1d0f:7596 64GT/s x8 stable; FLR-soak station; BMC resolves els15 NOT els34	2026-10-11
 dsk14	yoni.izutskiver@sa-dsk14-csr	stand-alone	bmc-sa-eab01-csr	?	1x card @02:00.0; vendor flipped 208b->1d0f:7596 after POR; shares NFS home with srv15	2026-10-11
+srv29	yoni.izutskiver@sa-srv29-csr	tray	bmc-sa-els12-csr	bmc:2200-2207	User-confirmed 2026-10-16: sa-srv29-csr -> bmc-sa-els12-csr, NUC sa-nuc57-csr. Do not infer BMC from server number.	2026-10-15
+srv06	yoni.izutskiver@sa-srv06-csr	tray	bmc-sa-els20-csr	bmc:2200-2207		2026-10-18

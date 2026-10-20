@@ -492,6 +492,13 @@
   .vm-t-err { color:var(--danger); }
   .vm-age { font-size:10px; color:var(--muted); }
   .vm-age.old { color:var(--warn); font-weight:700; }
+  /* Verification age of a status. A verdict nobody has reconfirmed must read as
+     a dated reading, not as current fact. */
+  .vm-ver { font-size:10px; color:var(--muted); }
+  .vm-unver { font-size:10px; color:var(--warn); font-weight:700; }
+  .vm-verline { display:block; margin-top:3px; }
+  tr.vm-stale td { background:color-mix(in srgb, var(--warn) 7%, transparent); }
+  tr.vm-stale .vm-st { opacity:.65; }
   .vm-logcell { white-space:normal; }
   .vm-logmeta { display:block; color:var(--muted); font-weight:400; font-size:10px; margin-top:3px; }
   .vm-live .vm-log { margin-top:8px; }

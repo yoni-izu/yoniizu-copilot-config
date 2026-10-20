@@ -48,6 +48,13 @@ Node `c2c_topo_same_index` (`compatible = "el,c2c-topology"`):
   0→1→2→**3**, bar_size_gb 256→512→1024→**2048**, nlut window shifts up each step.
 
 ## Implementation state (IPSESW-295)
+**Update 2026-10-15:** The implementation status below is historical. The A1
+0.5.152 review checkout now wires `C2C_TOPO_SAME_INDEX` into both preset/name
+tables and selects it from DTS before port bring-up. The old 2048-GiB calculation
+is not a requirement for the revised same-index-only software routing contract:
+see [256-GiB BAR propagation and selector constraints](same-index-256gb-bar-propagation.md).
+Shrinking the BAR alone does not disable address-bit folding.
+
 - **Landed (DTS/binding side, under review):**
   - `ip.se.sw.fw` PR #123 — widens `el,c2c-topology.yaml`: `num-rails` enum += 8,
     `bar-size-gb` enum += 2048, `topology-type` docs += `same_index`.

@@ -24,9 +24,16 @@ fleet refresh waits for every dead lab desktop.
     vd.py list                 history + resolved status
     vd.py targets              per-target freshness, job counts and last error
     vd.py refresh [target]     probe + mirror logs (one target, or all)
+    vd.py watchdog [max_age]   re-probe only targets holding unconfirmed jobs
     vd.py sync    [target]     mirror logs only
     vd.py log|tail <target> <tag> [kind]
     vd.py vms | start <id> | stop <id>
+
+A status is a READING, not a fact. It is only true as of `checked`, the moment
+the target last confirmed it, so a failed probe must never advance that stamp
+and never invent a verdict -- otherwise an unreachable target leaves day-old
+`running` rows rendering as freshly verified. Readings that go unconfirmed decay
+on their own (flagged, then demoted to `unknown`) and the watchdog re-asks.
 """
 
 from __future__ import annotations
@@ -54,7 +61,27 @@ SYNC_TIMEOUT = 180          # rsync of the whole job-log tree
 TAIL_TIMEOUT = 25           # one `tail -n` over ssh; the UI polls on a timer
 LOG_MAX_BYTES = 512 * 1024  # how much of a stored log the portal will render
 
+# A `jobs-probe` that fails at the ssh layer (rc=255: refused / reset / no route)
+# is usually a blip -- a VPN hiccup or a sshd that was busy for a second. One
+# such blip used to poison the whole view until somebody clicked Refresh again,
+# so it is retried. A TIMEOUT is NOT retried: a box that stonewalled for
+# PROBE_TIMEOUT is genuinely down and a second wait only doubles the stall.
+PROBE_RETRIES = 2           # extra attempts after a connection-level failure
+PROBE_BACKOFF = (2.0, 5.0)  # seconds to wait before each retry
+SSH_FAIL_RC = 255           # ssh's own "could not establish the session"
+
+# Staleness. A status is a READING, not a fact: it is only true as of the moment
+# the target confirmed it. Past these ages an unconfirmed `running` stops being
+# presented as live -- first flagged, then demoted -- because the common failure
+# is a job that finished (or died) while the target was unreachable.
+STALE_AFTER = 600           # 10 min unverified -> flag it, drop it from "live"
+RUNNING_TTL = 6 * 3600      # 6 h unverified -> demote `running` to `unknown`
+LIVE_RECHECK = 120          # a job believed RUNNING is reconfirmed this often
+ERROR_BACKOFF = 600         # ... but a target that just failed is left alone
+
 # Terminal = the outcome is final and no further probe can change it.
+# `unknown` is deliberately NOT terminal: a demoted job must stay re-resolvable
+# the moment the target answers again.
 TERMINAL = {"passed", "failed", "died", "superseded", "gone"}
 
 
@@ -80,15 +107,37 @@ def _read_log() -> list[dict]:
 
 def _read_state() -> dict:
     if not JOBSTATE.exists():
-        return {"jobs": {}, "last_refresh": "", "errors": {}}
+        return {"jobs": {}, "last_refresh": "", "last_attempt": "",
+                "errors": {}, "attempted": {}}
     try:
         d = json.loads(JOBSTATE.read_text(encoding="utf-8"))
     except (ValueError, OSError):
-        return {"jobs": {}, "last_refresh": "", "errors": {}}
+        return {"jobs": {}, "last_refresh": "", "last_attempt": "",
+                "errors": {}, "attempted": {}}
     d.setdefault("jobs", {})
     d.setdefault("last_refresh", "")
+    d.setdefault("last_attempt", "")
     d.setdefault("errors", {})
+    d.setdefault("attempted", {})
+    _disown_poisoned_stamps(d)
     return d
+
+
+def _disown_poisoned_stamps(d: dict) -> None:
+    """Drop `checked` stamps that an earlier version wrote on a FAILED probe.
+
+    That version stamped every attempted target as checked, so an unreachable
+    box kept reporting "verified seconds ago" forever. Such a stamp is
+    identifiable: the current writer records an `attempted` time for every
+    target it probes, so a target that is erroring and carries `checked` but no
+    `attempted` was stamped by the old path and its stamp means nothing.
+    """
+    checked = d.get("checked") or {}
+    tried = d.get("attempted") or {}
+    errs = d.get("errors") or {}
+    for name in [n for n in checked if errs.get(n) and n not in tried]:
+        del checked[name]
+    d["checked"] = checked
 
 
 def _write_state(state: dict) -> None:
@@ -182,20 +231,97 @@ def _status_of(state: str, rc) -> str:
 # --------------------------------------------------------------------------
 # probe
 # --------------------------------------------------------------------------
-def probe(target: str) -> tuple[dict, str]:
-    """One ssh round trip. Returns ({(tag,kind): row}, error-or-empty)."""
-    if not MCTL.exists():
-        return {}, "mctl not installed"
+# --------------------------------------------------------------------------
+# ssh agent — every probe is `ssh -o BatchMode=yes`, so it needs a key. A
+# long-lived portal process keeps whatever SSH_AUTH_SOCK it was started with,
+# and that is routinely the WRONG one: a gpg-agent socket that holds no
+# identities. ssh then fails rc=255 with no stdout and no stderr, for every
+# target, forever -- which reads as "the whole fleet is unreachable" and, worse,
+# used to be recorded as a successful check. So the socket is validated, and a
+# working one is looked for before the failure is reported.
+# --------------------------------------------------------------------------
+_AGENT: dict = {"sock": None, "error": "", "at": 0.0}
+AGENT_RECHECK = 300        # re-validate the resolved socket this often
+
+
+def _sock_has_keys(sock: str) -> bool:
+    if not sock or not Path(sock).exists():
+        return False
+    env = dict(os.environ, SSH_AUTH_SOCK=sock)
+    try:
+        p = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True,
+                           timeout=10, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0          # 1 = agent without identities, 2 = no agent
+
+
+def _agent_candidates() -> list[str]:
+    """Plausible agent sockets, most recently touched first."""
+    pats = [Path("/tmp").glob("ssh-*/agent.*"),
+            Path(f"/run/user/{os.getuid()}").glob("keyring/ssh"),
+            Path(f"/run/user/{os.getuid()}").glob("ssh-agent*")]
+    found: list[tuple[float, str]] = []
+    for it in pats:
+        try:
+            for s in it:
+                try:
+                    found.append((s.stat().st_mtime, str(s)))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    found.sort(reverse=True)
+    return [s for _, s in found]
+
+
+def agent_env() -> tuple[dict, str]:
+    """(env for ssh subprocesses, error-or-empty).
+
+    Prefers the inherited SSH_AUTH_SOCK when it actually holds identities;
+    otherwise adopts the newest agent socket that does. The error is returned
+    rather than raised so a probe can still run and report WHY it failed.
+    """
+    now = time.time()
+    if _AGENT["sock"] and now - _AGENT["at"] < AGENT_RECHECK:
+        return dict(os.environ, SSH_AUTH_SOCK=_AGENT["sock"]), _AGENT["error"]
+
+    cur = os.environ.get("SSH_AUTH_SOCK", "")
+    if cur and _sock_has_keys(cur):
+        _AGENT.update(sock=cur, error="", at=now)
+        return dict(os.environ), ""
+    for cand in _agent_candidates():
+        if cand != cur and _sock_has_keys(cand):
+            _AGENT.update(sock=cand, error="", at=now)
+            return dict(os.environ, SSH_AUTH_SOCK=cand), ""
+    err = ("no ssh-agent with identities"
+           + (f" (SSH_AUTH_SOCK={cur} holds none)" if cur else " and SSH_AUTH_SOCK is unset")
+           + " \u2014 run ssh-add, or restart the portal from a shell that has one")
+    _AGENT.update(sock=None, error=err, at=now)
+    return dict(os.environ), err
+
+
+def _probe_once(target: str) -> tuple[dict, str, bool]:
+    """One ssh round trip. Returns (rows, error-or-empty, retryable)."""
+    env, agent_err = agent_env()
     try:
         p = subprocess.run([str(MCTL), "-t", target, "jobs-probe"],
-                           capture_output=True, text=True, timeout=PROBE_TIMEOUT)
+                           capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
-        return {}, f"'{target}' did not answer within {PROBE_TIMEOUT}s"
+        # Not retryable: it already cost PROBE_TIMEOUT seconds.
+        return {}, f"'{target}' did not answer within {PROBE_TIMEOUT}s", False
     except OSError as e:
-        return {}, str(e)
+        return {}, str(e), True
     if p.returncode != 0 and not p.stdout.strip():
         err = (p.stderr or "").strip().splitlines()
-        return {}, (err[-1] if err else f"jobs-probe failed (rc={p.returncode})")
+        msg = err[-1] if err else f"jobs-probe failed (rc={p.returncode})"
+        if p.returncode == SSH_FAIL_RC and agent_err:
+            # ssh -o BatchMode=yes with no usable key fails at rc=255 with NO
+            # diagnostic at all. Naming the real cause is the difference between
+            # a fixable report and a target that silently never answers.
+            msg = f"{msg} \u2014 {agent_err}"
+            return {}, msg, False          # retrying without a key is pointless
+        return {}, msg, p.returncode == SSH_FAIL_RC
 
     rows: dict[tuple[str, str], dict] = {}
     for line in p.stdout.splitlines():
@@ -215,7 +341,25 @@ def probe(target: str) -> tuple[dict, str]:
             "cmd": cmd,
             "last_line": last,
         }
-    return rows, ""
+    return rows, "", False
+
+
+def probe(target: str) -> tuple[dict, str]:
+    """Probe a target, retrying a connection-level failure. ({(tag,kind): row}, err)."""
+    if not MCTL.exists():
+        return {}, "mctl not installed"
+    attempts = PROBE_RETRIES + 1
+    err = ""
+    for i in range(attempts):
+        rows, err, retryable = _probe_once(target)
+        if not err:
+            return rows, ""
+        if not retryable or i == attempts - 1:
+            break
+        time.sleep(PROBE_BACKOFF[min(i, len(PROBE_BACKOFF) - 1)])
+    if err and PROBE_RETRIES:
+        err = f"{err} (after {attempts} attempts)"
+    return {}, err
 
 
 # --------------------------------------------------------------------------
@@ -241,31 +385,113 @@ def local_log(target: str, tag: str, kind: str) -> Path:
     return local_jobdir(target, tag) / f"{kind}.log"
 
 
-def sync_logs(target: str) -> dict:
-    """`mctl -t <target> jobs-sync` — mirror every remote job log locally."""
-    if not _safe_id(target):
-        return {"target": target, "error": "not a target name", "logs": 0}
-    if not MCTL.exists():
-        return {"target": target, "error": "mctl not installed", "logs": 0}
+def local_pid(target: str, tag: str, kind: str) -> Path:
+    return local_jobdir(target, tag) / f"{kind}.pid"
+
+
+# --------------------------------------------------------------------------
+# provenance — a log is addressed by (target, tag, kind) and NOTHING else, so a
+# second run in the same workspace writes the same path and the mirror of run N
+# would be served for run N+1. mctl mirrors `<kind>.pid` next to `<kind>.log`,
+# which is enough to name the run a stored log actually belongs to.
+# --------------------------------------------------------------------------
+def mirror_run(target: str, tag: str, kind: str) -> dict:
+    """Which run produced the STORED copy: {exists, pid, mtime, at}."""
+    log = local_log(target, tag, kind)
+    if not log.exists():
+        return {"exists": False, "pid": None, "mtime": 0.0, "at": ""}
+    pid = None
     try:
-        p = subprocess.run([str(MCTL), "-t", target, "jobs-sync"],
-                           capture_output=True, text=True, timeout=SYNC_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return {"target": target, "error": f"log sync timed out ({SYNC_TIMEOUT}s)", "logs": 0}
-    except OSError as e:
-        return {"target": target, "error": str(e), "logs": 0}
-    root = MCTL_DIR / "jobs" / target
-    n = len(list(root.rglob("*.log"))) if root.is_dir() else 0
-    err = ""
-    if p.returncode != 0:
-        lines = (p.stderr or "").strip().splitlines()
-        err = lines[-1] if lines else f"jobs-sync failed (rc={p.returncode})"
-    return {"target": target, "error": err, "logs": n}
+        raw = local_pid(target, tag, kind).read_text(encoding="utf-8").strip()
+        pid = int(raw) if raw.isdigit() else None
+    except (OSError, ValueError):
+        pid = None
+    mt = log.stat().st_mtime
+    return {"exists": True, "pid": pid, "mtime": mt,
+            "at": datetime.fromtimestamp(mt).strftime("%Y-%m-%dT%H:%M:%S")}
 
 
-def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES) -> dict:
-    """Serve a stored log. Falls back to the live remote copy if none is held."""
+def slot_dispatches(target: str, tag: str, kind: str) -> list[dict]:
+    """Every dispatch that has ever owned this slot, newest first."""
+    rows = [j for j in _read_log()
+            if (j.get("target") or "vm") == target
+            and j.get("tag", "") == tag and j.get("kind", "") == kind]
+    rows.sort(key=lambda r: _epoch(r.get("started", "")), reverse=True)
+    return rows
+
+
+def _job_by_id(job_id: str) -> dict | None:
+    for j in _read_log():
+        if j.get("id") == job_id:
+            return j
+    return None
+
+
+def owns_slot(job: dict) -> bool:
+    """True when this dispatch is the newest for its slot, i.e. the remote log
+    (and any live tail of it) is still ITS output rather than a successor's."""
+    if not job:
+        return False
+    peers = slot_dispatches(job.get("target") or "vm", job.get("tag", ""), job.get("kind", ""))
+    return bool(peers) and peers[0].get("id") == job.get("id")
+
+
+def _mirror_is(job: dict, mirror: dict, next_start: float | None = None) -> bool:
+    """Does the stored copy belong to THIS dispatch?"""
+    if not mirror["exists"]:
+        return False
+    jpid = job.get("pid")
+    if jpid and mirror["pid"]:
+        return int(jpid) == int(mirror["pid"])
+    # No pid to match on (adopted/legacy records): fall back to the time window
+    # between this dispatch and the next one in the same slot.
+    started = _epoch(job.get("started", ""))
+    if not started:
+        return False
+    if next_start is None:
+        peers = slot_dispatches(job.get("target") or "vm", job.get("tag", ""),
+                                job.get("kind", ""))
+        next_start = 0.0
+        for p in peers:                           # peers are newest-first
+            t = _epoch(p.get("started", ""))
+            if t > started and (not next_start or t < next_start):
+                next_start = t
+    return mirror["mtime"] >= started - 60 and (not next_start or mirror["mtime"] < next_start)
+
+
+def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
+             job_id: str = "") -> dict:
+    """Serve a job's log, never a different run's.
+
+    The stored copy is only this job's output when the run that wrote it matches
+    (`<kind>.pid`, or the dispatch window when there is no pid). Otherwise the
+    newest dispatch is served the LIVE remote log, and an older one is told its
+    output is gone rather than being shown a successor's.
+    """
     path = local_log(target, tag, kind)
+    mirror = mirror_run(target, tag, kind)
+    job = _job_by_id(job_id) if job_id else None
+
+    if job:
+        mine = _mirror_is(job, mirror)
+        newest = owns_slot(job)
+        if not mine:
+            text = tail_remote(target, tag, kind, 400) if newest else ""
+            if text:
+                return {"error": "", "path": "", "text": text, "bytes": len(text),
+                        "truncated": True, "source": "remote",
+                        "provenance": "live log for this run (no stored copy yet)",
+                        "job_pid": job.get("pid"), "log_pid": None}
+            lost = (f"this run's log is gone \u2014 a later run in the same workspace "
+                    f"({tag}) overwrote {kind}.log on the target, and the stored copy "
+                    f"here belongs to "
+                    + (f"pid {mirror['pid']}" if mirror["pid"] else "another run")
+                    + f" from {mirror['at']}") if mirror["exists"] else (
+                    f"no copy of {tag}/{kind}.log is held here and the target has none")
+            return {"error": lost, "path": str(path), "text": "", "bytes": 0,
+                    "truncated": False, "source": "none",
+                    "job_pid": job.get("pid"), "log_pid": mirror["pid"]}
+
     if not path.exists():
         text = tail_remote(target, tag, kind, 400)
         if not text:
@@ -283,8 +509,33 @@ def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES) -> di
     return {"error": "", "path": str(path), "source": "local",
             "text": _clean(raw.decode("utf-8", "replace")),
             "bytes": size, "truncated": size > limit,
-            "mtime": datetime.fromtimestamp(path.stat().st_mtime)
-                             .strftime("%Y-%m-%dT%H:%M:%S")}
+            "log_pid": mirror["pid"], "job_pid": (job or {}).get("pid"),
+            "provenance": ("stored copy of this run" if job
+                           else "stored copy of the newest mirrored run"),
+            "mtime": mirror["at"]}
+
+
+def sync_logs(target: str) -> dict:
+    """`mctl -t <target> jobs-sync` — mirror every remote job log locally."""
+    if not _safe_id(target):
+        return {"target": target, "error": "not a target name", "logs": 0}
+    if not MCTL.exists():
+        return {"target": target, "error": "mctl not installed", "logs": 0}
+    try:
+        p = subprocess.run([str(MCTL), "-t", target, "jobs-sync"],
+                           capture_output=True, text=True, timeout=SYNC_TIMEOUT,
+                           env=agent_env()[0])
+    except subprocess.TimeoutExpired:
+        return {"target": target, "error": f"log sync timed out ({SYNC_TIMEOUT}s)", "logs": 0}
+    except OSError as e:
+        return {"target": target, "error": str(e), "logs": 0}
+    root = MCTL_DIR / "jobs" / target
+    n = len(list(root.rglob("*.log"))) if root.is_dir() else 0
+    err = ""
+    if p.returncode != 0:
+        lines = (p.stderr or "").strip().splitlines()
+        err = lines[-1] if lines else f"jobs-sync failed (rc={p.returncode})"
+    return {"target": target, "error": err, "logs": n}
 
 
 def tail_remote(target: str, tag: str, kind: str, lines: int = 200) -> str:
@@ -293,7 +544,8 @@ def tail_remote(target: str, tag: str, kind: str, lines: int = 200) -> str:
         return ""
     try:
         p = subprocess.run([str(MCTL), "-t", target, "jobs-tail", tag, kind, str(lines)],
-                           capture_output=True, text=True, timeout=TAIL_TIMEOUT)
+                           capture_output=True, text=True, timeout=TAIL_TIMEOUT,
+                           env=agent_env()[0])
     except (subprocess.TimeoutExpired, OSError):
         return ""
     return _clean(p.stdout)
@@ -317,15 +569,28 @@ def _clean(text: str) -> str:
     return "".join(out)
 
 
-def tail(target: str, tag: str, kind: str, lines: int = 200) -> dict:
-    """One poll of a running job's log. The UI calls this on a timer."""
+def tail(target: str, tag: str, kind: str, lines: int = 200, job_id: str = "") -> dict:
+    """One poll of a running job's log. The UI calls this on a timer.
+
+    The remote holds one log per slot, so tailing it only shows THIS job while
+    this job is still the newest dispatch for the slot. Once a later run takes
+    the slot over, the tail would silently switch to the successor's output --
+    so it stops instead of lying.
+    """
+    job = _job_by_id(job_id) if job_id else None
+    if job and not owns_slot(job):
+        return {"error": f"a newer run in the same workspace ({tag}) now owns "
+                         f"{kind}.log on {target} \u2014 this job's live tail ended",
+                "text": "", "source": "none", "at": time.strftime("%H:%M:%S"),
+                "superseded": True}
     text = tail_remote(target, tag, kind, lines)
     if text:
         return {"error": "", "text": text, "source": "remote",
                 "at": time.strftime("%H:%M:%S")}
-    held = read_log(target, tag, kind)
+    held = read_log(target, tag, kind, job_id=job_id)
     if held.get("error"):
-        return {"error": f"could not reach '{target}' and hold no local copy",
+        return {"error": held.get("error")
+                         or f"could not reach '{target}' and hold no local copy",
                 "text": "", "source": "none", "at": time.strftime("%H:%M:%S")}
     body = held["text"].splitlines()[-lines:]
     return {"error": "", "text": "\n".join(body), "source": "local-fallback",
@@ -365,6 +630,19 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
             sync_logs(t)          # keep a local copy before the slot is reused
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # Only targets that ACTUALLY answered may be treated as verified. Everything
+    # downstream keys off this set, because the bug this guards against is an
+    # unreachable target leaving month-old verdicts looking freshly confirmed.
+    ok_targets = {t for t in probed if not errors.get(t)}
+
+    # A status entry whose dispatch record has vanished from the job log can
+    # never be re-probed (the loop below walks the log), so it would sit at
+    # whatever it last said -- typically a `running` frozen for days. It also
+    # blocks re-adoption of that exact slot id further down. Drop it.
+    if JOBLOG.exists() and jobs:
+        logged = {j["id"] for j in jobs}
+        for orphan in [k for k in jstate if k not in logged]:
+            del jstate[orphan]
 
     # A probe row describes the CURRENT remote slot, which belongs to the
     # newest dispatch for that (target, tag, kind). Anything older is history.
@@ -378,14 +656,20 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
         tkey = (j.get("target") or "vm", j.get("tag", ""), j.get("kind", ""))
         if tkey[0] not in probed:
             continue                      # target not queried this round
+        if tkey[0] not in ok_targets:
+            # The target did not answer. We learned NOTHING about this job, so
+            # neither its status nor its `checked` stamp may move -- `checked`
+            # is "when the target last confirmed this", and overwriting it here
+            # is what made unverified verdicts render as freshly probed. Record
+            # why instead, and leave the reading exactly as it was.
+            cur["note"] = errors[tkey[0]]
+            cur["unverified_since"] = cur.get("unverified_since") or now
+            continue
         if tkey in seen:                  # a newer dispatch owns the remote slot
             cur.update(status="superseded", checked=now)
+            cur.pop("unverified_since", None)
             continue
         seen.add(tkey)
-        if errors.get(tkey[0]):
-            cur.update(status=cur.get("status") or "running", checked=now,
-                       note=errors[tkey[0]])
-            continue
         row = probed[tkey[0]].get((tkey[1], tkey[2]))
         if row is None:
             cur.update(status="gone", checked=now,
@@ -397,6 +681,7 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
         if row["cmd"] and not j.get("cmd"):
             cur["cmd"] = row["cmd"]
         cur.pop("note", None)
+        cur.pop("unverified_since", None)
         if status == "running":
             cur["finished"] = ""
         elif not cur.get("finished"):
@@ -419,7 +704,7 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
                   for j in jobs if jstate.get(j["id"], {}).get("status") not in TERMINAL}
     rev = _tag_to_ws()
     for t, rows in probed.items():
-        if errors.get(t):
+        if t not in ok_targets:
             continue
         for (tag, kind), row in rows.items():
             key = (t, tag, kind)
@@ -444,7 +729,13 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
                                  "finished": "" if status == "running" else started}
 
     state["jobs"] = jstate
-    state["last_refresh"] = now
+    # `last_refresh` is what the UI ages ("probed 3m ago"), so it may only move
+    # when a target actually answered. An all-failed round is an ATTEMPT, not a
+    # refresh -- recording it as one is precisely how a dead probe used to
+    # present day-old verdicts as current.
+    state["last_attempt"] = now
+    if ok_targets:
+        state["last_refresh"] = now
     # A single-target refresh must not erase what we know about the others, nor
     # claim the whole fleet was just checked. Errors are merged per target and
     # every target carries its own timestamp.
@@ -454,10 +745,14 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
     prev_errors.update(errors)
     state["errors"] = prev_errors
     seen_at = dict(state.get("checked") or {})
-    seen_at.update({t: now for t in probed})
+    seen_at.update({t: now for t in ok_targets})     # verified
     state["checked"] = seen_at
+    tried_at = dict(state.get("attempted") or {})
+    tried_at.update({t: now for t in probed})        # asked, answer or not
+    state["attempted"] = tried_at
     _write_state(state)
-    return {"probed": len(probed), "targets": sorted(probed), "errors": errors}
+    return {"probed": len(probed), "targets": sorted(probed), "errors": errors,
+            "verified": sorted(ok_targets)}
 
 
 # --------------------------------------------------------------------------
@@ -591,23 +886,72 @@ def _ws_label(ws: str, tag: str) -> str:
 
 
 def jobs() -> list[dict]:
-    """Every delegated job, newest first, merged with its resolved status."""
+    """Every delegated job, newest first, merged with its resolved status.
+
+    A stored status is only as good as the moment the target confirmed it, so
+    an unconfirmed ``running`` decays here rather than being asserted forever:
+    flagged ``stale`` past STALE_AFTER, demoted to ``unknown`` past RUNNING_TTL.
+    The decay is DERIVED, never written back -- the stored reading survives, and
+    one successful probe restores the real status immediately.
+    """
     state = _read_state()
     jstate = state["jobs"]
     now = time.time()
+    log_rows = _read_log()
+    # Per slot, the dispatch start times -- so each row can tell whether a later
+    # run has taken the slot (and its log) over, without re-walking the log.
+    slot_starts: dict[tuple[str, str, str], list[float]] = {}
+    for j in log_rows:
+        key = (j.get("target") or "vm", j.get("tag", ""), j.get("kind", ""))
+        slot_starts.setdefault(key, []).append(_epoch(j.get("started", "")))
+    for v in slot_starts.values():
+        v.sort()
+    mirrors: dict[tuple[str, str, str], dict] = {}
     out = []
-    for j in _read_log():
+    for j in log_rows:
         st = jstate.get(j["id"], {})
         status = st.get("status") or "unknown"
+        checked = st.get("checked") or ""
+        t_chk = _epoch(checked)
+        unverified = (now - t_chk) if t_chk else 0.0
+        stale = False
+        demoted = ""
+        if status == "running":
+            if not t_chk or unverified > RUNNING_TTL:
+                # Nobody has confirmed this in RUNNING_TTL. Builds do not run
+                # that long unattended; far likelier it finished or died while
+                # the target was unreachable. Say "unknown", not "running".
+                demoted, status, stale = "running", "unknown", True
+            elif unverified > STALE_AFTER:
+                stale = True
         started = j.get("started", "")
         t0 = _epoch(started)
         fin = st.get("finished") or ""
-        t1 = _epoch(fin) if fin else (now if status == "running" else 0.0)
+        if fin:
+            t1 = _epoch(fin)
+        elif status in ("running", "unknown") and t_chk:
+            t1 = t_chk              # elapsed is only known up to the last check
+        elif status == "running":
+            t1 = now
+        else:
+            t1 = 0.0
         dur = max(0.0, t1 - t0) if t0 and t1 else 0.0
         target = j.get("target") or "vm"
         tag = j.get("tag") or ""
         kind = j.get("kind") or "?"
         held = local_log(target, tag, kind)
+        skey = (target, tag, kind)
+        if skey not in mirrors:
+            mirrors[skey] = mirror_run(target, tag, kind)
+        mirror = mirrors[skey]
+        starts = slot_starts.get(skey) or []
+        later = [s for s in starts if s > t0]
+        owns = not later                       # newest dispatch still owns the slot
+        # The remote (and the mirror) hold ONE log per slot, so "there is a log
+        # file" is not "there is THIS run's log". A second run in the same
+        # workspace overwrites the first, and serving the leftover as the new
+        # job's output is exactly how a fresh job shows a previous run's log.
+        mine = _mirror_is(j, mirror, later[0] if later else 0.0)
         out.append({
             "id": j["id"],
             "target": target,
@@ -619,6 +963,7 @@ def jobs() -> list[dict]:
             "cmd": j.get("cmd") or st.get("cmd") or "",
             "jobdir": j.get("jobdir") or "",
             "started": started,
+            "started_ts": t0,
             "finished": fin,
             "duration": int(dur),
             "duration_h": _human_dur(dur),
@@ -630,11 +975,23 @@ def jobs() -> list[dict]:
             "errors": st.get("errors") or 0,
             "last_line": st.get("last_line") or "",
             "note": st.get("note") or "",
-            "checked": st.get("checked") or "",
+            "checked": checked,
+            # How old the READING is, and whether it is still trustworthy.
+            "verified_age": int(unverified) if t_chk else -1,
+            "verified_age_h": _human_dur(unverified) if t_chk else "",
+            "stale": stale,
+            "demoted_from": demoted,
+            "unverified_since": st.get("unverified_since") or "",
             "adopted": bool(j.get("adopted")),
-            "active": status in ("running", "unknown"),
-            "has_log": held.exists(),
-            "log_bytes": held.stat().st_size if held.exists() else 0,
+            "active": status == "running" and not stale,
+            # has_log now means "a stored copy OF THIS RUN", not "some file
+            # exists at this slot's path".
+            "has_log": mine,
+            "log_is_mine": mine,
+            "owns_slot": owns,
+            "log_pid": mirror["pid"],
+            "log_at": mirror["at"],
+            "log_bytes": held.stat().st_size if (mine and held.exists()) else 0,
         })
     out.sort(key=lambda r: _epoch(r["started"]), reverse=True)
     return out
@@ -645,10 +1002,11 @@ def payload() -> dict:
     try:
         rows = jobs()
     except Exception as e:                                   # noqa: BLE001
-        return {"jobs": [], "running": [], "counts": {}, "targets": [],
-                "target_state": [],
+        return {"jobs": [], "running": [], "stale": [], "stale_n": 0, "counts": {},
+                "targets": [], "target_state": [],
                 "machines": [], "machines_checked": "", "machines_age_h": "",
                 "logs_held": 0, "last_refresh": "", "refresh_age_h": "",
+                "last_attempt": "", "attempt_age_h": "", "unreachable": [],
                 "log": str(JOBLOG), "error": str(e)}
     state = _read_state()
     vms = machines()
@@ -668,25 +1026,42 @@ def payload() -> dict:
     # when IT was last asked -- otherwise a single-target refresh makes the
     # whole fleet look freshly checked.
     seen_at = state.get("checked") or {}
+    tried_at = state.get("attempted") or {}
     machine_of = {m["target"]: m for m in (vms.get("machines") or []) if m.get("target")}
     tgts = []
     for name in targets():
         at = seen_at.get(name) or ""
+        tried = tried_at.get(name) or ""
         m = machine_of.get(name)
         tgts.append({
             "name": name,
             "checked": at,
             "age_h": _human_dur(now - _epoch(at)) if at else "",
+            # When we last ASKED, which differs from `checked` exactly when the
+            # target is failing to answer -- the case that must never look fresh.
+            "attempted": tried,
+            "attempt_age_h": _human_dur(now - _epoch(tried)) if tried else "",
             "error": errs.get(name, ""),
             "jobs": sum(1 for r in rows if r["target"] == name),
             "running": sum(1 for r in rows if r["target"] == name and r["status"] == "running"),
+            "stale": sum(1 for r in rows if r["target"] == name and r["stale"]),
             "instance": (m or {}).get("id", ""),
             "state": (m or {}).get("state", ""),
         })
 
+    attempt = state.get("last_attempt") or ""
+    stale_rows = [r for r in rows if r["stale"]]
     return {
         "jobs": rows,
-        "running": [r for r in rows if r["status"] == "running"],
+        # The browser ticks a running job's elapsed time locally, so it needs an
+        # absolute start AND this clock to correct for any skew against its own.
+        "now_ts": now,
+        # "Running now" must only ever contain CONFIRMED-live jobs. A reading
+        # nobody has reconfirmed is listed separately so it is acted on, not
+        # believed.
+        "running": [r for r in rows if r["status"] == "running" and not r["stale"]],
+        "stale": stale_rows,
+        "stale_n": len(stale_rows),
         "counts": counts,
         "targets": [t["name"] for t in tgts],
         "target_state": tgts,
@@ -698,6 +1073,13 @@ def payload() -> dict:
         "machines_age_h": _human_dur(now - _epoch(checked)) if checked else "",
         "last_refresh": last,
         "refresh_age_h": _human_dur(now - _epoch(last)) if last else "",
+        # Last time a probe was ATTEMPTED. When it trails `last_refresh`, every
+        # target is refusing us and nothing on screen has been reconfirmed.
+        "last_attempt": attempt,
+        "attempt_age_h": _human_dur(now - _epoch(attempt)) if attempt else "",
+        "unreachable": sorted(t["name"] for t in tgts if t["error"]),
+        "stale_after": STALE_AFTER,
+        "running_ttl": RUNNING_TTL,
         "logs_held": len(list(root.rglob("*.log"))) if root.is_dir() else 0,
         "log": str(JOBLOG),
         "error": "; ".join(f"{k}: {v}" for k, v in errs.items()),
@@ -716,6 +1098,58 @@ def has_instance(name: str) -> bool:
     want = ip.read_text(encoding="utf-8").strip()
     cached = machines()
     return any(m.get("ip") == want for m in cached.get("machines") or [])
+
+
+def unverified_targets(max_age: float = STALE_AFTER) -> list[str]:
+    """Targets carrying a job whose status has not been confirmed recently.
+
+    This is the watchdog's work list, and it is tiered on purpose:
+
+      * a job believed RUNNING is the one being watched, so it is reconfirmed
+        every LIVE_RECHECK -- otherwise the live view drifts minutes behind;
+      * any other unresolved job can wait for `max_age`;
+      * a target whose last probe FAILED is left alone for ERROR_BACKOFF, so an
+        unreachable box costs one timeout every ten minutes, not every sweep.
+
+    A target with nothing unresolved is never probed: an ssh per idle machine
+    buys nothing.
+    """
+    state = _read_state()
+    jstate = state["jobs"]
+    errs = state.get("errors") or {}
+    now = time.time()
+    want: set[str] = set()
+    known = set(targets())
+    for j in _read_log():
+        st = jstate.get(j["id"], {})
+        if st.get("status") in TERMINAL:
+            continue
+        t = j.get("target") or "vm"
+        if t not in known:
+            continue
+        need = LIVE_RECHECK if st.get("status") == "running" else max_age
+        if errs.get(t):
+            need = max(need, ERROR_BACKOFF)
+        t_chk = _epoch(st.get("checked") or "")
+        if not t_chk or (now - t_chk) > need:
+            want.add(t)
+    return sorted(want)
+
+
+def watchdog(max_age: float = STALE_AFTER) -> dict:
+    """One self-healing pass: re-probe only targets holding unconfirmed jobs."""
+    due = unverified_targets(max_age)
+    if not due:
+        return {"probed": 0, "targets": [], "errors": {}, "skipped": "nothing unconfirmed"}
+    errors: dict[str, str] = {}
+    done: list[str] = []
+    for t in due:
+        # One target at a time: an unreachable box costs PROBE_TIMEOUT, and a
+        # fleet-wide sweep behind it would stall the healthy ones for minutes.
+        res = refresh(t)
+        errors.update(res.get("errors") or {})
+        done.extend(res.get("targets") or [])
+    return {"probed": len(done), "targets": done, "errors": errors}
 
 
 def portal_refresh(only: str | None = None) -> dict:
@@ -756,17 +1190,19 @@ def portal_power(action: str, instance_id: str) -> dict:
     return out
 
 
-def portal_log(target: str, tag: str, kind: str) -> dict:
-    """Open a stored (or, failing that, live) job log."""
+def portal_log(target: str, tag: str, kind: str, job_id: str = "") -> dict:
+    """Open a job's log — its own, never a later run's in the same workspace."""
     kind = kind or "build"
     if not _safe_id(target) or not _safe_id(tag) or not _safe_id(kind):
         return {"error": "target, tag and kind must be plain identifiers"}
-    out = read_log(target, tag, kind)
+    out = read_log(target, tag, kind, job_id=job_id or "")
     out["target"], out["tag"], out["kind"] = target, tag, kind
+    out["job_id"] = job_id or ""
     return out
 
 
-def portal_tail(target: str, tag: str, kind: str, lines: int = 200) -> dict:
+def portal_tail(target: str, tag: str, kind: str, lines: int = 200,
+                job_id: str = "") -> dict:
     """One poll of a live job log, for the portal's tail panel."""
     kind = kind or "build"
     if not _safe_id(target) or not _safe_id(tag) or not _safe_id(kind):
@@ -775,8 +1211,9 @@ def portal_tail(target: str, tag: str, kind: str, lines: int = 200) -> dict:
         n = max(20, min(int(lines or 200), 2000))
     except (TypeError, ValueError):
         n = 200
-    out = tail(target, tag, kind, n)
+    out = tail(target, tag, kind, n, job_id=job_id or "")
     out["target"], out["tag"], out["kind"] = target, tag, kind
+    out["job_id"] = job_id or ""
     return out
 
 
@@ -813,11 +1250,23 @@ def main(argv: list[str]) -> int:
         for t, e in (res["errors"] or {}).items():
             print(f"[vd] {t}: {e}", file=sys.stderr)
         return 0
+    if cmd == "watchdog":
+        age = float(argv[2]) if len(argv) > 2 else STALE_AFTER
+        res = watchdog(age)
+        if res.get("skipped"):
+            print(f"[vd] watchdog: {res['skipped']}")
+            return 0
+        print(f"[vd] watchdog re-probed {res['probed']} target(s): "
+              f"{', '.join(res['targets']) or '-'}")
+        for t, e in (res["errors"] or {}).items():
+            print(f"[vd] {t}: {e}", file=sys.stderr)
+        return 0
     if cmd == "targets":
         for t in payload()["target_state"]:
             flag = f"\u26a0 {t['error']}" if t["error"] else "ok"
+            seen = f"verified {t['age_h']} ago" if t["checked"] else "never verified"
             print(f"{t['name']:10} {t['state'] or '-':10} jobs={t['jobs']:<3} "
-                  f"running={t['running']:<3} checked {t['age_h'] or 'never':>10} ago  {flag}")
+                  f"running={t['running']:<3} stale={t['stale']:<3} {seen:>22}  {flag}")
         return 0
     if cmd in ("vms", "machines"):
         st = machines(force=True)
@@ -869,8 +1318,9 @@ def main(argv: list[str]) -> int:
             return 0
         for r in rows:
             rc = "" if r["rc"] is None else f" rc={r['rc']}"
+            mark = " \u26a0 unverified " + (r["verified_age_h"] or "ever") if r["stale"] else ""
             print(f"{r['started']:19}  {r['target']:8} {r['kind']:6} "
-                  f"{r['status']:11}{rc:7} {r['duration_h']:>8}  {r['ws_label']}")
+                  f"{r['status']:11}{rc:7} {r['duration_h']:>8}  {r['ws_label']}{mark}")
         return 0
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 2

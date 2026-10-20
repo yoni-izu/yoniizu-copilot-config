@@ -202,3 +202,11 @@ Do NOT overwrite a script while a run is executing it - bash reads scripts incre
 - An octl ws debug --privileged --detached container does NOT survive a station power cycle, and worse, a STALE STOPPED container keeps holding the name - so recreating it fails with a name conflict while docker ps (running only) shows nothing. After any POR: docker ps -a | grep -- -dbg, docker rm <name>, then recreate. Seen 2026-10-11 on dsk14.
 Also: the fw_ctl container does NOT mount the NFS home, so any image or script you want it to read must be staged into /tmp first - reading straight from /users/home/... fails instantly with a -2 (ENOENT) that can masquerade as a flash/verify error.
 Finally, a detached soak launched with setsid nohup survives fine, but redirect its log PER HOST (see Evidence & NFS) or two stations overwrite one file. *(2026-10-11)*
+
+## BMC flashing
+- bmccli flash update -d all returns rc=0 but writes nothing when devices are INIT_FAILED (log: PrepFwUpdate start failed -110 - skipping flash write) -> PLDM handshake to A1 mng fails -> bmccli device reset-hold a1 assert/release -d N until READY, then flash; always check journalctl -u orchestrator + flash version, never rc *(2026-10-18)*
+- flash update -d N queued 8x then flash version/reset-hold -d all did NOT wait for the queue: FPT read mid-flash and reset-hold hit only READY devs -> poll until no UPDATING + no write/verify progress in orchestrator journal, then reset all once *(2026-10-18)*
+- ELS tray: BMC reset-hold of a card with host up -> EP stuck Polling.Compliance, host DSP 2.5GT x0, cfg reads ffffffff (EP DSPs have no pciehp) -> host power cycle (user) to retrain/enumerate; do not read it as FW link failure *(2026-10-18)*
+
+## Host tools
+- fw_ctl/fwloader "not on PATH" / /opt/atl absent on a lab host is NOT a blocker -> they are artifacts of the integration workspace, not host installs -> cd ~/projects/iridium/a1_power_on_branch/ws-integration-ci && octl ws exec run_fw_ctl (pilot exec defaults to that ws). Do not abandon a PCIe path or ask for installs because of this. *(2026-10-18)*
