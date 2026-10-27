@@ -1,7 +1,7 @@
 # PRSTn to PSOC is masked by default (eFuse) in Iridium — bring-up sequence impact
 
 - **Recorded:** 2026-09-08
-- **Status:** Reported by owner (Yoni, HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
+- **Status:** Reported by owner (HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
 - **Tags:** prstn, perst, psoc, fuse, efuse, masked, prst_select_source, boot_and_rst_top, rom bring-up, link training, gpio37, phy fw copy, a1_link_scale_dbg, prstn toggle
 
 ## Scope / Question
@@ -24,7 +24,7 @@ must the toggle be placed?
   source-swap timing govern when that happens.
 
 ## Sources
-- Owner FYI: Yoni Izutskiver (HSI/FW team lead), 2026-09-08 — "PRSTn to PSOC is masked by default
+- Owner FYI: FW team lead note, 2026-09-08 — "PRSTn to PSOC is masked by default
   through a fuse; when the ROM sequence swaps the PRSTn source to PSOC it is essentially masked,
   so mid-way PRSTn toggles are redundant — toggle at the beginning before the source is swapped."
 - Reg: `BOOT_AND_RST_TOP_0.PRST_SELECT_SOURCE` (offset `0xdac`; a1 abs `0x100000000019dac`).

@@ -4,6 +4,11 @@ description: "Schedule and run hardware tests on Palladium (PLDM) EDK machines v
 argument-hint: "What to test on PLDM (a pushed PR branch → remote mode, or local uncommitted changes → local mode) plus image type / group / timeout"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Palladium (PLDM) Job Queue Runner
 
 Schedule hardware tests on Palladium EDK machines through the **PLDM Job Queue**.
@@ -34,7 +39,7 @@ pool of PLDM stations without manually grabbing a station. Use it to validate
 ## Automation — `pjq.py`
 
 `~/.copilot/skills/pldm-job-queue/pjq.py` is the default entry point. It owns the
-tracker at `~/tasks/pldm-jobs.json`, wraps `octl` for dispatch, and does all
+tracker at `~/tasks/pldm.db`, wraps `octl` for dispatch, and does all
 status polling and log triage with plain `gh` calls — so a status refresh costs
 **zero tokens**. Prefer it over driving `octl` and reading Actions logs manually.
 

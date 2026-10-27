@@ -2,7 +2,8 @@
 
 ## Firmware Milestone Retrospective
 
-Use after each milestone closes. Write output to `~/team-planner/retros/<milestone>.md`.
+Use after each milestone closes. Write output to
+`~/.copilot-private/skills/team-planner/retros/<milestone>.md`.
 
 ```
 Milestone <name> Retrospective — <date>
@@ -61,7 +62,8 @@ Milestone <name> Retrospective — <date>
 
 ## Pre-Mortem
 
-Use before starting a milestone. Write output to `~/team-planner/premortems/<milestone>.md`.
+Use before starting a milestone. Write output to
+`~/.copilot-private/skills/team-planner/premortems/<milestone>.md`.
 
 ### Prompt
 
@@ -94,7 +96,7 @@ Use before starting a milestone. Write output to `~/team-planner/premortems/<mil
 
 ### Output
 
-Top risks → RAID rows in `~/team-planner/raid.md` with:
+Top risks → RAID rows in `rd.py payload` (team-planner's `~/tasks/raid.db`) with:
 - Type: Risk
 - Source: Pre-mortem for `<milestone>`
 - Full scoring (P × I), RAG, trigger, mitigation, contingency, due

@@ -15,14 +15,29 @@ config.json
 __pycache__/
 *.pyc
 
+# Private records and project knowledge live outside this repository.
+/skills/bug-triage/investigations/
+/skills/bug-triage/references/memoir.md
+/skills/machine-pilot/references/memoir.md
+/skills/machine-pilot/references/pitfalls.md
+/skills/machine-pilot/references/bmc.md
+/skills/machine-pilot/references/host-ops.md
+/skills/machine-pilot/references/setups.md
+/skills/machine-pilot/references/stations.tsv
+/skills/machine-pilot/references/uart.md
+/skills/machine-pilot/sessions/
+/skills/pldm/references/stations.md
+/team-portal/state/
+/skills/pr-review/references/memoir.md
+/skills/pr-review/drafts/
+/skills/team-planner/research.md
+/skills/team-manager/tmp*/
+
 # Editor / backup noise
 *.bak
 .DS_Store
 *.swp
 *~
-
-# PR review drafts — local working notes, never commit
-skills/pr-review/drafts/
 
 # Plugin-managed / client state
 .cache/

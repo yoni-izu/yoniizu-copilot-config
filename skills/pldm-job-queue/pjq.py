@@ -15,7 +15,8 @@ exposes:
   3. the *execution* run  — ``pldmJobQ-<edk>-<queue-id>-<epoch>``, created by
      the queue service when an EDK frees up.
 
-Store: ``~/tasks/pldm-jobs.json``.
+Store: ``~/tasks/pldm.db`` (``PLDM_DB`` override). ``migrate`` and ``export``
+are local-only; the legacy JSON is a backed-up, one-time import source.
 """
 
 from __future__ import annotations
@@ -31,8 +32,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pldm_db import Store
+
 STORE = Path(os.path.expanduser(os.environ.get(
     "PJQ_STORE", "~/tasks/pldm-jobs.json"))).expanduser()
+DB = Path(os.environ.get("PLDM_DB", "~/tasks/pldm.db")).expanduser()
 CONFIG_DIR = Path(os.path.expanduser("~/tasks/pldm"))
 REPO = os.environ.get("PJQ_REPO", "Elmnt-Internal/ip.infra.devops.workflow-entry")
 QUEUE_WORKFLOW = os.environ.get("PJQ_QUEUE_WORKFLOW", "PLDM - job queue")
@@ -49,7 +54,7 @@ RUN_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/(\d+)
 # The insert step prints the queue row it created; the id is the only handle
 # that ties a submission to the pldmJobQ run the queue later launches.
 QUEUE_ID_RE = re.compile(r"(?:job[_ -]?id|jobId|queue[_ -]?id)\D{0,4}(\d{2,8})", re.I)
-# pldmJobQ-pldm-edk4-z2a-2466-1788534750
+# Example queue title: pldmJobQ-<station>-<queue-id>-<epoch>
 EXEC_TITLE_RE = re.compile(r"^pldmJobQ-(?P<edk>.+?)-(?P<qid>\d+)-(?P<epoch>\d+)$")
 # gtest / pytest / octl summary lines worth keeping out of a 20 MB log.
 FAIL_LINE_RE = re.compile(
@@ -68,22 +73,11 @@ NOW = lambda: datetime.now().strftime("%Y-%m-%d %H:%M")  # noqa: E731
 # ----------------------------------------------------------------------------
 
 def load() -> dict:
-    if not STORE.exists():
-        return {"jobs": [], "last_scan": None}
-    try:
-        d = json.loads(STORE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"jobs": [], "last_scan": None}
-    d.setdefault("jobs", [])
-    d.setdefault("last_scan", None)
-    return d
+    return Store(DB, STORE).load()
 
 
 def save(d: dict) -> None:
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STORE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STORE)
+    Store(DB, STORE).save(d)
 
 
 def _next_id(jobs: list[dict]) -> int:
@@ -102,9 +96,7 @@ def get(ident) -> dict | None:
 def record(**kw) -> dict:
     """Insert a submission into the tracker. Used by the CLI and by the portal
     after it dispatches through its own workspace-alignment chain."""
-    d = load()
     job = {
-        "id": _next_id(d["jobs"]),
         "display_name": kw.get("display_name") or f"pldm-{datetime.now():%m%d-%H%M}",
         "image_type": kw.get("image_type") or IMAGE_TYPES[0],
         "group": kw.get("group", "default"),
@@ -122,7 +114,7 @@ def record(**kw) -> dict:
         "edk": "",
         "stage": kw.get("stage", "building"),
         "status": kw.get("status", "building"),
-        "submitted": NOW(),
+        "submitted": kw.get("submitted", NOW()),
         "updated": NOW(),
         "finished": None,
         "result": {},
@@ -130,19 +122,11 @@ def record(**kw) -> dict:
         "config": kw.get("config", ""),
         "octl_epoch": kw.get("octl_epoch"),
     }
-    d["jobs"].append(job)
-    save(d)
-    return job
+    return Store(DB, STORE).record(dict(kw, **job))
 
 
 def update(job_id, **kw) -> dict | None:
-    d = load()
-    for j in d["jobs"]:
-        if j["id"] == job_id:
-            j.update(kw, updated=NOW())
-            save(d)
-            return j
-    return None
+    return Store(DB, STORE).update(job_id, dict(kw, updated=NOW()))
 
 
 # ----------------------------------------------------------------------------
@@ -368,12 +352,15 @@ def _harvest(run_id: int) -> dict:
 def _scan_one(job: dict) -> dict:
     """Advance one job through dispatch → queue → execution. Pure gh reads."""
     j = dict(job)
+    j["last_attempt"] = datetime.now().isoformat()
 
     if j.get("stage") == "building" and j.get("dispatch_run"):
         st = _run_state(j["dispatch_run"])
         if st is None:
             j["note"] = "dispatch run not readable via gh"
+            j["error_at"] = j["last_attempt"]
             return j
+        j["checked"] = j["last_attempt"]
         if st["status"] != "completed":
             j["status"] = "building"
             j["note"] = "CI build in progress"
@@ -399,9 +386,12 @@ def _scan_one(job: dict) -> dict:
         st = _run_state(j["exec_run"])
         if st is None:
             j["note"] = "execution run not readable via gh"
+            j["error_at"] = j["last_attempt"]
         elif st["status"] != "completed":
+            j["checked"] = j["last_attempt"]
             j.update(stage="running", status="running", note="test running on " + (j.get("edk") or "EDK"))
         else:
+            j["checked"] = j["last_attempt"]
             c = st.get("conclusion")
             j.update(stage="done", finished=NOW(),
                      status={"success": "passed", "cancelled": "cancelled"}.get(c, "failed"),
@@ -509,9 +499,9 @@ def discover(lookback_h: int = OCTL_LOOKBACK_H) -> int:
                      dispatch_run=run_id, dispatch_url=run_url or PORTAL_URL,
                      stage="building" if run_id else "queued",
                      status="building" if run_id else "queued",
+                     octl_epoch=dsp["epoch"], submitted=dsp["when"],
                      note=("posted via octl" if run_id else
                            f"posted via octl @ {dsp['when']} \u2014 open Portal for live status"))
-        update(job["id"], octl_epoch=dsp["epoch"], submitted=dsp["when"])
         added += 1
     return added
 
@@ -702,9 +692,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-d", "--days", type=int, default=30)
     sub.add_parser("payload", help="emit the portal JSON")
     sub.add_parser("images", help="list known image types")
+    sub.add_parser("migrate", help="back up/import the local legacy tracker; no network")
+    sub.add_parser("export", help="emit rollback-compatible tracker JSON; no network")
 
     a = ap.parse_args(argv)
 
+    if a.cmd in ("migrate", "export"):
+        print(json.dumps(load(), indent=2, ensure_ascii=False))
+        return 0
     if a.cmd == "submit":
         ok, msg, _ = submit(a.workspace, display_name=a.display_name,
                             image_type=a.image_type, group=a.group,

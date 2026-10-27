@@ -4,6 +4,11 @@ description: 'Answer NoC (Network-on-Chip) / fabric IP design, address-map, rout
 argument-hint: 'Ask about the NoC/fabric IP — address map, routing, a specific fabric (MEM/MNG/CTRL/DBG/TRC/ECT/TS), FIU, or the RTL'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # NoC (Network-on-Chip) / Fabric IP Expert
 
 ## When to Use

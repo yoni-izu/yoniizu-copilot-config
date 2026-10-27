@@ -1,6 +1,6 @@
 # Projection method — "Will we hit it?"
 
-The brief's most important section. Goal: a defensible verdict per active milestone, with Yoni in the loop to review and adjust.
+The brief's most important section. Goal: a defensible verdict per active milestone, with the team lead in the loop to review and adjust.
 
 ## Inputs
 
@@ -95,19 +95,19 @@ Always compute and report:
 | Worst case | gap +1 ed | velocity 2.8, reserve doubled |
 ```
 
-## Yoni-in-the-loop
+## Team-lead review
 
-Before publishing, show Yoni:
+Before publishing, show the team lead:
 
 1. The verdict per milestone.
-2. The full inputs table (collapsible in the chat — Yoni scans it).
-3. Any verdict where Yoni's gut disagrees with the math — ask him to override and capture his reasoning in the appendix.
+2. The full inputs table (collapsible in the chat for quick scan).
+3. Any verdict where the team lead's judgment disagrees with the math — ask for an override and capture the reasoning in the appendix.
 
-A Yoni-override always wins in the published brief, but both the computed verdict and Yoni's adjusted verdict are recorded in the local archive appendix.
+A team-lead override always wins in the published brief, but both the computed verdict and adjusted verdict are recorded in the local archive appendix.
 
 ## Anti-patterns
 
-- **Do not** publish a projection without showing Yoni the inputs first.
+- **Do not** publish a projection without showing the team lead the inputs first.
 - **Do not** average across milestones — report each separately.
 - **Do not** use story points — this team uses effort-days only.
 - **Do not** count `resolution != Done` tickets as completed (see team-planner Ticket Resolution Semantics).

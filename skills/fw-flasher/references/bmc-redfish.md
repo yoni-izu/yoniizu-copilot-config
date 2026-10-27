@@ -5,7 +5,7 @@ on a sled in one command**, from any machine with network reach to the BMC. No
 PCIe link, no USB cable, no lab-host login required for the *load* itself.
 
 Added in `fw_ctl` 2.x (`fw_ctl/bmc_cmds.py` on top of the stdlib-only
-`scripts/bmc` Redfish client). Verified live against `bmc-sa-els35-csr` with
+`scripts/bmc` Redfish client). Verified live against a compatible sled BMC with
 `fw_ctl 2.3.0`.
 
 > **This is still a flash.** Everything in
@@ -39,9 +39,9 @@ Hard constraints to design around:
 ## Connection & credentials
 
 ```bash
-export BMC_HOST=bmc-sa-els35-csr     # else pass --bmc <name> on every verb
+export BMC_HOST="your-bmc-host"     # else pass --bmc <name> on every verb
 export BMC_USER=...                  # default: root
-export BMC_PASSWORD=...              # default: 0penBmc
+export BMC_PASSWORD=...              # load from your approved credential store
 ```
 
 The BMC is a **network peer**, so `bmc` verbs work on any `--interface`. Only
@@ -56,8 +56,8 @@ CLI). Never put the password on a command line or in a logged script — export 
 
 | Verb | Args | Example |
 |------|------|---------|
-| `bmc load` | `<image> [--bmc B] [--boot [--expect N] [--fw-sts-timeout S] [--die-count 1\|2\|4]] [--timeout S] [--no-wait] [--force]` | `bmc load ./a1.bin --bmc bmc-sa-els27-csr --boot --die-count 4` |
-| `bmc chips` | `[--bmc B] [--refresh]` | `bmc chips --bmc bmc-sa-els35-csr` |
+| `bmc load` | `<image> [--bmc B] [--boot [--expect N] [--fw-sts-timeout S] [--die-count 1\|2\|4]] [--timeout S] [--no-wait] [--force]` | `bmc load ./a1.bin --bmc your-bmc-host --boot --die-count 4` |
+| `bmc chips` | `[--bmc B] [--refresh]` | `bmc chips --bmc your-bmc-host` |
 | `bmc reset` | `(--oam N […] \| --all) [--bmc B] [--refresh] [--type T] [--timeout S] [--force]` | `bmc reset --oam 0 3` |
 | `bmc tasks` | `[--bmc B] [--last N]` | `bmc tasks --last 20` |
 | `bmc task` | `<id> [--bmc B] [--wait] [--timeout S]` | `bmc task 6 --wait` |
@@ -117,22 +117,22 @@ tells you to pick chips with `--oam`.
 
 ---
 
-## Live session (verified 2026-10-04, `bmc-sa-els35-csr`)
+## Live session example
 
 ```text
-ctl:pcie:asic> bmc chips --bmc bmc-sa-els35-csr
-BMC bmc-sa-els35-csr: 8 chip(s) (discovered)
+ctl:pcie:asic> bmc chips --bmc your-bmc-host
+BMC your-bmc-host: 8 chip(s) (discovered)
 OAM_0 … OAM_7
 
-ctl:pcie:asic> bmc tasks --bmc bmc-sa-els35-csr --last 5
-BMC bmc-sa-els35-csr: queue idle
+ctl:pcie:asic> bmc tasks --bmc your-bmc-host --last 5
+BMC your-bmc-host: queue idle
 task   name      state      pct   status  message
 OAM_7  UpdateA1  Completed  100%  OK      completed
 OAM_6  UpdateA1  Completed  100%  OK      completed
 …
 
-ctl:pcie:asic> bmc info --oam 0 --bmc bmc-sa-els35-csr
-BMC bmc-sa-els35-csr: 1 chip(s)
+ctl:pcie:asic> bmc info --oam 0 --bmc your-bmc-host
+BMC your-bmc-host: 1 chip(s)
 oam    model  state    health  reset types
 OAM_0  EA100  Enabled          On
 ```

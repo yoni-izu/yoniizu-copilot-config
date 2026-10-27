@@ -4,6 +4,11 @@ description: 'Answer PSOC (Platform/Management SoC block) design, uC cluster, bo
 argument-hint: 'Ask about PSOC — the uC cluster, boot/reset, slow IOs, eFuse/GPIO, HSM/Caliptra, or platform integration'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # PSOC (Platform / Management SoC) IP Expert
 
 ## When to Use

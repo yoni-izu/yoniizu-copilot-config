@@ -104,7 +104,7 @@ BMC remotely over Redfish, so you can flash **every device on a sled from the
 fw_ctl console** without a PCIe link or a lab-host login.
 
 ```bash
-export BMC_HOST=bmc-sa-els35-csr
+export BMC_HOST="your-bmc-host"
 ctl:pcie:asic> bmc load ./spi_flash_image_arm_asic.bin --boot --expect 8
 ```
 

@@ -1,7 +1,7 @@
 # LTSSM Logger (PEP_CTRL) — register map, RTL trigger semantics, FW driver
 
-- **Recorded:** 2026-10-05
-- **Status:** Verified from RTL + CSR headers + FW — one item (entry state = entered vs departed) pending author/RTL-owner confirmation
+- **Recorded:** 2026-10-05; refreshed 2026-10-20
+- **Status:** Verified from RTL + CSR headers + current EP/SE FW; entry-state interpretation still pending RTL-owner confirmation
 - **Tags:** ltssm logger, ltssm_logger, pep_ctrl, smlh_ltssm_state, smlh_ltssm_state_reason, state_mask, state_filter, cnt_thr, count threshold, halt_on_full, keep_recent, wr_addr, entry_data, entry_timestamp, viewport, link drop, link flap, ltssm transition table, dwc_ep_ctl_ltssm, dwc_dm_ctl ltssm, ippciesw-367, manageability 0x50
 
 ## Scope / Question
@@ -114,29 +114,32 @@ The LTSSM `(prev_state, reason) → next_state` table exists **twice**:
 
 | | file | symbol | rows |
 |---|---|---|---|
-| EP | `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ctl.c` | `g_ltssm_transitions[]` | 88 |
+| EP | `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ctl_shell.c` | `g_ltssm_transitions[]` | 88 |
 | SE/DM | `fw/ip/se/drivers/snps_dm_ctl/dwc_dm_ctl.c` | `dm_ltssm_transitions[]` (+ `dwc_dm_ctl_ltssm_map_next_state()`) | 88 |
 
-At EP #442 `bf8a83bd` and SE #247 `a1abc587` (2026-10-19), the two tables
-have 88 identical ordered rows and unique keys. Prior drift/duplicate-key claims
-must not be carried forward onto these revisions.
+EP #442 moved its unchanged diagnostic table into the shell-only translation unit
+in commit `5dbc2eda`; the helper has no other in-repository callers. At the
+previously compared EP/SE snapshots the tables had 88 identical ordered rows and
+unique keys. Prior drift/duplicate-key claims must not be carried forward.
 
 ### Current management-contract gaps
 
 See [the RAS/manageability contract audit](../../ras-manageability/knowledge/ltssm-logger-contract.md).
 The 2026-10-19 18:10 replacement spec explicitly permits software-only consumption:
 hardware has no read pointer and entries cannot be invalidated (table 9-68).
-Both count-query helpers still fetch a previously consumed entry and may reset the cursor,
-contrary to explicit count-query requirements. SE additionally does this from Start
-and Configure. Filter and zero-threshold definitions now agree with the drivers.
-The revised mapping also requires BUSY for Read next while keep-most-recent is running;
-both driver read_next paths lack that gate. Do not expose these unchanged APIs as fully
-spec-aligned PLDM services.
+It requires count queries not to fetch entry data or move the logical read
+position, and requires BUSY for Read next during active keep-most-recent capture.
+Filter and zero-threshold definitions agree with the drivers.
 
-Rechecked 2026-10-20 at EP #442 `35997898` and SE #247 `487074f0`.
-The incremental changes only remove comments/documentation and relocate status
-declarations; both open behaviors above remain unchanged. See the RAS contract
-entry for current source anchors.
+Rechecked EP #442 at `d1e9d3cea61ead6783882fbbd3a947d230a2ec28` against the
+previously reviewed `35997898328eec65db3da751b7d1af23e90ba1d1`: status reads now
+observe only control/write-pointer registers, and `read_next` enforces the busy
+rule under the logger lock before cursor recovery or entry access. The stop path
+records an already-overwritten cursor as stale so the frozen retained entries can
+be read; it does not change `rd_pos` until a consuming read. SE #247's latest
+reviewed head also fixes the corresponding count/read restrictions; see the RAS
+contract entry for the cross-IP audit. Reset-generation behavior remains a
+platform verification item, not a newly established code defect.
 
 ## Sources
 
@@ -146,6 +149,9 @@ entry for current source anchors.
 - CSR (different revision — do **not** use for a1): `~/build_artifacts/include/specs/pep_ctrl_regs.h`
 - FW: `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ctl.c`, `include/dwc_ep_ctl.h`,
   `include/dwc_ep_ctl_api.h`, `drivers/el_pcie_ep/el_pcie_ep.c`, `drivers/snps_ep_ctl/Kconfig`
+- EP re-review: `drivers/snps_ep_ctl/dwc_ep_ctl.c` (`ltssm_logger_status_read`,
+  `ltssm_logger_cursor_is_stale`, `dwc_ep_ctl_ltssm_logger_read_next`) and
+  `drivers/snps_ep_ctl/dwc_ep_ctl_shell.c` (`g_ltssm_transitions`)
 - FW (duplicate table): `fw/ip/se/drivers/snps_dm_ctl/dwc_dm_ctl.c`
 - Locking precedent: `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ras_des.c`
 - Spec: Device Manageability, replacement received 2026-10-19 18:10 — LTSSM logger command `0x50`, tables 9-58..9-71; current contract linked above

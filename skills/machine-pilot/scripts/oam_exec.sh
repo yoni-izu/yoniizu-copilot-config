@@ -4,11 +4,11 @@
 #
 # Runs from the WORKSTATION. This is the only console input path proven to work
 # on ELS100: `ssh -tt -p 220<n> root@<bmc>`. Driving the consoles from the BMC
-# itself does NOT work — see references/pitfalls.md "OAM console input".
+# itself does NOT work — see the private machine-pilot pitfalls reference.
 #
 #   oam_exec.sh [-b BMC] [-o OUTDIR] [-d LIST] [-w SECS] [-t SECS] 'cmd' ['cmd'...]
 #
-#   -b BMC     BMC host/IP           (default $BMC, else bmc-sa-els35-csr)
+#   -b BMC     BMC host/IP           (default from private station config or $BMC)
 #   -o OUTDIR  capture directory     (default ~/.pilot/evidence/oam-exec/<UTC>)
 #   -d LIST    OAMs, e.g. "0 3 5"    (default 0..7)
 #   -w SECS    settle after each cmd (default 5)
@@ -21,7 +21,7 @@
 # an error. The summary marks them, and `-- SILENT` is printed for each.
 set -uo pipefail
 
-BMC=${BMC:-bmc-sa-els35-csr}
+BMC=${BMC:-}
 OUT=""
 OAMS="0 1 2 3 4 5 6 7"
 SETTLE=5
@@ -46,6 +46,17 @@ while getopts ":b:o:d:w:t:h" o; do
 	esac
 done
 shift $((OPTIND - 1))
+
+PRIVATE_ROOT=${COPILOT_PRIVATE_DIR:-$HOME/.copilot-private}
+BMC_DEFAULT_FILE=$PRIVATE_ROOT/skills/machine-pilot/default-bmc
+if [[ -z $BMC && -r $BMC_DEFAULT_FILE ]]; then
+	IFS= read -r BMC <"$BMC_DEFAULT_FILE"
+fi
+
+[[ -n $BMC ]] || {
+	echo "oam_exec.sh: BMC is missing; set -b BMC, BMC, or private station config" >&2
+	exit 2
+}
 
 [[ $# -gt 0 ]] || {
 	echo "oam_exec.sh: need at least one command (-h for help)" >&2

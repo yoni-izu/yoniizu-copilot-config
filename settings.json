@@ -15,5 +15,7 @@
   "enabledPlugins": {
     "github@ai-toolkit": true,
     "fw-soc@ai-toolkit": true
-  }
+  },
+  "model": "auto",
+  "autoTier": "balance"
 }

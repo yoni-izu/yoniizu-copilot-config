@@ -4,6 +4,11 @@ description: 'Project expert for the Atlantic project — the current, most-rece
 argument-hint: 'Ask a question about the Atlantic project — architecture, PRM/NoC spec, flows, security, or FW/SW integration'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Atlantic Project Expert
 
 ## When to Use

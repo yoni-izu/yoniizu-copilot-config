@@ -4,6 +4,11 @@ description: "Deploy verified firmware build artifacts to the user's shared NFS 
 argument-hint: "Source image or build workspace, destination target/NFS directory, and optional machines to verify"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Firmware Artifact Deployment to NFS
 
 Copy an identified build artifact to a shared lab filesystem and prove that the
@@ -51,7 +56,8 @@ consult `vm-delegate` for machine lifecycle and access handling.
 Confirm the remote home, existing firmware directories and filesystem mount:
 
 ```bash
-rtk proxy mctl -t dsk61 sh ': || cd "$HOME"; printf "HOME=%s\n" "$HOME"; findmnt -T "$HOME" -n -o SOURCE,FSTYPE,TARGET; ls -ld "$HOME/a1_power_on_images"' "$ws"
+target="<registered-target>"
+rtk proxy mctl -t "$target" sh ': || cd "$HOME"; printf "HOME=%s\n" "$HOME"; findmnt -T "$HOME" -n -o SOURCE,FSTYPE,TARGET; ls -ld "$HOME/a1_power_on_images"' "$ws"
 ```
 
 `ws` is the local absolute firmware workspace path. Set it explicitly before
@@ -163,12 +169,16 @@ pattern with the naming convention applied:
 
 ```bash
 deployment="$(rtk proxy date -u +%d%m%Y_%H%M%S)_pcie_diag_d3cold"
-rtk proxy mctl -t dsk61 sh ": || cd \"\$HOME\"; mkdir -p \"\$HOME/a1_power_on_images/$deployment/asic\"" "$ws"
-rtk proxy rsync -az --no-owner --no-group --checksum --ignore-existing "$local_stage/spi_flash_image_arm_asic.bin" "$local_stage/CHANGE_NOTES.md" "yoni.izutskiver@SA-DSK61-CSR:/users/home/yoni.izutskiver/a1_power_on_images/$deployment/asic/"
+target="<registered-target>"
+remote="<user>@<host>"
+remote_home="<remote-home>"
+rtk proxy mctl -t "$target" sh ": || cd \"\$HOME\"; mkdir -p \"\$HOME/a1_power_on_images/$deployment/asic\"" "$ws"
+rtk proxy rsync -az --no-owner --no-group --checksum --ignore-existing "$local_stage/spi_flash_image_arm_asic.bin" "$local_stage/CHANGE_NOTES.md" "$remote:$remote_home/a1_power_on_images/$deployment/asic/"
 ```
 
-This SSH login comes from the configured `dsk61` target. Discover it again for
-future deployments; it is not a general default for every user or machine.
+Use the SSH login and home associated with the selected target. Discover them
+again for future deployments; they are not general defaults for every user or
+machine.
 Use an existing dedicated upload command if one becomes available. Otherwise,
 direct `rsync` is the file-upload fallback because `mctl` currently has no upload
 subcommand; keep target discovery and remote checks in `mctl`.
@@ -204,22 +214,12 @@ Do not mark deployment complete if any required target is unreachable, the
 file is absent, or a hash differs. Report the exact partial outcome and blocker.
 Do not flash or reset devices as a verification shortcut.
 
-## Verified Personal Setup
+## Private deployment notes
 
-Verified on 2026-10-04; rediscover before relying on these facts in another setup:
-
-- Targets `dsk61`, `dsk70`, and `nuc74` share `/users/home/yoni.izutskiver`.
-- The shared home is NFSv4; the image area is `a1_power_on_images`.
-- The PCIe diagnostic candidate was published under
-  `a1_power_on_images/pcie_diag_d3cold/asic/spi_flash_image_arm_asic.bin`.
-- This is a historical deployment path predating the naming rule above, not a
-   template for new deployment folders. Do not rename it automatically.
-- All three machines verified the same bytes as the VM source. No devices were
-  flashed and existing images were preserved.
-- On that workspace, a parallel dependency build returned success without
-  packaging the image. A subsequent direct `octl ws build proj_infra` without
-  `--parallel` produced it. Always verify packaging output, not just job status;
-  do not generalize this observation to every octl version or build setup.
+User-specific target names, NFS paths and historical deployment results belong
+outside this repository. If applicable, consult
+`~/.copilot-private/skills/fw-deploy/references/personal-setup.md`; rediscover
+targets and verify current conditions before relying on those notes.
 
 ## Final Report
 

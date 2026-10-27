@@ -11,15 +11,15 @@ Verbose, includes private notes. Lives at `~/team-planner/team-weekly/archive/YY
 ```markdown
 # HSI FW Team Weekly — YYYY-MM-DD
 
-**Attendees:** <list> | **Duration:** <if known> | **Next weekly:** <auto-computed date>
+**Attendees:** <team-members[]> | **Duration:** <if known> | **Next weekly:** <auto-computed date>
 **Sprint:** <sprint name>, day <N> | **Milestone:** MS<N>, <X> days remaining, RAG <color>
 
 ## Summary
-<3-5 line auto-drafted summary; Yoni edits before commit>
+<3-5 line auto-drafted summary; <team-lead> edits before commit>
 
 ## Past — what shipped
 ### Wins delivered
-- <name>: <one-line> — cite: <PR / JIRA>
+- <team-member>: <one-line> — cite: <PR / JIRA>
 
 ### Closed tickets (resolution=Done)
 | Key | Owner | Summary | Effort |
@@ -42,8 +42,8 @@ Verbose, includes private notes. Lives at `~/team-planner/team-weekly/archive/YY
 
 ## Discussion
 ### <Topic 1>
-- <name> said: <paraphrase>
-- <name> said: <paraphrase>
+- <team-member> said: <paraphrase>
+- <team-member> said: <paraphrase>
 - Outcome: <note / decision / action>
 
 ### <Topic 2>
@@ -58,7 +58,7 @@ Verbose, includes private notes. Lives at `~/team-planner/team-weekly/archive/YY
 ## Action items
 | # | Action | Owner | Due | Status | Jira |
 |---|---|---|---|---|---|
-| 1 | <text> | <name> | YYYY-MM-DD | Open | <KEY or "—"> |
+| 1 | <text> | <team-member> | YYYY-MM-DD | Open | <KEY or "—"> |
 
 ## Risks captured
 - <risk text> — promoted to RAID? <R-XXX or "no, deferred"> — confirmation: <yes/no>
@@ -76,7 +76,7 @@ Verbose, includes private notes. Lives at `~/team-planner/team-weekly/archive/YY
 - Items the team flagged as at-risk this week:
 - Net change vs last weekly: <Green ↑ / flat / Red ↓>
 
-## Private notes (PRIVATE — Yoni only)
+## Private notes (PRIVATE — <team-lead> only)
 - <impressions, team-energy notes, individual concerns>
 - <coaching follow-ups for 1:1s>
 - <things to verify before next weekly>
@@ -99,10 +99,10 @@ Sanitized. The same page that was created in prep is **updated in place**. Visib
 # HSI FW Weekly — YYYY-MM-DD
 
 ## Summary
-<3-5 line summary, sanitized — same as local archive Summary, reviewed by Yoni>
+<3-5 line summary, sanitized — same as local archive Summary, reviewed by <team-lead>>
 
 ## Past — what shipped
-- <name>: <one-line win> ([link](<URL>))
+- <team-member>: <one-line win> ([link](<URL>))
 
 ## Present — sprint health
 - Done <X>d · In progress <Y>d · Blocked <Z>d · To-do <W>d · Confidence <X>/10
@@ -153,8 +153,8 @@ Sanitized. The same page that was created in prep is **updated in place**. Visib
 
 **Mention rules** (principle 14):
 - Push the published page in HTML (`contentFormat: "html"`).
-- Every named attendee, action-item owner, and sprint-focus owner is rendered as a Confluence mention: `<span data-type="mention" data-user-id="ACCOUNT_ID">@Display Name</span>`.
-- Cache account IDs in `~/team-planner/team-weekly/_attendee-ids.md` (one row per team member: `Display Name | accountId`). Look up missing IDs with `mcp_atlassian-mcp_lookupJiraAccountId` (uses parameter `searchString`).
+- Every attendee, action-item owner, and sprint-focus owner is rendered as a Confluence mention: `<span data-type="mention" data-user-id="TEAM_MEMBER_ACCOUNT_ID">@TEAM_MEMBER_DISPLAY_NAME</span>`.
+- Cache account IDs only in the local team-member records or `~/team-planner/team-weekly/_attendee-ids.md` (one row per person: `<team-member-display-name> | <team-member-account-id>`). Look up missing IDs with `mcp_atlassian-mcp_lookupJiraAccountId` (uses parameter `searchString`).
 - Local archive may keep plain-text names — tagging is published-page only.
 
 ---

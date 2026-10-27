@@ -4,10 +4,15 @@ description: "Manage physical workspace-slot occupancy (which ~/projects/<projec
 argument-hint: "Action (list/status/occupy/release/whereami) and slot + holder details"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Workspace Manager
 
 You are the **Workspace Manager** — the single source of truth for **workspace
-slot occupancy**, backed by `~/tasks/workspaces.json`.
+slot occupancy**, backed by `~/tasks/workspaces.db`.
 
 A *slot* is a physical checkout directory under `~/projects/<project>/<slot>`
 (e.g. `one`, `two`, … `six`, plus any other dir like `main`). At most **one**
@@ -28,6 +33,91 @@ mutations. `task-manager`'s `tm.py` **imports** `wm.py` and routes every
 workspace change through it, so occupancy stays consistent no matter which skill
 touched it.
 
+## Local and remote workspace lifecycle
+
+The roster in `~/tasks/workspaces.db` is authoritative for tracked locations. Every
+entry has an immutable `id`: `WS-L-<uuid>` for local or `WS-R-<uuid>` for remote.
+The L/R field describes location relative to this controller, not an EC2 type.
+Existing local slot keys remain compatible; new remote/colliding entries use
+their ID as the slot key. APIs accept either the slot key or its ID. Labels,
+directory basenames and group names are not identities.
+
+Remote records add `target`, a registered `mctl` machine name, and an absolute or
+`~/` remote path. Never test a remote path on the local filesystem. Registration
+does not contact or start the target. First refresh resolves its canonical path
+and adopts a pre-existing on-machine ID if another controller registered it.
+Use the same target name for a machine consistently; shared NFS paths may refer
+to the same physical checkout on several hosts.
+
+- **Refresh** at the top of the portal reads saved workspace data only.
+  **Check local status** checks tracked local workspaces; **Check VM status**
+  checks tracked remote workspaces only. Each card's check is scoped to that card.
+  Live checks are read-only with respect to checkouts and persist owner readings.
+  Remote operations run through `mctl workspace`, never a separate SSH config.
+- **Clean** means every manifest repository is at its declared revision, with
+  no modified/untracked files or local-only commits. Missing/unverifiable
+  revisions and scan failures fail closed. Per-project pinned revisions count;
+  the manifests checkout is checked separately. The configured roster revision
+  must agree with the selected manifest's default revision.
+- **Occupy** requires a fresh clean check and no mirror relationship. An
+  existing holder cannot be displaced with `--force`; free first. A task cannot
+  move to another slot until its previous slot has been freed successfully.
+- **Sync**, for an independent workspace, refuses an occupied or non-clean
+  checkout and reports why. For an active mirror it preserves development branch
+  choices, syncs non-development repositories to manifest revisions and updates
+  development branches from their matching origin branches. Dirty/local-only
+  work is never reset, rebased or silently discarded; updates are fast-forward
+  only. Failed/in-progress mirrors must be re-mirrored or freed, not synced.
+- **Free** returns all repositories to their manifest revisions, then runs
+  `octl ws sync --no-plugins` and verifies the result. Holder and mirror state
+  clear only after success. Failures keep the reservation and are visible.
+  `release(..., reset=False)` is internal to the portal worker after it has
+  completed that physical operation, not a shortcut for callers.
+
+The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws` for
+multi-repository operations, verifies complete manifest coverage, and checks
+each repository's result (the wip wrapper's exit status alone is insufficient).
+Temporary scans preserve the user's existing WIP branch plan; concurrent
+changes are reported rather than overwritten. Undeclared source repositories
+and missing manifest repositories block checkout-changing actions.
+Only supported, fully resolved manifests are acted on; unsupported manifest
+elements fail explicitly. It must not be used for arbitrary shell commands.
+
+### Mirror state and history
+
+On each machine, `~/.mctl/workspaces/<sha256(canonical-path)>.json` stores the
+checkout ID and `mirror` relationship; the sibling `.jsonl` is append-only
+action history. This is outside source repositories and survives portal
+restarts, untracking and failed connections. `mctl mirror` creates both IDs,
+records `source_id`, `source_path`, `source_host` and `syncing` before changing
+branches, and marks `active` only after verification. Failure is not active.
+Successful `mctl release` or portal Free clears the marker; the next mirror
+reads that marker instead of inferring use from an old build log.
+
+Controller readings and append-only action logs live in
+`~/tasks/workspace-state/<ID>.json` / `.jsonl`. `checked` advances only after a
+successful status read; failed attempts retain the previous reading with an
+explicit error and attempt timestamp. Mirror state is distinct from task
+occupancy: a mirror reserves capacity but does not move the source task's hold.
+The card's action log shows controller events and the last-fetched machine
+events; full history remains on disk.
+
+Additional CLI commands:
+
+```bash
+wm.py identity PATH [--target MACHINE]       # find/register a stable identity
+wm.py refresh SLOT_OR_ID                    # checks only this workspace
+wm.py sync SLOT_OR_ID                       # guarded lifecycle operation
+wm.py log SLOT_OR_ID                        # controller action history
+wm.py mirror-state TARGET PATH --source-id ID --source-path PATH \
+  --state syncing|active|failed|released     # mctl lifecycle integration
+```
+
+The owner database uses transactions alongside the process/thread lifecycle lock.
+`workspaces.json` is a backed-up migration input/explicit export, never a second writer.
+Tests:
+`python3 -m unittest discover -s ~/.copilot/skills/workspace-manager -p 'test_*.py'`.
+
 ## CLI cheatsheet
 
 Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
@@ -36,15 +126,15 @@ Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
 |------------|---------|-------|
 | `list [--project NAME]` | Show every slot and its holder | Default project: `iridium`. Slots come from the project dir plus any occupied slot. |
 | `status <slot>` | Show one slot's holder | Normalizes sub-paths (`one/fw` → `one`). |
-| `occupy <slot> --task T-NNN [--detail PATH] [--force]` | Give a slot to a task | Refuses a busy slot unless `--force` (which displaces the holder). |
+| `occupy <slot> --task T-NNN [--detail PATH] [--force]` | Give a slot to a task | Requires a fresh clean baseline and a free slot; `--force` cannot displace a hold. |
 | `occupy <slot> --label "purpose" [--tag TAG] [--force]` | Grab a slot for an **ad-hoc** purpose | `--tag` ∈ `monitor`, `debug`, `development`, `experiment`, `other` (default `other`). |
 | `release <slot>` / `free <slot>` | Free a slot | No-op if already free. |
 | `whereami [--cwd PATH]` | Report the slot for the current (or given) directory | Resolves `~/projects/<project>/<slot>/...`. |
-| `migrate [--keep-fields]` | One-time import of legacy per-task `workspace` holds | Moves active holds into this store and strips `workspace`/`workspace_since` from `tasks.json` (unless `--keep-fields`). |
+| `migrate [--keep-fields]` | One-time import of legacy per-task `workspace` holds | Moves active holds through owner APIs and removes legacy fields from task records (unless `--keep-fields`). This is distinct from database import. |
 
-## Store schema (single source of truth)
+## Owner API shape
 
-`~/tasks/workspaces.json`:
+The following JSON describes the owner API representation, not an editable database file:
 
 ```json
 {
@@ -79,14 +169,13 @@ Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
 
 ## Rules
 
-1. **One holder per slot.** `occupy_*` refuses a busy slot unless `--force`
-   (which displaces the current holder and returns it as `displaced`).
-2. **Never lose task context silently.** When a `--force` occupy displaces a
-   *task* holder, the caller (`tm.py`) notes the displacement on that task.
-   When you displace via the CLI, tell the user who you displaced.
+1. **One holder per slot.** `occupy_*` refuses a busy slot; successfully free
+   the previous hold before assigning another task or purpose.
+2. **Never lose task context silently.** Occupying a held slot is refused,
+   including with `--force`. Free the old holder successfully first.
 3. **Task holds mirror task lifecycle.** `task-manager` releases a task's slot
    automatically on `done`/`cancelled` and when a review's ball moves to the
-   author / re-review. Don't hand-edit `workspaces.json` for task holds — go
+   author / re-review. Don't hand-edit workspace storage or exports for task holds — go
    through `tm.py` (`assign`/`release`/`done`) or `wm.release_task`.
 4. **Ad-hoc holds are yours to manage.** They have no task lifecycle; free them
    when you're done (`wm.py release <slot>` or the dashboard **Set free**).

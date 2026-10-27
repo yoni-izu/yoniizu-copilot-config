@@ -4,6 +4,11 @@ description: 'Answer Scale Up (SU) IP design, usage, C2C, and PCIe DM controller
 argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM controller, or PHY behavior'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Scale Up (SU) IP Documentation Q&A
 
 ## When to Use

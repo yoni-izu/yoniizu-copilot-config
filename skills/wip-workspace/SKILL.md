@@ -4,6 +4,11 @@ description: "Workspace-level git operations using the `wip` CLI. Use when: user
 argument-hint: "Action (scan/mode/save/load/list/status/info/forall or checkout/push/pull/stash/pop/align/diff/return/hard-reset/set-upstream/depends-on) and optionally: save name, scope (ws or all)"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # WIP Workspace Manager
 
 Manage multi-repo workspaces using the `wip` CLI (`~/bin/wip`). It performs git

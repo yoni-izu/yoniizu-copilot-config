@@ -4,6 +4,11 @@ description: 'Answer RAS, manageability, error handling, telemetry, PLDM/MCTP, p
 argument-hint: 'Ask a question about RAS design, manageability protocol, error handling, or FW responsibilities'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # RAS & Device Manageability Skill
 
 ## When to Use

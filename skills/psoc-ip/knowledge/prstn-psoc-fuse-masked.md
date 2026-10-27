@@ -1,7 +1,7 @@
 # PRSTn to PSOC is masked by default (eFuse) in Iridium
 
 - **Recorded:** 2026-09-08
-- **Status:** Reported by owner (Yoni, HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
+- **Status:** Reported by owner (HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
 - **RTL branch/tag:** iridium (A1 baseline)
 - **Tags:** prstn, perst, psoc, fuse, efuse, masked, prst_select_source, boot_and_rst_top, reset source, reset manager, el_reset, link training, gpio37, rom bring-up
 
@@ -25,7 +25,7 @@ reset-manager handling and for bring-up sequences that toggle PRSTn.
   edges to PSOC until unmasked / source configured appropriately.
 
 ## Sources
-- Owner FYI: Yoni Izutskiver (HSI/FW team lead), 2026-09-08 — "PRSTn to PSOC is masked by default
+- Owner FYI: FW team lead note, 2026-09-08 — "PRSTn to PSOC is masked by default
   through a fuse; when the ROM sequence swaps the PRSTn source to PSOC it is essentially masked,
   so mid-way PRSTn toggles are redundant — toggle at the beginning before the source is swapped."
 - Reg: `BOOT_AND_RST_TOP_0.PRST_SELECT_SOURCE` (offset `0xdac`; a1 abs `0x100000000019dac`).

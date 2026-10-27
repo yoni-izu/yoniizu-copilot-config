@@ -4,11 +4,16 @@ description: "Review a GitHub pull request end-to-end with the reviewer's own st
 argument-hint: "PR URL or owner/repo#number, OR 'local' to review checked-out workspace branches; optionally: re-review, walkthrough, draft-only, submit"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # PR Review
 
 Conduct a high-signal code review of a GitHub PR grounded in three things, in priority order:
 
-1. **The review memoir** — [references/memoir.md](./references/memoir.md): the reviewer's accumulated philosophy, always-checks, recurring patterns, approved designs, anti-patterns, and theme-grouped lessons. **Read it before every review.**
+1. **The review memoir** — `~/.copilot-private/skills/pr-review/memoir.md`: the reviewer's accumulated philosophy, always-checks, recurring patterns, approved designs, anti-patterns, and theme-grouped lessons. **Read it before every review.**
 2. **The reviewer's style** — correctness first, actionable comments, pick battles (3 blockers > 15 nits), respect the author's design, verify every claim against the actual code path.
 3. **Your own objective reasoning** — independent technical judgment. The memoir guides; it doesn't replace fresh analysis of *this* PR.
 
@@ -19,10 +24,11 @@ Conduct a high-signal code review of a GitHub PR grounded in three things, in pr
 
 ## Hard Rules (never violate)
 
+- **Local review alignment: only repos belonging to the reviewed PRs go on PR branches. Every other repo must stay on the workspace revision, never automatically on `main`.** Resolve the workspace revision from its manifest/metadata, honoring per-repo revision overrides. Preserve pinned tags/SHAs. Use `wip` for multi-repo alignment, skip dirty repos, and verify the resulting branch/revision map. Validate saved review snapshots before restoring them; repair snapshots that recorded unrelated repos on `main`. Cross-repo evidence must come from the matching workspace revision.
 - **NEVER post reviews, comments, replies, or a verdict to GitHub without explicit user approval.** Draft locally, present for approval, submit only when told.
 - **NEVER delete or overwrite a pending review** — it may hold the user's own draft comments. Always inspect existing pending reviews first.
 - **NEVER auto-submit a verdict.** Recommend approve / comment / request-changes; the user decides and triggers submission.
-- Draft files live under [drafts/](./drafts/) (skill-local). Name them `pr-<N>-<repo>-<YYYYMMDD-HHMM>.md`.
+- Draft files live under `~/.copilot-private/skills/pr-review/drafts/`. Name them `pr-<N>-<repo>-<YYYYMMDD-HHMM>.md`.
 
 ## Tooling
 
@@ -31,7 +37,7 @@ Prefer the `gh` CLI in a terminal (`gh pr view`, `gh pr diff`, `gh pr view --jso
 ## Workflow
 
 ### Step 0 — Consult the memoir
-Read [references/memoir.md](./references/memoir.md) in full. Note which "Always Check" items, anti-patterns, and lessons are likely to apply to this PR's domain.
+Read `~/.copilot-private/skills/pr-review/memoir.md` in full. Note which "Always Check" items, anti-patterns, and lessons are likely to apply to this PR's domain.
 
 ### Step 1 — Fetch and understand the PR
 
@@ -66,7 +72,7 @@ Apply the memoir's checklists plus independent reasoning. For each candidate fin
 - Pick battles: drop nits that don't hurt readability or maintainability. Distinguish PR-introduced from pre-existing issues; defer the latter to their own PR.
 
 ### Step 4 — Draft locally
-Write a draft to [drafts/](./drafts/) using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
+Write a draft under `~/.copilot-private/skills/pr-review/drafts/` using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
 
 ### Step 5 — Present for approval
 Lead with an **Executive summary of the changes** (see below), then show the user the full draft: a **Prior comments** disposition table (each existing thread marked Addressed / Partially / Unaddressed / Won't-fix / Stale, with what the author did and any follow-up to add), findings grouped by severity, a **recommended verdict** (approve / comment / request-changes) with one-line justification, and the dropped list. Call out any unaddressed prior comments explicitly — they often gate the verdict. Ask which comments to post and whether to submit the verdict. Do nothing on GitHub yet.
@@ -81,10 +87,10 @@ This is a summary of the *changes*, separate from and preceding the findings —
 **Interactive option:** if the user wants to refine findings one at a time before seeing the consolidated draft, run the [Walkthrough](#walkthrough) first — it lets them adjust, question, polish, reclassify, or reject each finding. It's the natural next step after a local review is drafted.
 
 ### Step 6 — Submit only what's approved
-On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set into [drafts/](./drafts/) (e.g. `pr-<N>-submitted-<timestamp>.md`).
+On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set under `~/.copilot-private/skills/pr-review/drafts/` (e.g. `pr-<N>-submitted-<timestamp>.md`).
 
 ### Step 7 — Update the memoir
-After the review, fold genuinely new, reusable lessons into [references/memoir.md](./references/memoir.md). **Consolidate intelligently:** group each lesson under the right existing theme, merge true duplicates, and keep entries tight and principle-first (drop review-specific provenance). Do not append a per-review log section.
+After the review, fold genuinely new, reusable lessons into `~/.copilot-private/skills/pr-review/memoir.md`. **Consolidate intelligently:** group each lesson under the right existing theme, merge true duplicates, and keep entries tight and principle-first (drop review-specific provenance). Do not append a per-review log section.
 
 ## Local Workspace Mode
 
@@ -99,9 +105,24 @@ Local mode always begins by determining, **per repo/PR and without asking the us
 Make this decision independently for each repo in a multi-repo task.
 
 ### Resolve which repos/branches/PRs to review
-1. **Prefer the review-mgr task store** as the source of truth. Read it with `python3 ~/.copilot/skills/task-manager/tm.py list --category code-review` (or read the store JSON). Pick the in-progress `code-review` task (the one matching the current `workspace`, or ask if several). Each `reviews[]` entry gives `repo`, `branch`, `owner`, `pr_number`, `pr_url`, `author` — this is the local-path-to-PR mapping needed for posting later.
+1. **Prefer the review-mgr task store** as the source of truth. Read it with `python3 ~/.copilot/skills/task-manager/tm.py list --category code-review --json`. Do not read stale legacy JSON or edit the database. Pick the in-progress `code-review` task (the one matching the current `workspace`, or ask if several). Each `reviews[]` entry gives `repo`, `branch`, `owner`, `pr_number`, `pr_url`, `author` — this is the local-path-to-PR mapping needed for posting later.
 2. **Workspace root:** the task's `workspace` field, else the current `~/projects/<project>/<ws>` root, else cwd. Map repo names to local paths via the workspace manifest (`.repo/manifests/` → `<project name="..." path="...">`). Note the manifest `revision` attribute — that fb/base branch is the diff base, **not** `main`.
 3. **Fallback when no store entry exists:** for each repo on a non-base branch, resolve the PR with `gh pr list --head <branch> --repo <owner>/<repo> --json number,url,headRefName`.
+
+### Local preflight: PR recognition and upstream tracking
+
+Before diff acquisition, including re-review and snapshot-restored workspaces, apply
+review-mgr's [PR upstream and VS Code review detection](../review-mgr/SKILL.md#pr-upstream-and-vs-code-review-detection)
+checklist. A branch at the exact PR commit can still be unrecognized by the extension when
+upstream tracking is missing. Resolve the live PR head repository and `headRefName`, match
+that repository to a remote, then set/verify the corresponding remote-tracking branch,
+subject to approval gates. Explain why that upstream is correct: it tracks the author's
+source branch, not the PR base/diff base or workspace revision; `origin` is not guaranteed,
+especially for forks. Never force checkout/pull/reset or fabricate tracking for an
+unavailable head merely to make the review view appear. Verify recognition from the
+affected extension log separately; if unavailable, report it as unverified. Correct Git
+tracking does not guarantee the UI auto-focuses; **Go to Review** can open a recognized PR.
+This preflight applies to local review only; remote-only review needs no checkout changes.
 
 ### Acquire the diff locally
 For each review repo:
@@ -119,12 +140,12 @@ For each review repo:
 
 ### Continue with the standard flow
 - Step 2 (existing review state) and Step 6 (submission) still hit **GitHub** — the author's pending drafts, other reviewers' threads, and posted comments live there. Use the `owner`/`repo`/`pr_number` from the store/`gh` to target the right PR.
-- Draft to [drafts/](./drafts/) as usual; record the local head SHA reviewed (one per repo in a multi-repo set).
+- Draft under `~/.copilot-private/skills/pr-review/drafts/` as usual; record the local head SHA reviewed (one per repo in a multi-repo set).
 - When done, prefer `review-mgr done <id> <outcome>` so the review task status and the memoir update flow through the review-queue lifecycle. **Record the reviewed head SHA(s) in the task notes** (e.g. `reviewed @ <repo>:<sha>`), so the next re-review can diff `that-sha .. new-head` without re-deriving the baseline. This is the authoritative re-review baseline when no prior draft exists.
 
 ## Re-Review (force-push / rebase)
 When invoked with `re-review` or when the PR changed since the last pass:
-1. **Find the last actually-reviewed SHA** — the head from the *previous review pass*, not the head you just recomputed this session. Resolve it in priority order: (a) the `Head SHA reviewed` line in the most recent prior draft in [drafts/](./drafts/); (b) the `reviewed @ <sha>` recorded in the task-manager task notes (see `review-done`); (c) the `commit.oid` GitHub attaches to your last submitted review (`gh pr view <N> --json reviews` / GraphQL `reviews.nodes.commit.oid`). **Never diff a SHA against itself** — if old and new heads match, retrieve the older one from (a)/(b)/(c) before concluding "no new code".
+1. **Find the last actually-reviewed SHA** — the head from the *previous review pass*, not the head you just recomputed this session. Resolve it in priority order: (a) the `Head SHA reviewed` line in the most recent prior draft under `~/.copilot-private/skills/pr-review/drafts/`; (b) the `reviewed @ <sha>` recorded in the task-manager task notes (see `review-done`); (c) the `commit.oid` GitHub attaches to your last submitted review (`gh pr view <N> --json reviews` / GraphQL `reviews.nodes.commit.oid`). **Never diff a SHA against itself** — if old and new heads match, retrieve the older one from (a)/(b)/(c) before concluding "no new code".
 2. **Fetch the old SHA even if it was force-pushed away** (`git fetch origin <old-sha>`; rebases orphan it but it stays fetchable by hash). Then `git diff <old-sha>..<new-sha>` (or `gh pr diff`) and triage per file: scrutinize comment-addressing fixes; glance-and-pass unrelated rebase artifacts (path repaths, CI config, base advances). Don't re-review unchanged files.
 3. **Confirm "no new code" by diff, never by head-equality alone.** A rebase changes the head SHA even when your session's recomputed head already matches the PR head; the real question is `old-reviewed-SHA .. current-head`. New files (e.g. a driver split) hide here — list `git diff --name-status <old>..<new>` before claiming nothing changed.
 4. Check for silent changes and JIRA ticket renumbering in commit messages (can signal scope change).
@@ -135,7 +156,7 @@ When invoked with `re-review` or when the PR changed since the last pass:
 An optional interactive pass that refines a drafted review **one finding at a time** before anything is presented for submission. Trigger it when the user says "walkthrough", "walk me through the findings", "go finding by finding", or after a local review is drafted and the user wants to adjust, question, polish, reclassify, or reject findings. It sits between Step 4 (draft) and Step 5 (present) and is the natural next step once a local review is done. It is **purely local refinement of the draft** — it never touches GitHub, and all Hard Rules still hold.
 
 ### Entering the walkthrough
-1. **Locate the draft.** Use the most recent draft(s) in [drafts/](./drafts/) for this PR/workspace (`pr-<N>-<repo>-<timestamp>.md`). If no draft exists yet, run Steps 0–4 first, then enter the walkthrough. For a multi-repo set, confirm the order and walk one repo's draft at a time.
+1. **Locate the draft.** Use the most recent draft(s) under `~/.copilot-private/skills/pr-review/drafts/` for this PR/workspace (`pr-<N>-<repo>-<timestamp>.md`). If no draft exists yet, run Steps 0–4 first, then enter the walkthrough. For a multi-repo set, confirm the order and walk one repo's draft at a time.
 2. **State the lay of the land.** Up front, announce the totals and order, e.g. "12 findings — 3 blockers, 5 suggestions, 3 nits, 1 question. Walking blockers first." Default order is by severity (blockers → suggestions → nits → questions/praise); honor a different order if asked. Carry-forward prior-comment items (from Step 2) are part of the walk.
 
 ### Per-finding loop

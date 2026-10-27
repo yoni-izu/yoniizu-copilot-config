@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""pr-monitor store reader and token-free status refresher.
+"""Outgoing PR owner: SQLite state and token-free GitHub mirror refresh.
 
-The pr-monitor skill keeps its state in a markdown memoir at
-``/memories/pr-monitor-features.md``. This module parses that file, refreshes
-each PR's status straight from the ``gh`` CLI (no model in the loop), writes the
-Status column back, and exposes a JSON payload for the Team Portal.
+PRS_DB overrides ~/tasks/prs.db. Markdown is explicit import/export only;
+GitHub remains authoritative for probed PR status.
 
     pm.py list                 # what is tracked right now
     pm.py refresh [-f ID]      # hit GitHub, update the Status column
-    pm.py add-feature NAME [-d DESC] [-p REF ...]
+    pm.py add-feature NAME [-P PRIO] [-s SUMMARY] [-j JIRA] [-d DESC] [-p REF ...]
     pm.py add-pr ID REF        # REF = PR URL or owner/repo#123
     pm.py rm-pr ID NUMBER      # stop tracking one PR
     pm.py drop-feature ID      # retire a feature from active tracking
@@ -26,8 +24,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+import pr_store as db
 
-# The memory tool owns this file; we only rewrite the Status cells in place.
+# Legacy discovery is used only by the explicit migrate command.
 STORE_CANDIDATES = [
     "~/.vscode-server/data/User/globalStorage/github.copilot-chat/memory-tool"
     "/memories/pr-monitor-features.md",
@@ -60,27 +59,67 @@ FEAT_RE = re.compile(r"^##\s*\[(\d+)\]\s*(.+?)\s*$")
 ROW_RE = re.compile(r"^(\s*)\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(\d+)\s*\|"
                     r"\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*$")
 FIELD_RE = re.compile(r"^\s*-\s*\*\*([^:*]+):\*\*\s*(.*)$")
-NOTE_RE = re.compile(r"^\s*-\s*\*\*(\d{4}-\d{2}-\d{2})[^*]*\*\*[:.]?\s*(.*)$")
+NOTE_RE = re.compile(r"^\s*-\s*\*\*(\d{4}-\d{2}-\d{2})\s*(?:\(([^)]*)\))?[^*]*\*\*[:.]?\s*(.*)$")
+# The block's opening note is written as a field: "- **Notes:** 2026-10-12 — text".
+FIELD_NOTE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*[\u2014\u2013-]+\s*(.*)$")
+JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,15}-\d+)\b")
+SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[`*])")
 ARCHIVED_RE = re.compile(r"COMPLETE|DROPPED|ABANDONED", re.I)
+SUMMARY_MAX = 240
+PRIORITIES = ("critical", "high", "medium", "low")
+DEFAULT_PRIORITY = "medium"
+
+
+def jira_keys(*texts: str) -> list[str]:
+    """Distinct Jira keys in order of appearance. ``SW-0`` style placeholders
+    (number 0) mean "no ticket yet" and are dropped."""
+    out: list[str] = []
+    for t in texts:
+        for k in JIRA_KEY_RE.findall(t or ""):
+            if int(k.rsplit("-", 1)[1]) and k not in out:
+                out.append(k)
+    return out
+
+
+def derive_summary(description: str) -> str:
+    """First sentence of the description, minus its leading ``[KEY]`` tags."""
+    d = re.sub(r"^(\s*\[[^\]]*\]\s*)+", "", description or "").strip()
+    if not d:
+        return ""
+    first = SENTENCE_END_RE.split(d, maxsplit=1)[0].strip()
+    if len(first) > SUMMARY_MAX:
+        first = first[:SUMMARY_MAX].rsplit(" ", 1)[0].rstrip(",;:") + "\u2026"
+    return first
 
 
 def parse(text: str) -> list[dict]:
-    """Extract features from the memoir. Unknown lines are ignored on purpose —
-    the file is a human memoir first and a data store second."""
+    """Parse explicit markdown interchange, retaining complete field values.
+
+    Unknown narrative is preserved in the canonical document and raw blocks
+    exposed by records(), rather than being reconstructed from display fields.
+    """
     feats: list[dict] = []
     cur: dict | None = None
+    tail: dict | None = None    # last note, so wrapped lines join it
     for line in text.splitlines():
         m = FEAT_RE.match(line)
         if m:
             name = m.group(2)
             cur = {"id": int(m.group(1)), "name": name, "logged": None,
-                   "description": "", "pldm": "not-tested", "pldm_details": "",
+                   "summary": "", "jira": [], "description": "", "priority": "",
+                   "pldm": "not-tested", "pldm_details": "",
                    "prs": [], "notes": [],
                    "complete": bool(ARCHIVED_RE.search(name))}
             feats.append(cur)
+            tail = None
             continue
         if cur is None:
             continue
+        if tail is not None and line[:1].isspace() and line.strip() \
+                and not line.lstrip().startswith(("|", "-")):
+            tail["text"] += " " + line.strip()
+            continue
+        tail = None
         row = ROW_RE.match(line)
         if row and row.group(2).lower() not in ("owner", "-------", "---"):
             owner, repo, num = row.group(2), row.group(3), int(row.group(4))
@@ -94,24 +133,121 @@ def parse(text: str) -> list[dict]:
             continue
         note = NOTE_RE.match(line)
         if note:
-            cur["notes"].append({"date": note.group(1), "text": note.group(2)})
+            tail = {"date": note.group(1), "label": (note.group(2) or "").strip(),
+                    "text": note.group(3)}
+            cur["notes"].append(tail)
             continue
         fld = FIELD_RE.match(line)
         if fld:
             key, val = fld.group(1).strip().lower(), fld.group(2).strip()
             if key == "logged":
                 cur["logged"] = val
+            elif key == "summary":
+                cur["summary"] = val
+            elif key == "jira":
+                cur["jira"] = jira_keys(val)
+            elif key == "priority":
+                cur["priority"] = _norm_priority(val)
             elif key == "description":
                 cur["description"] = val
+            elif key == "notes" and val:
+                fn = FIELD_NOTE_RE.match(val)
+                tail = ({"date": fn.group(1), "label": "logged", "text": fn.group(2)} if fn
+                        else {"date": cur["logged"] or "", "label": "logged", "text": val})
+                cur["notes"].append(tail)
             elif key == "pldm test":
                 cur["pldm"] = val.lower()
             elif key == "pldm details":
                 cur["pldm_details"] = val
     for f in feats:
+        # Keep full multiline fields/notes in the parser API as well as the
+        # original document; display summaries alone are not migration data.
+        block_lines = []
+        active = False
+        for line in text.splitlines():
+            head = FEAT_RE.match(line)
+            if head:
+                active = int(head.group(1)) == f["id"] and head.group(2) == f["name"]
+            if active:
+                block_lines.append(line)
+        raw_fields = {}
+        for i, line in enumerate(block_lines):
+            fld = FIELD_RE.match(line)
+            if fld and not NOTE_RE.match(line):
+                end = _value_end(block_lines, i)
+                raw_fields[fld.group(1).lower()] = "\n".join(
+                    [fld.group(2)] + block_lines[i + 1:end]).rstrip("\n")
+        f["fields_raw"] = raw_fields
+        for field in ("description", "summary", "pldm_details"):
+            label = field.replace("_", " ")
+            if label in raw_fields:
+                f[field] = raw_fields[label]
+        notes = []
+        for i, line in enumerate(block_lines):
+            note = NOTE_RE.match(line)
+            fld = FIELD_RE.match(line)
+            if note:
+                end = _value_end(block_lines, i)
+                notes.append({"date": note.group(1), "label": (note.group(2) or "").strip(),
+                              "text": "\n".join([note.group(3)] + block_lines[i + 1:end]).rstrip("\n")})
+            elif fld and fld.group(1).lower() == "notes" and fld.group(2):
+                end = _value_end(block_lines, i)
+                value = "\n".join([fld.group(2)] + block_lines[i + 1:end]).rstrip("\n")
+                fn = FIELD_NOTE_RE.match(value)
+                notes.append({"date": fn.group(1) if fn else f["logged"] or "",
+                              "label": "logged",
+                              "text": value[fn.start(2):] if fn else value})
+        f["notes"] = notes
+        f["priority_derived"] = not f["priority"]
+        f["priority"] = f["priority"] or DEFAULT_PRIORITY
+        f["summary_derived"] = not f["summary"]
+        if not f["summary"]:
+            f["summary"] = derive_summary(f["description"])
+        f["jira_derived"] = not f["jira"]
+        if not f["jira"]:
+            f["jira"] = jira_keys(f["name"], f["description"])
+        # Stable: same-day notes keep their memoir order.
         f["notes"].sort(key=lambda n: n["date"], reverse=True)
         f["last_note"] = f["notes"][0] if f["notes"] else None
-        f["notes"] = f["notes"][:6]
     return _dedupe(feats)
+
+
+def _value_end(lines: list[str], start: int) -> int:
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if FEAT_RE.match(line) or FIELD_RE.match(line) or line.lstrip().startswith("|"):
+            break
+        end += 1
+    return end
+
+
+def records() -> list[dict]:
+    """Canonical records, including archived features and complete raw evidence."""
+    text, revision, cached = db.snapshot()
+    feats = parse(text)
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if FEAT_RE.match(line)]
+    for f in feats:
+        blocks = []
+        for n, start in enumerate(starts):
+            if int(FEAT_RE.match(lines[start]).group(1)) != f["id"]:
+                continue
+            blocks.append("".join(lines[start:starts[n + 1] if n + 1 < len(starts) else len(lines)]))
+        f["raw_markdown"] = "".join(blocks)
+        f["revision"] = revision
+    observed = cached.get("_feature_history", []) + cached.get("features", [])
+    previous = {f["id"]: f for f in observed if "id" in f}
+    feats = [{**previous.get(f["id"], {}), **f} for f in feats]
+    probed = {(pr["owner"], pr["repo"], pr["number"]): pr
+              for f in observed for pr in f.get("prs", [])}
+    for f in feats:
+        for i, pr in enumerate(f["prs"]):
+            old = probed.get((pr["owner"], pr["repo"], pr["number"]))
+            if old:
+                # The last GitHub observation, not a stale memoir status, wins.
+                f["prs"][i] = {**pr, **old}
+    return feats
 
 
 def _dedupe(feats: list[dict]) -> list[dict]:
@@ -209,7 +345,7 @@ def probe(pr: dict) -> dict:
         return out
 
     ok, raw = _gh(["pr", "checks", str(pr["number"]), "--repo", slug,
-                   "--json", "name,state,bucket"])
+                   "--json", "name,state,bucket,link"])
     checks = []
     if ok and raw:
         try:
@@ -226,6 +362,16 @@ def probe(pr: dict) -> dict:
             out["checks_pending"] += 1
     out["failed_checks"] = [c.get("name") for c in checks
                             if (c.get("bucket") or "").lower() == "fail"][:4]
+    # Run URLs (job suffix stripped) of the failing checks, for the portal's
+    # "Why red" deep link into the pipeline explorer.
+    runs = []
+    for c in checks:
+        if (c.get("bucket") or "").lower() != "fail":
+            continue
+        m = re.match(r"(https://github\.com/[^/]+/[^/]+/actions/runs/\d+)", c.get("link") or "")
+        if m and m.group(1) not in runs:
+            runs.append(m.group(1))
+    out["failed_runs"] = runs[:4]
 
     # Already handed to the merge queue: it is landing on its own and nothing
     # else about it is actionable, so it outranks the review/CI cascade.
@@ -244,20 +390,23 @@ def probe(pr: dict) -> dict:
     return out
 
 
-def refresh(only: int | None = None, workers: int = 8,
+def refresh(only=None, workers: int = 8,
             do_purge: bool = True, progress=None) -> dict:
     """Re-probe every tracked PR and persist the new Status cells.
+
+    ``only`` limits the scan to one feature id or an iterable of ids; the probe
+    detail (checks, gate, merge state) of every other feature is carried over
+    from the cache so a partial scan never blanks the rest of the portal.
 
     ``progress`` is an optional ``fn(done, total, feature, pr)`` called once per
     completed probe so a caller can stream the scan to a UI.
     """
-    p = store_path()
-    if p is None:
-        return {"error": "pr-monitor store not found", "features": []}
-    text = p.read_text(encoding="utf-8")
-    feats = parse(text)
+    with db.edit():
+        text, revision, _ = db.snapshot()
+        feats = records()
+    ids = None if only is None else ({only} if isinstance(only, int) else {int(i) for i in only})
     targets = [f for f in feats
-               if not f["complete"] and (only is None or f["id"] == only)]
+               if not f["complete"] and (ids is None or f["id"] in ids)]
     jobs = [(f, pr) for f in targets for pr in f["prs"]]
     if jobs:
         if progress:
@@ -278,7 +427,6 @@ def refresh(only: int | None = None, workers: int = 8,
     done = []
     if do_purge:
         text, done = purge(text, targets)
-    p.write_text(text, encoding="utf-8")
     payload = _payload(feats)
     payload["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     payload["scanned"] = len(jobs)
@@ -289,9 +437,29 @@ def refresh(only: int | None = None, workers: int = 8,
                          for _, pr in jobs if pr.get("error")]
     payload["purged"] = [{"id": f["id"], "name": f["name"], "total": len(f["prs"])}
                          for f in done]
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Network work happens outside the write lock. A simultaneous user edit
+    # invalidates this snapshot instead of silently being overwritten.
+    try:
+        db.save(text, {**db.snapshot()[2], **payload, "_feature_history": feats},
+                expected_revision=revision, action="refresh")
+    except db.Conflict as exc:
+        return {"error": str(exc), "features": [], "retry": True}
     return payload
+
+
+def _carry_probe(feats: list[dict], skip: set[int]) -> None:
+    """Merge cached probe detail into PRs of features not being re-probed."""
+    cached = db.snapshot()[2]
+    probed = {(pr["owner"], pr["repo"], pr["number"]): pr
+              for f in cached.get("_feature_history", []) + cached.get("features", [])
+              for pr in f.get("prs", [])}
+    for f in feats:
+        if f["id"] in skip:
+            continue
+        for i, pr in enumerate(f["prs"]):
+            old = probed.get((pr["owner"], pr["repo"], pr["number"]))
+            if old:
+                f["prs"][i] = {**old, **{k: v for k, v in pr.items() if v}}
 
 
 def purge(text: str, feats: list[dict]) -> tuple[str, list[dict]]:
@@ -362,18 +530,12 @@ def _no_span(lines: list[str], feat_id: int) -> str:
     return f"feature [{feat_id}] not found"
 
 
+@db.atomic
 def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
-    """Stamp a feature's PLDM Test/Details fields in the memoir.
-
-    Rewrites the two field lines in place, or inserts them after the last
-    ``- **…:**`` field of the block if the feature never carried them.
-    """
-    p = store_path()
-    if not p:
-        return False, "pr-monitor store not found"
+    """Atomically stamp a feature's local PLDM state and probe projection."""
     if state not in PLDM_STATES:
         return False, f"invalid PLDM state: {state}"
-    lines = p.read_text(encoding="utf-8").splitlines()
+    lines = db.snapshot()[0].splitlines()
 
     span = _span(lines, feat_id)
     if span is None:
@@ -383,20 +545,23 @@ def set_pldm(feat_id: int, state: str, details: str = "") -> tuple[bool, str]:
     want = {"pldm test": f"- **PLDM Test:** {state}"}
     if details:
         want["pldm details"] = f"- **PLDM Details:** {details}"
-    last_field = start
-    for i in range(start + 1, end):
-        f = FIELD_RE.match(lines[i])
-        if not f:
-            continue
-        last_field = i
-        key = f.group(1).strip().lower()
-        if key in want:
-            lines[i] = want.pop(key)
-    # Leftovers never existed on this feature — add them after its last field.
-    for i, line in enumerate(want.values()):
-        lines.insert(last_field + 1 + i, line)
+    for key, replacement in want.items():
+        start, end = _span(lines, feat_id)
+        found = next((i for i in range(start + 1, end)
+                      if (f := FIELD_RE.match(lines[i]))
+                      and f.group(1).strip().lower() == key), None)
+        if found is not None:
+            lines[found:_value_end(lines, found)] = [replacement]
+        else:
+            anchor = next((i for i in range(start + 1, end)
+                           if NOTE_RE.match(lines[i])
+                           or lines[i].lstrip().startswith("|")
+                           or (FIELD_RE.match(lines[i])
+                               and FIELD_RE.match(lines[i]).group(1).lower() == "prs")),
+                          end)
+            lines.insert(anchor, replacement)
 
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.save("\n".join(lines) + "\n")
     _patch_cache_pldm(feat_id, state, details)
     return True, f"[{feat_id}] PLDM Test: {state}"
 
@@ -427,51 +592,41 @@ def _pr_row(owner: str, repo: str, number: int, branch: str, title: str,
 
 
 def _sync_cache() -> None:
-    """Rebuild the cache from the just-edited memoir, keeping probe detail.
-
-    Writing the memoir makes it newer than the cache, which would make
-    ``payload()`` fall back to a bare parse and drop every probed field until
-    the next scan. Re-derive the features from the memoir and carry over the
-    checks/gate data of every PR that is still tracked.
-    """
-    p = store_path()
-    if p is None or not CACHE.exists():
-        return
-    try:
-        cached = json.loads(CACHE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        CACHE.unlink(missing_ok=True)
-        return
+    """Rebuild the SQLite portal projection without losing GitHub observations."""
+    text, _, cached = db.snapshot()
     probed = {(pr["owner"], pr["repo"], pr["number"]): pr
-              for f in cached.get("features", []) for pr in f.get("prs", [])}
-    feats = parse(p.read_text(encoding="utf-8"))
+              for f in cached.get("_feature_history", []) + cached.get("features", [])
+              for pr in f.get("prs", [])}
+    feats = parse(text)
+    previous = {f["id"]: f
+                for f in cached.get("_feature_history", []) + cached.get("features", [])
+                if "id" in f}
+    feats = [{**previous.get(f["id"], {}), **f} for f in feats]
     for f in feats:
         for i, pr in enumerate(f["prs"]):
             old = probed.get((pr["owner"], pr["repo"], pr["number"]))
             if old:
                 # The memoir wins, but only where it actually says something.
-                f["prs"][i] = {**old, **{k: v for k, v in pr.items() if v}}
+                f["prs"][i] = {**pr, **old}
     out = _payload(feats)
     out["last_scan"] = cached.get("last_scan")
-    CACHE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    db.save(text, {**cached, **out, "_feature_history": feats}, action="cache")
 
 
+@db.atomic
 def add_pr(feat_id: int, ref: str, branch: str = "", title: str = "",
            status: str = "pending", lookup: bool = True) -> tuple[bool, str]:
-    """Add one PR row to a feature's table, opening the table if it has none.
+    """Track one PR on a canonical feature, opening its table if necessary.
 
     ``ref`` is a PR URL or ``owner/repo#123``. With ``lookup`` the branch, title
     and merged/closed state come from ``gh``, so the row lands carrying the same
     detail a scan would have written.
     """
-    p = store_path()
-    if p is None:
-        return False, "pr-monitor store not found"
     parsed = parse_pr_ref(ref)
     if not parsed:
         return False, f"could not read a PR reference from {ref!r}"
     owner, repo, number = parsed
-    lines = p.read_text(encoding="utf-8").splitlines()
+    lines = db.snapshot()[0].splitlines()
     span = _span(lines, feat_id)
     if span is None:
         return False, _no_span(lines, feat_id)
@@ -518,17 +673,15 @@ def add_pr(feat_id: int, ref: str, branch: str = "", title: str = "",
             + ([] if has_table else TABLE_HEAD) + [row]
         lines[anchor + 1:anchor + 1] = block
 
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.save("\n".join(lines) + "\n")
     _sync_cache()
     return True, f"[{feat_id}] + {repo}#{number}"
 
 
+@db.atomic
 def remove_pr(feat_id: int, number: int, repo: str = "") -> tuple[bool, str]:
-    """Drop one PR row from a feature. Nothing else in the memoir moves."""
-    p = store_path()
-    if p is None:
-        return False, "pr-monitor store not found"
-    lines = p.read_text(encoding="utf-8").splitlines()
+    """Stop tracking one PR without disturbing other feature state."""
+    lines = db.snapshot()[0].splitlines()
     span = _span(lines, feat_id)
     if span is None:
         return False, _no_span(lines, feat_id)
@@ -543,30 +696,34 @@ def remove_pr(feat_id: int, number: int, repo: str = "") -> tuple[bool, str]:
         return False, f"#{number} is ambiguous on [{feat_id}] \u2014 name the repo"
     gone = ROW_RE.match(lines[hits[0]]).group(3)
     del lines[hits[0]]
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.save("\n".join(lines) + "\n")
     _sync_cache()
     return True, f"[{feat_id}] \u2212 {gone}#{number}"
 
 
+@db.atomic
 def add_feature(name: str, description: str = "", refs: list[str] | None = None,
-                lookup: bool = True) -> tuple[bool, str, int | None]:
-    """Open a new feature block at the end of the memoir and fill its table."""
-    p = store_path()
-    if p is None:
-        return False, "pr-monitor store not found", None
+                lookup: bool = True, summary: str = "",
+                jira: str = "", priority: str = "") -> tuple[bool, str, int | None]:
+    """Atomically allocate a feature ID, including archived IDs in the sequence."""
     name = _cell(name)
     if not name:
         return False, "a feature name is required", None
-    text = p.read_text(encoding="utf-8")
+    text = db.snapshot()[0]
     ids = [int(m.group(1)) for m in map(FEAT_RE.match, text.splitlines()) if m]
     fid = max(ids, default=0) + 1
     block = [f"## [{fid}] {name}",
              f"- **Logged:** {datetime.now().strftime('%Y-%m-%d')}"]
+    if _norm_priority(priority):
+        block.append(f"- **Priority:** {_norm_priority(priority)}")
+    if summary and _cell(summary):
+        block.append(f"- **Summary:** {_cell(summary)}")
+    if jira and _norm_jira(jira):
+        block.append(f"- **Jira:** {_norm_jira(jira)}")
     if description:
-        block.append(f"- **Description:** {_cell(description)}")
+        block.append(f"- **Description:** {description}")
     block += ["- **PRs:**"] + TABLE_HEAD
-    p.write_text(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n",
-                 encoding="utf-8")
+    db.save(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n", action="new")
 
     added, bad = 0, []
     for ref in refs or []:
@@ -579,13 +736,10 @@ def add_feature(name: str, description: str = "", refs: list[str] | None = None,
     return True, (note + " \u00b7 " + "; ".join(bad) if bad else note), fid
 
 
+@db.atomic
 def drop_feature(feat_id: int) -> tuple[bool, str]:
-    """Retire a feature by annotating its heading, the same shape ``purge``
-    writes. Nothing is deleted — ARCHIVED_RE just stops it reaching the payload."""
-    p = store_path()
-    if p is None:
-        return False, "pr-monitor store not found"
-    lines = p.read_text(encoding="utf-8").splitlines()
+    """Retire a feature without deleting any history."""
+    lines = db.snapshot()[0].splitlines()
     span = _span(lines, feat_id)
     if span is None:
         return False, _no_span(lines, feat_id)
@@ -595,10 +749,123 @@ def drop_feature(feat_id: int) -> tuple[bool, str]:
     lines[span[0]] = (f"## [{feat_id}] {name} \u2014 \U0001f6ab DROPPED "
                       f"({datetime.now().strftime('%Y-%m-%d')}, "
                       "dropped from active tracking)")
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.save("\n".join(lines) + "\n", action="retire")
     _sync_cache()
     return True, f"[{feat_id}] {name} \u2014 dropped from tracking"
 
+
+FIELD_ORDER = ["logged", "priority", "summary", "jira", "description"]
+
+
+def _set_field(lines: list[str], start: int, end: int, label: str, value: str) -> None:
+    """Upsert or (empty value) delete one ``- **Label:** value`` field in a block,
+    keeping new fields in ``FIELD_ORDER`` position."""
+    key = label.lower()
+    rank = FIELD_ORDER.index(key)
+    idx, insert_at = None, start + 1
+    for i in range(start + 1, end):
+        f = FIELD_RE.match(lines[i])
+        if not f or NOTE_RE.match(lines[i]):
+            continue
+        k = f.group(1).strip().lower()
+        if k == key:
+            idx = i
+            break
+        if k in FIELD_ORDER and FIELD_ORDER.index(k) < rank:
+            insert_at = _value_end(lines, i)
+    row = f"- **{label}:** {value}"
+    if value:
+        if idx is not None:
+            lines[idx:_value_end(lines, idx)] = [row]
+        else:
+            lines.insert(insert_at, row)
+    elif idx is not None:
+        del lines[idx:_value_end(lines, idx)]
+
+
+def _norm_priority(value: str) -> str:
+    v = (value or "").strip().lower()
+    return v if v in PRIORITIES else ""
+
+
+def _norm_jira(value: str) -> str:
+    keys = jira_keys((value or "").upper())
+    return ", ".join(keys)
+
+
+@db.atomic
+def edit_feature(feat_id: int, name: str | None = None,
+                 description: str | None = None, summary: str | None = None,
+                 jira: str | None = None,
+                 priority: str | None = None,
+                 expected_revision: int | None = None) -> tuple[bool, str]:
+    """Edit selected local fields, optionally checking an optimistic revision.
+
+    ``None`` leaves a field alone; an empty string removes it (summary and jira
+    then fall back to being derived from the description).
+    """
+    text, revision, _ = db.snapshot()
+    if expected_revision is not None and expected_revision != revision:
+        return False, f"PR revision conflict: expected {expected_revision}, current {revision}"
+    lines = text.splitlines()
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    start = span[0]
+
+    if name is not None:
+        clean_name = _cell(name)
+        if not clean_name:
+            return False, "feature name cannot be empty"
+        current = FEAT_RE.match(lines[start]).group(2)
+        suffix = ""
+        if " \u2014 " in current:
+            _, tail = current.split(" \u2014 ", 1)
+            if ARCHIVED_RE.search(tail):
+                suffix = " \u2014 " + tail
+        lines[start] = f"## [{feat_id}] {clean_name}{suffix}"
+
+    if jira is not None and jira.strip() and not _norm_jira(jira):
+        return False, f"no Jira key found in {jira!r} (expected e.g. IPPCIESW-684)"
+    if priority is not None and priority.strip() and not _norm_priority(priority):
+        return False, f"priority must be one of {', '.join(PRIORITIES)}"
+    changed = []
+    for label, val in (("Priority", priority), ("Summary", summary), ("Jira", jira), ("Description", description)):
+        if val is None:
+            continue
+        clean = (_norm_jira(val) if label == "Jira"
+                 else _norm_priority(val) if label == "Priority" else val)
+        # The span shifts as fields are inserted/removed — re-resolve each time.
+        s, e = _span(lines, feat_id)
+        _set_field(lines, s, e, label, clean)
+        changed.append(label.lower())
+    if name is not None:
+        changed.insert(0, "name")
+
+    db.save("\n".join(lines) + "\n", expected_revision=revision)
+    _sync_cache()
+    return True, f"[{feat_id}] updated " + (", ".join(changed) or "nothing")
+
+
+@db.atomic
+def add_note(feat_id: int, text: str, label: str = "") -> tuple[bool, str]:
+    """Append one dated activity note to a feature's history."""
+    clean = text or ""
+    if not clean.strip():
+        return False, "note text is empty"
+    lines = db.snapshot()[0].splitlines()
+    span = _span(lines, feat_id)
+    if span is None:
+        return False, _no_span(lines, feat_id)
+    start, end = span
+    while end - 1 > start and not lines[end - 1].strip():
+        end -= 1
+    lbl = re.sub(r"[()*]", "", label or "").strip()
+    head = datetime.now().strftime("%Y-%m-%d") + (f" ({lbl})" if lbl else "")
+    lines.insert(end, f"- **{head}:** {clean}")
+    db.save("\n".join(lines) + "\n", action="note")
+    _sync_cache()
+    return True, f"[{feat_id}] note added"
 
 
 def post_ci(owner: str, repo: str, number: int) -> tuple[bool, str]:
@@ -650,26 +917,15 @@ def trigger_ci(feat_id: int, scope: str = "all",
 
 
 def _patch_cache_pldm(feat_id: int, state: str, details: str) -> None:
-    """Mirror a PLDM stamp into the cache and re-stamp its mtime.
-
-    Writing the memoir makes it newer than the cache, which would make
-    ``payload()`` fall back to a bare parse and drop every probed field until
-    the next scan. Patching keeps the check counts and gates alive.
-    """
-    if not CACHE.exists():
-        return
-    try:
-        data = json.loads(CACHE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        CACHE.unlink(missing_ok=True)
-        return
+    """Mirror local PLDM state into the transactional SQLite projection."""
+    text, _, data = db.snapshot()
     for f in data.get("features", []):
         if f.get("id") == feat_id:
             f["pldm"] = state
             f["pldm_stale"] = state in ("queued", "running")
             if details:
                 f["pldm_details"] = details
-    CACHE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    db.save(text, data, action="pldm")
 
 
 # --- payload ----------------------------------------------------------------
@@ -714,29 +970,12 @@ def _counts(active: list[dict]) -> dict:
 
 
 def payload() -> dict:
-    """Portal payload. Prefers the cache (it carries the live probe detail) and
-    falls back to a plain parse of the memoir when no scan has run yet."""
-    p = store_path()
-    if p is None:
-        return {"features": [], "counts": {}, "last_scan": None,
-                "error": "pr-monitor store not found"}
-    base = _payload(parse(p.read_text(encoding="utf-8")))
-    if CACHE.exists():
-        try:
-            cached = json.loads(CACHE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return base
-        if p.stat().st_mtime <= CACHE.stat().st_mtime + 2:
-            return cached
-        # The memoir was edited behind our back (the memory tool also writes
-        # it). Fold the hand-edit in rather than serving a cache that can never
-        # catch up, and keep the probe detail the bare parse does not have.
-        _sync_cache()
-        try:
-            return json.loads(CACHE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            base["last_scan"] = cached.get("last_scan")
-    return base
+    """Portal projection of canonical state with the latest GitHub observations."""
+    with db.edit():
+        _, _, cached = db.snapshot()
+        base = _payload(records())
+        return {**{k: v for k, v in cached.items() if not k.startswith("_")},
+                **base, "last_scan": cached.get("last_scan")}
 
 
 # --- CLI --------------------------------------------------------------------
@@ -770,7 +1009,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="show tracked features from the store")
     r = sub.add_parser("refresh", help="re-probe every PR via gh and save")
-    r.add_argument("-f", "--feature", type=int, help="only this feature id")
+    r.add_argument("-f", "--feature", type=int, action="append",
+                   help="only this feature id (repeatable)")
     r.add_argument("--no-purge", action="store_true",
                    help="keep fully-merged features in active tracking")
     g = sub.add_parser("purge", help="retire features whose PRs are all merged")
@@ -787,24 +1027,71 @@ def main(argv: list[str] | None = None) -> int:
     af = sub.add_parser("add-feature", help="open a new tracked feature")
     af.add_argument("name")
     af.add_argument("-d", "--description", default="")
+    af.add_argument("-s", "--summary", default="", help="one-line summary for the portal")
+    af.add_argument("-j", "--jira", default="", help="Jira key(s), comma-separated")
+    af.add_argument("-P", "--priority", default="", choices=("",) + PRIORITIES)
     af.add_argument("-p", "--pr", action="append", default=[],
                     help="PR URL or owner/repo#123 (repeatable)")
+    ef = sub.add_parser("edit-feature", help="edit name/priority/summary/jira/description "
+                        "(pass \"\" to clear a field)")
+    ef.add_argument("feature", type=int)
+    ef.add_argument("--name")
+    ef.add_argument("-s", "--summary")
+    ef.add_argument("-j", "--jira")
+    ef.add_argument("-P", "--priority", choices=("",) + PRIORITIES)
+    ef.add_argument("-d", "--description")
+    ef.add_argument("--expected-revision", type=int)
+    nt = sub.add_parser("note", help="append a dated activity note to a feature")
+    nt.add_argument("feature", type=int)
+    nt.add_argument("text")
+    nt.add_argument("-l", "--label", default="", help="short tag, e.g. 'rebase + /ci'")
     df = sub.add_parser("drop-feature", help="retire a feature from tracking")
     df.add_argument("feature", type=int)
     sub.add_parser("payload", help="emit the portal JSON")
+    sub.add_parser("paths", help="show canonical and legacy store paths")
+    sh = sub.add_parser("show", help="show one feature, including archived history")
+    sh.add_argument("feature", type=int)
+    mg = sub.add_parser("migrate", help="one-time backed-up legacy import (local only)")
+    mg.add_argument("--source", type=Path)
+    mg.add_argument("--cache", type=Path, default=CACHE)
+    ex = sub.add_parser("export", help="explicit markdown/cache interchange")
+    ex.add_argument("destination", type=Path)
+    ex.add_argument("--cache", type=Path)
     a = ap.parse_args(argv)
 
-    if a.cmd == "list":
+    if a.cmd == "paths":
+        print(json.dumps({"database": str(db.path()), "legacy": str(store_path()),
+                          "legacy_cache": str(CACHE)}))
+    elif a.cmd == "migrate":
+        source = a.source or store_path()
+        if source is None:
+            ap.error("legacy memoir not found; specify --source")
+        print("imported" if db.migrate(source, a.cache) else "already imported")
+    elif a.cmd == "export":
+        db.export(a.destination, a.cache)
+    elif a.cmd == "show":
+        matches = [f for f in records() if f["id"] == a.feature]
+        print(json.dumps(matches, indent=2, ensure_ascii=False))
+        return 0 if matches else 1
+    elif a.cmd == "list":
         _print(payload())
-    elif a.cmd in ("add-pr", "rm-pr", "add-feature", "drop-feature"):
+    elif a.cmd in ("add-pr", "rm-pr", "add-feature", "drop-feature", "edit-feature", "note"):
         if a.cmd == "add-pr":
             ok, msg = add_pr(a.feature, a.ref, lookup=not a.no_lookup)
         elif a.cmd == "rm-pr":
             ok, msg = remove_pr(a.feature, a.number, a.repo)
         elif a.cmd == "drop-feature":
             ok, msg = drop_feature(a.feature)
+        elif a.cmd == "edit-feature":
+            ok, msg = edit_feature(a.feature, name=a.name, description=a.description,
+                                   summary=a.summary, jira=a.jira,
+                                   priority=a.priority, expected_revision=a.expected_revision)
+        elif a.cmd == "note":
+            ok, msg = add_note(a.feature, a.text, a.label)
         else:
-            ok, msg, _ = add_feature(a.name, a.description, a.pr)
+            ok, msg, _ = add_feature(a.name, a.description, a.pr,
+                                     summary=a.summary, jira=a.jira,
+                                     priority=a.priority)
         print(f"[pm] {msg}")
         return 0 if ok else 1
     elif a.cmd == "refresh":
@@ -816,22 +1103,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[pm] all {f['total']} PRs merged for [{f['id']}] "
                       f"{f['name']} \u2014 dropped from active tracking")
     elif a.cmd == "purge":
-        p = store_path()
-        if p is None:
-            print("[pm] pr-monitor store not found")
-            return 1
-        text = p.read_text(encoding="utf-8")
-        new, done = purge(text, parse(text))
-        for f in done:
-            print(f"[pm] [{f['id']}] {f['name']} \u2014 {len(f['prs'])}/{len(f['prs'])} merged")
-        if not done:
-            print("[pm] nothing to retire")
-        elif a.dry_run:
-            print(f"[pm] dry run \u2014 {len(done)} feature(s) would be retired")
-        else:
-            p.write_text(new, encoding="utf-8")
-            CACHE.unlink(missing_ok=True)
-            print(f"[pm] retired {len(done)} feature(s)")
+        with db.edit():
+            text = db.snapshot()[0]
+            new, done = purge(text, records())
+            for f in done:
+                print(f"[pm] [{f['id']}] {f['name']} \u2014 {len(f['prs'])}/{len(f['prs'])} merged")
+            if not done:
+                print("[pm] nothing to retire")
+            elif a.dry_run:
+                print(f"[pm] dry run \u2014 {len(done)} feature(s) would be retired")
+            else:
+                db.save(new, action="purge")
+                _sync_cache()
+                print(f"[pm] retired {len(done)} feature(s)")
     else:
         print(json.dumps(payload(), indent=2, ensure_ascii=False))
     return 0

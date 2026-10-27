@@ -4,6 +4,11 @@ description: 'Answer PCIe EP IP design, usage, register, PHY, controller, and PI
 argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or controller behavior'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # PCIe EP IP Documentation Q&A
 
 ## When to Use

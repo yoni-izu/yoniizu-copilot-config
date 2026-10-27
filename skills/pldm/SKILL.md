@@ -4,6 +4,11 @@ description: 'Connect to and run firmware on Palladium (PLDM) emulation stations
 argument-hint: 'What you want to do on Palladium — connect, load image, power cycle, capture/load waves, init memories, or debug'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Palladium (PLDM) Emulation Stations
 
 ## When to Use
@@ -28,18 +33,19 @@ argument-hint: 'What you want to do on Palladium — connect, load image, power 
 - **VPN** connection if not on the office network.
 - **VNC / EDK host login**: personal user credentials (the same personal credentials documented
   on the platform wiki). Do NOT hardcode these.
-- **IPMI login** (shared lab creds): user `elmnt_user`, password `elmnt123!`.
+- **IPMI login** (shared lab creds): user `elmnt_user`, password from an approved protected secret source.
 
 ## Quick Index of Resources
 
-- Full station / EDK-host / IPMI inventory (Iridium Z2 & Z3, Lotus): [references/stations.md](./references/stations.md)
+- Full station / EDK-host / IPMI inventory: `~/.copilot-private/skills/pldm/references/stations.md`
 - Image name ⇄ PCIe rev ID lookup table: [references/images.md](./references/images.md)
 - Palladium dashboard (image content, machine status, allocation calendar):
   https://emul-online.elmnt.local/simple_view.html
 
 ## 1. Connect and Load an Image
 
-1. Pick a station for the design from [references/stations.md](./references/stations.md). Each
+1. Pick a station for the design from
+   `~/.copilot-private/skills/pldm/references/stations.md`. Each
    station maps to a **VNC desktop** (the Palladium GUI / control terminal) and an **EDK host
    server** (the SoC host, reachable by SSH).
 2. **VNC in** to the station (e.g. `vnc-emul-iridium01:1` → `192.168.110.142:1`) using your
@@ -54,7 +60,7 @@ argument-hint: 'What you want to do on Palladium — connect, load image, power 
    ```
 5. **SSH to the EDK host** for the SoC side (X-forwarding for GUIs):
    ```bash
-   ssh user@pldm-edk0-z2a -X     # host hostname from references/stations.md
+   ssh user@<edk-host> -X
    ```
    On a **first-time** connection to a station/EDK host, bootstrap your personal environment
    first — see [§1a](#1a-first-time-station-setup-bootstrap).
@@ -67,7 +73,7 @@ already set up.
 
 **Detection** (run against the target host; replace `<host>`):
 ```bash
-host=<host>   # e.g. pldm-edk0-z2a
+host=<host>
 if ssh "$host" 'test -f ~/.palladium_bootstrapped'; then
   echo "already bootstrapped"
 else
@@ -78,7 +84,7 @@ fi
 **Bootstrap** — copy SSH keypair, the `wip` CLI, `wip_funcs.sh`, aliases, and `my_funcs.sh`,
 then drop the marker. Use the helper script:
 ```bash
-./scripts/bootstrap_station.sh <host>     # e.g. ./scripts/bootstrap_station.sh pldm-edk0-z2a
+./scripts/bootstrap_station.sh <host>
 ```
 
 What it copies (only the items present locally):
@@ -101,7 +107,7 @@ functions. `bootstrap_station.sh` installs `wip`, but a host bootstrapped before
 this tool existed may lack it. If `wip` is `command not found` on a station,
 deploy it standalone (no full re-bootstrap needed):
 ```bash
-~/bin/wip-deploy <host>     # e.g. ~/bin/wip-deploy pldm-edk0-z2a
+~/bin/wip-deploy <host>
 ```
 > Re-run with `--force` to refresh the copied files.
 
@@ -116,9 +122,9 @@ Do BOTH steps — reset the emulated design first, then power-cycle the EDK host
    force <proj>_rst_n 1'b1
    ```
 2. Power-cycle the EDK host over IPMI (from a shell; mgmt host/IP from
-   [references/stations.md](./references/stations.md)):
+   `~/.copilot-private/skills/pldm/references/stations.md`):
    ```bash
-   ipmitool -I lanplus -H <mgmt-host-or-ip> -U elmnt_user -P 'elmnt123!' power cycle
+   ipmitool -I lanplus -H <mgmt-host-or-ip> -U elmnt_user -E power cycle
    ```
    `power` also accepts `status` / `on` / `off`.
 
@@ -147,7 +153,7 @@ pd_wave /vlsi/proj/neon/emul/users/<user>/trace.phy iridium_fullchip_687_mc_1rac
 ```
 - Default wave tool is **Verisium**. To use **SimVision** instead, run `pd_wave_simv`.
 - Use the dedicated wave-loading VNC desktops (displays `:9`–`:16` on each station — see
-  [references/stations.md](./references/stations.md)).
+  `~/.copilot-private/skills/pldm/references/stations.md`).
 
 ## 5. Memories Initialization (backdoor load with ECC)
 

@@ -4,6 +4,11 @@ description: "Checkout local repos to PR branches. Use when: user pastes GitHub 
 argument-hint: "Paste one or more GitHub PR URLs"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Checkout PR Branches
 
 ## When to Use

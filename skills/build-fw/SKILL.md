@@ -4,6 +4,11 @@ description: "Build FW (firmware) Zephyr applications for specific boards/varian
 argument-hint: "App name and optionally: platform (host|arm), variant (sim|palladium|onix|asic|...), is_test (true|false)"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Build FW Environment
 
 ## When to Use
@@ -296,6 +301,10 @@ one costs a wasted round trip; check them up front.
 
 ### Rebase / stale-source pitfalls (2026-10-18, IPPCIESW-695): now enforced by `mctl build`
 
+> ⚠️ **2026-10-26: these guards are NOT in the current `~/bin/mctl`.** The 2026-10-25 rewrite
+> dropped them, and the last version with them is `~/bin/mctl.bak.20261018185316`. Apply each
+> rule below by hand until they are restored. See "Full-workspace build on a reused VM slot".
+
 An ASIC image was built from **pre-rebase heads** and flashed to all 8 cards of a
 tray; the rebuild after the rebase then failed **twice** on stale generated
 syscall headers. These are now **hard guards in `~/bin/mctl build`**. Do not
@@ -330,6 +339,29 @@ mctl mirror                                     # or per-repo checkout -B
 mctl sh 'for r in <changed repos>; do git -C $r log --oneline -1; done'   # verify!
 mctl build . proj_infra --with-deps             # ws arg FIRST
 mctl build-status
+```
+
+### Full-workspace build on a reused VM slot (2026-10-26, LTSSM logger + MNG #441)
+
+A full `octl ws build --parallel` on a VM slot reused from an old FW experiment
+took **four** launches to get green. None of the failures were source defects:
+
+| Pitfall | Symptom | Do this instead |
+| --- | --- | --- |
+| **The `mctl build` stale-tree and stale-base guards above are no longer in the script.** `~/bin/mctl` was rewritten on 2026-10-25 and has no `[mctl-guard]`, `STALE-BASE` or `twister-out` logic. Only `mctl.bak.20261018185316` predates the rewrite | Old trees survive the build and cause the syscall errors listed in "Known false failures" | Until the guards are restored, wipe the trees by hand before building (next rows), and check freshness yourself with `git rev-list --count HEAD..origin/<base>` |
+| **`octl ws clean` does not remove `twister-out`.** It clears `build_artifacts` and the app `build/` dirs, but Twister output under `ip/*/twister-out`, `ip/*/*/twister-out` and `infra/el_utils/twister-out` survives | After a clean, the build still failed: `ip.pcie.sw.fw.ep` Twister `el_piw.host_test` reported `el_reset_config_comp_reset_mask_die declared 'static' but never defined`. The generated `syscalls/el_reset_common.h` was dated 2026-10-11, while `syscalls.json` was fresh | After `octl ws clean`, also run `find . -maxdepth 5 -type d -name 'twister-out*' -not -path './build_artifacts/*' -not -path './.repo/*' -prune -exec rm -rf {} +`. Compare the generated header's mtime against `syscalls.json` to confirm |
+| **An old external-FW extract sits next to the pinned one.** `build_artifacts/opt/atl/fw_external/d2d/phy/` held `eland_pshaper_cal_1009_*` (old) and `eland_regression_1021_*` (pinned) | `<command-line>: error: "D2D_PHY_VER_STR" redefined [-Werror]` in pwr_thrm, d2d and pcie phy. MNG then fails across every board, which looks like a code break | Make sure each `fw_external/<ip>/phy/` holds **only** the version the manifest pins. Delete the others, or run `octl ws clean` |
+| **A single-board failure hides behind a whole-app failure.** The ITCM overflow was quad-die only, but the D2D/syscall pollution failed all 28 MNG ARM/host boards | Every board fails, so you can't tell whether the change under test helped | First get a pristine tree in which the other boards pass. Only then read the board you care about |
+| **ITCM headroom is in the per-board log, not the summary** | — | `grep -E '^\s*(ITCM\|DTCM):' zephyr_apps/mng/build_logs/<NN>_arm_<board>_*.log`. On 2026-10-26, with #441, `palladium_aw_quad_die` used 252,992 B of 256 KB ITCM (96.5%, about 3 KB free) |
+| **A PR branch is older than the slot base.** MNG #441 was 14 commits behind `a1_power_on_branch` and lacked the IPSESW-392 per-die SE board nodes that the rebased SE needed | Building the PR branch raw would test an MNG that doesn't match the SE/EP under test | Cherry-pick the PR's commit(s) onto the current base on a scratch branch (`git checkout -B … <base-sha>; git cherry-pick <pr-sha>`), and report it as "PR + current base", not "PR as-is" |
+
+Pristine full-build order for a reused slot:
+
+```bash
+mctl sh 'octl ws clean'
+mctl sh "find . -maxdepth 5 -type d -name 'twister-out*' -not -path './build_artifacts/*' -not -path './.repo/*' -prune -exec rm -rf {} +"
+mctl sh 'ls build_artifacts/opt/atl/fw_external/*/phy/ 2>/dev/null'   # exactly one pinned version each
+mctl build
 ```
 
 ## Additional Notes

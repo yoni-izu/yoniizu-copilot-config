@@ -53,7 +53,7 @@ Milestone <name> Status — FW Interfaces
 
 ## Weekly 5-15
 
-Source: Will Larson's 5-15 format — 15 minutes to write, 5 minutes to read.
+Use the 5-15 format — 15 minutes to write, 5 minutes to read.
 
 ```
 Subject: FW Interfaces weekly 5-15 — Week of <date>
@@ -147,7 +147,7 @@ How we will verify
 ## Per-Person Briefing
 
 ```
-<Name> — Sprint Outlook (<sprint name>)
+<team-member> — Sprint Outlook (<sprint name>)
 
 Priorities (ordered)
 1. <ticket>: <goal + evidence target>

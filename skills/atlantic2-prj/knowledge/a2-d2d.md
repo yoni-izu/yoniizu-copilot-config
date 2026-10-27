@@ -9,7 +9,7 @@
 - **Tags:** d2d, ucie, phy, aw, alphawave, arescore, gammacore, chiplet, die-to-die, as-is, no initiatives, fw config
 
 ## Architect input (AUTHORITATIVE — Maxim Leshin, 2026-08-30)
-Yoni (PCIe/D2D FW planner) emailed the architect: "I don't see any initiatives open for D2D at
+The FW planner emailed the architect: "I don't see any initiatives open for D2D at
 all. Also the Rev 2 specification is an exact copy of Rev 1. What should be done on FW side on D2D
 for A2?" Architect reply:
 > **"We are keeping the D2D as is. The FW should be updated only if the new AW IP requires a

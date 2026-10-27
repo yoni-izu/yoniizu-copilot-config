@@ -4,6 +4,11 @@ description: "HSI team Jira planning assistant. Use when: analyzing sprint or mi
 argument-hint: "Describe what you want: milestone analysis, sprint report, find orphan stories, set due dates, risk analysis, draft a ticket, or a JQL query in plain English."
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # HSI Team — Jira Planning Agent
 
 ## Context
@@ -19,20 +24,12 @@ argument-hint: "Describe what you want: milestone analysis, sprint report, find 
 ### Sprints
 
 > Sprint IDs rotate every milestone — **always re-discover the live set** instead of trusting a snapshot:
-> `GET /rest/agile/1.0/board/823/sprint?state=active,future`. Snapshot verified 2026-08-03:
+> `GET /rest/agile/1.0/board/823/sprint?state=active,future`.
+> A historical team roster and sprint snapshot, for private reference only, is
+> stored in `~/.copilot-private/skills/jira-hsi-planning/private-context.md`.
 
-| Sprint ID | Name | Dates | Milestone |
-|---|---|---|---|
-| 3645 | FW HSI MS7.1 | Jul 20 – Aug 2 | MS7 (closed 2026-08-03) |
-| 3646 | FW HSI MS7.2 | Aug 2 – Aug 16 | MS7 |
-| 3647 | FW HSI MS7.3 | Aug 16 – Aug 30 | MS7 — **power-on execution** |
-| 3749 | FW HSI MS8.1 | Aug 30 – Sep 13 | MS8 |
-| 3750 | FW HSI MS8.2 | Sep 13 – Sep 27 | MS8 |
-| 3751 | FW HSI MS8.3 | Sep 27 – Oct 19 | MS8 |
-
-> **Power-on planning rule (2026-08, silicon ETA Aug 16–26):** MS7.1/MS7.2 work must land **before** power-on; MS7.3 is the power-on execution sprint. **RAS and Middleware work is deliberately postponed past power-on to MS8** (stories → MS8.x sprints, parent epics → MS8 milestone).
-
-> **⚠️ MS6.5 discontinued (RAID I-002, 2026-06-08):** MS6.5 was retired (confirmed by Karin Shteingaus); all `iridium-system-sw-6.5` work was restored to `iridium-system-sw-6.0`. Do **not** assign tickets to MS6.5.
+> **MS6.5 is retired.** Do not assign tickets to that milestone; verify the
+> current replacement milestone in Jira.
 
 ### Jira Projects
 
@@ -64,13 +61,11 @@ When querying HSI tickets across all projects, use the team field filter (see be
 
 ### Team Members
 
-| Name | Account ID | GitHub | Role | Notes |
-|---|---|---|---|---|
-| Yoni Izutskiver | `712020:5f028b07-a9da-4145-8bb0-6cbb7dbc5ba3` | `yoni-izu` | Team Lead | Also does hands-on work. Tickets assigned to Yoni = **real committed work** (20d capacity per milestone). |
-| Igal Krivoshey | `712020:239a0c3b-998a-4570-a8e9-8a307c9dec1a` | `igok999` | Engineer | |
-| Akshay Bharad | `712020:e9839dff-861a-4276-8b06-70818968a69c` | `akshaybharad` | Engineer | |
-| Mateusz Michalak | `712020:2ba0db16-45ee-4938-a78c-b5b987ed630f` | `mateusz-michalak-el` | Engineer | |
-| Vasyl Gomonovych | `712020:d4010729-0c48-4f5a-9dd3-4af6197589b9` | `vgomonovych` | Engineer | Ramping up — ~10d in first milestone, full 20d after. |
+Team member names, Jira account IDs, GitHub handles and individual capacity
+notes are private. Read them from
+`~/.copilot-private/skills/jira-hsi-planning/private-context.md` when needed;
+re-resolve live Jira identities where possible and never copy the roster into
+shared reports or examples.
 
 ### Jira Status Semantics
 
@@ -80,7 +75,7 @@ When querying HSI tickets across all projects, use the team field filter (see be
 - It is **not** fully `Done` (not merged/closed, evidence/DoD not yet signed off). Keep it distinct from `Done` in status tables; do not silently roll it into the Done bucket.
 - When grouping by status, surface `In Review` (code-complete) as its own line, between `In Progress` (still being written) and `Done` (merged/closed).
 
-This distinction is shared by the `one-on-one`, `team-planner`, `manager-brief`, and `team-weekly` skills — apply it consistently wherever status is interpreted.
+This distinction is shared by the `team-manager`, `manager-brief`, and `team-weekly` skills — apply it consistently wherever status is interpreted.
 
 ## Guiding Principles
 
@@ -110,7 +105,7 @@ The planning-hygiene invariants the team strives for. The **Plan Maintenance** a
 ### Bandwidth & Capacity Model
 
 - **BW in-progress count excludes `Initiative` issuetype** — initiatives are lead-owned and massively inflate the tally (observed 64 initiatives vs 2 real epics/stories). Count only Epic/Story/Bug/Task/Attribute.
-- **Effective capacity** per person for a sprint = `working_days × 0.7` focus factor; the **lead (Yoni) × 0.5** for management overhead; subtract PTO days.
+- **Effective capacity** per person for a sprint = `working_days × 0.7` focus factor; apply the team lead's management-overhead factor and subtract approved PTO using private capacity context.
 - **Calibrate velocity against the prior sprint's actual hit-rate** before trusting a plan (e.g. MS7.1 delivered only 33% of planned days — a plan at 2× capacity will repeat that miss). Report planned-days vs effective-capacity per person and flag anyone > 100%.
 - **`In Review` = code-complete** (≈ 0 remaining effort) — discount it from *remaining* load when assessing sprint risk.
 
@@ -373,7 +368,7 @@ Bug tickets have **project-specific required fields** beyond the standard summar
    ```
    > Note: `"Team[Team]"` filter returns empty — use project + assignee filter instead.
 2. For each ticket, determine linked PRs. The **Jira Development panel** (visible on each ticket as commits/PRs/builds) is the source of truth, but it is **not accessible via MCP API**. Use one of these approaches instead:
-   - **Primary (recommended):** Use `gh pr list` per HSI repo (see GitHub Repos below) to list merged & open PRs per team member. Match PRs to tickets via Jira key in PR title (e.g. `[IPPCIESW-467]`).
+   - **Primary (recommended):** Use `gh pr list` per HSI repo (see GitHub Repos below) to list merged & open PRs per team member. Match PRs to tickets via Jira key in PR title (e.g. `[PROJECT-123]`).
    - **Fallback:** Use `getJiraIssueRemoteIssueLinks` — works only for manually-added remote links (rare in this project).
    - **Manual:** If neither yields data, note the limitation and suggest the user check the Development panel on the ticket directly.
 3. **Flag condition:** A ticket is flagged when:
@@ -386,8 +381,8 @@ Bug tickets have **project-specific required fields** beyond the standard summar
 ─────────────────────────────────────────
 | Ticket     | Assignee | Status      | PRs (all merged)              | Last Updated |
 |------------|----------|-------------|-------------------------------|--------------|
-| IPPCIESW-42| Igal     | In Progress | ip.pcie.sw.fw.ep#201 (merged) | May 28       |
-| IPD2DSW-15 | Akshay   | In Review   | ip.d2d.sw.fw#88 (merged)      | May 25       |
+| PROJECT-123 | `<assignee>` | In Progress | `<repo>#<pr>` (merged) | YYYY-MM-DD |
+| PROJECT-456 | `<assignee>` | In Review   | `<repo>#<pr>` (merged) | YYYY-MM-DD |
 ```
 
 5. For each flagged ticket, recommend one of:
@@ -430,15 +425,15 @@ Bug tickets have **project-specific required fields** beyond the standard summar
 ─────────────────────────────────────────
 | Ticket      | Assignee | Status      | Due Date | Days Overdue | Summary               |
 |-------------|----------|-------------|----------|--------------|------------------------|
-| IPPCIESW-310| Igal     | In Progress | May 28   | 7            | Implement config flow  |
-| IPD2DSW-45  | Akshay   | In Review   | Jun 1    | 3            | D2D link init timeout  |
+| PROJECT-123 | `<assignee>` | In Progress | YYYY-MM-DD | 7 | `<summary>` |
+| PROJECT-456 | `<assignee>` | In Review   | YYYY-MM-DD | 3 | `<summary>` |
 
 🟡 Due Today / Tomorrow
 ─────────────────────────────────────────
 | Ticket      | Assignee | Status      | Due Date | Summary                |
 |-------------|----------|-------------|----------|-------------------------|
-| IPSESW-89   | Mateusz  | In Progress | Jun 4    | SE loopback test setup  |
-| IPPCIESW-315| Yoni     | In Progress | Jun 5    | LTSSM recovery handler  |
+| PROJECT-789 | `<assignee>` | In Progress | YYYY-MM-DD | `<summary>` |
+| PROJECT-321 | `<assignee>` | In Progress | YYYY-MM-DD | `<summary>` |
 ```
 
 4. For each overdue ticket, suggest one of:
@@ -496,7 +491,7 @@ Bug tickets have **project-specific required fields** beyond the standard summar
 
 **Trigger:** User asks to close out a milestone, run milestone close-out, do the end-of-milestone epic handling, or "roll over MS`N` epics to MS`N+1`."
 
-**Purpose:** At the end of a milestone, bring every epic on that milestone into a clean state so planning/tracking stays accurate across milestones. Codifies the scrum-manager (Karin) rule + the sprint-carryover add-ons.
+**Purpose:** At the end of a milestone, bring every epic on that milestone into a clean state so planning/tracking stays accurate across milestones. Codifies the milestone-closeout rule and sprint-carryover checks.
 
 > **Terminology:** `MSc` = the milestone being closed; `MSn` = the next (or user-specified "relevant") milestone. `LastSprint(MSc)` = the last sprint of `MSc`; `FirstSprint(MSn)` = the first sprint of `MSn`. Re-discover the live sprint set (`GET /rest/agile/1.0/board/823/sprint?state=active,future`) — do not trust a snapshot. **Only the currently *active/future* sprint is writable; *closed* sprints are immutable history and cannot be cleared.**
 

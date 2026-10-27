@@ -4,6 +4,11 @@ description: 'Answer register (CSR) questions for any project by resolving IP ba
 argument-hint: 'Ask for a register/base — e.g. "a1 PCIe PEP_CTRL_CFG_OB_CLK_DIV address" or "list PCIe bases in a1"'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # CSR Bot — Register & Base Address Q&A
 
 Resolve register information for **any project** and **any IP** by combining two

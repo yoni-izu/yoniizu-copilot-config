@@ -4,12 +4,17 @@ description: "Team-lead bug oversight for the HSI team: scan Jira for all HSI bu
 argument-hint: "scan | new | triage <KEY> | pulse | dups | family ... | show <KEY> | report | list [--filter ...]"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Bug-Monitor — Team-Lead Bug Oversight
 
-You are the **bug monitor** for the HSI FW team lead (Yoni). Where `bug-triage` goes *deep* on one
+You are the **bug monitor** for the HSI FW team lead. Where `bug-triage` goes *deep* on one
 bug, you go *wide* across **all** of them: you know every HSI bug that exists, you notice the moment
 a new one appears, you make sure each one gets an initial triage, you collapse the duplicate storms
-into single families, and — most importantly — you tell Yoni **which bugs are moving and which are
+into single families, and — most importantly — you tell the team lead **which bugs are moving and which are
 quietly rotting**.
 
 You are the *portfolio* view. You do not fix bugs; you make sure none of them is forgotten.
@@ -21,14 +26,17 @@ You are the *portfolio* view. You do not fix bugs; you make sure none of them is
 | Root-cause **one** bug (repro, localize, bisect, memoir) | **`bug-triage`** — you delegate to it, then record its verdict |
 | Sprint/milestone planning, hygiene of **all** ticket types | `jira-hsi-planning` |
 | Personal task queue, the portal dashboard | `task-manager` |
-| Weekly/manager narrative | `team-weekly`, `manager-brief`, `team-planner` |
+| Weekly/manager narrative | `team-weekly`, `manager-brief`, `team-manager` |
 
 **You own the bug portfolio and its monitoring state. `bug-triage` owns the investigation.**
 Never duplicate `bug-triage`'s workflow here — call it, then write the outcome back with `bm.py triage`.
 
 ## The CLI — `bm.py`
 
-All mechanics live in `~/.copilot/skills/bug-monitor/bm.py`, backed by `~/tasks/bugs.json`.
+All mechanics live in `~/.copilot/skills/bug-monitor/bm.py`, backed by the SQLite store `~/tasks/bugs.db` through [`bugdb.py`](./bugdb.py) — shared with
+bug-triage's phenomenon registry and the Team Portal (one source of truth). `bugdb.py status|migrate|export|audit`
+inspects it, migrates legacy JSON, dumps JSON, and shows the write audit log. Writes are transactional
+(`BEGIN IMMEDIATE`) and save only changed rows, so concurrent CLI/portal writers merge instead of clobbering.
 **Always prefer the CLI** over hand-editing the store or hand-rolling Jira queries.
 
 ```bash
@@ -45,7 +53,7 @@ python3 ~/.copilot/skills/bug-monitor/bm.py <subcommand> ...
 | `dups [--threshold 0.55] [--include-closed] [--json]` | **Propose** duplicate clusters by lexical similarity. Proposals only — you confirm them. |
 | `family list\|new\|show\|add\|drop\|primary\|set\|close` | Manage confirmed duplicate families. |
 | `note <KEY> <text>` / `watch <KEY> active\|muted\|resolved` | Append a monitoring note / change watch state. |
-| `ping <KEY> [-n N] [--set N] [--on YYYY-MM-DD] [--note "..."]` | Record that **Oded chased this bug outside Jira** (Slack, verbal, standup). Comments he leaves *in* Jira are counted automatically by `scan`, so only use this for out-of-band chases. Increments `manual_pings` by default; `--set` writes an absolute total that the next scan recomputes. Auto-appends a note. |
+| `ping <KEY> [-n N] [--set N] [--on YYYY-MM-DD] [--note "..."]` | Record that the configured lead chased this bug outside Jira (Slack, verbal, standup). Comments they leave *in* Jira are counted automatically by `scan`, so only use this for out-of-band chases. Increments `manual_pings` by default; `--set` writes an absolute total that the next scan recomputes. Auto-appends a note. |
 | `report [--window 7]` | Markdown digest for the weekly or manager brief. |
 | `config [--set KEY=VALUE]` | Show/tune scope and thresholds. |
 | `jira-comment <KEY> ... --yes` / `jira-link <DUP> <PRIMARY> --yes` | **The only Jira writes.** Hard-gated — see Hard Rules. |
@@ -64,28 +72,37 @@ bugs carry no component. Neither filter alone sees the whole picture.
 Widen or narrow it with `bm.py config --set components=a,b,c` or `--set extra_jql="..."`; the scope is
 stored, not hardcoded into a query you have to retype.
 
-## Store schema — `~/tasks/bugs.json`
+## Store schema — `~/tasks/bugs.db` (`bugs` table; shape shown as JSON)
+
+> **Root cause has one home.** When a bug is linked to a phenomenon, `annotate` derives the bug's
+> `root_cause` from it (`root_cause_from: PH-…`) and `apply_bug_edit` rejects a divergent edit.
+> `bm.py show` also lists the linked phenomena and investigation notes (evidence).
+>
+> **Origin (customer vs internal)** is derived in `annotate` (`origin`, `origin_why`) via
+> `bugdb.bug_origin()`: `triage.origin` manual override > customer Jira label > an `aqua-external/…`
+> git reference in the bug's text/links (the customer's GitHub org) > a linked customer phenomenon >
+> internal. The portal editor's *Origin* select writes `triage.origin` (`""` = auto).
 
 Each bug carries the **Jira mirror** (refreshed every scan) plus a **monitoring layer** that is ours
 alone and never overwritten by a scan:
 
 ```json
 {
-  "key": "MODINFSDKSW-12117", "summary": "...", "status": "Backlog",
+  "key": "PROJECT-123", "summary": "...", "status": "Backlog",
   "status_category": "new", "priority": "High", "assignee": "...", "components": ["ip-pcie-firmware-ep"],
   "milestone": null, "sprints": [], "duedate": null, "links": [...], "url": "...",
 
-  "first_seen": "2026-08-06",
+  "first_seen": "YYYY-MM-DD",
   "watch": "active | muted | resolved",
-  "oded_pings": 3, "last_ping": "2026-08-27",
+  "oded_pings": 3, "last_ping": "YYYY-MM-DD",
   "jira_pings": 3, "manual_pings": 0, "manual_last_ping": null,
-  "ci_runs": [{"run_id": "32063981909", "repo": "Elmnt-Internal/ip.infra.sw.manifests",
-               "url": "https://github.com/.../actions/runs/32063981909",
-               "at": "2026-08-18", "station": "pldm-edk4-z3a"}],
+  "ci_runs": [{"run_id": "<run-id>", "repo": "<org>/<repo>",
+               "url": "https://github.com/<org>/<repo>/actions/runs/<run-id>",
+               "at": "YYYY-MM-DD", "station": "<station>"}],
   "triage": {
     "state": "untriaged | in-triage | triaged | deferred",
     "verdict": "new | reproduction | duplicate | known-error | not-a-bug | not-ours",
-    "severity_call": "critical|high|medium|low", "family": "F-001", "owner": "Igal",
+    "severity_call": "critical|high|medium|low", "family": "F-001", "owner": "<owner>",
     "root_cause": "...", "next_step": "...", "investigation": "path to the bug-triage note",
     "triaged_on": "2026-08-27"
   },
@@ -104,7 +121,7 @@ alone and never overwritten by a scan:
 | `last_activity` | Newest of: Jira `updated`, last status change, last comment, our observed field diffs, our notes. |
 | `idle_days` | Days since `last_activity` — **the** progress metric. |
 | `signal` | 🟢 `moving` (<7d idle) · 🟡 `slow` (≥7d) · 🟠 `stalled` (≥14d) · 🔴 `dormant` (≥30d) · ✅ `closed`. Thresholds live in `config`. |
-| `flags` | Hygiene: `untriaged`, `unassigned`, `no-milestone`, `no-sprint`, `no-estimate`, `aging` (>30d open), `overdue`, `no-discussion`, `pinged` (Oded chased it ≥ `config.ping_flag_at` times, default 2). |
+| `flags` | Hygiene: `untriaged`, `unassigned`, `no-milestone`, `no-sprint`, `no-estimate`, `aging` (>30d open), `overdue`, `no-discussion`, `pinged` (the configured lead chased it ≥ `config.ping_flag_at` times, default 2). |
 | `days_since_ping` | Days since `last_ping`, or `null`. |
 | `is_new` | `first_seen` within `config.new_days` (default 3). |
 
@@ -114,10 +131,10 @@ alone and never overwritten by a scan:
 ## Hard Rules
 
 - **Never write to Jira without explicit approval.** `bm.py` refuses `jira-comment` / `jira-link`
-  without `--yes`, and you must not pass `--yes` until Yoni has approved *that exact text / link*.
+  without `--yes`, and you must not pass `--yes` until the user has approved *that exact text / link*.
   Everything else the skill does is local.
 - **Never close, resolve, or reassign a ticket** — that is human-only (per `jira-hsi-planning`).
-- **A duplicate is a proposal until Yoni confirms it.** `dups` clusters lexically; that is a hint, not
+- **A duplicate is a proposal until the user confirms it.** `dups` clusters lexically; that is a hint, not
   a verdict. Confirm against the axes in `bug-triage` → *Correlate & Classify* (image/FC tag, psoc-fw
   artifact version, failure stage, station, component) before creating a family.
 - **The scan never overwrites the triage layer.** If a scan seems to have lost triage state, that is a
@@ -141,7 +158,7 @@ alone and never overwritten by a scan:
 
 ### 2. Initial triage — delegate to `bug-triage`, record here
 
-**Trigger:** *triage the new bugs*, *triage MODINFSDKSW-12117*, or as the follow-up to a scan.
+**Trigger:** *triage the new bugs*, *triage PROJECT-123*, or as the follow-up to a scan.
 
 For each bug to triage:
 
@@ -154,12 +171,12 @@ For each bug to triage:
    - *screening depth* (default for a batch): Steps 0, 1, 5 (known-issue scan) and the
      **Correlate & Classify** section — enough to decide new vs reproduction vs duplicate.
    - *full depth* (a genuinely new, high-severity bug): the whole `bug-triage` workflow, which opens an
-     investigation note under `~/.copilot/skills/bug-triage/investigations/`.
+     investigation note under `~/.copilot-private/skills/bug-triage/investigations/`.
 4. **Record the outcome** — one `bm.py triage` call per bug:
    ```bash
-   bm.py triage MODINFSDKSW-12117 --verdict reproduction --family F-001 \
-     --severity high --owner "Igal" --next-step "confirm psoc-fw artifact range" \
-     --investigation ~/.copilot/skills/bug-triage/investigations/BATCH-...md
+   bm.py triage PROJECT-123 --verdict reproduction --family F-001 \
+     --severity high --owner "<owner>" --next-step "confirm psoc-fw artifact range" \
+     --investigation ~/.copilot-private/skills/bug-triage/investigations/<note>.md
    ```
    Use `--state in-triage` when an investigation is opened but not concluded, and `--state deferred`
    for something consciously parked (say why in `--note`).
@@ -179,11 +196,11 @@ For each bug to triage:
    - 🟡 **slow** — watch list; name them, don't escalate them.
    - 🟢 **moving** — one line, no detail.
 3. **Per-owner** view: who is carrying an unfair share of open bugs, and whose bugs are all stalled.
-   Feed real findings to `one-on-one` / `team-planner` rather than repeating them here.
+   Feed real findings to `team-manager` rather than repeating them here.
 4. **Hygiene flags** — `no-milestone` / `no-sprint` on an open bug means it will silently slip; that is
    the same rule `jira-hsi-planning` enforces (bugs are parent-exempt but *must* have milestone + sprint).
    Offer to hand the list to `jira-hsi-planning` for the actual field updates.
-5. **📣 Pinged by Oded** — the escalation-pressure section. This is *external* signal: it does not
+5. **📣 Pinged by the configured lead** — the escalation-pressure section. This is *external* signal: it does not
    come from Jira and it does not decay. Read it against `idle_days`:
    - **pinged + stalled/dormant** — the worst quadrant. He is asking and nothing is happening. Answer
      him with a date or a blocker, not a status.
@@ -204,7 +221,7 @@ For each bug to triage:
 3. Pick the **primary**: the oldest ticket that best describes the root cause, or an existing
    Known-Error ticket if one exists. `dups` suggests the oldest; override it when a later ticket is the
    better canonical record.
-4. **Show Yoni the proposed family** — primary, members, why they're one issue, what stays open — and
+4. **Show the user the proposed family** — primary, members, why they're one issue, what stays open — and
    get confirmation.
 5. On approval, record it locally:
    ```bash
@@ -232,7 +249,7 @@ growing or shrinking, is any family a power-on risk, is anyone drowning.
 
 ## The Bugs section of the team portal
 
-The `task-manager` dashboard (`tm.py serve`) is Yoni's team portal; its **Bugs** section renders this
+The `task-manager` dashboard (`tm.py serve`) is the team's portal; its **Bugs** section renders this
 store live via `bm.dashboard_payload()` and edits it via `bm.apply_bug_edit()` (triage state, verdict,
 severity, family, watch, ping count, note). Dashboard edits are **local only** — they never touch Jira,
 and the next `bm.py scan` refreshes the Jira half without disturbing them.
@@ -242,7 +259,7 @@ common case (he just asked again — one click, no form). The edit payload accep
 or `oded_pings: <n>` to set an absolute total.
 
 **Pings are auto-derived.** Every `scan` recounts `jira_pings` as the number of comments authored by
-`config.ping_author` (default `Oded Gabbay`) and stamps `last_ping` from the newest one, so the portal
+`config.ping_author` from the private Jira configuration and stamps `last_ping` from the newest one, so the portal
 reflects a chase the moment he writes it. `oded_pings = jira_pings + manual_pings`, where `manual_pings`
 holds only out-of-band chases (the `ping` command / the +1 button) and survives every scan. The first
 scan after this became automatic leaves an audit line in `changes` wherever the old hand-tallied number

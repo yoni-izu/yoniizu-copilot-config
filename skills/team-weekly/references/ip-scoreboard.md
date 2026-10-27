@@ -2,16 +2,16 @@
 
 Used in prep (capability 1) and archive (capability 3) of the `team-weekly` skill to produce a one-line win + one-line gap per active IP.
 
-## Active IPs and owners
+## Active IPs and owner resolution
 
-Mirror `team-planner` HSI ownership (`/memories/repo/team-planner-conventions.md`). Keep in sync.
+Resolve current owners from `team-planner` ownership data and the active member records at runtime. Do not store a named roster in this skill.
 
-| IP | Engineer(s) | Components hint |
+| IP | Owner hook | Components hint |
 |---|---|---|
-| PCIe EP | Mateusz + Vasyl | components contain "pcie" |
-| SE | Akshay | components contain "ip-se-" |
-| D2D | Igal | components contain "d2d" |
-| Infra/Mng | Yoni (cross-cutting) | components contain "infra", "mng", "noc" |
+| PCIe EP | `team-members[]` assigned to the IP | components contain "pcie" |
+| SE | `team-members[]` assigned to the IP | components contain "ip-se-" |
+| D2D | `team-members[]` assigned to the IP | components contain "d2d" |
+| Infra/Mng | <team-lead> (cross-cutting) | components contain "infra", "mng", "noc" |
 
 If a new IP becomes active (e.g., SU), add a row here and to the templates.
 
@@ -25,7 +25,7 @@ Prefer the strongest signal available. Pick **one** per IP, in this priority:
 4. **Cross-IP collaboration delivery** (e.g., D2D + PCIe joint bring-up step).
 5. **Process win** (CI green-streak, test backlog cleared) — only if no technical win exists.
 
-Format: `<name>: <one-line action>` — cite source.
+Format: `<team-member>: <one-line action>` — cite source.
 
 ## Gap selection (one per IP)
 

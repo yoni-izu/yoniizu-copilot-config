@@ -1,7 +1,7 @@
 # FLA.RT PERSTn-deassert wait — long blocking busy-loop before PIW access (A1 warm-reset)
 
 - **Recorded:** 2026-09-23
-- **Status:** Reported by owner (Yoni) — accepted for A1 bring-up, flagged risky
+- **Status:** Reported by owner (FW lead) — accepted for A1 bring-up, flagged risky
 - **Tags:** perstn, perst, fla_runtime, fla rt, wait_for_perstn, k_busy_wait, watchdog, wdt, piw reset, warm reset, psoc reboot, phy fw staging, perstn wait timeout, FLA_RT_PCIE_PERSTN_WAIT, 50s timeout, busy-wait, bring-up hang risk
 
 ## Scope / Question

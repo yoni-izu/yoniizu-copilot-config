@@ -6,7 +6,7 @@ Used by capability 1 (Prep) of the `team-weekly` skill. Two outputs per prep: a 
 
 ## Local `_next.md`
 
-Verbose, private. Yoni's eyes only. Lives at `~/team-planner/team-weekly/_next.md`.
+Verbose, private. <team-lead>'s eyes only. Lives at `~/team-planner/team-weekly/_next.md`.
 
 ```markdown
 # HSI FW Team Weekly — <next-meeting-date>
@@ -16,7 +16,7 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/team-weekly/_next.m
 ---
 
 ## Announcements
-- [ ] <new process, policy change, or carry-over action — owner: <name>>
+- [ ] <new process, policy change, or carry-over action — owner: <team-member>>
 
 ---
 
@@ -55,7 +55,7 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/team-weekly/_next.m
 - <update — one line>
 - <update — one line>
 
-**Yoni-private (do NOT present to team):**
+**Private to <team-lead> (do NOT present to team):**
 - <personal action items from staff meetings>
 - <general FW org context that doesn't need team airtime>
 
@@ -73,13 +73,13 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/team-weekly/_next.m
 
 ---
 
-## Risks / things to flag (PRIVATE — Yoni only)
+## Risks / things to flag (PRIVATE — <team-lead> only)
 - <e.g., over-committed vs remaining capacity>
 - <e.g., RAID row still unresolved>
 
 ---
 
-## Private notes (Yoni only — never reaches Confluence)
+## Private notes (<team-lead> only — never reaches Confluence)
 - <impressions, concerns, coaching notes>
 
 ---
@@ -92,10 +92,10 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/team-weekly/_next.m
 
 ## Confluence draft page
 
-Sanitized, team-facing. Created in SWENG folder `695369790` with title `HSI FW Weekly — <next-date>`. **Restrictions: Yoni only** during prep.
+Sanitized, team-facing. Created in SWENG folder `695369790` with title `HSI FW Weekly — <next-date>`. **Restrictions: <team-lead> only** during prep.
 
 **Voice rules** (apply to every line on this page):
-- **Objective tone.** No "I'd like to" / "I plan to". Use "agree X", "confirm Y", "<name> to do Z".
+- **Objective tone.** No "I'd like to" / "I plan to". Use "agree X", "confirm Y", or "<team-member> to do Z".
 - **No filler prompts.** Don't include habitual "anything to add?" lines. Only include topics with a concrete trigger.
 - **Wins are evidence.** Every win cites a PR, Jira key, merged feature, lab run.
 - **Ticket context is mandatory.** Never present a bare Jira key. Always pair the key with the story it represents, in plain language — e.g. "deferred link-training validation ([IPPCIESW-399])", not "([IPPCIESW-399])". No one remembers numbers; the reader must understand the item without opening the link. The same applies to PRs where the title isn't self-evident.
@@ -158,11 +158,11 @@ Sanitized, team-facing. Created in SWENG folder `695369790` with title `HSI FW W
 
 **Sanitization rules** (what goes into the Confluence page from `_next.md`):
 - Announcements ✓ (only team-facing actions)
-- Global updates ✓ (one-liner; **never cite staff meeting as source**; **exclude Yoni-personal action items**)
+- Global updates ✓ (one-liner; **never cite staff meeting as source**; **exclude <team-lead>'s personal action items**)
 - Per-domain Done / In progress / Next ✓ (each item carries ticket context; no internal rationale; no per-person capacity numbers)
 - Cross-team items ✓ (favor interest-everyone topics; with one-line context each)
-- PTO → **omit by default** unless Yoni explicitly requests
-- **Excluded:** "Sprint health" section, per-IP scoreboard table, "Open discussion" seeds, "Risks / things to flag", "Private notes", per-person capacity numbers, planning churn detail, RAID P/I scores, Yoni-personal staff action items
+- PTO → **omit by default** unless <team-lead> explicitly requests
+- **Excluded:** "Sprint health" section, per-IP scoreboard table, "Open discussion" seeds, "Risks / things to flag", "Private notes", per-person capacity numbers, planning churn detail, RAID P/I scores, <team-lead>'s personal staff action items
 
 **Anti-repetition rule:** Each fact appears in exactly ONE bullet. Within a domain, an item lives in exactly one of Done / In progress / Next. Cross-team topics should reference items briefly — full context lives in the domain bucket where they first appear.
 

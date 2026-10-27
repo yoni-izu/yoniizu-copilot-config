@@ -42,7 +42,7 @@ value produced a bit-identical runtime behaviour.
 > `el_se.c` `#undef`/`#define`s its gate. This file carries power-on bring-up
 > overrides that silently outrank Kconfig.
 
-## Resolution (commit `4bfebd3`, branch `dev/yoni.izutskiver/se-lut-mw-timeout-10min`)
+## Resolution (commit `4bfebd3`, branch `dev/<owner>/se-lut-mw-timeout-10min`)
 
 The two waits were split onto separate gates:
 

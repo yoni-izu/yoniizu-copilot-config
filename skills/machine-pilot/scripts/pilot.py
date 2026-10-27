@@ -3,7 +3,7 @@
 
 usage: pilot [-t STATION|mctl-target|user@host] [-v] [--json] CMD [ARGS]
 
-  stations [set STATION k=v ...]    registry (references/stations.tsv): host type bmc uart notes
+  stations [set STATION k=v ...]    private registry: host type bmc uart notes
   probe                             one-screen summary: alloc, devices+link, setup guess, serial, nfs, bmc, dmesg
   devices                           our devices only (lspci -d 208b: + 1d0f:, via sysfs)
   dmesg [--grep RE] [--tail N] [--since 'HH:MM'|'Mon D HH:MM'] [--save TOPIC]
@@ -15,10 +15,10 @@ usage: pilot [-t STATION|mctl-target|user@host] [-v] [--json] CMD [ARGS]
   nfs deployments [N] | notes DIR | hash PATH | ls PATH
   evidence TOPIC [--bmc] [--oam N] [--tty PORT] [--secs S]
   session open TOPIC | session close FILE
-  memoir 'TEXT'                     dated entry under ### STATION in references/memoir.md
-  pitfall THEME 'TEXT'              dated entry under ## THEME in references/pitfalls.md
+  memoir 'TEXT'                     dated entry in the private machine-pilot memoir
+  pitfall THEME 'TEXT'              dated entry in the private machine-pilot pitfalls
 
-Observe-only by design: no reset/power/flash/mux verbs exist here (see references/bmc.md, fw-flasher).
+Observe-only by design: no reset/power/flash/mux verbs exist here (see the private BMC guide, fw-flasher).
 """
 import argparse
 import hashlib
@@ -32,7 +32,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
-REF, SCRIPTS, SESSIONS = SKILL / "references", SKILL / "scripts", SKILL / "sessions"
+sys.path.insert(0, str(SKILL.parents[1] / "lib"))
+from private_paths import private_root  # noqa: E402
+
+PRIVATE_SKILL = private_root() / "skills" / "machine-pilot"
+REF, SCRIPTS, SESSIONS = PRIVATE_SKILL / "references", SKILL / "scripts", PRIVATE_SKILL / "sessions"
 STATIONS, MEMOIR, PITFALLS = REF / "stations.tsv", REF / "memoir.md", REF / "pitfalls.md"
 PILOT_DIR = Path.home() / ".pilot"
 EVIDENCE = PILOT_DIR / "evidence"
@@ -64,6 +68,7 @@ def load_stations():
 
 
 def save_stations(rows):
+    STATIONS.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     head = [l for l in STATIONS.read_text().splitlines() if l.startswith("#")] if STATIONS.exists() else []
     body = ["\t".join(r[k] for k in ["station", "host", "type", "bmc", "uart", "notes", "verified"]) for r in rows.values()]
     STATIONS.write_text("\n".join(head + body) + "\n")
@@ -459,7 +464,7 @@ def cmd_session(a, station, host, row):
     sub = a.args[0] if a.args else "open"
     if sub == "open":
         topic = a.args[1] if len(a.args) > 1 else die("session open TOPIC")
-        SESSIONS.mkdir(exist_ok=True)
+        SESSIONS.mkdir(parents=True, exist_ok=True, mode=0o700)
         p = SESSIONS / ("%s-%s.md" % (station, utc("%Y%m%d-%H%M")))
         p.write_text("# %s — %s — %s\n\n**Goal:** %s\n**Setup (memoir / probe):** %s / ?\n**Host:** %s  **BMC:** %s  **UART:** %s\n**Allocation:** ?\n**Devices:** ?\n\n## Actions (UTC, class, command, rc)\n\n## Evidence\n\n## Findings\n- *observed*:\n- *inferred*:\n\n## Handoffs\n\n## Memoir / pitfalls updated\n\n**Status:** open\n" % (
             station, utc("%Y-%m-%d %H:%M UTC"), topic, topic, (row or {}).get("type", "?"), host, (row or {}).get("bmc", "?"), (row or {}).get("uart", "?")))

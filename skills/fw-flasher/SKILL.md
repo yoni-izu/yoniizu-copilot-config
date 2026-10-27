@@ -4,6 +4,11 @@ description: "Flash firmware onto SoC devices from lab hosts (servers/desktops) 
 argument-hint: "What you want to flash and where — e.g. 'flash the released FLA runtime to a1-r3-d2 over PCIe' or 'reflash the BMC MTD on the ELS tray and verify the version'"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # FW Flasher — Safe Firmware Flashing to Lab Devices
 
 Flash firmware onto SoC devices from a **lab host** (server/desktop) or the

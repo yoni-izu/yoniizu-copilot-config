@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """workspace-manager CLI + library — owns workspace slot occupancy.
 
-``~/tasks/workspaces.json`` is the single source of truth for which physical
+``~/tasks/workspaces.db`` is the single source of truth for which physical
 workspace slot (``~/projects/<project>/<slot>``) is currently occupied and by
 what. A slot can be held by:
 
@@ -12,8 +12,8 @@ what. A slot can be held by:
 
 This module is imported by task-manager's ``tm.py`` (which delegates every
 workspace mutation here) and is also runnable as a standalone CLI. It carries
-**no** task-store knowledge beyond the task id string it stores in a holder —
-resolving that id back to a task is the caller's job.
+no task-store persistence knowledge: title lookup and legacy hold migration use
+the owning task_store API.
 """
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ import argparse
 import json
 import os
 import sys
+import fcntl
+import functools
+import threading
+import uuid
+import subprocess
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from datetime import date
 from pathlib import Path
 
@@ -28,8 +35,12 @@ from pathlib import Path
 # Constants
 # ----------------------------------------------------------------------------
 
-STORE = Path(os.path.expanduser("~/tasks/workspaces.json"))
-TASKS_STORE = Path(os.path.expanduser("~/tasks/tasks.json"))
+import workspace_store
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "task-manager"))
+import task_store
+
+STORE = workspace_store.DB_PATH
 PROJECTS_ROOT = Path(os.path.expanduser("~/projects"))
 DEFAULT_PROJECT = "iridium"
 
@@ -37,6 +48,41 @@ ADHOC_TAGS = ["monitor", "debug", "development", "experiment", "other"]
 HOLDER_TYPES = ["task", "adhoc"]
 
 TODAY = date.today().isoformat()
+_STORE_LOCK = threading.RLock()
+_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def store_lock():
+    with _STORE_LOCK:
+        if getattr(_LOCK_STATE, "depth", 0):
+            yield
+            return
+        STORE.parent.mkdir(parents=True, exist_ok=True)
+        with STORE.with_suffix(".lock").open("a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            _LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _LOCK_STATE.depth = 0
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def serialized(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with store_lock():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def new_id(remote: bool = False) -> str:
+    return f"WS-{'R' if remote else 'L'}-{uuid.uuid4().hex}"
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ----------------------------------------------------------------------------
@@ -47,25 +93,15 @@ def _empty() -> dict:
     return {"version": 1, "slots": {}, "tracked": {}, "groups": []}
 
 
+@serialized
 def load() -> dict:
-    if not STORE.exists():
-        return _empty()
-    try:
-        with STORE.open() as f:
-            d = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return _empty()
-    d.setdefault("version", 1)
-    d.setdefault("slots", {})
-    d.setdefault("tracked", {})
-    d.setdefault("groups", [])
-    return d
+    workspace_store.DB_PATH = Path(STORE)
+    return workspace_store.load(lambda: dict(_empty(), tracked=_seed_tracked()))
 
 
 def save(d: dict) -> None:
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    with STORE.open("w") as f:
-        json.dump(d, f, indent=2)
+    workspace_store.DB_PATH = Path(STORE)
+    workspace_store.save(d)
 
 
 # ----------------------------------------------------------------------------
@@ -80,6 +116,11 @@ def normalize_slot(ws: str | None) -> str | None:
     """
     if not ws:
         return None
+    if ws.startswith("WS-"):
+        for slot, rec in load()["tracked"].items():
+            if rec.get("id") == ws:
+                return slot
+        return ws
     ws = ws.strip().strip("/")
     if not ws:
         return None
@@ -111,10 +152,10 @@ def canonical_slots(project: str | None = None) -> list[str]:
 _SEED_TRACKED = (
     [{"slot": s, "badge": str(i + 1), "rev": "main"}
      for i, s in enumerate(["one", "two", "three", "four", "five", "six"])]
-    + [{"slot": "a1_power_on", "badge": "A1", "rev": "a1_power_on",
+    + [{"slot": "a1_power_on", "badge": "A1", "rev": "a1_power_on_branch",
         "label": "A1 Power-On"}]
     + [{"slot": f"a1_power_on_{n:03d}", "badge": f"A1\u00b7{n}",
-        "rev": "a1_power_on", "label": f"A1 Power-On {n:03d}"}
+        "rev": "a1_power_on_branch", "label": f"A1 Power-On {n:03d}"}
        for n in (2, 3, 4)]
 )
 
@@ -124,6 +165,7 @@ def _seed_tracked() -> dict:
     for rec in _SEED_TRACKED:
         slot = rec["slot"]
         out[slot] = {
+            "id": new_id(),
             "path": str(PROJECTS_ROOT / DEFAULT_PROJECT / slot),
             "label": rec.get("label") or slot,
             "badge": rec["badge"],
@@ -134,31 +176,37 @@ def _seed_tracked() -> dict:
     return out
 
 
+@serialized
 def tracked(d: dict | None = None, persist: bool = True) -> dict:
     """Roster of tracked workspaces: ``slot -> record``. Seeds on first use."""
     own = d if d is not None else load()
-    if not own.get("tracked"):
+    if "tracked" not in own:
         own["tracked"] = _seed_tracked()
-        if persist and d is None:
+        if persist:
             save(own)
     return own["tracked"]
 
 
-def roster(d: dict | None = None) -> list[dict]:
-    """Tracked workspaces as an ordered list of UI-ready records."""
+def roster(d: dict | None = None, *, cached_only: bool = False) -> list[dict]:
+    """Tracked records; cached_only avoids even local directory existence checks."""
     own = d if d is not None else load()
     recs = tracked(own, persist=d is None)
     out = []
     for slot, rec in recs.items():
+        reading = status_read(rec["id"])
         out.append({
             "slot": slot,
+            "id": rec["id"],
+            "target": rec.get("target") or "",
+            "location": "remote" if rec.get("target") else "local",
+            "status": reading,
             "path": rec.get("path") or str(PROJECTS_ROOT / DEFAULT_PROJECT / slot),
             "label": rec.get("label") or slot,
             "badge": rec.get("badge") or slot[:2].upper(),
             "rev": rec.get("rev") or "main",
             "group": rec.get("group") or "",
             "order": rec.get("order", 0),
-            "exists": Path(os.path.expanduser(
+            "exists": reading.get("exists") if cached_only or rec.get("target") else Path(os.path.expanduser(
                 rec.get("path") or str(PROJECTS_ROOT / DEFAULT_PROJECT / slot))).is_dir(),
         })
     out.sort(key=lambda r: (r["order"], r["slot"]))
@@ -169,39 +217,303 @@ def slot_path(slot: str, d: dict | None = None) -> Path:
     """On-disk directory for a slot — the tracked path, else the project dir."""
     root = normalize_slot(slot) or ""
     rec = tracked(d if d is not None else load(), persist=False).get(root)
+    if rec and rec.get("target"):
+        raise ValueError("remote workspace paths must be accessed through mctl")
     if rec and rec.get("path"):
         return Path(os.path.expanduser(rec["path"]))
     return PROJECTS_ROOT / DEFAULT_PROJECT / root
 
 
+def machine_targets() -> list[str]:
+    path = Path.home() / ".mctl/targets"
+    if not path.exists():
+        return []
+    return [parts[0] for line in path.read_text().splitlines()
+            if (parts := line.split()) and not parts[0].startswith("#")]
+
+
+def record(slot: str, d: dict | None = None) -> dict:
+    own = d if d is not None else load()
+    root = normalize_slot(slot)
+    rec = tracked(own, persist=False).get(root)
+    if rec is None:
+        raise ValueError(f"workspace is not tracked: {slot}")
+    return dict(rec, slot=root)
+
+
+def _state_path(wid: str, suffix: str = ".json") -> Path:
+    import re
+    if not re.fullmatch(r"WS-[LR]-[0-9a-f]{32}", wid):
+        raise ValueError(f"invalid workspace id: {wid}")
+    return STORE.parent / "workspace-state" / (wid + suffix)
+
+
+def workspace_serialized(fn):
+    @functools.wraps(fn)
+    def wrapped(slot, *args, **kwargs):
+        wid = record(slot)["id"]
+        held = getattr(_LOCK_STATE, "workspaces", set())
+        if wid in held:
+            return fn(slot, *args, **kwargs)
+        path = _state_path(wid, ".operation.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise ValueError(f"workspace operation already running: {slot}") from e
+            _LOCK_STATE.workspaces = held | {wid}
+            try:
+                return fn(slot, *args, **kwargs)
+            finally:
+                _LOCK_STATE.workspaces = held
+                fcntl.flock(f, fcntl.LOCK_UN)
+    return wrapped
+
+
+def status_read(wid: str) -> dict:
+    workspace_store.DB_PATH = Path(STORE)
+    return workspace_store.status_read(wid)
+
+
+@serialized
+def status_write(slot: str, reading: dict) -> None:
+    rec = record(slot)
+    workspace_store.status_write(rec["id"], reading)
+
+
+@serialized
+def log_action(slot: str, action: str, outcome: str, detail: str = "") -> None:
+    rec = record(slot)
+    workspace_store.append_event(rec["id"], {
+        "at": stamp(), "workspace_id": rec["id"],
+        "action": action, "outcome": outcome, "detail": detail})
+
+
+def action_log(slot: str) -> list[dict]:
+    return workspace_store.events(record(slot)["id"])
+
+
+@serialized
+def identity(path: str, target: str = "") -> dict:
+    raw = path.rstrip("/")
+    if not target:
+        raw = str(Path(path).expanduser().resolve())
+    d = load()
+    candidates = [(slot, rec) for slot, rec in tracked(d).items()
+                  if (rec.get("target") or "") == target
+                  and (raw == rec["path"] or raw.startswith(rec["path"].rstrip("/") + "/"))]
+    if candidates:
+        slot, rec = max(candidates, key=lambda item: len(item[1]["path"]))
+        return dict(rec, slot=slot)
+    ok, msg, slot = track(raw, target=target)
+    if not ok:
+        raise ValueError(msg)
+    return record(slot)
+
+
+@serialized
+def mirror_state(target: str, path: str, source_id: str, source_path: str,
+                 state: str, detail: str = "") -> dict:
+    rec = identity(path, target)
+    reading = status_read(rec["id"])
+    reading["mirror"] = None if state == "released" else {
+        "source_id": source_id, "source_path": source_path,
+        "state": state, "updated": stamp(),
+    }
+    status_write(rec["slot"], reading)
+    log_action(rec["slot"], "mirror-" + state, "ok" if state != "failed" else "error", detail)
+    return rec
+
+
+def _run_with_progress(args: list, timeout: int, progress) -> subprocess.CompletedProcess:
+    """Run the runtime, forwarding its WS_PROGRESS stderr events to ``progress`` live."""
+    proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout: list[str] = []
+    reader = threading.Thread(target=lambda: stdout.append(proc.stdout.read()), daemon=True)
+    reader.start()
+    expired: list[bool] = []
+    timer = threading.Timer(timeout, lambda: (expired.append(True), proc.kill()))
+    timer.start()
+    stderr = []
+    try:
+        for line in proc.stderr:
+            if line.startswith("WS_PROGRESS:"):
+                try:
+                    event = json.loads(line[len("WS_PROGRESS:"):])
+                    if isinstance(event, dict):
+                        progress(event)
+                except (ValueError, KeyError, TypeError):
+                    pass  # a malformed or failing progress event must not abort the operation
+            else:
+                stderr.append(line)
+        code = proc.wait()
+        reader.join()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if expired:
+        raise subprocess.TimeoutExpired(args, timeout)
+    return subprocess.CompletedProcess(args, code, "".join(stdout), "".join(stderr))
+
+
+@workspace_serialized
+def workspace_request(slot: str, action: str = "status", *, _adopted: bool = False,
+                      progress=None, **options) -> dict:
+    rec = record(slot)
+    request = {"id": rec["id"], "path": rec["path"], "rev": rec["rev"], "action": action}
+    request.update(options)
+    if action == "sync" and get_holder(slot) and not status_read(rec["id"]).get("mirror"):
+        log_action(slot, action, "rejected", "workspace is occupied")
+        raise ValueError("workspace is occupied; free it before syncing")
+    if rec.get("target"):
+        args = [str(Path.home() / "bin/mctl"), "-t", rec["target"], "workspace",
+                action, rec["path"], rec["id"], rec["rev"]]
+        if options:
+            args.append(json.dumps(options))
+    else:
+        args = [sys.executable, str(Path(__file__).with_name("workspace_runtime.py")),
+                json.dumps(request)]
+    result = {}
+    try:
+        timeout = 2400 if action != "status" else 180
+        r = (_run_with_progress(args, timeout, progress) if progress else
+             subprocess.run(args, text=True, capture_output=True, timeout=timeout))
+        if r.returncode and not r.stdout.lstrip().startswith("{"):
+            raise RuntimeError((r.stderr or r.stdout).strip()[-3000:] or f"exit {r.returncode}")
+        result = json.loads(r.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("invalid workspace response: expected a JSON object")
+        if r.returncode and result.get("ok") is not False:
+            raise RuntimeError((r.stderr or r.stdout).strip()[-3000:] or f"exit {r.returncode}")
+        if result.get("workspace_id") and result.get("path"):
+            if _adopted:
+                raise RuntimeError("workspace identity changed during verification; retry after investigation")
+            prefix = "WS-R-" if rec.get("target") else "WS-L-"
+            if not result["workspace_id"].startswith(prefix):
+                raise ValueError("checkout identity belongs to a different local/remote role; "
+                                 "refusing to overwrite or silently reclassify it")
+            # A checkout already registered by another controller owns its ID.
+            with store_lock():
+                d = load()
+                duplicate = next((r for key, r in d["tracked"].items()
+                                  if key != rec["slot"] and r["id"] == result["workspace_id"]), None)
+                if duplicate:
+                    raise ValueError("this physical workspace is already tracked via "
+                                     f"{duplicate.get('target') or 'local'}:{duplicate['path']}")
+                prior_events = action_log(rec["slot"])
+                item = d["tracked"][rec["slot"]]
+                _state_path(result["workspace_id"])
+                item["id"] = result["workspace_id"]
+                item["path"] = result["path"]
+                save(d)
+                for event in prior_events:
+                    workspace_store.append_event(item["id"], event)
+                log_action(rec["slot"], "identity-adopt", "ok",
+                           f"adopted {item['id']} from machine; prior controller history: {rec['id']}")
+            return workspace_request(slot, action, _adopted=True, progress=progress, **options)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "workspace operation failed")
+        if not isinstance(result.get("status"), dict):
+            raise ValueError("invalid workspace response: status reading missing")
+        reading = result["status"]
+        canonical = reading.get("path")
+        if canonical and canonical != rec["path"]:
+            with store_lock():
+                d = load()
+                if any(r["id"] != rec["id"] and r.get("target") == rec.get("target")
+                       and r["path"] == canonical for r in d["tracked"].values()):
+                    raise ValueError("this canonical machine/path is already tracked under another ID")
+                d["tracked"][rec["slot"]]["path"] = canonical
+                save(d)
+        reading["attempted"] = stamp()
+        reading["log"] = result.get("log", [])
+        status_write(slot, reading)
+        log_action(slot, action, "ok")
+        return reading
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        reading = status_read(rec["id"])
+        reading.update(error=str(e), attempted=stamp())
+        if isinstance(result, dict) and "mirror" in result:
+            reading["mirror"] = result["mirror"]
+        status_write(slot, reading)
+        log_action(slot, action, "error", str(e))
+        raise ValueError(str(e)) from e
+
+
+def require_clean(slot: str) -> None:
+    reading = workspace_request(slot)
+    if reading.get("mirror"):
+        raise ValueError("workspace is a mirror; free it before assigning independent work")
+    if not reading.get("clean"):
+        raise ValueError("; ".join(reading.get("reasons") or ["workspace is not clean"]))
+
+
+def guarded_occupancy(fn):
+    @workspace_serialized
+    def locked(slot, *args, **kwargs):
+        if kwargs.pop("_validated", False) is not True:
+            require_clean(slot)
+        result = fn(slot, *args, **kwargs)
+        log_action(slot, "occupy", "ok" if result[0] else "rejected", result[1])
+        return result
+
+    @functools.wraps(fn)
+    def wrapped(slot, *args, **kwargs):
+        try:
+            return locked(slot, *args, **kwargs)
+        except ValueError as e:
+            if normalize_slot(slot) in tracked():
+                log_action(slot, "occupy", "rejected", str(e))
+            return False, str(e), None
+    return wrapped
+
+
+@serialized
 def track(path: str, label: str | None = None, rev: str | None = None,
-          group: str | None = None, badge: str | None = None):
+          group: str | None = None, badge: str | None = None,
+          target: str | None = None):
     """Add a workspace directory to the tracked roster. ``(ok, msg, slot)``."""
     raw = (path or "").strip()
     if not raw:
         return False, "a workspace path is required", None
-    p = Path(os.path.expanduser(raw)).resolve()
-    if not p.is_dir():
+    if target and target not in machine_targets():
+        return False, f"unknown machine target: {target}", None
+    if target and not (raw.startswith("/") or raw.startswith("~/")):
+        return False, "remote paths must be absolute or start with ~/", None
+    p = Path(raw) if target else Path(os.path.expanduser(raw)).resolve()
+    if not target and not p.is_dir():
         return False, f"not a directory: {p}", None
     slot = p.name
     d = load()
     recs = tracked(d, persist=False)
-    if slot in recs:
-        return False, f"'{slot}' is already tracked ({recs[slot].get('path')})", None
+    if any(r.get("path") == str(p) and (r.get("target") or "") == (target or "")
+           for r in recs.values()):
+        return False, f"'{p}' is already tracked on {target or 'local'}", None
     if group and not get_group(group, d):
         return False, f"unknown group: {group}", None
+    wid = new_id(bool(target))
+    if target or slot in recs:
+        slot = wid
     recs[slot] = {
+        "id": wid,
+        "target": target or "",
         "path": str(p),
-        "label": (label or "").strip() or slot,
-        "badge": (badge or "").strip() or slot[:2].upper(),
+        "label": (label or "").strip() or p.name,
+        "badge": (badge or "").strip() or p.name[:2].upper(),
         "rev": (rev or "").strip() or "main",
         "group": group or "",
         "order": max((r.get("order", 0) for r in recs.values()), default=-1) + 1,
     }
     save(d)
+    log_action(slot, "track", "ok", f"{target or 'local'}:{p}")
     return True, f"tracking '{slot}' ({p})", slot
 
 
+@workspace_serialized
+@serialized
 def untrack(slot: str):
     """Drop a workspace from the roster. Refuses while it is held."""
     root = normalize_slot(slot)
@@ -214,11 +526,16 @@ def untrack(slot: str):
     if get_holder(root, d):
         return False, (f"'{root}' is held by {_holder_label(get_holder(root, d))}"
                        " \u2014 free it first")
+    if status_read(recs[root]["id"]).get("mirror"):
+        return False, "release the mirror before stopping tracking"
+    log_action(root, "untrack", "ok", "directory left untouched")
     recs.pop(root)
     save(d)
     return True, f"stopped tracking '{root}'"
 
 
+@workspace_serialized
+@serialized
 def set_slot_fields(slot: str, fields: dict):
     """Update roster metadata (``group``/``label``/``rev``/``badge``) for a slot."""
     root = normalize_slot(slot)
@@ -229,6 +546,10 @@ def set_slot_fields(slot: str, fields: dict):
     rec = recs.get(root)
     if rec is None:
         return False, f"'{root}' is not tracked"
+    if fields.get("rev") and fields["rev"] != rec.get("rev"):
+        if get_holder(root, d) or status_read(rec["id"]).get("mirror"):
+            log_action(root, "metadata", "rejected", "cannot change revision while occupied or mirroring")
+            return False, "free the workspace before changing its revision"
     if "group" in fields:
         gid = (fields.get("group") or "").strip()
         if gid and not get_group(gid, d):
@@ -239,6 +560,7 @@ def set_slot_fields(slot: str, fields: dict):
             val = (fields.get(key) or "").strip()
             rec[key] = val or (root if key == "label" else rec.get(key, ""))
     save(d)
+    log_action(root, "metadata", "ok", json.dumps(fields))
     return True, f"updated '{root}'"
 
 
@@ -264,6 +586,7 @@ def _group_id(name: str, existing: set) -> str:
     return gid
 
 
+@serialized
 def add_group(name: str, color: str | None = None):
     name = (name or "").strip()
     if not name:
@@ -279,6 +602,7 @@ def add_group(name: str, color: str | None = None):
     return True, f"group '{name}' added", gid
 
 
+@serialized
 def edit_group(gid: str, name: str | None = None, color: str | None = None):
     d = load()
     g = get_group(gid, d)
@@ -297,6 +621,7 @@ def edit_group(gid: str, name: str | None = None, color: str | None = None):
     return True, f"group '{g['name']}' updated"
 
 
+@serialized
 def delete_group(gid: str):
     """Remove a group; its workspaces fall back to ungrouped."""
     d = load()
@@ -338,7 +663,17 @@ def get_holder(slot: str, d: dict | None = None) -> dict | None:
 
 
 def is_free(slot: str, d: dict | None = None) -> bool:
-    return get_holder(slot, d) is None
+    own = d if d is not None else load()
+    if get_holder(slot, own):
+        return False
+    rec = tracked(own, persist=False).get(normalize_slot(slot))
+    if not rec:
+        return True
+    reading = status_read(rec["id"])
+    if rec.get("target") and (not reading.get("checked") or reading.get("error")
+                              or reading.get("exists") is False):
+        return False
+    return not reading.get("mirror")
 
 
 def all_holders(d: dict | None = None) -> dict[str, dict]:
@@ -369,35 +704,33 @@ def _set_holder(d: dict, slot: str, holder: dict | None) -> None:
         d["slots"][slot] = {"holder": holder}
 
 
+@guarded_occupancy
+@serialized
 def occupy_task(slot: str, task_id: str, detail: str | None = None,
                 force: bool = False, since: str | None = None,
                 d: dict | None = None, autosave: bool = True):
     """Assign a task to a slot.
 
-    Returns ``(ok, message, displaced_holder)``. Refuses a busy slot unless
-    ``force`` (which displaces the current holder). Moving a task that already
-    holds another slot releases the old slot first and preserves its acquire
-    date.
+    Returns ``(ok, message, None)``. Both the target and any previous task hold
+    must be freed before reassigning. ``force`` is retained for API compatibility.
     """
     root = normalize_slot(slot)
     if not root:
         return False, f"invalid slot: {slot!r}", None
     own = d if d is not None else load()
 
+    current = get_holder(root, own)
+    if current and not (current.get("type") == "task" and current.get("task_id") == task_id):
+        return False, f"slot '{root}' occupied by {_holder_label(current)}; free it first", None
     # Preserve the acquire date if this task is simply being re-stamped / moved.
     prev_slot = slot_of_task(task_id, own)
     prev_since = None
     if prev_slot:
         prev_since = (own["slots"][prev_slot]["holder"] or {}).get("since")
         if prev_slot != root:
-            _set_holder(own, prev_slot, None)
+            return False, f"{task_id} already holds {prev_slot}; free it before moving the task", None
 
-    current = get_holder(root, own)
     displaced = None
-    if current and not (current.get("type") == "task" and current.get("task_id") == task_id):
-        if not force:
-            return False, f"slot '{root}' occupied by {_holder_label(current)}", None
-        displaced = current
 
     holder = {
         "type": "task",
@@ -412,6 +745,8 @@ def occupy_task(slot: str, task_id: str, detail: str | None = None,
     return True, f"{task_id} → {root}", displaced
 
 
+@guarded_occupancy
+@serialized
 def occupy_adhoc(slot: str, label: str, tag: str = "other",
                  force: bool = False, since: str | None = None,
                  d: dict | None = None, autosave: bool = True):
@@ -431,9 +766,7 @@ def occupy_adhoc(slot: str, label: str, tag: str = "other",
     current = get_holder(root, own)
     displaced = None
     if current:
-        if not force:
-            return False, f"slot '{root}' occupied by {_holder_label(current)}", None
-        displaced = current
+        return False, f"slot '{root}' occupied by {_holder_label(current)}; free it first", None
 
     holder = {
         "type": "adhoc",
@@ -448,18 +781,26 @@ def occupy_adhoc(slot: str, label: str, tag: str = "other",
     return True, f"{root} ← {label.strip()} ({tag})", displaced
 
 
-def release(slot: str, d: dict | None = None, autosave: bool = True):
-    """Free a slot. Returns ``(ok, released_holder_or_None)``."""
+@workspace_serialized
+def release(slot: str, d: dict | None = None, autosave: bool = True,
+            reset: bool = True):
+    """Free only after a verified baseline return/sync; retain holder on failure.
+
+    ``reset=False`` is for a caller that has just completed the same guarded
+    physical operation (the portal background worker).
+    """
     root = normalize_slot(slot)
     if not root:
         return False, None
-    own = d if d is not None else load()
-    holder = get_holder(root, own)
-    if not holder:
-        return True, None
-    _set_holder(own, root, None)
-    if autosave and d is None:
-        save(own)
+    if reset:
+        workspace_request(root, "free")
+    with store_lock():
+        own = d if d is not None else load()
+        holder = get_holder(root, own)
+        _set_holder(own, root, None)
+        if autosave and d is None:
+            save(own)
+        log_action(root, "release-hold", "ok")
     return True, holder
 
 
@@ -469,9 +810,7 @@ def release_task(task_id: str, d: dict | None = None, autosave: bool = True):
     slot = slot_of_task(task_id, own)
     if not slot:
         return None
-    _set_holder(own, slot, None)
-    if autosave and d is None:
-        save(own)
+    release(slot, d=d, autosave=autosave)
     return slot
 
 
@@ -517,10 +856,7 @@ def migrate_from_tasks(strip: bool = True) -> list[str]:
     fields are removed from the task store afterward. Returns a report log.
     """
     log: list[str] = []
-    if not TASKS_STORE.exists():
-        return ["no tasks.json — nothing to migrate"]
-    with TASKS_STORE.open() as f:
-        tdata = json.load(f)
+    tdata = task_store.load()
 
     def _last_worked(t: dict) -> str:
         best = t.get("updated") or t.get("created") or "0000-00-00"
@@ -544,8 +880,11 @@ def migrate_from_tasks(strip: bool = True) -> list[str]:
     for root, holders in sorted(by_slot.items()):
         holders.sort(key=_last_worked, reverse=True)
         winner = holders[0]
-        occupy_task(root, winner["id"], detail=winner.get("workspace"),
-                    since=winner.get("workspace_since"), force=True, d=d, autosave=False)
+        ok, message, _ = occupy_task(
+            root, winner["id"], detail=winner.get("workspace"),
+            since=winner.get("workspace_since"), force=True, d=d, autosave=False)
+        if not ok:
+            raise ValueError(f"migration stopped without stripping task fields: {message}")
         log.append(f"{root} ← {winner['id']} ({winner.get('workspace')})")
         for loser in holders[1:]:
             log.append(f"  dropped {loser['id']} from {root} "
@@ -557,9 +896,8 @@ def migrate_from_tasks(strip: bool = True) -> list[str]:
         for t in tdata.get("tasks", []):
             t.pop("workspace", None)
             t.pop("workspace_since", None)
-        with TASKS_STORE.open("w") as f:
-            json.dump(tdata, f, indent=2)
-        log.append("stripped legacy workspace/workspace_since from tasks.json")
+        task_store.save(tdata)
+        log.append("stripped legacy workspace/workspace_since from task store")
     return log
 
 
@@ -568,13 +906,9 @@ def migrate_from_tasks(strip: bool = True) -> list[str]:
 # ----------------------------------------------------------------------------
 
 def _resolve_task_title(task_id: str) -> str:
-    try:
-        with TASKS_STORE.open() as f:
-            for t in json.load(f).get("tasks", []):
-                if t.get("id") == task_id:
-                    return t.get("title", "")
-    except (OSError, json.JSONDecodeError):
-        pass
+    for t in task_store.load().get("tasks", []):
+        if t.get("id") == task_id:
+            return t.get("title", "")
     return ""
 
 
@@ -641,7 +975,7 @@ def cmd_occupy(args: argparse.Namespace) -> int:
         ok, msg, displaced = occupy_adhoc(args.slot, args.label, tag=args.tag,
                                           force=args.force)
     if not ok:
-        print(f"[wm] {msg}. Use --force to displace.", file=sys.stderr)
+        print(f"[wm] {msg}. Free the old hold and verify a clean baseline before retrying.", file=sys.stderr)
         return 1
     if displaced:
         print(f"[wm] displaced {_holder_label(displaced)}")
@@ -650,7 +984,11 @@ def cmd_occupy(args: argparse.Namespace) -> int:
 
 
 def cmd_release(args: argparse.Namespace) -> int:
-    ok, holder = release(args.slot)
+    try:
+        ok, holder = release(args.slot)
+    except ValueError as e:
+        print(f"[wm] release rejected: {e}", file=sys.stderr)
+        return 1
     root = normalize_slot(args.slot)
     if not ok:
         print(f"[wm] invalid slot: {args.slot}", file=sys.stderr)
@@ -682,6 +1020,25 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wm", description="workspace-manager CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    for command in ("refresh", "sync", "log"):
+        a = sub.add_parser(command)
+        a.add_argument("slot")
+        a.set_defaults(func=lambda args, command=command: _workspace_cli(args, command))
+
+    a = sub.add_parser("identity", help="find or register a workspace identity")
+    a.add_argument("path")
+    a.add_argument("--target", default="")
+    a.set_defaults(func=lambda args: _print_identity(args))
+
+    a = sub.add_parser("mirror-state", help="record the mirror lifecycle")
+    a.add_argument("target")
+    a.add_argument("path")
+    a.add_argument("--source-id", required=True)
+    a.add_argument("--source-path", required=True)
+    a.add_argument("--state", choices=["syncing", "active", "failed", "released"], required=True)
+    a.add_argument("--detail", default="")
+    a.set_defaults(func=lambda args: _print_mirror_state(args))
+
     a = sub.add_parser("list", help="show all slots and their holders")
     a.add_argument("--project", help=f"project dir under ~/projects (default {DEFAULT_PROJECT})")
     a.set_defaults(func=cmd_list)
@@ -697,7 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--tag", choices=ADHOC_TAGS, default="other",
                    help="ad-hoc category (default: other)")
     a.add_argument("--detail", help="explicit workspace sub-path for a task holder")
-    a.add_argument("--force", action="store_true", help="displace the current holder")
+    a.add_argument("--force", action="store_true", help="legacy flag; held slots must still be freed first")
     a.set_defaults(func=cmd_occupy)
 
     a = sub.add_parser("release", aliases=["free"], help="free a slot")
@@ -710,7 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("migrate", help="import legacy per-task workspace holds")
     a.add_argument("--keep-fields", action="store_true",
-                   help="do not strip workspace/workspace_since from tasks.json")
+                   help="do not strip workspace/workspace_since from the task store")
     a.set_defaults(func=cmd_migrate)
 
     return p
@@ -720,6 +1077,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _print_identity(args) -> int:
+    print(json.dumps(identity(args.path, args.target)))
+    return 0
+
+
+def _workspace_cli(args, command) -> int:
+    try:
+        value = action_log(args.slot) if command == "log" else workspace_request(
+            args.slot, "status" if command == "refresh" else command)
+        print(json.dumps(value, indent=2))
+        return 0
+    except ValueError as e:
+        print(f"[wm] {e}", file=sys.stderr)
+        return 1
+
+
+def _print_mirror_state(args) -> int:
+    print(json.dumps(mirror_state(args.target, args.path, args.source_id,
+                                 args.source_path, args.state, args.detail)))
+    return 0
 
 
 if __name__ == "__main__":

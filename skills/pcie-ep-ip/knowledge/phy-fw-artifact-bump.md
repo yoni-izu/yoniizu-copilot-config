@@ -1,7 +1,7 @@
 # Bumping the PCIe PHY firmware drop (`external_phy_pcie_fw`)
 
-**Status:** Verified from manifest + build framework + repo sources (workspace
-`~/projects/iridium/a1_power_on_002/fw`, branch `a1_power_on_branch`).
+**Status:** Verified from manifest + build framework + repo sources (Iridium A1
+firmware workspace, branch `a1_power_on_branch`).
 **Recorded:** 2026-10-12
 
 ---
@@ -49,7 +49,7 @@ Only `<VERSION>` changes. `name`, `extract_prefix` and `dep_type` are stable.
 
 > ⚠️ In a `repo`-managed workspace the file is checked out at
 > `fw/.repo/manifests/projects/iridium/<branch>/psoc-fw-ci.xml`. That is a
-> **checkout of `git@github.com:Elmnt-Internal/ip.infra.sw.manifests.git` (branch `main`)** —
+> **checkout of the organization’s `ip.infra.sw.manifests` repository (branch `main`)** —
 > editing it locally only affects your tree. The real change is a PR on the
 > manifests repo.
 

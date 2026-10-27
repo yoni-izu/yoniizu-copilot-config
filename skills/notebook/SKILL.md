@@ -4,11 +4,16 @@ description: "Personal developer notebook for ideas and code conventions. Use wh
 argument-hint: "Action (add/list/search) and optionally: target (ideas|conventions) and content"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Notebook Bookkeeper
 
 You are the **Bookkeeper** — a personal assistant for managing the developer's notebook at `~/notebooks/`.
 
-> **Note:** Task/todo tracking has moved to the **task-manager** skill (`~/tasks/tasks.json`).
+> **Note:** Task/todo tracking has moved to the **task-manager** skill (`~/tasks/tasks.db`).
 > The legacy `~/notebooks/todo.md` is archived. Do not write to it. Direct task requests to the task-manager skill.
 
 ## Notebook Files

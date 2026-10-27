@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """bug-monitor CLI + library — mechanics for the bug-monitor skill.
 
-Owns ``~/tasks/bugs.json``: the local mirror of every HSI bug in Jira plus the
+Owns the bug store in ``~/tasks/bugs.db`` (via ``bugdb.py``, the single source
+of truth shared with ``bug-triage/ph.py`` and the Team Portal): the local mirror of every HSI bug in Jira plus the
 team-lead's own monitoring layer on top of it (triage verdict, duplicate
 families, watch state, progress signals, notes).
 
@@ -37,17 +38,23 @@ from typing import Any
 # Constants
 # ----------------------------------------------------------------------------
 
-STORE = Path(os.path.expanduser("~/tasks/bugs.json"))
-SITE = "https://elementlabs.atlassian.net"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bugdb  # noqa: E402  — the shared bug database (single source of truth)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
+from private_paths import load_private_json  # noqa: E402
+
+STORE = bugdb.DB_PATH
+PRIVATE_JIRA = load_private_json("config/jira.json")
+SITE = os.environ.get("JIRA_SITE", PRIVATE_JIRA.get("site", "")).rstrip("/")
 BROWSE = f"{SITE}/browse/"
 
-HSI_TEAM_ID = "705f36d3-e7b3-4b7e-a220-d28f31f013ab"
-HSI_COMPONENTS = ["ip-pcie-firmware-ep", "ip-se-firmware", "ip-d2d-firmware"]
+HSI_TEAM_ID = os.environ.get("JIRA_TEAM_ID", PRIVATE_JIRA.get("team_id", ""))
+HSI_COMPONENTS = PRIVATE_JIRA.get("components", [])
 
 # Jira custom fields (see jira-hsi-planning skill for the full map).
-CF_TEAM = "customfield_10001"
-CF_MILESTONE = "customfield_10702"
-CF_SPRINT = "customfield_10020"
+CF_TEAM = PRIVATE_JIRA.get("team_field", "customfield_10001")
+CF_MILESTONE = PRIVATE_JIRA.get("milestone_field", "customfield_10702")
+CF_SPRINT = PRIVATE_JIRA.get("sprint_field", "customfield_10020")
 
 JIRA_FIELDS = [
     "summary", "status", "statuscategorychangedate", "assignee", "reporter",
@@ -86,10 +93,15 @@ DEFAULT_CONFIG = {
     "stall_days": 14,         # no activity for N days => "stalled"
     "dormant_days": 30,       # no activity for N days => "dormant"
     "aging_days": 30,         # open longer than N days => "aging"
-    "ping_flag_at": 2,        # Oded pinged N+ times => "pinged" flag
-    "ping_author": "Oded Gabbay",  # Jira comments by this person count as pings
+    "ping_flag_at": 2,        # configured ping author pinged N+ times => "pinged" flag
+    "ping_author": PRIVATE_JIRA.get("ping_author", ""),
     "closed_retention_days": 90,   # drop closed bugs untouched this long
 }
+
+
+def _ping_author(config: dict) -> str:
+    return str(config.get("ping_author") or "configured author")
+
 
 TODAY = date.today().isoformat()
 NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -111,13 +123,9 @@ def _empty() -> dict:
 
 
 def load() -> dict:
-    if not STORE.exists():
-        return _empty()
-    try:
-        with STORE.open() as f:
-            d = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return _empty()
+    """The store in its classic dict shape, read from the shared database.
+    ``triage.investigation`` is assembled from the note-link table."""
+    d = bugdb.load_bugs()
     base = _empty()
     for k, v in base.items():
         d.setdefault(k, v)
@@ -134,11 +142,8 @@ def load() -> dict:
 
 
 def save(d: dict) -> None:
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STORE.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(d, f, indent=2, ensure_ascii=False)
-    tmp.replace(STORE)
+    """Write changed rows only, merging with any concurrent writer."""
+    bugdb.save_bugs(d)
 
 
 def find_bug(d: dict, key: str) -> dict | None:
@@ -199,6 +204,10 @@ def _credentials() -> tuple[str, str]:
 
 def _request(method: str, path: str, body: dict | None = None,
              params: dict | None = None) -> Any:
+    if not SITE:
+        raise RuntimeError(
+            "Jira site is not configured; set JIRA_SITE or add config/jira.json "
+            "under COPILOT_PRIVATE_DIR")
     email, token = _credentials()
     url = SITE + path
     if params:
@@ -453,8 +462,8 @@ def _new_bug_record(flat: dict, bootstrap: bool = False) -> dict:
         **flat,
         "first_seen": (flat.get("created") or TODAY) if bootstrap else TODAY,
         "watch": "active",
-        # How many times Oded has chased this bug for progress/status, and when
-        # he last did. Auto-derived from Jira comments on every scan.
+        # How many times the configured ping author chased this bug, derived
+        # from Jira comments on every scan.
         "oded_pings": 0,
         "last_ping": None,
         "jira_pings": 0,
@@ -611,7 +620,13 @@ def flags_of(b: dict, cfg: dict) -> list[str]:
     return out
 
 
-def annotate(b: dict, d: dict) -> dict:
+def root_cause_owner(key: str) -> str | None:
+    """The phenomenon that owns this bug's root cause, if any. A bug linked to a
+    phenomenon with a root cause must not carry a second, diverging copy."""
+    return (bugdb.bug_evidence().get(key) or {}).get("root_cause_from")
+
+
+def annotate(b: dict, d: dict, ev: dict | None = None) -> dict:
     """Return a display copy of the bug with all derived fields resolved."""
     cfg = d["config"]
     fam_id = (b.get("triage") or {}).get("family")
@@ -629,11 +644,24 @@ def annotate(b: dict, d: dict) -> dict:
     c["open"] = b.get("status_category") != "done"
     c["oded_pings"] = b.get("oded_pings") or 0
     c["days_since_ping"] = _days_since(b.get("last_ping"))
+    if ev is None:
+        ev = bugdb.bug_evidence()
+    e = ev.get(b["key"]) or {}
+    c["phenomena"] = e.get("phenomena") or []
+    c["investigations"] = e.get("investigations") or []
+    c["root_cause_from"] = e.get("root_cause_from")
+    if c["root_cause_from"]:
+        ph = next(x for x in c["phenomena"] if x["id"] == c["root_cause_from"])
+        c["root_cause"] = ph["root_cause"]
+    else:
+        c["root_cause"] = (b.get("triage") or {}).get("root_cause")
+    c["origin"], c["origin_why"] = bugdb.bug_origin(b, c["phenomena"])
     return c
 
 
 def view(d: dict) -> list[dict]:
-    return [annotate(b, d) for b in d["bugs"]]
+    ev = bugdb.bug_evidence()
+    return [annotate(b, d, ev) for b in d["bugs"]]
 
 
 # ----------------------------------------------------------------------------
@@ -871,14 +899,18 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"  triage     : {tri.get('state')} / verdict={tri.get('verdict') or '—'} "
           f"family={tri.get('family') or '—'} ({a.get('family_title') or '—'}) "
           f"owner={tri.get('owner') or '—'}")
-    if tri.get("root_cause"):
-        print(f"  root cause : {tri['root_cause']}")
+    if a.get("root_cause"):
+        src = f" (from {a['root_cause_from']})" if a.get("root_cause_from") else ""
+        print(f"  root cause : {a['root_cause']}{src}")
+    for ph in a.get("phenomena") or []:
+        print(f"  phenomenon : {ph['id']} [{ph.get('status') or '?'}] "
+              f"{(ph.get('title') or '')[:70]}")
     if tri.get("next_step"):
         print(f"  next step  : {tri['next_step']}")
-    if tri.get("investigation"):
-        print(f"  note file  : {tri['investigation']}")
+    for n in a.get("investigations") or []:
+        print(f"  note file  : {n['name']}  ({n['source']})")
     print(f"  flags      : {', '.join(a['flags']) or '—'}   watch: {a.get('watch')}")
-    print(f"  oded pings : {a['oded_pings']}"
+    print(f"  author pings : {a['oded_pings']}"
           + (f"   last {a.get('last_ping')} ({a['days_since_ping']}d ago)"
              if a.get("last_ping") else ""))
     if a.get("links"):
@@ -906,6 +938,11 @@ def cmd_triage(args: argparse.Namespace) -> int:
         return 1
     tri = b.setdefault("triage", {})
     changed = []
+    owner = root_cause_owner(b["key"]) if args.root_cause is not None else None
+    if owner:
+        print(f"[bm] {b['key']}'s root cause lives on {owner} — set it there: "
+              f"ph.py set {owner} --root-cause '...'", file=sys.stderr)
+        return 1
     for attr, field in (("state", "state"), ("verdict", "verdict"),
                         ("severity", "severity_call"), ("owner", "owner"),
                         ("root_cause", "root_cause"), ("next_step", "next_step"),
@@ -964,8 +1001,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_ping(args: argparse.Namespace) -> int:
-    """Record that Oded chased this bug for progress/status."""
+    """Record an out-of-band progress ping from the configured author."""
     d = load()
+    author = _ping_author(d.get("config", {}))
     b = find_bug(d, args.key)
     if not b:
         print(f"[bm] unknown bug {args.key}", file=sys.stderr)
@@ -974,7 +1012,7 @@ def cmd_ping(args: argparse.Namespace) -> int:
         b["manual_pings"] = 0
         b["oded_pings"] = max(0, args.set)
         b["last_ping"] = args.on or (TODAY if args.set else None)
-        msg = f"oded pings set to {b['oded_pings']} (until next scan)"
+        msg = f"author pings set to {b['oded_pings']} (until next scan)"
     else:
         # Scans recompute oded_pings from Jira, so an out-of-band chase has to
         # live in manual_pings or it would vanish on the next refresh.
@@ -982,7 +1020,7 @@ def cmd_ping(args: argparse.Namespace) -> int:
         b["oded_pings"] = (b.get("oded_pings") or 0) + args.n
         b["manual_last_ping"] = args.on or TODAY
         b["last_ping"] = b["manual_last_ping"]
-        msg = (f"pinged by Oded x{args.n}" if args.n > 1 else "pinged by Oded")
+        msg = f"pinged by {author}" + (f" x{args.n}" if args.n > 1 else "")
         msg += f" (total {b['oded_pings']})"
     append_note(b, msg + (f" — {args.note}" if args.note else ""))
     save(d)
@@ -1313,6 +1351,11 @@ def cmd_jira_link(args: argparse.Namespace) -> int:
 def apply_bug_edit(key: str, payload: dict) -> tuple[bool, str]:
     """Apply a dashboard edit to one bug. Local monitoring fields only —
     never touches Jira (Jira state is refreshed by `scan`)."""
+    with bugdb.tx("portal"):
+        return _apply_bug_edit(key, payload)
+
+
+def _apply_bug_edit(key: str, payload: dict) -> tuple[bool, str]:
     d = load()
     b = find_bug(d, key)
     if not b:
@@ -1351,6 +1394,20 @@ def apply_bug_edit(key: str, payload: dict) -> tuple[bool, str]:
             if b["key"] not in fam["members"]:
                 fam["members"].append(b["key"])
         changed.append(f"family={fid or '—'}")
+    if "origin" in payload:
+        o = payload["origin"] or None
+        if o and o not in bugdb.ORIGINS:
+            return False, "invalid origin"
+        if o != tri.get("origin"):
+            if o:
+                tri["origin"] = o
+            else:
+                tri.pop("origin", None)
+            changed.append(f"origin={o or 'auto'}")
+    if "root_cause" in payload and (payload["root_cause"] or None) != tri.get("root_cause"):
+        owner = root_cause_owner(b["key"])
+        if owner:
+            return False, f"root cause lives on {owner} — edit it in the Phenomena tab"
     for fld in ("root_cause", "next_step", "owner"):
         if fld in payload:
             tri[fld] = payload[fld] or None
@@ -1365,7 +1422,7 @@ def apply_bug_edit(key: str, payload: dict) -> tuple[bool, str]:
         b["oded_pings"] = (b.get("oded_pings") or 0) + 1
         b["manual_last_ping"] = TODAY
         b["last_ping"] = TODAY
-        changed.append(f"pinged by Oded (total {b['oded_pings']})")
+        changed.append(f"pinged by {_ping_author(d.get('config', {}))} (total {b['oded_pings']})")
     elif "oded_pings" in payload and payload["oded_pings"] != "":
         try:
             n = max(0, int(payload["oded_pings"]))
@@ -1476,7 +1533,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--reason")
     s.set_defaults(func=cmd_watch)
 
-    s = sub.add_parser("ping", help="record a ping from Oded chasing progress/status")
+    s = sub.add_parser("ping", help="record an out-of-band progress ping from the configured author")
     s.add_argument("key")
     s.add_argument("-n", type=int, default=1, help="how many pings to add (default 1)")
     s.add_argument("--set", type=int, help="set the total instead of incrementing")
@@ -1550,7 +1607,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    if args.func is cmd_scan:
+        # A Jira scan is minutes of network I/O: don't hold the write lock;
+        # the row-level 3-way merge reconciles any edit made meanwhile.
+        return args.func(args)
+    with bugdb.tx("cli"):
+        return args.func(args)
 
 
 if __name__ == "__main__":

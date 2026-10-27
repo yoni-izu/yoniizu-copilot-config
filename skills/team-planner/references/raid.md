@@ -1,5 +1,11 @@
 # RAID Log Reference
 
+Canonical records live in `~/tasks/raid.db`, owned by `../rd.py`.
+Use `rd.py list/show/payload` to read and `set/new/close` to mutate.
+The old `~/team-planner/raid.md` is a backed-up import/export document only.
+Do not hand-edit Markdown or SQLite to update a live record. Preserve narrative
+Markdown through owner APIs.
+
 ## Columns
 
 | Field | Description |

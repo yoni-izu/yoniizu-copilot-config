@@ -4,6 +4,11 @@ description: 'Project expert for the Atlantic2 (A2) project — the NEXT project
 argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium (A1), an IP/spec/RTL area, or the project plan'
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Atlantic2 (A2) Project Expert
 
 ## When to Use

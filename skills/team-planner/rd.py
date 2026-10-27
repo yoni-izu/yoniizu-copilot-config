@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""RAID log reader/writer for ~/team-planner/raid.md.
+"""RAID log owner for ~/tasks/raid.db (RAID_DB overrides).
 
-The file stays the source of truth and stays hand-editable; this only rewrites
-the specific field lines it is asked to change.
+Use migrate for a one-time backed-up import and export for markdown interchange.
 
     rd.py list                      # open rows, worst first
     rd.py show R-001
     rd.py set R-001 --rag red --status "Open" --note "..."
-    rd.py new --type risk --title "..." --owner Yoni --p 3 --i 4
+    rd.py new --type risk --title "..." --fw-owner "<team-member>" --p 3 --i 4
     rd.py close R-001 --resolution "PRs merged ahead of trigger"
     rd.py payload                   # JSON for the Team Portal
 """
@@ -21,6 +20,7 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
+import raid_store as db
 
 RAID = Path(os.path.expanduser("~/team-planner/raid.md"))
 TODAY = date.today().isoformat()
@@ -61,14 +61,17 @@ def _plain(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse(text: str | None = None) -> list[dict]:
+    revision = None
     if text is None:
-        text = RAID.read_text(encoding="utf-8", errors="replace") if RAID.exists() else ""
+        text, revision = db.snapshot()
     lines = text.splitlines()
     rows, cur = [], None
 
     for i, line in enumerate(lines):
         m = HEAD_RE.match(line)
         if m:
+            if cur is not None:
+                cur["end"] = i
             cur = {"id": m.group(1), "type": m.group(2), "start": i, "end": len(lines),
                    "fields": {}, "p": 0, "i": 0, "score": 0, "rag": ""}
             rows.append(cur)
@@ -87,11 +90,19 @@ def parse(text: str | None = None) -> list[dict]:
             continue
         fm = FIELD_RE.match(line)
         if fm:
-            cur["fields"].setdefault(fm.group(1).strip(), {"line": i, "value": fm.group(2).strip()})
+            end = _field_span(lines, i)
+            value = "\n".join([fm.group(2)] + lines[i + 1:end]).rstrip("\n")
+            cur["fields"].setdefault(fm.group(1).strip(), {"line": i, "value": value})
 
     for r in rows:
+        if revision is not None:
+            r["revision"] = revision
         f = r.pop("fields")
         r["lines"] = {k: v["line"] for k, v in f.items()}
+        r["fields_raw"] = {k: v["value"] for k, v in f.items()}
+        r["raw_markdown"] = "\n".join(lines[r["start"]:r["end"]])
+        for name, value in r["fields_raw"].items():
+            r[name.lower().replace(" ", "_") + "_raw"] = value
         status = f.get("Status", {}).get("value", "")
         r.update({
             "title": _plain(f.get("Title", {}).get("value", "")),
@@ -120,8 +131,6 @@ def _field_span(lines: list[str], start: int) -> int:
         s = lines[j]
         if s.startswith("### ") or s.startswith("## ") or FIELD_RE.match(s):
             break
-        if s.strip() and not s.startswith((" ", "\t")):
-            break
         j += 1
     return j
 
@@ -130,11 +139,13 @@ def _field_span(lines: list[str], start: int) -> int:
 # Writing
 # ---------------------------------------------------------------------------
 
+@db.atomic
 def apply_edit(rid: str, payload: dict) -> tuple[bool, str]:
     """Rewrite one row's fields. Untouched fields keep their exact text."""
-    if not RAID.exists():
-        return False, "raid.md not found"
-    text = RAID.read_text(encoding="utf-8")
+    text, revision = db.snapshot()
+    expected = payload.get("expected_revision", payload.get("revision"))
+    if expected is not None and int(expected) != revision:
+        return False, f"RAID revision conflict: expected {expected}, current {revision}"
     lines = text.splitlines()
     rows = parse(text)
     row = next((r for r in rows if r["id"].upper() == rid.upper()), None)
@@ -148,7 +159,7 @@ def apply_edit(rid: str, payload: dict) -> tuple[bool, str]:
         key = name.lower().replace(" ", "_")
         if key not in payload:
             continue
-        val = str(payload[key]).strip()
+        val = str(payload[key])
         if name in row["lines"]:
             a = row["lines"][name]
             if lines[a] == f"- **{name}:** {val}".rstrip():
@@ -183,7 +194,7 @@ def apply_edit(rid: str, payload: dict) -> tuple[bool, str]:
     for a, b, repl in sorted(edits, key=lambda e: -e[0]):
         lines[a:b] = [repl]
 
-    RAID.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.save("\n".join(lines) + "\n", revision)
     return True, f"{row['id']}: " + ", ".join(changed)
 
 
@@ -197,6 +208,7 @@ def next_id(kind: str, rows: list[dict]) -> str:
     return f"{pre}-{max(used, default=0) + 1:03d}"
 
 
+@db.atomic
 def new_row(payload: dict) -> tuple[bool, str]:
     kind = str(payload.get("type") or "risk").lower()
     if kind not in PREFIX:
@@ -204,6 +216,8 @@ def new_row(payload: dict) -> tuple[bool, str]:
     title = str(payload.get("title") or "").strip()
     if not title:
         return False, "title is required"
+    if not str(payload.get("fw_owner") or "").strip():
+        return False, "FW Owner is required"
 
     rows = parse()
     rid = next_id(kind, rows)
@@ -213,13 +227,13 @@ def new_row(payload: dict) -> tuple[bool, str]:
     rag = str(payload.get("rag") or "").capitalize() or rag_for(score)
 
     def f(key, default="—"):
-        return str(payload.get(key) or default).strip()
+        return str(payload.get(key) or default)
 
     block = [
         f"### {rid} | {TYPES[PREFIX[kind]]}",
         f"- **Title:** {title}",
         f"- **Description:** {f('description')}",
-        f"- **FW Owner:** {f('fw_owner', 'Yoni')}",
+        f"- **FW Owner:** {f('fw_owner')}",
         f"- **External Owner:** {f('external_owner')}",
         f"- **P:** {p} | **I:** {i} | **Score:** {score} | **RAG:** {rag}",
         f"- **Trigger:** {f('trigger')}",
@@ -231,18 +245,14 @@ def new_row(payload: dict) -> tuple[bool, str]:
         "",
     ]
 
-    if not RAID.exists():
-        RAID.parent.mkdir(parents=True, exist_ok=True)
-        RAID.write_text("# RAID Log — HSI Firmware\n\n## Active Items\n\n", encoding="utf-8")
-
-    text = RAID.read_text(encoding="utf-8")
+    text = db.snapshot()[0] or "# RAID Log — HSI Firmware\n\n## Active Items\n\n"
     lines = text.splitlines()
     # New rows go at the end of the last open block, before any trailing sections.
     at = rows[-1]["end"] if rows else len(lines)
     while at > 0 and not lines[at - 1].strip():
         at -= 1
     lines[at:at] = [""] + block[:-1]
-    RAID.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    db.save("\n".join(lines).rstrip("\n") + "\n", action="new")
     return True, rid
 
 
@@ -250,6 +260,7 @@ def new_row(payload: dict) -> tuple[bool, str]:
 # Portal payload
 # ---------------------------------------------------------------------------
 
+@db.atomic
 def payload() -> dict:
     rows = [{k: v for k, v in r.items() if k not in ("lines", "start", "end", "score_line")}
             for r in parse()]
@@ -265,7 +276,8 @@ def payload() -> dict:
             "hot": len([r for r in open_rows if r["rag"] in ("red", "orange")]),
             "overdue": len([r for r in open_rows if r["due"] and r["due"] < TODAY]),
         },
-        "path": str(RAID),
+        "path": str(db.path()),
+        "revision": db.snapshot()[1],
     }
 
 
@@ -291,6 +303,7 @@ def main(argv=None) -> int:
     s.add_argument("--i", type=int)
     s.add_argument("--rag", choices=RAGS)
     s.add_argument("--type", choices=sorted(PREFIX))
+    s.add_argument("--expected-revision", type=int)
 
     s = sub.add_parser("new")
     s.add_argument("--type", choices=sorted(PREFIX), default="risk")
@@ -305,9 +318,23 @@ def main(argv=None) -> int:
     s.add_argument("--resolution", required=True)
 
     sub.add_parser("payload")
+    sub.add_parser("paths")
+    s = sub.add_parser("migrate")
+    s.add_argument("--source", type=Path, default=RAID)
+    s = sub.add_parser("export")
+    s.add_argument("destination", type=Path)
 
     a = p.parse_args(argv)
 
+    if a.cmd == "paths":
+        print(json.dumps({"database": str(db.path()), "legacy": str(RAID)}))
+        return 0
+    if a.cmd == "migrate":
+        print("imported" if db.migrate(a.source) else "already imported")
+        return 0
+    if a.cmd == "export":
+        db.export(a.destination)
+        return 0
     if a.cmd == "payload":
         print(json.dumps(payload(), indent=2, ensure_ascii=False))
         return 0

@@ -1,8 +1,13 @@
 ---
 name: vm-delegate
 description: "Delegate FW workspace work to a mirror workspace on ANY machine (EC2 VM or shared lab desktop) via the mctl script (formerly vmctl). Use when: mirror/align a workspace to a VM or remote machine, remote build, run a full parallel workspace build on a strong machine, pull build results/binaries/logs back, run workspace tests remotely, release/clean up the remote mirror workspace, run any wip_/ws_ git operation remotely, start/stop a VM, manage machine targets, execute a command on a target and pull its output, or delegate long-running work that must survive SSH hangups."
-argument-hint: "Optional -t <target>, an operation (mirror/build/build-status/test/test-status/pull-build/pull-logs/release/wip/sh/start/stop/setup), and optionally a workspace path"
+argument-hint: "Optional -t <target>, an operation (mirror/workspace/build/build-status/test/test-status/pull-build/pull-logs/release/wip/sh/start/stop/setup), and optionally a workspace path"
 ---
+
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
 
 # mctl — Multi-Machine Mirror-Workspace Work Offloading
 
@@ -27,9 +32,9 @@ every action can be run by hand with no AI involvement.
 >
 > **Path mapping is home-relative.** The mirror lives at the same path relative
 > to `$HOME`. On a VM the home is identical so the absolute path is identical
-> (the original behaviour). On a lab machine with a different login/home (e.g.
-> `SA-DSK61-CSR` → `/users/home/yoni.izutskiver`), the path is remapped
-> home-relative. Many lab boxes share one NFS home, so a single `mctl mirror`
+> (the original behaviour). On a remote machine with a different login/home,
+> the path is remapped home-relative. Multiple lab boxes may share one NFS home,
+> so a single `mctl mirror`
 > is visible on all of them — mirror once, build on whichever box is free. The
 > remote workspace must already exist at the mapped path.
 
@@ -95,6 +100,7 @@ Prefix any command with `-t <target>` to pick a machine (or set a default with
 | Last N lines of one live remote job log | `mctl -t <name> jobs-tail <tag> [kind] [n]` |
 | EC2 power state of every instance | `vd.py vms` (wraps `octl vm list`) |
 | Clean up: return remote repos to baseline + sync | `mctl release [ws]` |
+| Guarded independent remote slot operations | `mctl -t NAME workspace status\|sync\|free\|mirror\|align /absolute/remote/path WS-R-uuid BASELINE [options-json]` |
 | Any `wip` git op remotely | `mctl wip <action> [ws]` or `... --wip` |
 | Run an arbitrary command in the remote ws root | `mctl sh '<cmd>' [ws]` |
 | Print a VM target's private IP (auto-discovered) | `mctl -t <vm> ip` (add `--refresh`) |
@@ -146,15 +152,32 @@ The `.wip` save file **is** the transferred branch scheme (its `# WIP_INFO`
 section maps `ws:repo=path:branch` for every repo, using **workspace-relative**
 paths so it ports cleanly across machines with different homes):
 
-1. Local: `wip scan` (fresh scan of the workspace) → `wip ws push --yes`
-   (force-push every non-baseline branch to origin) → `wip save <tag>` (save the
-   branch map to `~/.wip/saved/<tag>.wip`).
-2. `scp` that one saved map to the target's `~/.wip/saved/`.
-3. Target: `wip load <tag>` (consume the branch map) → `wip ws checkout` (check
+1. Resolve/register the local source's stable `WS-L-uuid` and the remote slot's
+   `WS-R-uuid` using `wm.py identity`. A source under a tracked `slot/fw` maps
+   to its tracked ancestor slot; the **slot**, not just `fw`, owns the mirror
+   marker. Check the actual remote marker every time: cached portal relations
+   are not authoritative after a portal Free. Adopt an existing remote marker
+   ID through workspace-manager's guarded status/identity reconciliation;
+   never replace an unknown identity.
+   First-time remote registration inherits the source roster's manifest
+   revision (for example `a1_power_on`), not the remote identity default
+   `main`. Existing remote registrations retain their configured revision.
+2. Refuse occupied remote reservations, dirty/local-only commits, another
+   source's mirror, and nonbaseline independent workspaces. Preserve the
+   manifest/pin drift gate. Scan/save the local branch map, then publish the
+   allowed development branches (subject to the script's push safety policy).
+3. With `--sync`, use the guarded whole-slot runtime sync before replay. Mark
+   the remote marker and local registry **syncing before alignment**, then
+   `scp` the saved map to the target's `~/.wip/saved/`.
+4. Target: `wip load <tag>` (consume the branch map) → `wip ws checkout` (check
    out every recorded branch) → `wip ws hard-reset --yes` (fetch + `reset --hard
    origin/<branch>` so a rebased/force-pushed branch is reproduced *exactly* —
    this is mode-independent, unlike `align`, so the mirror is an exact copy of
    the pushed state regardless of the target's `wip` mode).
+5. Verify branch/SHA parity, then mark both records **active**. Alignment,
+   transfer, or verification failure marks the relation **failed**, not active.
+   Runtime and alignment calls use ordinary `rlogin`: credential provisioning
+   must not automatically replay a partially completed mutation.
 
 Because step 1 **force-pushes** your dev branches, only run `mirror` when you
 intend to publish the current local state. After a local rebase, re-run
@@ -255,15 +278,15 @@ dead lab desktops registered a fleet refresh runs for minutes while
 about.
 
 Scoping is honest about what it did *not* check. Each target carries its own
-`checked` timestamp in `jobstate.json`, surfaced per target in the payload's
+`checked` timestamp in `~/tasks/delegation.db`, surfaced per target in the payload's
 `target_state`, so refreshing one machine never makes the rest look freshly
-read; and per-target errors are merged rather than replaced, so a VM-only
-refresh does not erase the knowledge that `dsk61` was unreachable.
+read; and per-target errors are merged rather than replaced, so a refresh of
+one target does not erase another target's recorded error.
 
 ```
 $ vd.py targets
-vm         running    jobs=16  running=0   checked        11s ago  ok
-dsk61      -          jobs=0   running=0   checked     3m 10s ago  ⚠ jobs-probe failed (rc=255)
+<target>   running    jobs=<n> running=<n> checked <age> ago       ok
+<target>   -          jobs=0   running=0   checked <age> ago        ⚠ jobs-probe failed (rc=<code>)
 ```
 
 Scoped to a target with no EC2 instance behind it, the `octl vm list` call is
@@ -289,7 +312,7 @@ target, so the command survives even for a job adopted from another machine.
 Jobs that predate this show **not recorded** in the portal rather than a command
 that was never captured.
 
-`vd.py` writes the resolved status to `~/.mctl/jobstate.json` and binds each
+`vd.py` writes resolved observations to `~/tasks/delegation.db` and binds each
 probe row to the **newest** dispatch for that `(target, tag, kind)` — older
 entries settle as `superseded`, because their log is gone. Jobs found on a
 target that were never dispatched from here are adopted once (`found on target`).
@@ -308,7 +331,7 @@ does **not** silently drop the target, and the probe is retried next refresh.
 
 `vd.py vms` parses `octl vm list --output json` (instance id, state, type,
 private IP, lease expiry) and matches each instance to an mctl target through
-the cached `~/.mctl/<target>.ip`, caching the result in `~/.mctl/vmstate.json`.
+the cached `~/.mctl/<target>.ip`, caching the result in the delegation database.
 `vd.py start|stop <id>` shells out to `octl vm start|stop`; a start also clears
 the cached IPs, because a resumed VM usually comes back on a different one.
 
@@ -354,10 +377,57 @@ stopped VM that ssh could reach perfectly well.
 
 ## Releasing the mirror
 
-`mctl release` returns every repo in the remote workspace to its manifest
-baseline (`main` / the project fb tag) via `wip ws return` and runs `octl ws
-sync`. Use it when you're done with a delegated task so the mirror is clean for
-the next one.
+`mctl release` resolves the registered **whole remote slot**, checks its actual
+marker/source identity, then calls guarded runtime `free`. This refuses dirty
+working trees and local-only commits, returns repositories to their configured
+manifest baseline and syncs them. Only successful free clears the remote
+mirror marker; only then is `wm.py mirror-state ... --state released` recorded.
+A failed release retains the relation (possibly marked failed) and never prints
+success. Do not replace this with unchecked `wip return && octl ws sync`.
+
+### Independent remote workspace transport
+
+```bash
+mctl -t NAME workspace status /independent/remote/slot WS-R-uuid main
+mctl -t NAME workspace sync /independent/remote/slot WS-R-uuid main
+mctl -t NAME workspace free /independent/remote/slot WS-R-uuid main
+mctl -t NAME workspace align /independent/remote/slot WS-R-uuid main \
+  '{"prs":[{"owner":"ORG","repo":"REPO","branch":"dev/review","pr_number":123}]}'
+```
+
+This command does **not** call `find_ws` or `map_remote`: the absolute path is
+already the target's path. All calls require a stable remote ID and configured
+manifest baseline revision (`main` or a release branch/tag, **not a counter**).
+An optional final JSON argument is a mirror object or `null` for `mirror`;
+for other actions it is an options object allowing only a `prs` list. PR
+alignment is passed to the runtime; the transport never invokes remote `gh`.
+
+The local portable `workspace-manager/workspace_runtime.py` is base64-encoded
+and sent through existing `rlogin`/login-shell stdin, with shell-quoted JSON:
+`{action,path,id,rev,mirror?}` (or `prs` for review alignment). No remote
+installation beyond Python's standard library and the existing `wip`/`octl` for repository
+operations is needed, and no remote `rtk` is used. Stdout is the runtime's
+single JSON response `{ok,error?,status?,log?}`. Domain failures preserve JSON
+and exit zero at this transport layer; callers must check `ok`. SSH/transport
+errors retain nonzero exit status and stderr, with no automatic retry.
+
+Remote identity/mirror state and append-only history live under
+`~/.mctl/workspaces/<sha256(canonical-path)>.json` and `.jsonl`. A mirror object
+contains `source_id`, `source_path`, `source_host`, `state`, and `updated`.
+Use `mirror ... null` to clear a relation only after successful free (normally
+free itself performs this). Portal Free calls this same `workspace free`
+transport directly and reconciles the registry from returned status. A later
+`mctl mirror` always reads the live marker instead of assuming the last cached
+relation is still active.
+
+Mirror/free/sync/align and occupancy changes have per-workspace action history.
+The workspace-scoped `build`, `test`, `run`, `wip`, `sh`, `pull-build`, and
+`pull-logs` commands also append outcome events to the local and cached remote
+workspace histories. These events contain action, outcome and target only—not
+command text, arguments, credentials or output. Build/test/run entries mean
+**dispatch outcome**; the existing job history tracks eventual completion.
+History logging preserves the command's exit code and warns if the event could
+not be persisted.
 
 ## wip/ws operations on a target
 
@@ -385,12 +455,28 @@ Default scope is the single workspace (`ws_*`); pass `--wip` for all-workspaces
   failures" sections before blaming a change.
 - Deduplicate errors — the same `error:` repeats per translation unit.
 
+## Pitfalls seen on a reused VM slot (2026-10-26)
+
+Mirroring `a1_power_on_003` to the VM, then running a full build. For the build-side
+pitfalls (`twister-out`, external-FW versions, missing guards), see `build-fw`, section
+"Full-workspace build on a reused VM slot".
+
+| Pitfall | Symptom | Do this instead |
+| --- | --- | --- |
+| **`octl ws sync` on the target may not move `.repo/manifests`** | Exited 0 with no output, and the target manifest stayed at an older `main` commit (`a7c7bbd`) while local was at `31d51c5` | If the local commit is a descendant: `mctl sh 'git -C .repo/manifests fetch -q origin && git -C .repo/manifests merge --ff-only <local-sha>'`, then re-check parity |
+| **Mirror refused: "remote workspace is missing or unsafe"** | The slot was still on an old experiment's `dev/*` branches with untracked files. `mctl -t vm workspace status <path> <WS-R-id> <rev>` lists the reasons, and `mirror` was `None` | Inspect before freeing. For each repo on a `dev/*` branch, check `ls-remote` + `merge-base --is-ancestor`, and back up the branch map with `wip scan && wip save <name>` **on the target**. Push any commit that is only local, or ask the user. Only then free the slot |
+| **Guarded `workspace free` fails on an older target `octl`** | `octl ws sync --no-plugins: ERROR: unknown flag: --no-plugins`. The checkout half had already run, so `status` then showed `safe=True` | Run `octl update` on the target. A partly completed free can still leave the slot safe, so re-check `workspace status` before retrying |
+| **`mirror` verification fails on baseline repos that are behind locally** | `REPO … LOCAL_SHA … REMOTE_SHA` mismatch for `infra` and `build_framework`, local one commit behind origin | Either `wip ws pull` locally first, or, to reproduce local exactly, pin the target with `git checkout --detach <local-sha>`. Then diff per-repo `rev-parse HEAD` lists for both sides |
+| **Detached build hangs silently on expired AWS SSO** | `build-status` says RUNNING, `build.log` is 0 bytes, and the child is `aws sso login --no-browser --profile devops-cli` | Kill the job. `mctl sh` captures output, so the device URL never shows. Run `ssh -A -tt <ip> 'bash -lc "aws sso login --no-browser --profile devops-cli"'` (async) and hand the URL/code to the user. If the CLI then reports `InvalidGrantException`, check `aws sts get-caller-identity` before re-prompting, because the token may already be valid |
+| **`mctl sh` grep over `~/.mctl/jobs/*/build.log` matches other workspaces' logs** | Old `FAILED BUILDS` lines from other slots get mixed into the result | Grep this job's log only: `~/.mctl/jobs/<home-relative-path-with-underscores>_fw/build.log` (for example `projects_iridium_a1_power_on_003_fw`) |
+| **Git hooks on the target reject non-`dev/<user>/…` branch names** | `Invalid branch name. Must follow the convention…` on `checkout -B test/…` | The checkout still happens (only a warning), but use `dev/<user>/…` for scratch branches to avoid confusion. Never push scratch branches from the target |
+
 ## Script reference
 
 `~/bin/mctl` (on `PATH`; `~/bin/vmctl` is a backward-compat shim). Run `mctl
 help` for the built-in usage summary. The script is intentionally
 self-contained: local state lives in `~/.mctl/` (per-target IP/home caches +
-per-target job dirs + `joblog.jsonl`/`jobstate.json`) so builds/tests keep
+per-target job dirs + `joblog.jsonl` (external producer) / `delegation.db` (local observations)) so builds/tests keep
 running and remain pollable even across disconnects and token-less sessions.
 
 `~/.copilot/skills/vm-delegate/vd.py` is the companion resolver: it merges the

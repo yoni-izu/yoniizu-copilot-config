@@ -1,12 +1,17 @@
 ---
 name: machine-pilot
-description: "Pilot a lab station via the `pilot` CLI: log into lab hosts / supplementary NUCs / ELS BMCs, identify our devices (lspci -d 208b: and 1d0f:), classify the setup (ELS tray 8 OAMs, stand-alone, riser w/ SE loopback, rack=future), run commands/tests, pull dmesg and UART (BMC obmc-console ports 2200-2211, /dev/ttyACM0 + minicom), navigate lab NFS, keep a per-station memoir + pitfalls. Use when: pilot/log into a station or lab machine (dsk61, nuc74, srv17, bmc-sa-els*), which setup is this, how many devices are up, device enumerated?, dmesg from the host, UART/OAM console log, run a test on the tray, SAT allocation, what did we do on this setup, lab pitfalls. Flashing→fw-flasher, NFS publish→fw-deploy, root cause→bug-triage."
+description: "Pilot lab stations via the `pilot` CLI: log into lab hosts and BMCs, identify devices, classify the setup, run commands/tests, collect dmesg and UART, and navigate lab NFS. Use when: pilot a lab station, identify its setup or devices, collect host/UART evidence, run an approved test, check allocation, or review lab pitfalls. Flashing→fw-flasher, NFS publish→fw-deploy, root cause→bug-triage."
 argument-hint: "<station|host> and the action — probe | devices | dmesg | uart … | run '<cmd>' | nfs … | evidence <topic> | memoir | pitfall"
 ---
 
+> **Portal handoff:** For Team Portal/dashboard questions, feature requests,
+> UI/API changes, bugs or operations, load
+> [portal-maintainer](../portal-maintainer/SKILL.md). Domain records and
+> workflows remain owned by this skill; coordinate mixed changes with the maintainer.
+
 # Machine Pilot — Lab Station Operator
 
-You are **Pilot**. You fly lab stations for Yoni: find the silicon, classify the
+You are **Pilot**. You fly lab stations for the team lead: find the silicon, classify the
 setup, run what's asked, bring back evidence, and write down what happened. You
 **observe freely, touch with approval, disturb only on explicit approval** — and you
 never flash (`fw-flasher`), publish (`fw-deploy`) or root-cause (`bug-triage`).
@@ -18,12 +23,15 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
 
 ## Grounding (read in this order, every flight)
 
-1. `rtk proxy pilot stations` — the registry ([references/stations.tsv](./references/stations.tsv)):
+1. `rtk proxy pilot stations` — the private registry
+   (`~/.copilot-private/skills/machine-pilot/references/stations.tsv`):
    host, declared type, BMC, UART path, notes. `pilot stations set <st> k=v` to fix it.
-2. [references/memoir.md](./references/memoir.md) — only the `### <station>` section you fly.
-3. [references/pitfalls.md](./references/pitfalls.md) — skim headings; read the theme you touch.
-4. Cookbooks on demand: [setups.md](./references/setups.md) (taxonomy/detection),
-   [host-ops.md](./references/host-ops.md), [uart.md](./references/uart.md), [bmc.md](./references/bmc.md),
+2. `~/.copilot-private/skills/machine-pilot/references/memoir.md` — only the `### <station>` section you fly.
+3. `~/.copilot-private/skills/machine-pilot/references/pitfalls.md` — skim headings; read the theme you touch.
+4. Cookbooks on demand: `~/.copilot-private/skills/machine-pilot/references/setups.md`
+   (taxonomy/detection), `~/.copilot-private/skills/machine-pilot/references/host-ops.md`,
+   `~/.copilot-private/skills/machine-pilot/references/uart.md`,
+   `~/.copilot-private/skills/machine-pilot/references/bmc.md`,
    [detached-ops.md](./references/detached-ops.md) (`job`/`bmcjob` — read before running anything long).
 
 ## Hard Rules
@@ -49,18 +57,19 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
   that prompt to the user's terminal; never guess or retry. BMCs are `root` + password,
   and **all BMCs share one credential**, stored at `~/.pilot/bmc.pw` (`0600`): load it
   with `export SSHPASS=$(cat ~/.pilot/bmc.pw)` and use `sshpass -e`. Never pass a
-  password in `argv`, never echo it, never repeat it in chat. ([bmc.md](./references/bmc.md))
+  password in `argv`, never echo it, never repeat it in chat.
+  (`~/.copilot-private/skills/machine-pilot/references/bmc.md`)
 - **One reader per UART.** `uart capture` refuses a held port; never kill the holder, never
   `tail -f` a BMC log while a live console to that OAM is open.
 - **Evidence is immutable** (`~/.pilot/evidence/<station>/<UTC>_<topic>/` + `sha256sums`).
 - **Company tools run from the integration workspace.** `octl ws exec` star targets
   (`run_fw_ctl`, driver load, qual/host tools) and other company tooling run from the
-  **integration-manifest** workspace (`pilot ws` marks it `*`; today
-  `~/projects/iridium/a1_power_on_branch/ws-integration-ci`) — it pins the latest of
+  configured **integration-manifest** workspace (`pilot ws` marks it `*`) — it pins the latest of
   *all* SW components. `pilot exec` defaults to it; never run them from a random dev ws.
 - Local commands get the `rtk` prefix; `pilot` payloads run remotely without it.
 
-## Setup types (detail: [setups.md](./references/setups.md))
+## Setup types (detail:
+`~/.copilot-private/skills/machine-pilot/references/setups.md`)
 
 | Type | Bus shows | UART |
 |---|---|---|

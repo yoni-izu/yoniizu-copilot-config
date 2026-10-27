@@ -6,13 +6,13 @@ Used by capability 1 (Prep) of the `one-on-one` skill. Two outputs per prep: a v
 
 ## Running record (`running.md`)
 
-Per-member rolling log Yoni updates throughout the week via `log 1:1 with <name>: <text>`. Yoni-private; never reaches Confluence. Appended to continuously; consumed and reset at each prep. Lives at `~/team-planner/members/<name>/running.md`.
+Per-member rolling log <team-lead> updates throughout the week via `log 1:1 with <team-member>: <text>`. Private to <team-lead>; never reaches Confluence. Appended to continuously; consumed and reset at each prep. Lives at `~/team-planner/members/<team-member-key>/running.md`.
 
 ```markdown
-# Running record — <Name>
+# Running record — <team-member>
 
-Quick notes logged between 1:1s via `log 1:1 with <name>: <text>`.
-Consumed into the agenda and reset at each prep. Yoni-private.
+Quick notes logged between 1:1s via `log 1:1 with <team-member>: <text>`.
+Consumed into the agenda and reset at each prep. Private to <team-lead>.
 
 _Last consumed: <prep-date or "never">_
 
@@ -28,10 +28,10 @@ _Last consumed: <prep-date or "never">_
 **Reset form** (written at prep, after entries are folded into `_next.md`):
 
 ```markdown
-# Running record — <Name>
+# Running record — <team-member>
 
-Quick notes logged between 1:1s via `log 1:1 with <name>: <text>`.
-Consumed into the agenda and reset at each prep. Yoni-private.
+Quick notes logged between 1:1s via `log 1:1 with <team-member>: <text>`.
+Consumed into the agenda and reset at each prep. Private to <team-lead>.
 
 _Last consumed: <prep-date>_
 
@@ -42,19 +42,19 @@ _Last consumed: <prep-date>_
 
 ## Local `_next.md`
 
-Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_next.md`.
+Verbose, private. <team-lead>'s eyes only. Lives at `~/team-planner/members/<team-member-key>/_next.md`.
 
 ```markdown
-# 1:1 with <Name> — <next-meeting-date>
+# 1:1 with <team-member> — <next-meeting-date>
 
 **Cadence:** weekly | **Last meeting:** <prev-date> | **Days since:** <N>
 **Upcoming PTO:** <list or "none">
 **Confluence page:** <URL>
 
 ## Carry-over from <prev-date>
-- [ ] <open action item> — owner: <Yoni/Name> — due: <date>
+- [ ] <open action item> — owner: <team-lead> or <team-member> — due: <date>
 - [ ] <carry-over topic>
-- [ ] <thing Yoni said he would follow up on>
+- [ ] <thing <team-lead> said they would follow up on>
 
 ## From running record (logged since <prev-date>)
 *(raw entries consumed from `running.md` this prep — routed into the sections below; kept here for traceability)*
@@ -72,13 +72,13 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 | Status | Key | Summary | Est | Spent | Rem | Flag |
 |---|---|---|---|---|---|---|
 | In progress | KEY | ... | Xd | Xd | Xd | <stale / no progress / no time logged> |
-| In Review | KEY | ... | Xd | Xd | Xd | PR <url>, reviewer <name> |
+| In Review | KEY | ... | Xd | Xd | Xd | PR <url>, reviewer <team-member> |
 | Backlog | KEY | ... | Xd | — | Xd | <flag if over capacity> |
 | Blocked | KEY | ... | Xd | — | Xd | <reason, days blocked> |
 
 ## Wins (proposed — PRIVATE rationale)
 1. **<one-line win>** — cite: <PR URL / Jira KEY / review URL>
-   - *Why this matters:* <Yoni's private context, e.g. "first major refactor they shipped solo">
+   - *Why this matters:* <team-lead>-private rationale: <specific context>
 
 ## Done (page-bound — completed this cycle, mirrors the page's Done section)
 - <what shipped/closed/delivered in the last 7 days — merged/tested/closed — incl. approved wins>
@@ -112,7 +112,7 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 - <e.g., what is blocking progress on SE Intr cluster?>
 - <e.g., do you want help on Y?>
 
-## Private notes (Yoni only — never reaches Confluence)
+## Private notes (<team-lead> only — never reaches Confluence)
 - <impressions, concerns, feedback drafts>
 - <conversation context to remember>
 - <things to verify with their work before raising>
@@ -125,19 +125,19 @@ Verbose, private. Yoni's eyes only. Lives at `~/team-planner/members/<name>/_nex
 
 ## Confluence draft page
 
-Sanitized, member-facing. Created in the member's personal space, in folder `Yoni:<Name>`, with title `Yoni:<Name> - <next-date>`. **Restrictions: Yoni + member** during prep — the member can read the agenda but only Yoni can edit it (use Yoni-only restrictions only if Yoni explicitly asks for a private prep page).
+Sanitized, member-facing. Created in the member's personal space, in folder `<team-lead>:<team-member>`, with title `<team-lead>:<team-member> - <next-date>`. **Restrictions: <team-lead> + member** during prep — the member can read the agenda but only <team-lead> can edit it (use lead-only restrictions only if <team-lead> explicitly asks for a private prep page).
 
 **Voice rules** (apply to every line on this page):
 - **Status-first and self-contained.** Each bullet states **what the work is** in plain language the reader grasps *without opening the ticket*, then **where it stands** with an explicit status word: **not started / work-in-progress / blocked / in review / merged / tested / done**. Ticket/PR keys are trailing bracketed references, never the subject of the sentence.
 - **Work, not planning.** Describe the work and its state — never the planning mechanics around it (sprint/milestone moves, re-estimation, "needs a commit/sequencing call", what should be planned, sprint/PTO capacity math). Those stay in `_next.md`.
-- **Objective tone, third-person or imperative.** Never write from Yoni's perspective. No "I will", "I'll personally", "I'd like to". Use "transition X", "confirm Y", "agree Z" or "<Name> to do X".
+- **Objective tone, third-person or imperative.** Never write from <team-lead>'s perspective. No "I will", "I'll personally", "I'd like to". Use "transition X", "confirm Y", "agree Z" or "<team-member> to do X".
 - **No filler topics.** Do not add habitual prompts like "Anything from you?", "Reviewer bandwidth — is the review pile the blocker?", "How are you feeling?". The member will raise what they need. Only include topics with a concrete trigger.
 - **RAID items: orient toward the member.** Do not paste full RAID descriptions or scoring. Translate into one line of what changed for *them* (e.g. "MS6.5 no longer exists — treat scope as MS6 + MS7") and omit the internal mechanics (escalation paths, P/I scores, owners, due dates). Those stay in `_next.md`.
-- **No Yoni-private considerations.** Spillover decisions, capacity calculus, reassignment plans, and reviewer logistics stay local. The page should only contain what the member needs to walk in informed.
-- **No editorial / meta notes on the page.** The storefront contains only headings and content bullets — never section-purpose annotations (e.g. "*(populated live during the meeting — discussion topics only…)*"), authoring placeholders, status hints about how a section is filled, or prep/publish footers (e.g. "*Prepared `<today>` — shared with `<Name>`…*"). Lifecycle state (prep vs. live vs. published) is conveyed by Confluence permissions and page history, not by text on the page. Any `*(…)*` parenthetical in these templates is authoring guidance for you — do **not** copy it onto the page.
+- **No lead-only considerations.** Spillover decisions, capacity calculus, reassignment plans, and reviewer logistics stay local. The page should only contain what the member needs to walk in informed.
+- **No editorial / meta notes on the page.** The storefront contains only headings and content bullets — never section-purpose annotations (e.g. "*(populated live during the meeting — discussion topics only…)*"), authoring placeholders, status hints about how a section is filled, or prep/publish footers (e.g. "*Prepared `<today>` — shared with `<team-member>`…*"). Lifecycle state (prep vs. live vs. published) is conveyed by Confluence permissions and page history, not by text on the page. Any `*(…)*` parenthetical in these templates is authoring guidance for you — do **not** copy it onto the page.
 
 ```markdown
-# 1:1 with <Name> — <next-meeting-date>
+# 1:1 with <team-member> — <next-meeting-date>
 
 ## Done
 - <completed-this-cycle work — what it is + merged/tested/closed/delivered — link to PR / Jira KEY> *(approved wins are the highlight-worthy Done items; no separate Wins section)*
@@ -173,4 +173,4 @@ Sanitized, member-facing. Created in the member's personal space, in folder `Yon
 - Discussion-only topics with a concrete trigger → **Meeting notes** (edited live; drop filler/habit prompts). Omit the section if empty.
 - **No overlap:** every Jira key / PR link / epic appears **at most once** across the whole page. If an item could fit two sections, its status word decides — it has exactly one.
 - RAID items → one-line member-facing heads-up inside the relevant work-state section, never the full row.
-- **Excluded:** "Risks / things to flag", "Private notes", win rationale, RAID detail, spillover/capacity/reassignment decisions, reviewer-bandwidth prompts, "Anything from you"-style filler, T-IDs from `task-manager`, **PTO / upcoming day-off entries** (kept in the day-off log only; a forward PTO heads-up affecting sprint capacity → **Planned (not started)**), **Yoni-owned action items** (anything where `owner: Yoni` — kept in the local archive only), **sprint / milestone mechanics irrelevant to the member** (sprint renames, milestone retirements by automation, planning-tool quirks — only surface when they directly affect the member's owned work).
+- **Excluded:** "Risks / things to flag", "Private notes", win rationale, RAID detail, spillover/capacity/reassignment decisions, reviewer-bandwidth prompts, "Anything from you"-style filler, T-IDs from `task-manager`, **PTO / upcoming day-off entries** (kept in the day-off log only; a forward PTO heads-up affecting sprint capacity → **Planned (not started)**), **<team-lead>-owned action items** (anything where `owner: <team-lead>` — kept in the local archive only), **sprint / milestone mechanics irrelevant to the member** (sprint renames, milestone retirements by automation, planning-tool quirks — only surface when they directly affect the member's owned work).

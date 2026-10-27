@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./bootstrap_station.sh <host> [--force]
-#   ./bootstrap_station.sh pldm-edk0-z2a
+#   ./bootstrap_station.sh <host>
 #
 # <host> is anything ssh can reach (hostname or user@host). On first run it copies:
 #   ~/.ssh/id_ed25519, ~/.ssh/id_ed25519.pub, ~/bin/wip (+ completion),

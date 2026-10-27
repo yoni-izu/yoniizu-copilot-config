@@ -146,19 +146,6 @@
           ]
         }
       ]
-    },
-    "/home/yoniizu/projects/iridium/a1_power_on_0p5p152": {
-      "tool_approvals": [
-        {
-          "kind": "commands",
-          "commandIdentifiers": [
-            "xargs"
-          ]
-        },
-        {
-          "kind": "write"
-        }
-      ]
     }
   }
 }

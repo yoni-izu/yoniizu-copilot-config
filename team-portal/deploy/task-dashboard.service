@@ -1,0 +1,12 @@
+[Unit]
+Description=Team Portal (portal-maintainer)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 %h/.copilot/team-portal/portal.py serve --port 8787
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -9,7 +9,11 @@ history at all.
 This module adds the missing half:
 
   ~/.mctl/joblog.jsonl   append-only, one line per dispatch, written by `mctl`
-  ~/.mctl/jobstate.json  resolved status per job id, written by refresh()
+  ~/tasks/delegation.db  local resolved observations and durable job history
+
+``DELEGATION_DB`` overrides the DB path. ``migrate`` imports local legacy
+jobstate/vmstate once (with backups) and ingests joblog; ``export`` emits a
+rollback bundle. Neither command probes targets or controls VMs.
 
 `refresh()` runs `mctl -t <target> jobs-probe` — ONE ssh round trip per target,
 no model involved — and binds each probe row to the NEWEST logged job for that
@@ -39,6 +43,7 @@ on their own (flagged, then demoted to `unknown`) and the watchdog re-asks.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -47,6 +52,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from delegation_db import Store, EMPTY_STATE
+
+DB = Path(os.environ.get("DELEGATION_DB", "~/tasks/delegation.db")).expanduser()
 MCTL_DIR = Path(os.path.expanduser("~/.mctl"))
 JOBLOG = MCTL_DIR / "joblog.jsonl"
 JOBSTATE = MCTL_DIR / "jobstate.json"
@@ -89,36 +98,17 @@ TERMINAL = {"passed", "failed", "died", "superseded", "gone"}
 # store
 # --------------------------------------------------------------------------
 def _read_log() -> list[dict]:
-    if not JOBLOG.exists():
-        return []
-    out = []
-    for line in JOBLOG.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and rec.get("id"):
-            out.append(rec)
-    return out
+    return _store().history()
+
+
+def _store() -> Store:
+    return Store(DB, JOBLOG, JOBSTATE, VMSTATE)
 
 
 def _read_state() -> dict:
-    if not JOBSTATE.exists():
-        return {"jobs": {}, "last_refresh": "", "last_attempt": "",
-                "errors": {}, "attempted": {}}
-    try:
-        d = json.loads(JOBSTATE.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return {"jobs": {}, "last_refresh": "", "last_attempt": "",
-                "errors": {}, "attempted": {}}
-    d.setdefault("jobs", {})
-    d.setdefault("last_refresh", "")
-    d.setdefault("last_attempt", "")
-    d.setdefault("errors", {})
-    d.setdefault("attempted", {})
+    d = _store().read("jobstate")
+    for key, value in EMPTY_STATE.items():
+        d.setdefault(key, value.copy() if isinstance(value, dict) else value)
     _disown_poisoned_stamps(d)
     return d
 
@@ -140,17 +130,12 @@ def _disown_poisoned_stamps(d: dict) -> None:
     d["checked"] = checked
 
 
-def _write_state(state: dict) -> None:
-    MCTL_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = JOBSTATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(JOBSTATE)
+def _write_state(state: dict, dispatches=()) -> None:
+    _store().write("jobstate", state, dispatches=dispatches)
 
 
 def _append_log(rec: dict) -> None:
-    MCTL_DIR.mkdir(parents=True, exist_ok=True)
-    with JOBLOG.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    _store().adopt(rec)
 
 
 def targets() -> list[str]:
@@ -598,8 +583,10 @@ def tail(target: str, tag: str, kind: str, lines: int = 200, job_id: str = "") -
 
 
 def refresh(only: str | None = None, sync: bool = True) -> dict:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
     jobs = _read_log()
     state = _read_state()
+    adopted = []
     jstate = state["jobs"]
     errors: dict[str, str] = {}
 
@@ -629,20 +616,10 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
         elif sync:
             sync_logs(t)          # keep a local copy before the slot is reused
 
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
     # Only targets that ACTUALLY answered may be treated as verified. Everything
     # downstream keys off this set, because the bug this guards against is an
     # unreachable target leaving month-old verdicts looking freshly confirmed.
     ok_targets = {t for t in probed if not errors.get(t)}
-
-    # A status entry whose dispatch record has vanished from the job log can
-    # never be re-probed (the loop below walks the log), so it would sit at
-    # whatever it last said -- typically a `running` frozen for days. It also
-    # blocks re-adoption of that exact slot id further down. Drop it.
-    if JOBLOG.exists() and jobs:
-        logged = {j["id"] for j in jobs}
-        for orphan in [k for k in jstate if k not in logged]:
-            del jstate[orphan]
 
     # A probe row describes the CURRENT remote slot, which belongs to the
     # newest dispatch for that (target, tag, kind). Anything older is history.
@@ -714,14 +691,15 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
                 continue                       # settled record, slot untouched
             started = (datetime.fromtimestamp(row["mtime"]).strftime("%Y-%m-%dT%H:%M:%S")
                        if row["mtime"] else now)
-            rec = {"id": f"{int(row['mtime'] * 1000) or int(time.time() * 1000)}-{kind}-adopted",
+            identity = json.dumps([t, tag, kind, row["mtime"], row["pid"]])
+            rec = {"id": hashlib.sha256(identity.encode()).hexdigest() + "-adopted",
                    "target": t, "dest": "", "kind": kind,
                    "ws": rev.get(tag, ""), "tag": tag,
                    "cmd": row["cmd"], "pid": row["pid"], "jobdir": "",
                    "started": started, "state": "adopted", "adopted": True}
             if rec["id"] in jstate:
                 continue                       # already adopted this very slot
-            _append_log(rec)
+            adopted.append(rec)
             status = _status_of(row["state"], row["rc"])
             jstate[rec["id"]] = {"status": status, "rc": row["rc"], "pid": row["pid"],
                                  "lines": row["lines"], "errors": row["errors"],
@@ -750,7 +728,7 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
     tried_at = dict(state.get("attempted") or {})
     tried_at.update({t: now for t in probed})        # asked, answer or not
     state["attempted"] = tried_at
-    _write_state(state)
+    _write_state(state, adopted)
     return {"probed": len(probed), "targets": sorted(probed), "errors": errors,
             "verified": sorted(ok_targets)}
 
@@ -780,26 +758,32 @@ def _target_ips() -> dict[str, str]:
 
 
 def machines(force: bool = False) -> dict:
-    """EC2 instances from `octl vm list --output json`, cached in vmstate.json.
+    """EC2 instances from `octl vm list --output json`, observed in SQLite.
 
     The call revalidates SSO and takes tens of seconds, so the portal serves the
     cache and only re-queries when the user asks for it.
     """
-    if not force and VMSTATE.exists():
-        try:
-            return json.loads(VMSTATE.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            pass
     if not force:
-        return {"machines": [], "checked": "", "error": ""}
+        return _store().read("vmstate")
+
+    baseline = _store().read("vmstate")
+    attempted = datetime.now().isoformat()
+
+    def failed(error):
+        baseline.update(error=error, error_at=attempted, last_attempt=attempted)
+        _store().write("vmstate", baseline)
+        return _store().read("vmstate")
 
     try:
         p = subprocess.run(["octl", "vm", "list", "--output", "json", "--silent"],
                            capture_output=True, text=True, timeout=OCTL_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"machines": [], "checked": "", "error": f"octl vm list timed out ({OCTL_TIMEOUT}s)"}
+        return failed(f"octl vm list timed out ({OCTL_TIMEOUT}s)")
     except OSError as e:
-        return {"machines": [], "checked": "", "error": str(e)}
+        return failed(str(e))
+
+    if p.returncode:
+        return failed((p.stderr or p.stdout or f"octl vm list failed ({p.returncode})").strip())
 
     raw = p.stdout.strip()
     # octl brackets the payload with noise: `INF ... Validating SSO credentials`
@@ -811,10 +795,13 @@ def machines(force: bool = False) -> dict:
         if start < 0:
             raise ValueError("no json object in octl output")
         data, _ = json.JSONDecoder().raw_decode(raw[start:])
+        if not isinstance(data, dict) or not isinstance(data.get("aws", []), list):
+            raise ValueError("invalid octl vm list object")
+        if any(not isinstance(inst, dict) for inst in data.get("aws", [])):
+            raise ValueError("invalid octl vm instance")
     except ValueError:
         err = (p.stderr or raw or "").strip().splitlines()
-        return {"machines": [], "checked": "",
-                "error": err[-1] if err else "could not parse octl vm list"}
+        return failed(err[-1] if err else "could not parse octl vm list")
 
     ips = _target_ips()
     now = time.time()
@@ -844,10 +831,10 @@ def machines(force: bool = False) -> dict:
         })
     out.sort(key=lambda m: (m["state"] != "running", m["name"]))
     state = {"machines": out, "checked": time.strftime("%Y-%m-%dT%H:%M:%S"),
-             "error": "", "age": int(now)}
-    MCTL_DIR.mkdir(parents=True, exist_ok=True)
-    VMSTATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    return state
+             "error": "", "age": int(now), "last_attempt": attempted}
+    baseline.update(state)
+    _store().write("vmstate", baseline)
+    return _store().read("vmstate")
 
 
 def power(action: str, instance_id: str) -> dict:
@@ -1236,6 +1223,9 @@ def portal_sync(only: str | None = None) -> dict:
 # --------------------------------------------------------------------------
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "list"
+    if cmd in ("migrate", "export"):
+        print(json.dumps(_store().export(), indent=2, ensure_ascii=False))
+        return 0
     if cmd in ("-h", "--help", "help"):
         print(__doc__)
         return 0

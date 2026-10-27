@@ -2,12 +2,12 @@
 
 File: `~/team-planner/manager-brief/commitments.md`
 
-This is the **canonical** store for everything Yoni has committed to Timor. The `task-manager` mirror (if any) is just for daily visibility — rich state, history, and outcome narrative live here.
+This is the **canonical** store for everything the team lead has committed to the manager. The `task-manager` mirror (if any) is just for daily visibility — rich state, history, and outcome narrative live here.
 
 ## File header
 
 ```markdown
-# Commitments to Timor
+# Commitments to the manager
 
 <!-- Managed by the manager-brief skill. ID counter is at the end of the file. -->
 
@@ -46,7 +46,7 @@ next-id: C-008
 |---|---|
 | `C-NNN` | Monotonic, never reused. Allocated from `next-id`; bump after allocation. |
 | `Status` | One of the listed values. Closed values (`done`, `cancelled`) move the entry to the `## Closed` section. |
-| `Committed` | Date Yoni made the promise. Never changes. |
+| `Committed` | Date the team lead made the promise. Never changes. |
 | `Due` | Current committed-by date. Updated on slip; old value stays in `History`. |
 | `Surfaced in briefs` | Append the date of each brief this commitment appeared in. Drives "since last sync" carry-over. |
 | `Task mirror` | If a `task-manager` task was created, its ID. The task `context` field references back: `manager-brief C-NNN`. |

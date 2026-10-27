@@ -1,8 +1,8 @@
 # Brief template
 
-Two views of every brief: the **Confluence storefront** (what Timor reads) and the **local archive** (verbose; adds Yoni-only private notes + projection appendix + standing-topics coverage).
+Two views of every brief: the **Confluence storefront** (what the manager reads) and the **local archive** (verbose; adds team-lead-only private notes + projection appendix + standing-topics coverage).
 
-Both follow the same section order. The local archive may include `**Private (Yoni only):**` blocks the Confluence version omits.
+Both follow the same section order. The local archive may include `**Private (team lead only):**` blocks the Confluence version omits.
 
 ## Hard caps (enforced)
 
@@ -10,9 +10,9 @@ Both follow the same section order. The local archive may include `**Private (Yo
 |---|---|
 | Bottom line | 1 sentence |
 | Milestone health | 1 row per milestone (RAG + verdict + confidence in the same row \u2014 no separate "Will we hit it?" section) |
-| Commitments to Timor | table; one row per commitment |
-| Decisions \u2014 Taken | bullets, one line each (mine, FYI for Timor) |
-| Decisions \u2014 Pending | bullets, one line each (mine, target date) |
+| Commitments to manager | table; one row per commitment |
+| Decisions \u2014 Taken | bullets, one line each (team lead's decisions, FYI for manager) |
+| Decisions \u2014 Pending | bullets, one line each (team lead's decisions, target date) |
 | Top risk | max 1 row |
 | Agile changes | bullets, one line each |
 | Highlights | max 2 bullets |
@@ -35,10 +35,10 @@ If two sections describe the same milestone state (RAG + projection + scope cut)
 
 ## Confluence storefront layout
 
-Title: `Yoni:Timor - YYYY-MM-DD`
+Title: `<configured-team-lead>:<configured-manager> - YYYY-MM-DD`
 
 ```markdown
-# Yoni:Timor \u2014 YYYY-MM-DD
+# <configured-team-lead>:<configured-manager> \u2014 YYYY-MM-DD
 
 ## Bottom line
 <one sentence verdict>
@@ -49,14 +49,14 @@ Title: `Yoni:Timor - YYYY-MM-DD`
 | MS6 | 2026-07-21 | \ud83d\udd34 | Will miss as scoped \u2014 <one-line why> | 7/10 |
 | MS7 | 2026-09-01 | \ud83d\udfe1 | <one-line> | \u2014 |
 
-## Commitments to Timor
+## Commitments to manager
 | ID | Commitment | Due | Status | Outcome / next |
 |---|---|---|---|---|
 | C-NNN | <short title> | YYYY-MM-DD | in-flight \\| done \\| slipped \\| blocked | <one line> |
 
 ## Decisions
 **Taken:** <one-line decision> (citation)
-**Pending (mine):** <one-line decision Yoni will make> \u2014 target YYYY-MM-DD
+**Pending (team lead):** <one-line decision the team lead will make> \u2014 target YYYY-MM-DD
 
 ## Top risk
 | Risk | Mitigation |
@@ -81,11 +81,11 @@ Mirrors the Confluence layout, plus:
 - **Header metadata block** with `Brief date`, `Previous brief`, `Confluence page URL`, `Published: <timestamp>`.
 - **Inputs used** section listing snapshot IDs, RAID revision, PR-monitor pull time, velocity source file.
 - **Standing topics coverage** table \u2014 one row per standing topic, status `addressed` / `no change` / `deferred (reason)`.
-- **Private (Yoni only)** blocks inline under any section where Yoni captured private context. These never reach Confluence.
+- **Private (team lead only)** blocks inline under any section where the team lead captured private context. These never reach Confluence.
 - **Projection details** appendix \u2014 full inputs + math per the [projection method](./projection.md).
 
 ```markdown
-# Yoni:Timor \u2014 YYYY-MM-DD (local archive)
+# <configured-team-lead>:<configured-manager> \u2014 YYYY-MM-DD (local archive)
 
 - Brief date: YYYY-MM-DD
 - Previous brief: YYYY-MM-DD | first brief
@@ -114,10 +114,10 @@ Mirrors the Confluence layout, plus:
 ### Projection details (appendix)
 <per projection.md \u2014 inputs, math, sensitivity, per milestone>
 
-## Commitments to Timor
+## Commitments to manager
 <same table>
 
-**Private (Yoni only):** <internal framing if any>
+**Private (team lead only):** <internal framing if any>
 
 ## Decisions
 <same>
@@ -138,5 +138,5 @@ Mirrors the Confluence layout, plus:
 - Numbers in the brief are rounded and qualitative ("~3\u00d7 capacity", "~310 effort-days"). Exact figures live in the archive projection appendix.
 - Routine motion is suppressed: sprint reshuffles, single-ticket transitions, routine review cycles do not belong here.
 - Citations are inline references (Jira key, PR, RAID row, snapshot ID, C-NNN, D-NNN), not footnotes or links to long pages.
-- Decisions never request permission. `Taken` = Yoni did it. `Pending` = Yoni will do it by target date. If Timor must do something, it's a risk mitigation, not a decision.
-- Commitments are only what Yoni owes Timor. Personal tasks, items owed to peers (Ziv/SiVal, scrum, etc.), team chores \u2014 these live in `task-manager`, not here.
+- Decisions never request permission. `Taken` = the team lead did it. `Pending` = the team lead will do it by target date. If the manager must do something, it's a risk mitigation, not a decision.
+- Commitments are only what the team lead owes the manager. Personal tasks, items owed to peers, scrum, or team chores \u2014 these live in `task-manager`, not here.

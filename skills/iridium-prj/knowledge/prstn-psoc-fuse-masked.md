@@ -1,7 +1,7 @@
 # PRSTn to PSOC is masked by default (eFuse) in Iridium
 
 - **Recorded:** 2026-09-08
-- **Status:** Reported by owner (Yoni, HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
+- **Status:** Reported by owner (HSI/FW lead) — authoritative; pending doc/eFuse-bit citation
 - **Tags:** prstn, perst, psoc, fuse, efuse, masked, prst_select_source, boot_and_rst_top, rom bring-up, reset source, link training, gpio37
 
 ## Scope / Question
@@ -23,7 +23,7 @@ sequences that toggle PRSTn.
   `PHY_PRE_FW_COPY_CFG` (which performs the source swap); the post-copy toggle was dropped.
 
 ## Sources
-- Owner FYI: Yoni Izutskiver (HSI/FW team lead), 2026-09-08 — "PRSTn to PSOC is masked by default
+- Owner FYI: FW team lead note, 2026-09-08 — "PRSTn to PSOC is masked by default
   through a fuse; when the ROM sequence swaps the PRSTn source to PSOC it is essentially masked, so
   mid-way PRSTn toggles are redundant — toggle at the beginning before the source is swapped."
 - Source (ROM src swap): `PHY_PRE_FW_COPY_CFG` seq / `BOOT_AND_RST_TOP_0.PRST_SELECT_SOURCE`

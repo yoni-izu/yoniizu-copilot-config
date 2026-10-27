@@ -7,7 +7,7 @@
 ## Scope / Question
 Does the DWC PCIe6 PHY have a per-lane CDR error count (e.g. for a Redfish `CDRErrorsPerLane`
 telemetry attribute)? Can `DFT_5`/`DFT_6::bit_error_count` be used in operational/mission mode?
-(SNPS support case 02034236; Ziv proposed DFT_5/DFT_6 as CDR-quality inference registers.)
+(SNPS support case 02034236; a teammate proposed DFT_5/DFT_6 as CDR-quality inference registers.)
 
 ## Findings
 - **No dedicated CDR error counter exists.** CDR is an analog RX function that recovers the clock
@@ -30,7 +30,7 @@ telemetry attribute)? Can `DFT_5`/`DFT_6::bit_error_count` be used in operationa
 - **Explicitly incompatible with live datapath:** "the local Protocol PCS triggers RX Data
   Recovery and disrupts the RX serial data seen by the BERT pattern checker" — mission-mode PCS
   and BERT checker are mutually exclusive.
-- **Ziv's answer verdict:** register identification correct, but "typically used to infer CDR
+- **Internal answer verdict:** register identification correct, but "typically used to infer CDR
   quality per lane" is misleading — cannot be polled during operational traffic.
 - **What exists in mission mode instead:** CDR-induced errors surface as PCIe-level errors
   (LCRC/framing → replay; controller-side RAS DES event counters). PHY also supports

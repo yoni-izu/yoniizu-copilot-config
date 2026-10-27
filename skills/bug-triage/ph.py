@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """bug-triage phenomenon registry — mechanics for ticketless, cross-platform triage.
 
-Owns ``~/tasks/phenomena.json``: every *observed failure* the team has seen,
-regardless of whether anyone ever opened a Jira ticket for it. Set ``PH_STORE``
-to point at a different store (used for testing — never share a store with the
-live registry).
+Owns the phenomenon registry: every *observed failure* the team has seen,
+regardless of whether anyone ever opened a Jira ticket for it. The registry
+lives in the shared bug database ``~/tasks/bugs.db`` (``bug-monitor/bugdb.py``),
+the single source of truth that ``bm.py`` and the Team Portal read and write
+too. Set ``BUGS_DB`` to point at a different database (used for testing —
+never share a test database with the live one).
 
 The unit of record is the **sighting** — one observation of a failure, on one
 platform (CI / sim / FPGA / Palladium / lab silicon / production), arriving
@@ -34,8 +36,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-STORE = Path(os.path.expanduser(
-    os.environ.get("PH_STORE", "~/tasks/phenomena.json")))
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/bug-monitor"))
+import bugdb  # noqa: E402  — the shared bug database (single source of truth)
+
+STORE = bugdb.DB_PATH
 
 PLATFORMS = ["ci", "sim", "fpga", "palladium", "silicon-lab", "production", "unknown"]
 SOURCES = ["ci", "jira", "slack", "chat", "email", "customer", "lab", "meeting",
@@ -145,10 +149,11 @@ def similarity(a: str, b: str) -> float:
 # ----------------------------------------------------------------------------
 
 def load() -> dict[str, Any]:
-    if not STORE.exists():
-        return {"version": 1, "config": dict(DEFAULT_CONFIG), "next_id": 1,
-                "next_sighting": 1, "phenomena": []}
-    data = json.loads(STORE.read_text())
+    """The registry in its classic dict shape, read from the shared database.
+    ``jira``/``investigations`` on each phenomenon are assembled from the link
+    tables; ``save()`` writes changed rows and link diffs back."""
+    data = bugdb.load_ph()
+    data.setdefault("version", 1)
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(data.get("config") or {})
     data["config"] = cfg
@@ -159,8 +164,7 @@ def load() -> dict[str, Any]:
 
 
 def save(store: dict[str, Any]) -> None:
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    STORE.write_text(json.dumps(store, indent=2, ensure_ascii=False) + "\n")
+    bugdb.save_ph(store)
 
 
 def find(store: dict[str, Any], pid: str) -> dict[str, Any]:
@@ -252,12 +256,14 @@ def derived(ph: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     if any(x.get("after_fix") for x in s) or (
             fixed_at and last and last > fixed_at):
         flags.append("regressed")
-    if any(x.get("source") in ("customer", "email") for x in s):
+    origin, origin_why = bugdb.ph_origin(ph)
+    if origin == "customer":
         flags.append("customer-reported")
 
     return {"platforms": platforms, "sources": sources, "first_seen": first,
             "last_seen": last, "count": len(s), "idle_days": idle,
-            "signal": signal, "flags": flags}
+            "signal": signal, "flags": flags,
+            "origin": origin, "origin_why": origin_why}
 
 
 def view(ph: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -688,6 +694,39 @@ def cmd_link(args) -> None:
     print(f"{ph['id']} linked: {', '.join(added)}")
 
 
+def cmd_unlink(args) -> None:
+    store = load()
+    ph = find(store, args.id)
+    gone = []
+    for key in args.jira or []:
+        key = key.strip().upper()
+        if key in ph.get("jira", []):
+            ph["jira"].remove(key)
+            gone.append(f"jira:{key}")
+    names = {bugdb.note_name(p): p for p in ph.get("investigations", [])}
+    for path in args.investigation or []:
+        n = bugdb.note_name(path)
+        if n in names:
+            ph["investigations"].remove(names[n])
+            gone.append(f"note:{n}")
+    if not gone:
+        sys.exit("error: nothing to unlink")
+    ph["updated"] = today()
+    ph.setdefault("notes", []).append(f"{today()}: unlinked {', '.join(gone)}")
+    save(store)
+    print(f"{ph['id']} unlinked: {', '.join(gone)}")
+
+
+def cmd_export(args) -> None:
+    store = load()
+    text = json.dumps(dict(store), indent=2, ensure_ascii=False) + "\n"
+    if args.output:
+        Path(os.path.expanduser(args.output)).write_text(text)
+        print(f"exported {len(store['phenomena'])} phenomena → {args.output}")
+    else:
+        sys.stdout.write(text)
+
+
 def cmd_note(args) -> None:
     store = load()
     ph = find(store, args.id)
@@ -930,6 +969,135 @@ def cmd_config(args) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Portal API (task-manager/tm.py) — same database, same rules as the CLI
+# ----------------------------------------------------------------------------
+
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,15}-\d{1,7}$")
+EDITABLE = ("title", "status", "severity", "owner", "component", "root_cause")
+FIX_FIELDS = ("version", "pr", "commit", "repo")
+
+
+def _as_list(val: Any) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        val = re.split(r"[,\s]+", val)
+    return [str(v).strip() for v in val if str(v).strip()]
+
+
+def apply_ph_edit(pid: str, payload: dict[str, Any],
+                  who: str = "portal") -> tuple[bool, str]:
+    """Apply one portal edit to a phenomenon. Mirrors set/link/unlink/note."""
+    with bugdb.tx(who):
+        store = load()
+        ph = next((p for p in store["phenomena"] if p["id"] == (pid or "").upper()), None)
+        if ph is None:
+            return False, f"unknown phenomenon {pid}"
+        changed: list[str] = []
+        for field in EDITABLE:
+            if field not in payload:
+                continue
+            val = payload[field]
+            val = val.strip() if isinstance(val, str) else val
+            if field == "title" and not val:
+                return False, "title cannot be empty"
+            if field == "status" and val not in STATUSES:
+                return False, f"invalid status {val!r}"
+            if field == "severity" and val and val not in SEVERITIES:
+                return False, f"invalid severity {val!r}"
+            val = val or None
+            if ph.get(field) != val:
+                ph[field] = val
+                changed.append(f"{field}={val if field != 'root_cause' else '…'}")
+        if ph.get("status") == "fixed" and not (ph.get("fix") or {}).get("at"):
+            ph.setdefault("fix", {})["at"] = today()
+        fix = ph.setdefault("fix", {})
+        for field in FIX_FIELDS:
+            key = f"fix_{field}"
+            if key not in payload:
+                continue
+            val = (payload[key] or "").strip() or None
+            if fix.get(field) != val:
+                if val:
+                    fix[field] = val
+                else:
+                    fix.pop(field, None)
+                changed.append(f"fix.{field}={val or '—'}")
+                if field == "version" and val:
+                    late = [s for s in ph.get("sightings", [])
+                            if at_or_after_fix(s.get("fw"), val) and not s.get("after_fix")]
+                    for s in late:
+                        s["after_fix"] = True
+                    if late:
+                        changed.append("re-classified " + ", ".join(s["id"] for s in late)
+                                       + " as after-fix")
+        for t in _as_list(payload.get("tag_add")):
+            if t not in ph.setdefault("tags", []):
+                ph["tags"].append(t)
+                changed.append(f"+tag:{t}")
+        for t in _as_list(payload.get("tag_remove")):
+            if t in ph.get("tags", []):
+                ph["tags"].remove(t)
+                changed.append(f"-tag:{t}")
+        for key in _as_list(payload.get("link_jira")):
+            key = key.upper()
+            if not JIRA_KEY_RE.match(key):
+                return False, f"not a Jira key: {key}"
+            if key not in ph.setdefault("jira", []):
+                ph["jira"].append(key)
+                changed.append(f"+jira:{key}")
+        for key in _as_list(payload.get("unlink_jira")):
+            key = key.upper()
+            if key in ph.get("jira", []):
+                ph["jira"].remove(key)
+                changed.append(f"-jira:{key}")
+        for name in _as_list(payload.get("link_note")):
+            if bugdb.read_investigation(name) is None:
+                return False, f"no such investigation note: {name}"
+            if name not in {bugdb.note_name(p) for p in ph.setdefault("investigations", [])}:
+                ph["investigations"].append(bugdb.note_path(name))
+                changed.append(f"+note:{name}")
+        for name in _as_list(payload.get("unlink_note")):
+            for p in list(ph.get("investigations", [])):
+                if bugdb.note_name(p) == name:
+                    ph["investigations"].remove(p)
+                    changed.append(f"-note:{name}")
+        note = (payload.get("note") or "").strip()
+        if not changed and not note:
+            return False, "nothing to change"
+        ph["updated"] = today()
+        if changed:
+            ph.setdefault("notes", []).append(f"{today()}: {who}: {', '.join(changed)}")
+        if note:
+            ph.setdefault("notes", []).append(f"{today()}: {note}")
+            changed.append("note")
+        save(store)
+        return True, f"{ph['id']}: " + ", ".join(changed)
+
+
+def portal_payload() -> dict[str, Any]:
+    """Everything the portal's Phenomena tab and per-bug triage block need."""
+    store = load()
+    cfg = store["config"]
+    views = []
+    for p in store["phenomena"]:
+        v = view(p, cfg)
+        v["sightings"] = [dict(s, raw=(s.get("raw") or "")[:1500])
+                          for s in v.get("sightings", [])]
+        v["signatures"] = [dict(sg, text=(sg.get("text") or "")[:600])
+                           for sg in v.get("signatures", [])]
+        views.append(v)
+    return {
+        "phenomena": views,
+        "evidence": bugdb.evidence(),
+        "investigations": bugdb.investigation_index(),
+        "statuses": STATUSES, "severities": SEVERITIES, "platforms": PLATFORMS,
+        "signal_icon": SIGNAL_ICON,
+        "db": str(bugdb.DB_PATH),
+    }
+
+
+# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 
@@ -1028,6 +1196,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--label", help="label for the added signature")
     sp.set_defaults(func=cmd_link)
 
+    sp = sub.add_parser("unlink", help="detach a Jira key or an investigation note")
+    sp.add_argument("id")
+    sp.add_argument("--jira", nargs="*")
+    sp.add_argument("--investigation", nargs="*")
+    sp.set_defaults(func=cmd_unlink)
+
+    sp = sub.add_parser("export", help="dump the registry as phenomena.json-shaped JSON")
+    sp.add_argument("-o", "--output")
+    sp.set_defaults(func=cmd_export)
+
     sp = sub.add_parser("note", help="append a note")
     sp.add_argument("id")
     sp.add_argument("text")
@@ -1071,7 +1249,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+    # One write lock per command: a portal edit can never interleave with it.
+    with bugdb.tx("cli"):
+        args.func(args)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,26 @@
 # Always loaded project context instructions
 
+## Team Portal ownership and data
+
+Keep personal records, credentials and private runtime state outside this
+repository under `~/.copilot-private/` or their domain-owned stores. Technical
+IP/project knowledge is shareable and remains in the repository. Scripts that
+need private local data must use the configured external paths; never copy
+personal records into tracked skill files.
+
+For any Team Portal/local dashboard feature request, question, UI/API change,
+bug, serving, restart or maintenance operation, load the `portal-maintainer`
+skill (`~/.copilot/skills/portal-maintainer/SKILL.md`). This applies regardless
+of which skill received the request, including future skills. The maintainer
+owns the website and its append-only action journal; domain skills own their
+records and coordinate through their supported APIs.
+
+Structured tasks, workspaces, PR tracking, RAID and local job tracking live in
+their owning skills' dedicated SQLite databases. Do not directly edit legacy
+JSON/Markdown exports or domain tables. Use the owning CLI/API. Jira, GitHub,
+PLDM and machine tooling retain external authority; documents and raw evidence
+remain files. See the maintainer's domain architecture for the ownership map.
+
 ## VM Management
 For any questions about VMs, EC2 instances, machine IPs, or SSH access, delegate to the `@vm` agent which manages instances via `octl vm`.
 

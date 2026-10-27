@@ -109,9 +109,32 @@ per-customer config. (2) The concrete preset values (8 rails / 2048 GB / bits [4
 fold [40:38]) were author-proposed and **architect-approved**, with the standing action
 to **verify in emulation** before it's fully trusted.
 
+## Connection-scheme strap vs LUT selection (A1 FW)
+
+The connection-scheme strap selects physical connection descriptors (per-die,
+per-port wiring) through `active_scheme_id` and also selects that scheme's
+optional NPA/CAM boot-default table lists. The topology remains independently
+selected from the SE node's `topology-ref` / `topology_type` during init; it
+continues to define the shared address-indexing/routing configuration. For DTS
+fallback, scheme table lists take precedence over topology lists, which take
+precedence over the SE-node single-table fallback. A table list may contain one
+shared table or one table per local `dev_idx`. A scheme's `req-id-overrides`
+(used by the riser scheme) patches the selected CAM. On A1 `same_index`, O/R/ELS1
+use Ocean legacy NPA/CAM defaults, A uses the Asgard per-chip NPA and even/odd
+CAM defaults, and TEST keeps the topology fallback. Middleware-provided BAR/BDF
+buffers take precedence when supplied before LUT programming.
+
 ## Sources
-- DT: `project.iridium.sw.fw.infra` → `soc/dts/a1_hsi.dtsi` (`c2c_topo_same_index`).
-- Binding: `ip.se.sw.fw` → `dts/bindings/el,c2c-topology.yaml`.
+- DT: `project.iridium.sw.fw.infra` → `soc/dts/a1_hsi.dtsi` (`c2c_topo_same_index`,
+  Ocean and Asgard table nodes, scheme table references).
+- A1 FW/DT: `proj_infra/soc/dts/a1/a1_hsi.dtsi` (topology table lists,
+  `topology-ref`, `default-conn-scheme`, and riser `req-id-overrides`);
+  `zephyr_apps/mng/boards/el_arm_a1_asic.overlay` (strap-to-scheme mapping).
+- A1 FW: `ip/se/drivers/scale_engine/el_se.c` (`el_se_init`,
+  `se_lut_dts_table_sel`, `se_lut_seed_dts_defaults`, MW wait/fallback);
+  `ip/se/drivers/scale_engine/el_se_strap.c` (`el_se_strap_get_scheme`).
+- Binding: `ip.se.sw.fw` → `dts/bindings/el,c2c-topology.yaml`,
+  `dts/bindings/el,se-conn-scheme.yaml`.
 - FW (consumer, pending): `ip.se.sw.fw` → `drivers/scale_engine/el_se_lut.c`
   (`topology_presets`, `TOPO_PRESET`), `include/el_se_lut.h` (`enum c2c_board_topology`).
 - Constants: `C2C_ADDR_BIT_BASE=36`, `C2C_NLUT_BIT_OFFSET_MAX=10` (`el_se_lut.c`),
