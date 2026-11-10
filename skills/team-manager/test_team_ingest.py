@@ -76,11 +76,13 @@ class TeamIngestTests(unittest.TestCase):
             version = up.execute("SELECT value FROM meta WHERE key='team_schema_version'").fetchone()[0]
             entry_cols = {r[1] for r in up.execute("PRAGMA table_info(meeting_entries)")}
             rb_cols = {r[1] for r in up.execute("PRAGMA table_info(roadblocks)")}
+            meeting_cols = {r[1] for r in up.execute("PRAGMA table_info(meetings)")}
         self.assertTrue({"fields_json", "record_type", "record_id"} <= entry_cols)
         self.assertTrue({"impact", "unblocker", "visibility"} <= rb_cols)
         self.assertIn("status", cols)
         self.assertIn("external_ref", cols)
-        self.assertEqual(version, "8")
+        self.assertIn("deleted_at", meeting_cols)
+        self.assertEqual(version, "11")
 
     def test_leave_import_preview_then_apply_idempotent(self) -> None:
         path = self._csv("hr.csv", (

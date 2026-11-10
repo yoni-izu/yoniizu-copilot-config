@@ -19,11 +19,15 @@ from team_portal import TeamPortalMixin
 
 
 DB_PATH = Path(os.environ.get("TEAM_DB", "~/tasks/team.db")).expanduser()
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "11"
 EMPLOYMENT_TYPES = ("full-time", "part-time", "student", "part-time-student", "contractor")
 ROSTER_ROLES = ("member", "lead")
 # Additive column upgrades keyed by the version that introduced them.
 SCHEMA_UPGRADES: dict[str, list[tuple[str, str, str]]] = {
+    "11": [
+        ("meeting_entries", "item_id", "TEXT REFERENCES tracked_items(item_id)"),
+        ("meeting_entries", "follow_up_from", "TEXT"),
+    ],
     "2": [
         ("leave_records", "status", "TEXT NOT NULL DEFAULT 'approved'"),
         ("leave_records", "external_ref", "TEXT"),
@@ -61,6 +65,12 @@ SCHEMA_UPGRADES: dict[str, list[tuple[str, str, str]]] = {
         ("roadblocks", "impact", "TEXT"),
         ("roadblocks", "unblocker", "TEXT"),
         ("roadblocks", "visibility", "TEXT NOT NULL DEFAULT 'private'"),
+    ],
+    "9": [
+        ("meeting_entries", "priority", "TEXT NOT NULL DEFAULT 'medium'"),
+    ],
+    "10": [
+        ("meetings", "deleted_at", "TEXT"),
     ],
 }
 
@@ -104,6 +114,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   private_summary TEXT,
   full_markdown TEXT NOT NULL,
   finalized INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
   visibility TEXT NOT NULL DEFAULT 'private',
   title_visibility TEXT NOT NULL DEFAULT 'private',
   created_at TEXT NOT NULL,
@@ -116,6 +127,7 @@ CREATE TABLE IF NOT EXISTS meeting_entries (
   tag TEXT NOT NULL,
   body TEXT NOT NULL,
   visibility TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'medium',
   actor TEXT,
   created_at TEXT NOT NULL,
   source_line TEXT
@@ -123,6 +135,36 @@ CREATE TABLE IF NOT EXISTS meeting_entries (
   ,fields_json TEXT
   ,record_type TEXT
   ,record_id TEXT
+  ,item_id TEXT REFERENCES tracked_items(item_id)
+  ,follow_up_from TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tracked_items (
+  item_id TEXT PRIMARY KEY,
+  member_key TEXT REFERENCES members(member_key),
+  item_type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  fields_json TEXT,
+  status TEXT NOT NULL DEFAULT 'unspecified',
+  priority TEXT NOT NULL DEFAULT 'medium',
+  owner TEXT,
+  target_date TEXT,
+  follow_up INTEGER NOT NULL DEFAULT 0 CHECK(follow_up IN (0,1)),
+  visibility TEXT NOT NULL DEFAULT 'private',
+  record_type TEXT,
+  record_id TEXT,
+  origin_meeting_id TEXT REFERENCES meetings(meeting_id),
+  origin_entry_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS item_updates (
+  update_id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES tracked_items(item_id),
+  note TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'private',
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS assignments (
@@ -397,29 +439,87 @@ class TeamStore(TeamPortalMixin):
 
     def connect(self) -> sqlite3.Connection:
         conn = domain_db.connect(self.db_path, SCHEMA)
-        current = conn.execute(
-            "SELECT value FROM meta WHERE key='team_schema_version'"
-        ).fetchone()
-        if current is None:
-            conn.execute(
-                "INSERT INTO meta(key,value) VALUES('team_schema_version',?)",
-                (SCHEMA_VERSION,),
-            )
-        elif current[0] != SCHEMA_VERSION:
-            if not current[0].isdigit() or int(current[0]) > int(SCHEMA_VERSION):
-                raise ValueError(
-                    f"unsupported team schema version: {current[0]} (expected {SCHEMA_VERSION})"
+        try:
+            current = conn.execute(
+                "SELECT value FROM meta WHERE key='team_schema_version'"
+            ).fetchone()
+            if current and current[0] == SCHEMA_VERSION:
+                missing = conn.execute(
+                    """SELECT 1 FROM meeting_entries e JOIN meetings m USING(meeting_id)
+                    WHERE e.item_id IS NULL AND m.deleted_at IS NULL LIMIT 1"""
+                ).fetchone() or conn.execute(
+                    """SELECT 1 FROM assignments a WHERE NOT EXISTS(
+                    SELECT 1 FROM tracked_items i WHERE i.record_type='assignment'
+                    AND i.record_id=a.assignment_id) LIMIT 1"""
+                ).fetchone()
+                # Re-entrant projections must not contend with their owner's write transaction.
+                if not missing:
+                    return conn
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT value FROM meta WHERE key='team_schema_version'"
+            ).fetchone()
+            if current is None:
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('team_schema_version',?)",
+                    (SCHEMA_VERSION,),
                 )
-            for version in range(int(current[0]) + 1, int(SCHEMA_VERSION) + 1):
-                for table, column, ddl in SCHEMA_UPGRADES.get(str(version), []):
-                    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-                    if column not in cols:
-                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-            conn.execute(
-                "UPDATE meta SET value=? WHERE key='team_schema_version'", (SCHEMA_VERSION,)
-            )
+            elif current[0] != SCHEMA_VERSION:
+                if not current[0].isdigit() or int(current[0]) > int(SCHEMA_VERSION):
+                    raise ValueError(
+                        f"unsupported team schema version: {current[0]} (expected {SCHEMA_VERSION})"
+                    )
+                for version in range(int(current[0]) + 1, int(SCHEMA_VERSION) + 1):
+                    for table, column, ddl in SCHEMA_UPGRADES.get(str(version), []):
+                        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                        if column not in cols:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    if version == 9:
+                        for row in conn.execute(
+                            """SELECT e.entry_id,e.fields_json,a.priority AS task_priority
+                            FROM meeting_entries e LEFT JOIN assignments a
+                            ON e.record_type='assignment' AND e.record_id=a.assignment_id
+                            WHERE e.tag='action'"""
+                        ):
+                            fields = json.loads(row["fields_json"]) if row["fields_json"] else {}
+                            priority = row["task_priority"] or fields.get("priority", "medium")
+                            if priority not in {"critical", "high", "medium", "low"}:
+                                raise ValueError(f"invalid stored action priority for {row['entry_id']}")
+                            conn.execute(
+                                "UPDATE meeting_entries SET priority=? WHERE entry_id=?",
+                                (priority, row["entry_id"]),
+                            )
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key='team_schema_version'", (SCHEMA_VERSION,)
+                )
+            self._backfill_tracked_items(conn)
             conn.commit()
+        except BaseException:
+            conn.rollback()
+            conn.close()
+            raise
         return conn
+
+    def backup(self, destination: Path) -> Path:
+        """Take a consistent backup without opening or upgrading the source schema."""
+        destination = Path(destination).expanduser()
+        if not self.db_path.is_file():
+            raise ValueError("team database does not exist")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination.touch(mode=0o600, exist_ok=False)
+        source = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+            if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("team backup integrity check failed")
+        except BaseException:
+            destination.unlink()
+            raise
+        finally:
+            target.close()
+            source.close()
+        return destination
 
     def init_db(self) -> None:
         with self.connect() as conn:

@@ -65,6 +65,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    print(TeamStore().backup(Path(args.destination)))
+    return 0
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     summary = TeamStore().migrate(Path(args.source).expanduser(), dry_run=args.dry_run)
     _print(summary)
@@ -162,6 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("init")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("backup")
+    p.add_argument("destination")
+    p.set_defaults(func=cmd_backup)
 
     p = sub.add_parser("migrate")
     p.add_argument("--source", default="~/team-planner/members")

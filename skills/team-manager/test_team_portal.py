@@ -268,6 +268,120 @@ class TeamPortalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "log type"):
             self.meeting(session_type="not-real")
 
+    def test_log_item_priority_defaults_validates_and_tracks_action_task(self):
+        created = self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [
+            {"tag": "notes", "body": "Short note"},
+            {"tag": "action", "fields": {"title": "Follow up", "priority": "high"}},
+        ]})["entity"]
+        note, action = created["entries"]
+        self.assertEqual(note["priority"], "medium")
+        self.assertEqual(action["priority"], "high")
+        assignment = next(a for a in self.store.portal_payload("private")["assignments"]
+                          if a["assignment_id"] == action["record_id"])
+        self.store.portal_mutate("assignment-set", {
+            "id": assignment["assignment_id"], "revision": assignment["revision"], "priority": "low",
+        })
+        refreshed = next(m for m in self.store.portal_payload("private")["meetings"]
+                         if m["meeting_id"] == created["meeting_id"])
+        self.assertEqual(refreshed["entries"][1]["priority"], "low")
+        with self.assertRaisesRegex(ValueError, "priority"):
+            self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [
+                {"tag": "notes", "body": "Bad", "priority": "urgent"},
+            ]})
+
+    def test_schema_v9_adds_priority_and_backfills_linked_action_priority(self):
+        created = self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [
+            {"tag": "action", "fields": {"title": "Keep priority", "priority": "high"}},
+        ]})["entity"]
+        action = created["entries"][0]
+        task = next(a for a in self.store.portal_payload("private")["assignments"]
+                    if a["assignment_id"] == action["record_id"])
+        self.store.portal_mutate("assignment-set", {
+            "id": task["assignment_id"], "revision": task["revision"], "priority": "low",
+        })
+        with self.store.connect() as conn:
+            conn.execute("ALTER TABLE meeting_entries DROP COLUMN priority")
+            conn.execute("UPDATE meta SET value='8' WHERE key='team_schema_version'")
+        with self.store.connect() as conn:
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key='team_schema_version'"
+            ).fetchone()[0]
+            priority = conn.execute(
+                "SELECT priority FROM meeting_entries WHERE entry_id=?", (action["entry_id"],)
+            ).fetchone()[0]
+        self.assertEqual(version, "11")
+        self.assertEqual(priority, "low")
+        refreshed = next(m for m in self.store.portal_payload("private")["meetings"]
+                         if m["meeting_id"] == created["meeting_id"])
+        self.assertEqual(refreshed["entries"][0]["priority"], "low")
+
+    def test_presentation_log_edit_preserves_hidden_rows_and_returns_shared_projection(self):
+        meeting = self.meeting()
+        shared = self.store.portal_payload("shared")["meetings"][0]
+        public_entry = shared["entries"][0]
+        saved = self.store.portal_mutate("meeting-shared-save", {
+            "id": meeting["meeting_id"], "revision": shared["edit_token"],
+            "meeting_date": meeting["meeting_date"],
+            "entries": [{
+                "entry_id": public_entry["entry_id"], "tag": "decision",
+                "fields": {"decision": "Updated public decision"},
+                "visibility": "shared", "priority": "critical",
+            }],
+        })["entity"]
+        self.assertNotIn("PRIVATE-", json.dumps(saved))
+        self.assertNotIn("revision", saved)
+        self.assertEqual(saved["entries"][0]["priority"], "critical")
+        private = next(m for m in self.store.portal_payload("private")["meetings"]
+                       if m["meeting_id"] == meeting["meeting_id"])
+        self.assertEqual(private["title"], "PRIVATE-TITLE")
+        self.assertEqual(private["title_visibility"], "private")
+        self.assertEqual(
+            [(e["body"], e["visibility"]) for e in private["entries"]],
+            [("Updated public decision", "shared"), ("PRIVATE-ENTRY", "private")],
+        )
+        fresh_shared = self.store.portal_payload("shared")["meetings"][0]
+        with self.assertRaisesRegex(ValueError, "private log items"):
+            self.store.portal_mutate("meeting-shared-save", {
+                "id": meeting["meeting_id"], "revision": fresh_shared["edit_token"],
+                "meeting_date": meeting["meeting_date"],
+                "entries": [
+                    {"entry_id": public_entry["entry_id"], "tag": "decision",
+                     "fields": {"decision": "No overwrite"}, "visibility": "shared"},
+                    {"entry_id": private["entries"][1]["entry_id"], "tag": "feedback",
+                     "body": "No leak", "visibility": "shared"},
+                ],
+            })
+        with self.assertRaisesRegex(ValueError, "hidden topic"):
+            self.store.portal_mutate("meeting-shared-save", {
+                "id": meeting["meeting_id"], "revision": fresh_shared["edit_token"],
+                "meeting_date": meeting["meeting_date"], "title": "Disclosure",
+                "entries": [{
+                    "entry_id": public_entry["entry_id"], "tag": "decision",
+                    "fields": {"decision": "Still public"}, "visibility": "shared",
+                }],
+            })
+
+    def test_changing_item_category_cleans_linked_records_but_keeps_tasks(self):
+        meeting = self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [
+            {"tag": "action", "fields": {"title": "Keep task"}},
+            {"tag": "roadblock", "fields": {"blocker": "Remove blocker"}},
+        ]})["entity"]
+        action, roadblock = meeting["entries"]
+        saved = self.store.portal_mutate("meeting-save", {
+            "id": meeting["meeting_id"], "revision": meeting["revision"],
+            "meeting_date": meeting["meeting_date"], "title": meeting["title"],
+            "entries": [
+                {"entry_id": action["entry_id"], "tag": "decision",
+                 "fields": {"decision": "Keep task as decision"}, "visibility": "shared"},
+                {"entry_id": roadblock["entry_id"], "tag": "discussion",
+                 "fields": {"topic": "Reclassified blocker"}, "visibility": "shared"},
+            ],
+        })["entity"]
+        self.assertEqual([e["tag"] for e in saved["entries"]], ["decision", "discussion"])
+        self.assertEqual(len(self._rows("SELECT * FROM assignments")), 1)
+        self.assertEqual(self._rows("SELECT * FROM roadblocks"), [])
+        self.assertEqual(len(self._rows("SELECT * FROM typed_refs WHERE source_type='roadblock'")), 0)
+
     def test_rich_tasks_refs_notes_and_atomic_session_actions(self):
         refs = [
             {"domain_name": "github", "target_type": "pr",
@@ -430,7 +544,8 @@ class TeamPortalTests(unittest.TestCase):
             {"tag": "feedback_given", "fields": {"polarity": "positive", "behavior": "Clear review"}},
             {"tag": "feedback_received", "fields": {"feedback": "More context please"}},
             {"tag": "growth", "fields": {"goal": "Own D2D"}},
-            {"tag": "personal", "fields": {"text": "PRIVATE-PERSONAL"}, "visibility": "shared"},
+            {"tag": "personal", "fields": {"text": "SHARED-PERSONAL"}, "visibility": "shared"},
+            {"tag": "personal", "fields": {"text": "PRIVATE-PERSONAL-DEFAULT"}},
         ]})["entity"]
         self.assertEqual(made["title"], f"1:1 with Ana Lee - {date.today().isoformat()}")
         by_tag = {}
@@ -446,19 +561,64 @@ class TeamPortalTests(unittest.TestCase):
         self.assertEqual((rb["title"], rb["unblocker"], rb["status"]), ("No board", "Lab", "open"))
         kinds = sorted(r["kind"] for r in self._rows("SELECT kind FROM feedback_items"))
         self.assertEqual(kinds, ["given-positive", "received"])
-        self.assertEqual(by_tag["personal"][0]["visibility"], "private")
+        self.assertEqual(by_tag["personal"][0]["visibility"], "shared")
+        self.assertEqual(by_tag["personal"][1]["visibility"], "private")
         self.assertEqual(by_tag["decision"][0]["body"], "Use DMA")
         self.assertTrue(by_tag["discussion"][0]["fields"]["follow_up"])
+        private_payload = self.store.portal_payload("private")
+        self.assertTrue(all(
+            spec["default_visibility"] == "shared"
+            for spec in private_payload["log_item_types"].values()
+        ))
         shared = self.store.portal_payload("shared")
         text = json.dumps(shared)
-        self.assertNotIn("PRIVATE-PERSONAL", text)
+        self.assertIn("SHARED-PERSONAL", text)
+        self.assertNotIn("PRIVATE-PERSONAL-DEFAULT", text)
         self.assertIn("Write plan", text)
         for bad in ({"tag": "decision", "fields": {}},
                     {"tag": "decision", "fields": {"decision": "x", "bogus": 1}},
                     {"tag": "roadblock", "fields": {"blocker": "x", "status": "maybe"}},
+                    {"tag": "status", "fields": {"activity": "Boot", "status": "blocked", "note": "x"}},
+                    {"tag": "status", "fields": {"assignment_id": task["assignment_id"],
+                                                 "activity": "Boot", "note": "x"}},
                     {"tag": "status", "fields": {"assignment_id": "nope", "note": "x"}}):
             with self.assertRaises(ValueError):
                 self.store.portal_mutate("meeting-create", {"member_key": "ana", "entries": [bad]})
+
+    def test_status_update_can_be_standalone_and_named(self):
+        self._member()
+        made = self.store.portal_mutate("meeting-create", {"member_key": "ana", "entries": [
+            {"tag": "status", "fields": {"activity": "Boot bringup", "note": "PHY training started"}},
+        ]})["entity"]
+        entry = made["entries"][0]
+        self.assertEqual(entry["body"], "Boot bringup: PHY training started")
+        self.assertEqual(entry["fields"], {"activity": "Boot bringup", "note": "PHY training started"})
+        self.assertIsNone(entry["record_id"])
+        self.assertEqual(self._rows("SELECT * FROM assignment_updates"), [])
+
+        task = self.store.portal_mutate("assignment-create", {
+            "member_key": "ana", "title": "PHY bringup",
+        })["entity"]
+        linked = self.store.portal_mutate("meeting-create", {"member_key": "ana", "entries": [
+            {"tag": "status", "fields": {"assignment_id": task["assignment_id"],
+                                         "status": "in-progress", "note": "Training started"}},
+        ]})["entity"]
+        linked_entry = linked["entries"][0]
+        self.assertIsNotNone(linked_entry["record_id"])
+        self.assertEqual(len(self._rows("SELECT * FROM assignment_updates")), 1)
+
+        standalone = self.store.portal_mutate("meeting-save", {
+            "id": linked["meeting_id"], "revision": linked["revision"],
+            "meeting_date": linked["meeting_date"], "title": linked["title"],
+            "entries": [{"entry_id": linked_entry["entry_id"], "tag": "status",
+                         "fields": {"activity": "Board bringup", "note": "Waiting on lab"}},
+                        ],
+        })["entity"]
+        self.assertEqual(standalone["entries"][0]["body"], "Board bringup: Waiting on lab")
+        self.assertIsNone(standalone["entries"][0]["record_id"])
+        self.assertEqual(self._rows("SELECT * FROM assignment_updates"), [])
+        self.assertEqual(self._rows("SELECT status FROM assignments WHERE assignment_id=?",
+                                    task["assignment_id"])[0]["status"], "in-progress")
 
     def test_typed_item_edits_update_in_place_and_removal_drops_owned_records(self):
         self._member()
@@ -489,6 +649,47 @@ class TeamPortalTests(unittest.TestCase):
         self.assertEqual(len(again["entries"]), 1)
         self.assertEqual(self._rows("SELECT * FROM roadblocks"), [])
         self.assertEqual(len(self._rows("SELECT * FROM assignments")), 1)
+
+    def test_delete_meeting_hides_session_and_removes_owned_records_but_keeps_tasks(self):
+        task = self.store.portal_mutate("assignment-create", {
+            "member_key": "yoni", "title": "Keep task",
+        })["entity"]
+        meeting = self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [
+            {"tag": "action", "fields": {"title": "Keep task"}},
+            {"tag": "status", "fields": {"assignment_id": task["assignment_id"],
+                                         "note": "Remove progress"}},
+            {"tag": "roadblock", "fields": {"blocker": "Remove blocker"}},
+            {"tag": "feedback_given", "fields": {"behavior": "Remove feedback"}},
+        ]})["entity"]
+        stale_revision = meeting["revision"]
+        updated = self.store.portal_mutate("meeting-save", {
+            "id": meeting["meeting_id"], "revision": meeting["revision"],
+            "meeting_date": meeting["meeting_date"], "title": meeting["title"],
+            "entries": [{k: entry[k] for k in ("entry_id", "tag", "body", "visibility")}
+                        for entry in meeting["entries"]],
+        })["entity"]
+        with self.assertRaisesRegex(ValueError, "stale revision"):
+            self.store.portal_mutate("meeting-delete", {
+                "id": meeting["meeting_id"], "revision": stale_revision,
+            })
+        result = self.store.portal_mutate("meeting-delete", {
+            "id": meeting["meeting_id"], "revision": updated["revision"],
+        })
+        self.assertEqual(result["id"], meeting["meeting_id"])
+        self.assertEqual(self.store.portal_payload("private")["meetings"], [])
+        self.assertEqual(self.store.portal_payload("shared")["meetings"], [])
+        self.assertEqual(len(self._rows("SELECT * FROM assignments")), 2)
+        self.assertEqual(self._rows("SELECT * FROM assignment_updates"), [])
+        self.assertEqual(self._rows("SELECT * FROM roadblocks"), [])
+        self.assertEqual(self._rows("SELECT * FROM feedback_items"), [])
+        self.assertEqual(len(self._rows(
+            "SELECT * FROM meeting_revisions WHERE meeting_id=?", meeting["meeting_id"])), 3)
+        with self.assertRaisesRegex(ValueError, "meeting was deleted"):
+            self.store.portal_mutate("meeting-save", {
+                "id": meeting["meeting_id"], "revision": result["revision"],
+                "meeting_date": updated["meeting_date"], "title": updated["title"],
+                "entries": [],
+            })
 
     def test_lead_page_one_on_one_is_with_manager(self):
         made = self.store.portal_mutate("meeting-create", {"member_key": "yoni", "entries": [

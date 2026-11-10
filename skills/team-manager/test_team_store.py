@@ -168,6 +168,18 @@ class TeamStoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(private["members"][0]["assignments"]), 1)
         self.assertEqual(len(shared["members"][0]["assignments"]), 0)
 
+    def test_schema_v9_adds_session_deletion_marker(self) -> None:
+        with self.store.connect() as conn:
+            conn.execute("ALTER TABLE meetings DROP COLUMN deleted_at")
+            conn.execute("UPDATE meta SET value='9' WHERE key='team_schema_version'")
+        with self.store.connect() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key='team_schema_version'"
+            ).fetchone()[0]
+        self.assertIn("deleted_at", columns)
+        self.assertEqual(version, "11")
+
     def test_group_prs_by_single_jira_key(self) -> None:
         grouped = self.store.group_prs_by_jira_title(
             [

@@ -1,7 +1,8 @@
 """Owner-side Team projections and validated portal mutations.
 
 This module is a TeamStore mixin, not a web server. Callers must authorize
-private access before selecting that audience or invoking a mutation.
+private access before selecting that audience or invoking private mutations.
+The shared-log edit mutation is restricted to shared-visible fields and rows.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ LOG_TYPES = {"one_on_one": "1:1", "conversation": "Conversation", "meeting": "Me
 ASSIGNMENT_STATUSES = (
     "assigned", "open", "todo", "backlog", "in-progress", "blocked", "done", "cancelled", "deferred",
 )
+LOG_ITEM_PRIORITIES = ("critical", "high", "medium", "low")
+ITEM_STATUSES = ("unspecified", "open", "in-progress", "blocked", "done", "cancelled", "deferred")
 # The lead's own log records 1:1s with their manager, so "member" reads as manager there.
 MANAGER_NAME = os.environ.get("TEAM_MANAGER_NAME", "Manager")
 PARTY = ["me", "member"]
@@ -26,57 +29,58 @@ PARTY = ["me", "member"]
 # Typed log items. Served to the portal so the form is generated from one spec.
 # Each field: key, label, input (text|textarea|date|select|checkbox|task), required, options.
 LOG_ITEM_TYPES: dict[str, dict[str, Any]] = {
-    "action": {"label": "Action item", "summary": "title", "fields": [
+    "action": {"label": "Action item", "summary": "title", "default_visibility": "shared", "fields": [
         {"key": "title", "label": "Action", "input": "text", "required": True},
         {"key": "owner", "label": "Owner", "input": "select", "options": PARTY},
         {"key": "target_date", "label": "Due", "input": "date"},
-        {"key": "category", "label": "Category", "input": "select", "options": list(TASK_CATEGORIES)},
+        {"key": "category", "label": "Task category", "input": "select", "options": list(TASK_CATEGORIES)},
         {"key": "priority", "label": "Priority", "input": "select",
          "options": ["medium", "high", "critical", "low"]},
         {"key": "jira_key", "label": "Jira", "input": "text"},
         {"key": "description", "label": "Details", "input": "textarea"},
     ]},
-    "decision": {"label": "Decision", "summary": "decision", "fields": [
+    "decision": {"label": "Decision", "summary": "decision", "default_visibility": "shared", "fields": [
         {"key": "decision", "label": "Decision", "input": "text", "required": True},
         {"key": "rationale", "label": "Rationale", "input": "textarea"},
         {"key": "decided_by", "label": "Decided by", "input": "select", "options": ["joint", "me", "member"]},
         {"key": "revisit_date", "label": "Revisit by", "input": "date"},
     ]},
-    "discussion": {"label": "Discussion point", "summary": "topic", "fields": [
+    "discussion": {"label": "Discussion point", "summary": "topic", "default_visibility": "shared", "fields": [
         {"key": "topic", "label": "Topic", "input": "text", "required": True},
         {"key": "raised_by", "label": "Raised by", "input": "select", "options": PARTY},
         {"key": "outcome", "label": "Outcome", "input": "textarea"},
         {"key": "follow_up", "label": "Follow-up needed", "input": "checkbox"},
     ]},
-    "status": {"label": "Status update", "summary": "note", "fields": [
-        {"key": "assignment_id", "label": "Task", "input": "task", "required": True},
+    "status": {"label": "Status update", "summary": "note", "default_visibility": "shared", "fields": [
+        {"key": "assignment_id", "label": "Task (optional)", "input": "task"},
+        {"key": "activity", "label": "Activity", "input": "text"},
         {"key": "status", "label": "New status", "input": "select", "options": [""] + list(ASSIGNMENT_STATUSES)},
         {"key": "note", "label": "Progress", "input": "textarea", "required": True},
     ]},
-    "roadblock": {"label": "Roadblock", "summary": "blocker", "fields": [
+    "roadblock": {"label": "Roadblock", "summary": "blocker", "default_visibility": "shared", "fields": [
         {"key": "blocker", "label": "Blocker", "input": "text", "required": True},
         {"key": "impact", "label": "Impact", "input": "textarea"},
         {"key": "unblocker", "label": "Who unblocks", "input": "select", "options": ["me", "member", "other"]},
         {"key": "unblocker_name", "label": "Name (if other)", "input": "text"},
         {"key": "status", "label": "Status", "input": "select", "options": ["open", "resolved"]},
     ]},
-    "feedback_given": {"label": "Feedback given", "summary": "behavior", "default_visibility": "private", "fields": [
+    "feedback_given": {"label": "Feedback given", "summary": "behavior", "default_visibility": "shared", "fields": [
         {"key": "polarity", "label": "Kind", "input": "select", "options": ["positive", "constructive"]},
         {"key": "situation", "label": "Situation", "input": "text"},
         {"key": "behavior", "label": "Behavior", "input": "textarea", "required": True},
         {"key": "impact", "label": "Impact", "input": "textarea"},
     ]},
-    "feedback_received": {"label": "Feedback received", "summary": "feedback", "default_visibility": "private",
+    "feedback_received": {"label": "Feedback received", "summary": "feedback", "default_visibility": "shared",
                           "fields": [
         {"key": "feedback", "label": "Feedback", "input": "textarea", "required": True},
         {"key": "follow_up", "label": "My follow-up", "input": "textarea"},
     ]},
-    "growth": {"label": "Growth / career", "summary": "goal", "default_visibility": "private", "fields": [
+    "growth": {"label": "Growth / career", "summary": "goal", "default_visibility": "shared", "fields": [
         {"key": "goal", "label": "Goal / aspiration", "input": "text", "required": True},
         {"key": "next_step", "label": "Next step", "input": "text"},
         {"key": "horizon", "label": "Horizon", "input": "text"},
     ]},
-    "personal": {"label": "Personal", "summary": "text", "always_private": True, "fields": [
+    "personal": {"label": "Personal", "summary": "text", "default_visibility": "shared", "fields": [
         {"key": "text", "label": "Note", "input": "textarea", "required": True},
     ]},
 }
@@ -127,6 +131,8 @@ def _item_fields(tag: str, raw: Any) -> dict[str, Any]:
     for key, field in known.items():
         value = raw.get(key)
         if field["input"] == "checkbox":
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{tag}.{key} must be a boolean")
             out[key] = bool(value)
             continue
         value = "" if value is None else value
@@ -144,10 +150,20 @@ def _item_fields(tag: str, raw: Any) -> dict[str, Any]:
     if tag == "action":
         if out.get("jira_key") and not re.fullmatch(r"[A-Z][A-Z0-9]{1,15}-\d+", out["jira_key"]):
             raise ValueError("invalid jira_key")
+    if tag == "status":
+        if out.get("assignment_id"):
+            if out.get("activity"):
+                raise ValueError("status.activity is only available without a task")
+        elif out.get("status"):
+            raise ValueError("status: New status requires a task")
     return out
 
 
 def _item_summary(tag: str, fields: dict[str, Any]) -> str:
+    if tag == "status" and not fields.get("assignment_id"):
+        activity = fields.get("activity")
+        text = f"{activity}: {fields['note']}" if activity else fields["note"]
+        return text.splitlines()[0][:240]
     text = str(fields.get(LOG_ITEM_TYPES[tag]["summary"], ""))
     return text.splitlines()[0][:240] if text else ""
 
@@ -181,9 +197,18 @@ class TeamPortalMixin:
 
     def _meeting_projection(self, conn, ident: str, audience: str) -> dict | None:
         row = self._meeting_snapshot(conn, ident)
+        if row.get("deleted_at") is not None:
+            return None
         revision = domain_db.revision(row)
         for e in row["entries"]:
             e["fields"] = _entry_fields(e)
+            if e["tag"] == "action" and e.get("record_id"):
+                task = conn.execute(
+                    "SELECT priority FROM assignments WHERE assignment_id=?", (e["record_id"],)
+                ).fetchone()
+                if task:
+                    e["priority"] = task["priority"]
+                    e["fields"]["priority"] = task["priority"]
             if e.get("record_type") == "roadblock" and e.get("record_id"):
                 ref = conn.execute(
                     """SELECT target_id FROM typed_refs WHERE source_type='roadblock' AND source_id=?
@@ -191,6 +216,15 @@ class TeamPortalMixin:
                 ).fetchone()
                 if ref:
                     e["raid_id"] = ref[0]
+            if e.get("item_id"):
+                item = self._item_projection(conn, e["item_id"], audience)
+                if item:
+                    e["tracking"] = {k: item.get(k) for k in (
+                        "status", "owner", "target_date", "follow_up",
+                    )}
+                    e["item_revision" if audience == "private" else "item_edit_token"] = item.get(
+                        "revision" if audience == "private" else "edit_token"
+                    )
         if audience == "private":
             row["revision"] = revision
             row["history"] = [
@@ -203,8 +237,12 @@ class TeamPortalMixin:
             ]
             return row
         entries = [
-            {k: e.get(k) for k in ("entry_id", "tag", "body", "visibility", "position", "fields", "raid_id")}
-            for e in row["entries"] if e["visibility"] == "shared"
+            {k: e.get(k) for k in (
+                "entry_id", "tag", "body", "visibility", "priority", "position", "fields", "raid_id",
+                "item_id", "tracking", "item_edit_token", "follow_up_from",
+            )}
+            | ({"locked": bool(e.get("record_id"))} if e["tag"] == "action" else {})
+            for e in row["entries"] if self._entry_shared(conn, e)
         ]
         if not entries:
             return None
@@ -213,8 +251,386 @@ class TeamPortalMixin:
             "session_type": row["session_type"],
             "meeting_date": row["meeting_date"], "state": row["state"],
             "finalized": bool(row["finalized"]), "entries": entries,
+            "title_visibility": row["title_visibility"], "edit_token": revision,
             "title": row["title"] if entries and row["title_visibility"] == "shared" else "1:1 session",
         }
+
+    def _register_tracked_item(self, conn, entry: dict, meeting: dict | None, *, historical=False) -> str:
+        record_type, record_id = entry.get("record_type"), entry.get("record_id")
+        if historical and entry.get("entry_id"):
+            found = conn.execute(
+                "SELECT item_id FROM tracked_items WHERE origin_entry_id=? AND item_type=?",
+                (entry["entry_id"], entry["tag"]),
+            ).fetchone()
+            if found:
+                return found[0]
+        if record_type == "assignment" and record_id:
+            found = conn.execute(
+                "SELECT item_id FROM tracked_items WHERE record_type='assignment' AND record_id=?",
+                (record_id,),
+            ).fetchone()
+            if found:
+                return found[0]
+        fields = entry.get("fields")
+        if fields is None and entry.get("fields_json"):
+            fields = json.loads(entry["fields_json"])
+        status = "unspecified" if historical else "open"
+        if entry["tag"] == "roadblock" and fields and fields.get("status"):
+            status = "done" if fields["status"] == "resolved" else "open"
+        follow_up = bool(fields and entry["tag"] == "discussion" and fields.get("follow_up"))
+        ident, stamp = f"item-{uuid4().hex}", entry.get("created_at") or _stamp()
+        conn.execute(
+            """INSERT INTO tracked_items(item_id,member_key,item_type,body,fields_json,status,
+            priority,follow_up,visibility,record_type,record_id,origin_meeting_id,origin_entry_id,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ident, meeting["member_key"] if meeting else entry["member_key"], entry["tag"],
+             entry["body"], json.dumps(fields, ensure_ascii=False) if fields is not None else None,
+             status, entry.get("priority", "medium"), int(follow_up), entry["visibility"],
+             record_type, record_id, meeting["meeting_id"] if meeting else entry.get("origin_meeting_id"),
+             entry.get("entry_id"), stamp, stamp),
+        )
+        return ident
+
+    def _backfill_tracked_items(self, conn) -> bool:
+        """Register historical/imported rows without inventing their lifecycle state."""
+        changed = False
+        for raw in conn.execute(
+            """SELECT a.* FROM assignments a WHERE NOT EXISTS(
+            SELECT 1 FROM tracked_items i WHERE i.record_type='assignment'
+            AND i.record_id=a.assignment_id)"""
+        ).fetchall():
+            task = dict(raw)
+            meeting = conn.execute("SELECT * FROM meetings WHERE meeting_id=?",
+                                   (task["origin_meeting_id"],)).fetchone()
+            self._register_tracked_item(conn, {
+                **task, "tag": "action", "body": task["title"],
+                "record_type": "assignment", "record_id": task["assignment_id"],
+            }, dict(meeting) if meeting else None, historical=True)
+            changed = True
+        for raw in conn.execute(
+            """SELECT e.* FROM meeting_entries e JOIN meetings m USING(meeting_id)
+            WHERE e.item_id IS NULL AND m.deleted_at IS NULL
+            ORDER BY m.meeting_date,m.created_at,e.position,e.entry_id"""
+        ).fetchall():
+            entry = dict(raw)
+            meeting = dict(conn.execute("SELECT * FROM meetings WHERE meeting_id=?",
+                                        (entry["meeting_id"],)).fetchone())
+            ident = self._register_tracked_item(conn, entry, meeting, historical=True)
+            conn.execute("UPDATE meeting_entries SET item_id=? WHERE entry_id=?", (ident, entry["entry_id"]))
+            changed = True
+        return changed
+
+    def _item_snapshot(self, conn, ident: str) -> dict:
+        raw = conn.execute("SELECT * FROM tracked_items WHERE item_id=?", (ident,)).fetchone()
+        if raw is None:
+            raise ValueError("tracked item not found")
+        row = dict(raw)
+        task = None
+        if row["record_type"] == "assignment" and row["record_id"]:
+            task = self._entity_row(conn, "assignment", row["record_id"])
+            if task is None:
+                raise ValueError("tracked task is missing its assignment")
+        linked = None
+        tables = {
+            "roadblock": ("roadblocks", "roadblock_id"),
+            "feedback": ("feedback_items", "feedback_id"),
+            "assignment_update": ("assignment_updates", "update_id"),
+        }
+        if row["record_type"] in tables and row["record_id"]:
+            table, key = tables[row["record_type"]]
+            linked = conn.execute(f"SELECT * FROM {table} WHERE {key}=?", (row["record_id"],)).fetchone()
+            if linked is None:
+                raise ValueError("tracked item is missing its linked record")
+            linked = dict(linked)
+        return {"item": row, "assignment": task, "linked": linked}
+
+    def _item_projection(self, conn, ident: str, audience: str) -> dict | None:
+        snapshot = self._item_snapshot(conn, ident)
+        row, task = snapshot["item"], snapshot["assignment"]
+        linked = snapshot["linked"]
+        if audience == "shared" and (
+            (task["visibility"] if task else row["visibility"]) != "shared"
+            or linked and linked.get("visibility", "shared") != "shared"
+        ):
+            return None
+        result = {k: row[k] for k in (
+            "item_id", "member_key", "item_type", "body", "status", "priority", "owner",
+            "target_date", "visibility", "created_at", "updated_at",
+        )}
+        result["follow_up"] = bool(row["follow_up"])
+        result["fields"] = json.loads(row["fields_json"]) if row["fields_json"] else None
+        if task:
+            result.update(
+                body=task["title"], status=task["status"], priority=task["priority"],
+                owner_key=task["member_key"], owner_label=task["owner_label"],
+                target_date=task["target_date"], category=task["category"],
+                assignment_id=task["assignment_id"],
+                visibility=task["visibility"],
+            )
+            lead = self._lead_key(conn)
+            result["owner"] = "member" if task["owner_label"] == "manager" else (
+                "me" if task["member_key"] == lead else "member"
+            )
+            result["fields"] = {
+                "title": task["title"], "owner": result["owner"], "priority": task["priority"],
+                "category": task["category"],
+                **{k: task[k] for k in ("description", "target_date", "jira_key") if task[k]},
+            }
+            assignment = self._assignment_projection(conn, task["assignment_id"], audience)
+            result["updates"], result["refs"] = assignment["updates"], assignment["refs"]
+            if audience == "private":
+                result["assignment_revision"] = assignment["revision"]
+        else:
+            if row["record_type"] == "roadblock" and row["record_id"]:
+                roadblock = conn.execute("SELECT status FROM roadblocks WHERE roadblock_id=?",
+                                         (row["record_id"],)).fetchone()
+                if roadblock and roadblock["status"] == "resolved" and result["status"] != "cancelled":
+                    result["status"] = "done"
+                if result["fields"] is not None and roadblock:
+                    result["fields"]["status"] = roadblock["status"]
+            result["updates"] = [
+                dict(r) for r in conn.execute(
+                    """SELECT update_id,note,visibility,created_at FROM item_updates
+                    WHERE item_id=? ORDER BY created_at,update_id""", (ident,)
+                ) if audience == "private" or r["visibility"] == "shared"
+            ]
+        result["occurrences"] = []
+        for raw in conn.execute(
+            """SELECT e.entry_id,e.body,e.visibility,e.follow_up_from,m.meeting_id,m.meeting_date,
+            m.title,m.title_visibility FROM meeting_entries e JOIN meetings m USING(meeting_id)
+            WHERE e.item_id=? AND m.deleted_at IS NULL ORDER BY m.meeting_date,m.created_at,e.position""",
+            (ident,),
+        ):
+            if audience == "shared" and raw["visibility"] != "shared":
+                continue
+            occurrence = {k: raw[k] for k in (
+                "entry_id", "body", "follow_up_from", "meeting_id", "meeting_date",
+            )}
+            occurrence["title"] = raw["title"] if audience == "private" or raw["title_visibility"] == "shared" else "1:1 session"
+            result["occurrences"].append(occurrence)
+        revision = domain_db.revision(snapshot)
+        result["revision" if audience == "private" else "edit_token"] = revision
+        return result
+
+    def _entry_shared(self, conn, entry: dict) -> bool:
+        return entry["visibility"] == "shared" and (
+            not entry.get("item_id") or self._item_projection(conn, entry["item_id"], "shared") is not None
+        )
+
+    def _prepare_meeting(self, data: dict) -> dict:
+        _keys(data, {"member_key", "meeting_date", "session_type"}, {"member_key"})
+        day = data.get("meeting_date") or date.today().isoformat()
+        _day(day, "meeting_date")
+        session_type = data.get("session_type", "one_on_one")
+        if session_type not in LOG_TYPES:
+            raise ValueError("invalid log type")
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM members WHERE member_key=?", (data["member_key"],)).fetchone():
+                raise ValueError("member not found")
+            entries = self._follow_up_entries(conn, data["member_key"], day) if session_type == "one_on_one" else []
+        return {"meeting_date": day, "session_type": session_type, "entries": entries}
+
+    def _follow_up_entries(self, conn, member: str, day: str) -> list[dict]:
+        entries = []
+        for raw in conn.execute(
+            "SELECT item_id FROM tracked_items WHERE follow_up=1 ORDER BY created_at,item_id"
+        ).fetchall():
+            item = self._item_projection(conn, raw[0], "private")
+            if item["status"] in {"done", "cancelled"}:
+                continue
+            source = conn.execute(
+                """SELECT m.meeting_date FROM meeting_entries e JOIN meetings m USING(meeting_id)
+                WHERE e.item_id=? AND m.member_key=? AND m.session_type='one_on_one'
+                AND m.deleted_at IS NULL
+                ORDER BY m.meeting_date DESC,m.created_at DESC LIMIT 1""", (raw[0], member)
+            ).fetchone()
+            if not source:
+                has_occurrence = conn.execute(
+                    "SELECT 1 FROM meeting_entries WHERE item_id=? LIMIT 1", (raw[0],)
+                ).fetchone()
+                if has_occurrence or not item.get("assignment_id") or item["owner_key"] != member:
+                    continue
+                source_day = item["created_at"][:10]
+            else:
+                source_day = source[0]
+            if source_day > day:
+                continue
+            entry = {
+                "entry_id": f"me-{uuid4().hex}",
+                "tag": item["item_type"], "body": item["body"], "priority": item["priority"],
+                "visibility": item["visibility"], "item_id": item["item_id"],
+                "item_revision": item["revision"], "tracking_status": item["status"],
+                "tracking_owner": item["owner"], "tracking_due": item["target_date"],
+                "follow_up": True, "follow_up_from": source_day,
+            }
+            if item["fields"] is not None:
+                entry["fields"] = item["fields"]
+            if item.get("assignment_id"):
+                entry["record_id"], entry["locked"] = item["assignment_id"], True
+            entries.append(entry)
+        return entries
+
+    def _bind_item(self, conn, meeting: dict, entry: dict, previous: dict | None) -> dict | None:
+        ident = entry.get("item_id") or (
+            previous.get("item_id") if previous and previous["tag"] == entry["tag"] else None
+        )
+        if not ident:
+            return None
+        snapshot = self._item_snapshot(conn, ident)
+        item = snapshot["item"]
+        if item["item_type"] != entry["tag"]:
+            raise ValueError("tracked item type mismatch")
+        if previous and previous.get("item_id") != ident:
+            raise ValueError("a saved row cannot change its tracked item identity")
+        if not previous:
+            eligible = {e["item_id"]: e for e in self._follow_up_entries(
+                conn, meeting["member_key"], meeting["meeting_date"]
+            )} if meeting["session_type"] == "one_on_one" else {}
+            if ident not in eligible:
+                raise ValueError("item is not an eligible follow-up for this member and date")
+            entry["follow_up_from"] = eligible[ident]["follow_up_from"]
+        if entry.get("item_revision") is not None:
+            if domain_db.revision(snapshot) != entry["item_revision"]:
+                raise ValueError("stale item revision; reload before saving")
+        elif not previous or any(k in entry for k in (
+            "follow_up", "tracking_status", "tracking_owner", "tracking_due"
+        )):
+            raise ValueError("tracked item revision is required")
+        entry["item_id"] = ident
+        entry["record_type"], entry["record_id"] = item["record_type"], item["record_id"]
+        return item
+
+    def _store_item(self, conn, meeting: dict, entry: dict, item: dict | None, stamp: str) -> None:
+        if item is None:
+            entry["item_id"] = self._register_tracked_item(conn, entry, meeting)
+            item = self._item_snapshot(conn, entry["item_id"])["item"]
+        updates = {"updated_at": stamp}
+        newest = conn.execute(
+            """SELECT m.meeting_id,m.meeting_date,m.created_at FROM meeting_entries e JOIN meetings m USING(meeting_id)
+            WHERE e.item_id=? AND m.deleted_at IS NULL ORDER BY m.meeting_date DESC,m.created_at DESC LIMIT 1""",
+            (entry["item_id"],),
+        ).fetchone()
+        if not newest or newest[0] == meeting["meeting_id"] or (
+            meeting["meeting_date"], meeting["created_at"]
+        ) >= (newest["meeting_date"], newest["created_at"]):
+            updates.update(body=entry["body"], fields_json=(
+                json.dumps(entry["fields"], ensure_ascii=False) if entry["fields"] is not None else None
+            ), priority=entry["priority"], visibility=entry["visibility"],
+                           record_type=entry.get("record_type"), record_id=entry.get("record_id"))
+        for key, column in (
+            ("follow_up", "follow_up"), ("tracking_status", "status"),
+            ("tracking_owner", "owner"), ("tracking_due", "target_date"),
+        ):
+            if key in entry:
+                updates[column] = int(entry[key]) if key == "follow_up" else entry[key]
+        if "follow_up" not in entry and entry["tag"] == "discussion" and entry["fields"] is not None:
+            updates["follow_up"] = int(entry["fields"].get("follow_up", False))
+        if entry.get("record_type") == "assignment":
+            task_updates = {k: updates.pop(k) for k in ("status", "owner", "target_date") if k in updates}
+            if task_updates:
+                self._set_item_task_fields(conn, entry["record_id"], meeting["member_key"], task_updates, stamp)
+        elif entry.get("record_type") == "roadblock" and "status" in updates:
+            self._set_item_roadblock_status(conn, entry["record_id"], updates["status"], stamp)
+        conn.execute(f"UPDATE tracked_items SET {','.join(k+'=?' for k in updates)} WHERE item_id=?",
+                     (*updates.values(), entry["item_id"]))
+        domain_db.audit(conn, "tracked-item", entry["item_id"], "save", {"meeting_id": meeting["meeting_id"]})
+
+    def _set_item_task_fields(self, conn, ident: str, member: str, updates: dict, stamp: str) -> None:
+        if "status" in updates and updates["status"] not in ASSIGNMENT_STATUSES:
+            raise ValueError("invalid task status")
+        if "owner" in updates:
+            owner = updates.pop("owner")
+            lead = self._lead_key(conn)
+            if owner not in {"me", "member"} or owner == "me" and not lead:
+                raise ValueError("task owner must be a member or configured lead")
+            updates["member_key"] = lead if owner == "me" else member
+            updates["owner_label"] = "manager" if owner == "member" and member == lead else updates["member_key"]
+        updates["updated_at"] = stamp
+        self._validate_assignment(updates)
+        conn.execute(f"UPDATE assignments SET {','.join(k+'=?' for k in updates)} WHERE assignment_id=?",
+                     (*updates.values(), ident))
+        domain_db.audit(conn, "assignment", ident, "item-update", updates)
+
+    def _set_item_roadblock_status(self, conn, ident: str, status: str, stamp: str) -> None:
+        resolved = status in {"done", "cancelled"}
+        conn.execute(
+            """UPDATE roadblocks SET status=?,resolved_at=?,updated_at=? WHERE roadblock_id=?""",
+            ("resolved" if resolved else "open", stamp if resolved else None, stamp, ident),
+        )
+
+    def _apply_item_patch(self, conn, snapshot: dict, values: dict, stamp: str) -> None:
+        item, task = snapshot["item"], snapshot["assignment"]
+        updates = dict(values)
+        self._validate_tracking(updates, task=bool(task))
+        if "follow_up" in updates:
+            updates["follow_up"] = int(updates["follow_up"])
+        if task:
+            task_updates = {k: updates.pop(k) for k in (
+                "status", "priority", "owner", "target_date", "visibility"
+            ) if k in updates}
+            if task_updates:
+                self._set_item_task_fields(conn, task["assignment_id"], item["member_key"], task_updates, stamp)
+                if "visibility" in task_updates:
+                    updates["visibility"] = task_updates["visibility"]
+        elif item["record_type"] == "roadblock" and "status" in updates:
+            self._set_item_roadblock_status(conn, item["record_id"], updates["status"], stamp)
+        if not task and "visibility" in updates and item["record_type"] in {"roadblock", "feedback"}:
+            table, key = ("roadblocks", "roadblock_id") if item["record_type"] == "roadblock" else (
+                "feedback_items", "feedback_id"
+            )
+            conn.execute(f"UPDATE {table} SET visibility=?,updated_at=? WHERE {key}=?",
+                         (updates["visibility"], stamp, item["record_id"]))
+        updates["updated_at"] = stamp
+        conn.execute(f"UPDATE tracked_items SET {','.join(k+'=?' for k in updates)} WHERE item_id=?",
+                     (*updates.values(), item["item_id"]))
+        domain_db.audit(conn, "tracked-item", item["item_id"], "update", updates)
+
+    def _mutate_item(self, action: str, data: dict) -> dict:
+        allowed = {"id", "revision", "status", "priority", "owner", "target_date", "follow_up", "visibility"}
+        if action == "item-note":
+            allowed = {"id", "revision", "note", "visibility"}
+        _keys(data, allowed, {"id", "revision"} | ({"note"} if action == "item-note" else set()))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot = self._item_snapshot(conn, data["id"])
+            if domain_db.revision(snapshot) != data["revision"]:
+                raise ValueError("stale item revision; reload before saving")
+            item, task, stamp = snapshot["item"], snapshot["assignment"], _stamp()
+            if action == "item-note":
+                _text(data["note"], "note")
+                visibility = _visibility(data.get("visibility", "private"))
+                table, key = ("assignment_updates", "assignment_id") if task else ("item_updates", "item_id")
+                columns = f"update_id,{key},note,visibility,created_at" + (",author" if task else "")
+                values = (f"iu-{uuid4().hex}", task["assignment_id"] if task else item["item_id"],
+                          data["note"], visibility, stamp) + (("team-manager",) if task else ())
+                conn.execute(f"INSERT INTO {table}({columns}) VALUES({','.join('?' for _ in values)})", values)
+                if task:
+                    conn.execute("UPDATE assignments SET updated_at=? WHERE assignment_id=?",
+                                 (stamp, task["assignment_id"]))
+                updates = {"updated_at": stamp}
+            else:
+                self._apply_item_patch(conn, snapshot, {
+                    k: v for k, v in data.items() if k not in {"id", "revision"}
+                }, stamp)
+                return self._item_projection(conn, item["item_id"], "private")
+            conn.execute(f"UPDATE tracked_items SET {','.join(k+'=?' for k in updates)} WHERE item_id=?",
+                         (*updates.values(), item["item_id"]))
+            domain_db.audit(conn, "tracked-item", item["item_id"], action, updates)
+            return self._item_projection(conn, item["item_id"], "private")
+
+    def _validate_tracking(self, values: dict, *, task=False) -> None:
+        if "status" in values and values["status"] not in (ASSIGNMENT_STATUSES if task else ITEM_STATUSES):
+            raise ValueError("invalid item status")
+        if "priority" in values and values["priority"] not in LOG_ITEM_PRIORITIES:
+            raise ValueError("invalid item priority")
+        if "owner" in values and values["owner"] not in {None, "me", "member"}:
+            raise ValueError("invalid item owner")
+        if "target_date" in values and values["target_date"] is not None:
+            _day(values["target_date"], "target_date")
+        if "follow_up" in values and not isinstance(values["follow_up"], bool):
+            raise ValueError("follow_up must be a boolean")
+        if "visibility" in values:
+            _visibility(values["visibility"])
 
     def _assignment_projection(self, conn, ident: str, audience: str) -> dict | None:
         row = self._entity_row(conn, "assignment", ident)
@@ -286,12 +702,18 @@ class TeamPortalMixin:
         calendar = self.calendar(audience)
         result = {
             "audience": audience, "as_of": when.isoformat(), "generated_at": _stamp(),
-            "members": [], "meetings": [], "assignments": [], "feedback": [],
+            "members": [], "meetings": [], "assignments": [], "items": [], "feedback": [],
             "calendar": calendar, "metrics": {},
             "task_categories": list(TASK_CATEGORIES), "log_types": LOG_TYPES,
-            "log_item_types": LOG_ITEM_TYPES, "manager_name": MANAGER_NAME,
+            "log_item_types": LOG_ITEM_TYPES, "log_item_priorities": list(LOG_ITEM_PRIORITIES),
+            "item_statuses": list(ITEM_STATUSES),
+            "manager_name": MANAGER_NAME,
         }
         with self.connect() as conn:
+            for row in conn.execute("SELECT item_id FROM tracked_items ORDER BY updated_at DESC,item_id"):
+                item = self._item_projection(conn, row[0], audience)
+                if item is not None:
+                    result["items"].append(item)
             for row in conn.execute("SELECT * FROM members ORDER BY display_name,member_key"):
                 member = dict(row)
                 key = member["member_key"]
@@ -337,7 +759,7 @@ class TeamPortalMixin:
                 result["feedback"] = self.list_entities("feedback", None)
         return result
 
-    def _save_meeting(self, data: dict, *, create: bool) -> dict:
+    def _save_meeting(self, data: dict, *, create: bool, shared_only: bool = False) -> dict:
         allowed = {
             "id", "revision", "member_key", "meeting_date", "title", "state",
             "entries", "visibility", "title_visibility", "action_items", "session_type",
@@ -345,6 +767,10 @@ class TeamPortalMixin:
         required = {"member_key", "entries"} if create else {
             "id", "revision", "meeting_date", "title", "entries",
         }
+        if shared_only:
+            allowed = {"id", "revision", "meeting_date", "title", "title_visibility",
+                       "entries", "session_type"}
+            required = {"id", "revision", "meeting_date", "entries"}
         _keys(data, allowed, required)
         data = dict(data)
         data["meeting_date"] = data.get("meeting_date") or date.today().isoformat()
@@ -376,7 +802,9 @@ class TeamPortalMixin:
         for pos, raw in enumerate(data["entries"]):
             if not isinstance(raw, dict):
                 raise ValueError("each entry must be an object")
-            _keys(raw, {"entry_id", "id", "tag", "body", "visibility", "fields"}, {"tag"})
+            _keys(raw, {"entry_id", "id", "tag", "body", "visibility", "priority", "fields",
+                        "item_id", "item_revision", "follow_up", "follow_up_from",
+                        "tracking_status", "tracking_owner", "tracking_due"}, {"tag"})
             if "id" in raw and "entry_id" in raw and raw["id"] != raw["entry_id"]:
                 raise ValueError("entry id aliases disagree")
             ident = raw.get("entry_id") or raw.get("id") or f"me-{uuid4().hex}"
@@ -389,15 +817,34 @@ class TeamPortalMixin:
             if tag in LOG_ITEM_TYPES and "fields" in raw:
                 fields = _item_fields(tag, raw["fields"])
                 body = _item_summary(tag, fields)
-                if LOG_ITEM_TYPES[tag].get("always_private"):
-                    visibility = "private"
             else:
                 if "body" not in raw:
                     raise ValueError("missing required fields: ['body']")
                 fields, body = None, _text(raw["body"], "body", empty=True)
+            priority = raw.get(
+                "priority", fields.get("priority", "medium") if tag == "action" and fields else "medium"
+            )
+            if priority not in LOG_ITEM_PRIORITIES:
+                raise ValueError(f"invalid log item priority: {priority}")
+            if fields is not None and tag == "action":
+                fields["priority"] = priority
+            if shared_only and visibility != "shared":
+                raise ValueError("Presentation edits can only save shared log items")
+            tracking = {column: raw[key] for key, column in (
+                ("tracking_status", "status"), ("tracking_owner", "owner"),
+                ("tracking_due", "target_date"), ("follow_up", "follow_up"),
+            ) if key in raw}
+            self._validate_tracking(tracking, task=tag == "action" and fields is not None)
+            for key in ("item_id", "item_revision"):
+                if key in raw:
+                    _text(raw[key], key)
             entries.append({
                 "entry_id": ident, "tag": tag, "body": body, "fields": fields,
-                "visibility": visibility, "position": pos,
+                "visibility": visibility, "priority": priority, "position": pos,
+                **{k: raw[k] for k in (
+                    "item_id", "item_revision", "follow_up", "tracking_status", "tracking_owner",
+                    "tracking_due",
+                ) if k in raw},
             })
         ident = data.get("id") if not create else f"mtg-{uuid4().hex}"
         stamp = _stamp()
@@ -428,8 +875,13 @@ class TeamPortalMixin:
                 before = self._meeting_snapshot(conn, ident)
                 if domain_db.revision(before) != data["revision"]:
                     raise ValueError("stale revision; re-read meeting before saving")
+                if before.get("deleted_at") is not None:
+                    raise ValueError("meeting was deleted")
                 if data.get("member_key", before["member_key"]) != before["member_key"]:
                     raise ValueError("meeting member cannot change")
+                if (shared_only and before["title_visibility"] != "shared"
+                        and ("title" in data or "title_visibility" in data)):
+                    raise ValueError("hidden topic cannot be edited in Presentation mode")
                 session_type = data.get("session_type", before["session_type"])
                 data["title"] = (data.get("title") or "").strip() or before["title"]
                 if "state" not in data:
@@ -460,15 +912,75 @@ class TeamPortalMixin:
                 f"UPDATE meetings SET {','.join(k+'=?' for k in updates)} WHERE meeting_id=?",
                 (*updates.values(), ident),
             )
-            previous = {r["entry_id"]: dict(r) for r in conn.execute(
-                "SELECT * FROM meeting_entries WHERE meeting_id=?", (ident,))}
+            previous_rows = [dict(r) for r in conn.execute(
+                """SELECT * FROM meeting_entries WHERE meeting_id=?
+                ORDER BY position,created_at,entry_id""", (ident,))]
+            previous = {r["entry_id"]: r for r in previous_rows}
+            if shared_only:
+                submitted = {e["entry_id"]: e for e in entries}
+                merged = []
+                for old in previous_rows:
+                    replacement = submitted.pop(old["entry_id"], None)
+                    if not self._entry_shared(conn, old):
+                        if replacement:
+                            raise ValueError("private log items cannot be edited in Presentation mode")
+                        merged.append({
+                            "entry_id": old["entry_id"], "tag": old["tag"], "body": old["body"],
+                            "fields": _entry_fields(old), "visibility": old["visibility"],
+                            "priority": old["priority"], "position": old["position"],
+                            "record_type": old["record_type"], "record_id": old["record_id"],
+                            "item_id": old["item_id"], "follow_up_from": old["follow_up_from"],
+                            "preserve_tracking": True,
+                        })
+                    elif replacement:
+                        merged.append(replacement)
+                entries = merged + list(submitted.values())
             meeting = dict(conn.execute("SELECT * FROM meetings WHERE meeting_id=?", (ident,)).fetchone())
+            item_ids = set()
+            bindings = {}
             for e in entries:
+                if e.get("preserve_tracking"):
+                    continue
+                old = previous.get(e["entry_id"])
+                item = self._bind_item(conn, meeting, e, old)
+                if shared_only and item and self._item_projection(conn, item["item_id"], "shared") is None:
+                    raise ValueError("private tracked items cannot be edited in Presentation mode")
+                if e.get("item_id") in item_ids:
+                    raise ValueError("duplicate tracked item in meeting")
+                if e.get("item_id"):
+                    item_ids.add(e["item_id"])
+                bindings[e["entry_id"]] = item
+            for e in entries:
+                if e.pop("preserve_tracking", False):
+                    continue
+                old = previous.get(e["entry_id"])
+                item = bindings[e["entry_id"]]
+                e["follow_up_from"] = old.get("follow_up_from") if old else e.get("follow_up_from")
+                latest = conn.execute(
+                    """SELECT m.meeting_id,m.meeting_date,m.created_at FROM meeting_entries e
+                    JOIN meetings m USING(meeting_id) WHERE e.item_id=? AND m.deleted_at IS NULL
+                    ORDER BY m.meeting_date DESC,m.created_at DESC LIMIT 1""", (e.get("item_id"),)
+                ).fetchone()
+                historical_edit = old and latest and latest["meeting_id"] != ident and (
+                    latest["meeting_date"], latest["created_at"]
+                ) > (meeting["meeting_date"], meeting["created_at"])
+                unchanged_carry = item and not old and e["fields"] == (
+                    json.loads(item["fields_json"]) if item["fields_json"] else None
+                )
                 if e["fields"] is not None:
-                    self._sync_item(conn, meeting, e, previous.get(e["entry_id"]), stamp)
-                elif previous.get(e["entry_id"]):
-                    old_entry = previous[e["entry_id"]]
-                    e["record_type"], e["record_id"] = old_entry["record_type"], old_entry["record_id"]
+                    if old and old["tag"] != e["tag"] and not old.get("record_id"):
+                        self._drop_item_record(conn, old)
+                    if not unchanged_carry and not historical_edit:
+                        if item and not old and e["tag"] == "status":
+                            e["record_type"], e["record_id"] = None, None
+                        self._sync_item(conn, meeting, e, old, stamp)
+                elif old:
+                    old_entry = old
+                    if old_entry["tag"] == e["tag"]:
+                        e["record_type"], e["record_id"] = old_entry["record_type"], old_entry["record_id"]
+                    else:
+                        self._drop_item_record(conn, old_entry)
+                self._store_item(conn, meeting, e, item, stamp)
             kept = {e["entry_id"] for e in entries}
             for old_entry in previous.values():
                 if old_entry["entry_id"] not in kept:
@@ -477,12 +989,13 @@ class TeamPortalMixin:
             for e in entries:
                 conn.execute(
                     """INSERT INTO meeting_entries(
-                      entry_id,meeting_id,tag,body,visibility,actor,created_at,position,
-                      fields_json,record_type,record_id
-                    ) VALUES(?,?,?,?,?,'team-manager',?,?,?,?,?)""",
-                    (e["entry_id"], ident, e["tag"], e["body"], e["visibility"], stamp, e["position"],
+                      entry_id,meeting_id,tag,body,visibility,priority,actor,created_at,position,
+                      fields_json,record_type,record_id,item_id,follow_up_from
+                    ) VALUES(?,?,?,?,?,?,'team-manager',?,?,?,?,?,?,?)""",
+                    (e["entry_id"], ident, e["tag"], e["body"], e["visibility"], e["priority"],
+                     stamp, e["position"],
                      json.dumps(e["fields"], ensure_ascii=False) if e["fields"] is not None else None,
-                     e.get("record_type"), e.get("record_id")),
+                     e.get("record_type"), e.get("record_id"), e.get("item_id"), e.get("follow_up_from")),
                 )
             snapshot = self._meeting_snapshot(conn, ident)
             for item in actions:
@@ -514,8 +1027,11 @@ class TeamPortalMixin:
     def _sync_item(self, conn, meeting: dict, e: dict, prev: dict | None, stamp: str) -> None:
         """Create or update the record a typed log item owns; links it back onto the entry."""
         tag, f = e["tag"], e["fields"]
-        if prev and prev.get("record_id") and prev.get("tag") == tag:
-            e["record_type"], e["record_id"] = prev["record_type"], prev["record_id"]
+        if prev and prev.get("record_id"):
+            if prev.get("tag") == tag:
+                e["record_type"], e["record_id"] = prev["record_type"], prev["record_id"]
+            else:
+                self._drop_item_record(conn, prev)
         member, day = meeting["member_key"], meeting["meeting_date"]
         lead = self._lead_key(conn)
         if tag == "action":
@@ -524,6 +1040,12 @@ class TeamPortalMixin:
                 if prev and prev.get("fields_json"):
                     e["fields"] = json.loads(prev["fields_json"])
                     e["body"] = _item_summary(tag, e["fields"])
+                task = conn.execute(
+                    "SELECT priority FROM assignments WHERE assignment_id=?", (e["record_id"],)
+                ).fetchone()
+                if task:
+                    e["priority"] = task["priority"]
+                    e["fields"]["priority"] = task["priority"]
                 return
             owner = f.get("owner", "member")
             owner_key, owner_label = member, member
@@ -544,6 +1066,12 @@ class TeamPortalMixin:
             domain_db.audit(conn, "assignment", asg, "create", {"origin_meeting_id": meeting["meeting_id"]})
             e["record_type"], e["record_id"] = "assignment", asg
         elif tag == "status":
+            if not f.get("assignment_id"):
+                if e.get("record_id"):
+                    conn.execute("DELETE FROM assignment_updates WHERE update_id=?", (e["record_id"],))
+                    e["record_type"], e["record_id"] = None, None
+                e["body"] = _item_summary(tag, f)
+                return
             task = conn.execute(
                 "SELECT assignment_id,title,status FROM assignments WHERE assignment_id=?", (f["assignment_id"],)
             ).fetchone()
@@ -619,7 +1147,21 @@ class TeamPortalMixin:
     def _drop_item_record(self, conn, entry: dict) -> None:
         """A removed log item takes its owned record along; tasks survive in Tasks."""
         kind, rid = entry.get("record_type"), entry.get("record_id")
-        if not rid or kind == "assignment":
+        if kind == "assignment":
+            return
+        if entry.get("item_id"):
+            other = conn.execute(
+                """SELECT 1 FROM meeting_entries e JOIN meetings m USING(meeting_id)
+                WHERE e.item_id=? AND e.entry_id<>? AND m.deleted_at IS NULL LIMIT 1""",
+                (entry["item_id"], entry["entry_id"]),
+            ).fetchone()
+            if other:
+                return
+            conn.execute(
+                """UPDATE tracked_items SET status='cancelled',follow_up=0,record_type=NULL,
+                record_id=NULL,updated_at=? WHERE item_id=?""", (_stamp(), entry["item_id"])
+            )
+        if not rid:
             return
         if kind == "assignment_update":
             conn.execute("DELETE FROM assignment_updates WHERE update_id=?", (rid,))
@@ -629,6 +1171,33 @@ class TeamPortalMixin:
         elif kind == "feedback":
             conn.execute("DELETE FROM feedback_items WHERE feedback_id=?", (rid,))
         domain_db.audit(conn, kind, rid, "delete", {"entry_id": entry["entry_id"]})
+
+    def _delete_meeting(self, data: dict) -> dict:
+        _keys(data, {"id", "revision"}, {"id", "revision"})
+        _text(data["id"], "id")
+        _text(data["revision"], "revision")
+        ident = data["id"]
+        stamp = _stamp()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            before = self._meeting_snapshot(conn, ident)
+            if domain_db.revision(before) != data["revision"]:
+                raise ValueError("stale revision; re-read meeting before deleting")
+            if before.get("deleted_at") is not None:
+                raise ValueError("meeting was deleted")
+            self._remember_meeting(conn, before)
+            for entry in before["entries"]:
+                self._drop_item_record(conn, entry)
+            conn.execute(
+                "UPDATE meetings SET deleted_at=?,updated_at=? WHERE meeting_id=?",
+                (stamp, stamp, ident),
+            )
+            after = self._meeting_snapshot(conn, ident)
+            revision = self._remember_meeting(conn, after)
+            domain_db.audit(conn, "meeting", ident, "delete", {
+                "member_key": before["member_key"], "entries": len(before["entries"]),
+            })
+        return {"meeting_id": ident, "deleted_at": stamp, "revision": revision}
 
     def _link_roadblock_raid(self, data: dict) -> dict:
         _keys(data, {"roadblock_id", "raid_id"}, {"roadblock_id", "raid_id"})
@@ -768,13 +1337,18 @@ class TeamPortalMixin:
         return next(b for b in self.calendar()["baselines"] if b["baseline_id"] == ident)
 
     def portal_mutate(self, action: str, data: dict) -> dict:
-        """Private-only owner mutation facade. Fields are flat, not nested patches."""
+        """Validate owner mutations; shared-log edits are limited to shared-visible data."""
         if not isinstance(data, dict):
             raise ValueError("mutation data must be an object")
         data = dict(data)
         if action == "bulk-set":
             return self._bulk_set(data)
-        if action == "member-add":
+        if action == "meeting-prepare":
+            return {"ok": True, "action": action, "entity": self._prepare_meeting(data)}
+        if action in {"item-set", "item-note"}:
+            entity = self._mutate_item(action, data)
+            ident = entity["item_id"]
+        elif action == "member-add":
             _keys(data, set(self.MEMBER_EDITABLE) | {"member_key"}, {"member_key", "display_name"})
             ident = data.pop("member_key")
             self.add_member(ident, data)
@@ -786,6 +1360,16 @@ class TeamPortalMixin:
             entity = self.get_member(ident)
         elif action in {"meeting-create", "meeting-save"}:
             entity = self._save_meeting(data, create=action == "meeting-create")
+            ident = entity["meeting_id"]
+        elif action == "meeting-shared-save":
+            saved = self._save_meeting(data, create=False, shared_only=True)
+            ident = saved["meeting_id"]
+            with self.connect() as conn:
+                entity = self._meeting_projection(conn, ident, "shared")
+            if entity is None:
+                entity = {"meeting_id": ident}
+        elif action == "meeting-delete":
+            entity = self._delete_meeting(data)
             ident = entity["meeting_id"]
         elif action in {"assignment-create", "assignment-set", "assignment-note", "note"}:
             entity = self._mutate_assignment(action, data)
@@ -808,6 +1392,8 @@ class TeamPortalMixin:
         _keys(data, {"entity_type", "member_key", "items", "field", "value"},
               {"entity_type", "member_key", "items", "field", "value"})
         entity_type, field, value = data["entity_type"], data["field"], data["value"]
+        if entity_type == "item":
+            return self._bulk_set_items(data)
         allowed = {
             "assignment": {"category", "priority", "status", "target_date"},
             "meeting": {"session_type", "meeting_date", "title_visibility"},
@@ -846,7 +1432,8 @@ class TeamPortalMixin:
             for item in items:
                 row = (self._meeting_snapshot(conn, item["id"]) if entity_type == "meeting"
                        else self._entity_row(conn, "assignment", item["id"]))
-                if row is None or row["member_key"] != data["member_key"]:
+                if (row is None or row["member_key"] != data["member_key"]
+                        or entity_type == "meeting" and row.get("deleted_at") is not None):
                     raise ValueError(f"missing {entity_type} for member: {item['id']}")
                 if domain_db.revision(row) != item["revision"]:
                     raise ValueError(f"stale revision for {item['id']}; reload before saving; no rows changed")
@@ -864,6 +1451,36 @@ class TeamPortalMixin:
                     self._remember_meeting(conn, self._meeting_snapshot(conn, ident))
                 domain_db.audit(conn, entity_type, ident, "bulk-update", {field: value})
         return {"ok": True, "action": "bulk-set", "count": len(items)}
+
+    def _bulk_set_items(self, data: dict) -> dict:
+        field = data["field"]
+        if field not in {"status", "priority", "target_date", "follow_up"}:
+            raise ValueError("unsupported bulk item field")
+        rows = data["items"]
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 500:
+            raise ValueError("bulk edit requires 1 to 500 items")
+        ids = set()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshots = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("bulk items must be objects")
+                _keys(row, {"id", "revision"}, {"id", "revision"})
+                if row["id"] in ids:
+                    raise ValueError("duplicate bulk item")
+                ids.add(row["id"])
+                snapshot = self._item_snapshot(conn, row["id"])
+                item, task = snapshot["item"], snapshot["assignment"]
+                if data["member_key"] not in {item["member_key"], task["member_key"] if task else None}:
+                    raise ValueError("item belongs to another member")
+                if domain_db.revision(snapshot) != row["revision"]:
+                    raise ValueError("stale item revision; no rows changed")
+                self._validate_tracking({field: data["value"]}, task=bool(task))
+                snapshots.append(snapshot)
+            for snapshot in snapshots:
+                self._apply_item_patch(conn, snapshot, {field: data["value"]}, _stamp())
+        return {"ok": True, "action": "bulk-set", "count": len(rows)}
 
     def _mutate_assignment(self, action: str, data: dict) -> dict:
         fields = {

@@ -50,7 +50,9 @@ This skill is the unified owner replacing legacy `one-on-one` and `team-planner`
 ## Data policy
 
 1. Database-first: write and read through owner API/CLI only.
-2. Keep private data private by default; shared payloads are allowlisted.
+2. Keep private data private by default outside member logs; new member-log
+   visibility controls default to Presentation, including Personal. Shared
+   payloads remain filtered by each entry's saved visibility.
 3. Unknown values remain unknown (never auto-zero or invented).
 4. Do not duplicate external authorities (Jira/GitHub/RAID/task DB); store typed references and observed facts.
 5. Use append-only event notes for timeline/provenance.

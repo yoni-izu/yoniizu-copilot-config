@@ -24,6 +24,25 @@ Assignments can represent:
 - broad direction (multi-ticket, cross-team)
 - concrete short task (including one-Jira-task tracking)
 
+### Tracked 1:1 items
+
+Each log row is a persistent item. Use the member Items tab to filter types,
+change lifecycle/priority/ownership/due date, append updates and view its meeting
+history. Tasks are one item type and retain their existing assignment lifecycle.
+Check Follow up next 1:1 on any row to include it in subsequent new 1:1 drafts
+with that member. Clear the flag after discussing it, or mark Done/Cancelled to
+stop carrying it. The new occurrence is labelled with its source date and does
+not create another task. Historical text remains in the original meeting.
+
+Before a schema upgrade, stop competing writers and take a private backup:
+
+```bash
+team.py backup ~/.copilot-private/team-portal/state/backups/team-before-upgrade.db
+```
+
+The destination must not already exist. Rehearse the upgrade on a backup copy
+before running the owner initializer against the live store.
+
 ### Portal single-field and batch edits
 
 Inline task/log editing uses the ordinary revision-checked owner mutations.
