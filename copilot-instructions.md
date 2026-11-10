@@ -21,6 +21,25 @@ JSON/Markdown exports or domain tables. Use the owning CLI/API. Jira, GitHub,
 PLDM and machine tooling retain external authority; documents and raw evidence
 remain files. See the maintainer's domain architecture for the ownership map.
 
+## RTL questions go to Neo, and only Neo
+
+Every RTL/HDL question, whether behaviour, signal, register implementation,
+A1-vs-A2 delta, RTL PR review or bisect, is answered by **Neo**. Neo is the
+RTL-grounded neo-brain agent running on the `vm` target. Ask it with:
+
+```bash
+~/bin/neo-ask [--chip a1|a2] "<question>"
+```
+
+Never read RTL any other way. That means no local or VM RTL checkouts
+(including `~/projects/iridium/rtl/ip/*`), no GitHub content/search/compare
+APIs, no `gh pr diff`, and no `mctl sh`/ssh grep. Neo returns paraphrased,
+cited findings only; never ask it for or relay verbatim HDL or patches. If
+`neo-ask` fails (VM stopped, not logged in), report the prerequisite and stop.
+Do not fall back to another RTL source. Local firmware and generated software
+CSR headers are not RTL. Existing RTL copies must not be accessed or deleted
+without separate approval. Details: the `rtl-vm-policy` skill.
+
 ## VM Management
 For any questions about VMs, EC2 instances, machine IPs, or SSH access, delegate to the `@vm` agent which manages instances via `octl vm`.
 

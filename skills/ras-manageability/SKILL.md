@@ -83,7 +83,7 @@ Headline: **FW reports the link-error event; BMC resets the entire tray on any l
 On the BMC-issued "scale up reset" request, FW must configure the reset mask and enable c2c
 reset before issuing the reset — nothing more for drop mode. Full detail (spec-owner directive,
 FW PR refs, superseded spec paragraphs) in [`knowledge/c2c-link-error-tray-reset.md`](knowledge/c2c-link-error-tray-reset.md).
-C2C-side / RTL detail (drain payload vs drop arming, `int_isolation('0)` tie-off) in the
+C2C-side / RTL detail is summarized in the
 `su-ip` knowledge base (`drop-mode-error-containment.md`).
 
 ### PIW SEI host-notify path — execution-context safety + plugin registration
@@ -207,10 +207,10 @@ and Device Manageability specs.
 - **Index:** `~/.copilot/skills/ras-manageability/knowledge/INDEX.md` — catalog of recorded topics
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
 
-The knowledge base is **always consulted first** (Step 0) and **always updated after**
-non-trivial research (final step). This is what makes the skill grow into a true RAS &
-manageability expert over time. RAS findings that are equally relevant to one specific IP
-(PCIe, SE/C2C, D2D) should also be mirrored or cross-linked in that IP's knowledge base.
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step). RAS findings that
+are equally relevant to one specific IP (PCIe, SE/C2C, D2D) may also be
+cross-linked in that IP's knowledge base.
 
 > **Recording trigger — read this twice.** Record a finding whenever you **verify** a
 > non-trivial RAS/manageability fact during this turn, regardless of *why* you were invoked.
@@ -238,17 +238,11 @@ manageability expert over time. RAS findings that are equally relevant to one sp
 
 ### Step 0: Consult the Knowledge Base (do this first)
 
-1. Read `~/.copilot/skills/ras-manageability/knowledge/INDEX.md` and scan the topic table.
-2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
-   `knowledge/` directory for the question's keywords:
-   ```python
-   import os, glob
-   kb = os.path.expanduser("~/.copilot/skills/ras-manageability/knowledge")
-   for f in glob.glob(os.path.join(kb, "*.md")):
-       txt = open(f, encoding="utf-8").read()
-       if "<keyword>" in txt.lower():
-           print(f"== {os.path.basename(f)} ==")
-   ```
+1. Use the topic names in this skill. Consult an index or note only if it is
+   already known not to contain HDL excerpts; do not bulk-search the knowledge
+   directory, which may contain historical source excerpts.
+2. If no verified source-free note is available, proceed using the specifications
+   or ask Neo (`neo-ask`) for a paraphrased finding.
 3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
    **narrow** the search before diving into the spec / FW code.
 
@@ -318,6 +312,11 @@ for t_idx, table in enumerate(doc.tables):
 | FW responsibilities (cross-cutting) | Both documents |
 
 ### Step 3: Extract and Answer
+
+For RTL evidence, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo**
+(`~/bin/neo-ask --chip a1|a2 "<question>"`) and relay only its paraphrased,
+cited findings, never HDL or patches. If Neo is unavailable, report the
+prerequisite and stop. FW and software CSR headers remain local.
 
 1. Search with broad keywords first, then narrow to specific sections
 2. For telemetry attributes: search tables in the Manageability spec (Tables 16-1 through 16-15)

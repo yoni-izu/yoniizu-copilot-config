@@ -11,6 +11,17 @@ argument-hint: "Action (scan/mode/save/load/list/status/info/forall or checkout/
 
 # WIP Workspace Manager
 
+**FW/software only:** Before any `wip scan`, snapshot restore, diff, or
+workspace-wide operation, use source-free manifest metadata to ensure its scope
+excludes all local RTL repositories. Never scan or run Git inside a local RTL
+checkout. [rtl-vm-policy](../rtl-vm-policy/SKILL.md) routes every RTL question to Neo
+(`~/bin/neo-ask`); never read RTL via `wip`, Git or GitHub, and never
+transfer source or patches back to WSL. If Neo is unavailable,
+report the prerequisite. Normal FW and software CSR operations are unchanged.
+`~/bin/wip` is a separate executable and is not automatically hardened by
+changes to the plugin's bundled copy: preflight every manifest/snapshot scope,
+including mixed HDL, before invoking it.
+
 Manage multi-repo workspaces using the `wip` CLI (`~/bin/wip`). It performs git
 operations across all repos in a single workspace (`ws`) or across every
 workspace in the WIP directory (`all`).
@@ -215,4 +226,3 @@ wip ws  depends-on   # non-upstream branches in the current workspace
 - `wip scan` auto-detects workspaces by looking for `.repo/metadata.json` in subdirectories.
 - Action names are hyphenated: `hard-reset`, `set-upstream`, `depends-on`.
 - Run `wip help` (or `wip help <action>`) for built-in documentation of every command and flag.
-

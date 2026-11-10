@@ -6,16 +6,16 @@
   the docs/plan say. Confirms Gen7 (PCIe EP + SU dual-mode), EFEC, C2C aggregators, 3nm PHY on the
   SU PHY, and GPU/INC fabric channels.
 - **RTL branch/tag:** **A1/Iridium = branch `iridium`; A2/Atlantic2 = branch `main`** (pre-freeze).
-  Delta = `gh api repos/Elmnt-Internal/ip.<ip>.rtl/compare/iridium...main`.
+  The historical delta used the GitHub compare API; this is provenance, not a current workflow.
 - **Tags:** rtl, iridium, main, gen7, efec, c2c, aggregator, dual-mode, dm, dmp, n3 phy, piw,
   pep, ppw, pmmu, ucie, gpu, inc, vsp, aligner, cce, ltssm logger, compare
 
 ## How to reproduce
-```bash
-gh api repos/Elmnt-Internal/ip.<ip>.rtl/compare/iridium...main --jq '{ahead:.ahead_by, files:(.files|length)}'
-gh api --paginate repos/Elmnt-Internal/ip.<ip>.rtl/compare/iridium...main --jq '.commits[].commit.message'
-gh api --paginate repos/Elmnt-Internal/ip.<ip>.rtl/compare/iridium...main --jq '.files[].filename'
-```
+Follow [rtl-vm-policy](../../rtl-vm-policy/SKILL.md): an agent actually running
+on `vm` verifies the historical ref and compares it with the latest
+`origin/main` at `~/projects/iridium/rtl/ip/<name>`. Return only paraphrased
+findings and citations, never the source or patch. If that agent is unavailable,
+report the prerequisite rather than using a local or GitHub content fallback.
 Delta magnitude (2026-08-30): pcie 241 commits/225 files · se 300/185 · d2d 78/154 · noc 535/300+
 · psoc 544/300+ · infra 529/300+ (300 = GitHub compare file-page cap).
 
@@ -87,10 +87,9 @@ Change areas: **`vsp` (114)**, **`algn` (81)**, `d2d_fabric` (34), `d2d_channel`
 ## Open follow-ups
 - `ip.psoc.rtl` (544) and `ip.infra.rtl` (529) not yet mined (RAS/manageability/infra — less
   HSI-central; do next for a full picture).
-- File pages cap at 300 for noc/psoc/infra — use `--paginate` on `.files` or per-directory
-  compare to enumerate all.
-- For any specific module, pull the actual diff:
-  `gh api repos/Elmnt-Internal/ip.<ip>.rtl/compare/iridium...main --jq '.files[]|select(.filename|test("<re>")).patch'`.
+- The historical GitHub comparison had a 300-file page cap for noc/psoc/infra.
+  Have the VM-hosted agent enumerate and examine any further delta entirely on
+  the VM, returning a paraphrased result rather than the diff.
 
 ## Sources
 - GitHub compare API `iridium...main` on `ip.pcie.rtl`, `ip.se.rtl`, `ip.d2d.rtl`, `ip.noc.rtl`

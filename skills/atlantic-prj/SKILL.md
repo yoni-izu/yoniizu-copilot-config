@@ -33,8 +33,8 @@ argument-hint: 'Ask a question about the Atlantic project — architecture, PRM/
 >
 > **Atlantic is the current, most-recent project.** In the RTL repos, Atlantic's latest
 > implementation lives on the **`main`** branch. Previous projects (e.g. **Iridium** — see the
-> `iridium-prj` skill) are frozen on their own **freezed rtl** branch. When researching RTL for
-> Atlantic, use `main`; for an earlier project, check out that project's freezed-RTL branch.
+> `iridium-prj` skill) are frozen on their own **freezed rtl** branch. For RTL, an agent actually
+> running on `vm` verifies the relevant ref and inspects it there; do not check it out locally.
 
 ## Project Context
 
@@ -104,19 +104,23 @@ A typical workspace contains:
 | `fw/tools/fw_host_streaming_boot/` | Host-side streaming/flashless boot tooling |
 | `kmd/` | Kernel-mode driver(s) for the Atlantic Linux stack |
 | `sim/`, `experiments/`, `evidence/`, `logs/` | Simulation, experiment runs, captured evidence |
-| `<repo>/.github/` | Per-repo skills / AI resources. **Every** repo in the workspace carries its own `.github/` with additional skills and AI context — consult them alongside this skill. |
+| `<repo>/.github/` | Per-repo skills / AI resources. Consult FW-repo guidance locally; RTL questions go to Neo (`~/bin/neo-ask`), never to the RTL repos. |
 
-**Local-first strategy** (this skill is global / user-level — the workspace may or may not
-contain the source):
-1. Prefer reading from a local checkout under `~/projects/atlantic/<variant>/...`.
+**Source strategy** (this skill is global / user-level — the workspace may or may not
+contain the software source):
+1. Prefer reading FW and other non-RTL software from a local checkout under
+   `~/projects/atlantic/<variant>/...`.
 2. Identify the deployment path of an IP driver via the project manifest
    (`project.atlantic.sw.fw.infra.star` and other `.star`/`octl` manifests).
-3. If a needed repo is not local, use the GitHub search tools against the relevant
-   `Elmnt-Internal/ip.<ip>.*` repos (see the IP skills for exact repo URLs). **Use the `main`
-   branch** for Atlantic RTL (the freezed-RTL branch is for previous projects like Iridium).
+3. If non-RTL software is not local, use GitHub search in its specific software
+   repository. For RTL, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md):
+   ask Neo — `~/bin/neo-ask --chip a2 "<question>"` (Atlantic RTL = `main`) —
+   and relay only its paraphrased findings and citations, never HDL or patches.
+   No local/VM checkout or GitHub RTL reads. If Neo is unavailable, report the
+   prerequisite and stop.
 4. The workspace is multi-repo, with its repo set and layout defined by the `octl` manifest.
-   Each repo has a `.github/` directory containing additional skills / AI resources — check
-   the relevant repo's `.github/` for project- or IP-specific guidance before/while researching.
+   Consult relevant non-RTL repo-local guidance locally; RTL questions go
+   to Neo only.
 
 ### Build / Workspace Conventions
 
@@ -135,25 +139,18 @@ NoC spec, or source tree.
 - **Index:** `~/.copilot/skills/atlantic-prj/knowledge/INDEX.md` — catalog of recorded topics
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
 
-The knowledge base is **always consulted first** (Step 0) and **always updated after**
-non-trivial research (final step). This is what makes the skill grow into a true Atlantic project
-expert over time.
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step).
 
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base (do this first)
 
-1. Read `~/.copilot/skills/atlantic-prj/knowledge/INDEX.md` and scan the topic table.
-2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
-   `knowledge/` directory for the question's keywords:
-   ```python
-   import os, glob
-   kb = os.path.expanduser("~/.copilot/skills/atlantic-prj/knowledge")
-   for f in glob.glob(os.path.join(kb, "*.md")):
-       txt = open(f, encoding="utf-8").read()
-       if "<keyword>" in txt.lower():
-           print(f"== {os.path.basename(f)} ==")
-   ```
+1. Use the topic names in this skill. Consult an index or note only if it is
+   already known not to contain HDL excerpts; do not bulk-search the knowledge
+   directory, which may contain historical source excerpts.
+2. If no verified source-free note is available, proceed using the external
+   specifications or ask Neo (`neo-ask`) for a paraphrased finding.
 3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
    **narrow** the search before diving into the docs/source.
 
@@ -209,9 +206,9 @@ for t_idx, table in enumerate(doc.tables):
             print(f"Table {t_idx}, Row {r_idx}: {row_text}")
 ```
 
-For the **source tree**, prefer the workspace tools (`grep_search`, `file_search`,
-`semantic_search`, `read_file`) under `~/projects/atlantic/<variant>/`. Fall back to GitHub
-search tools (RTL on the **`main`** branch) for repos not checked out locally.
+For **FW and non-RTL software**, prefer workspace tools under
+`~/projects/atlantic/<variant>/`, with a GitHub fallback limited to software.
+RTL inspection and comparisons go to Neo (`neo-ask`) only, as above.
 
 ### Step 3: Extract and Answer
 
@@ -251,7 +248,7 @@ Skip recording only for trivial lookups already fully covered by an existing ent
   under `fw/proj_infra/scripts/lua/sec_access_ctrl/`.
 - **Redundancy/binning**: PRM "Binning" cross-referenced with NoC spec "Redundancy".
 - **Scale-up / C2C**: PRM "C2C" + NoC spec "Scale-Up Connectivity" / "Device Routing".
-- **RTL**: use the IP repo's **`main`** branch for Atlantic (freezed-RTL branch is for Iridium
-  and earlier projects).
+- **RTL**: ask Neo (`neo-ask --chip a2`) — Atlantic is RTL `main`; the frozen branch is for
+  Iridium and earlier projects.
 - **Tables**: Register, field, and mapping definitions are usually in tables — search both
   paragraphs AND tables.

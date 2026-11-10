@@ -1,6 +1,6 @@
 ---
 name: psoc-ip
-description: 'Answer PSOC (Platform/Management SoC block) design, uC cluster, boot/reset, GPIO/straps, eFuse, slow-IO, HSM/Caliptra, and platform-integration questions using the internal PSOC specification and PSOC RTL. Use when: PSOC, platform SoC, management uC (MuC), power/thermal uC (PTuC), reset uC (RuC), tiny uC (TuC), uC cluster, Cortex-M7, boot flow, FLA, secure/unsecure boot, reset manager, reset notification, GPIO/straps, eFuse, slow IOs (SPI/I2C/I3C/UART/AVSBus/SVID/MDIO/PWM/RPM), mailbox, HSM, Caliptra, PUF, crypto (SHA/ECC), remote debug, multi-die, FIU, platform guidelines.'
+description: 'Answer PSOC (Platform/Management SoC block) design, uC cluster, boot/reset, GPIO/straps, eFuse, slow-IO, HSM/Caliptra, and platform-integration questions using the internal PSOC specification, with RTL questions answered by Neo (neo-ask). Use when: PSOC, platform SoC, management uC (MuC), power/thermal uC (PTuC), reset uC (RuC), tiny uC (TuC), uC cluster, Cortex-M7, boot flow, FLA, secure/unsecure boot, reset manager, reset notification, GPIO/straps, eFuse, slow IOs (SPI/I2C/I3C/UART/AVSBus/SVID/MDIO/PWM/RPM), mailbox, HSM, Caliptra, PUF, crypto (SHA/ECC), remote debug, multi-die, FIU, platform guidelines.'
 argument-hint: 'Ask about PSOC — the uC cluster, boot/reset, slow IOs, eFuse/GPIO, HSM/Caliptra, or platform integration'
 ---
 
@@ -42,7 +42,7 @@ argument-hint: 'Ask about PSOC — the uC cluster, boot/reset, slow IOs, eFuse/G
 
 - The current PSOC spec is the **Atlantic2 (A2)** revision. PSOC hosts the SoC-level FW agents.
   RTL repo: **`Elmnt-Internal/ip.psoc.rtl`** (A1/Iridium = branch `iridium`, A2 = `main`;
-  diff `iridium...main` for the A2 delta). SW/FW repo: `ip.psoc.sw.fw`.
+  RTL questions → Neo, `~/bin/neo-ask --chip a1|a2`). SW/FW repo: `ip.psoc.sw.fw`.
 - **The three SoC FW agents (Boot&Reset / Management / Power&Thermal from the A2 Overview) are the
   PSOC uC cluster**: MuC, PTuC, RuC (Cortex-M7). Note the A2 Overview lists a "Boot & Reset uC";
   the PSOC spec splits reset into **RuC** and folds secure-boot duties into **MuC**.
@@ -69,12 +69,16 @@ Guidelines` · `HSM Integration` · `FIU`.
 - **Index:** `~/.copilot/skills/psoc-ip/knowledge/INDEX.md`
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with citations.
 
-Consult it first (Step 0); update it after non-trivial research (final step).
+Consult source-free knowledge first when available (Step 0); update it with
+paraphrased findings after non-trivial research (final step).
 
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base
-Read `knowledge/INDEX.md`; full-text search `knowledge/` for the question's keywords.
+Use the topic names in this skill; consult an index or note only if it is
+already known not to contain HDL excerpts. Do not bulk-search the knowledge
+directory. If none is verified source-free, use the specification or ask Neo
+(`neo-ask`) for a paraphrased finding.
 
 ### Step 1: Classify → pick the spec section (see map). uC/CPU → "Micro Controllers"; boot →
 "Boot"; reset → "Reset"; crypto/eFuse/mailbox → "Peripheral Engines"; HSM → "HSM Integration".
@@ -90,10 +94,11 @@ for i,p in enumerate(doc.paragraphs):
 ```
 
 ### Step 3: Search the RTL
-```bash
-gh api repos/Elmnt-Internal/ip.psoc.rtl/compare/iridium...main --jq '{ahead:.ahead_by, files:(.files|length)}'
-gh api --paginate repos/Elmnt-Internal/ip.psoc.rtl/compare/iridium...main --jq '.commits[].commit.message'
-```
+Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
+`~/bin/neo-ask --chip a1|a2 "<PSOC question>"` (A1 = `iridium`, A2 = `main`).
+Relay only its paraphrased findings and citations, never HDL or patches. If Neo
+is unavailable, report the prerequisite and stop; no local, VM-worktree or
+GitHub RTL fallback. Local FW and CSR software headers are unaffected.
 
 ### Step 4: Answer + cite (spec para/table, RTL repo/branch/commit).
 
@@ -102,6 +107,6 @@ at top); correct stale entries when contradicted.
 
 ### Search Strategy Tips
 - **Acronyms**: spec Terminology/Acronyms section near the top (MuC/PTuC/RuC/TuC/FLA/HSM).
-- **A2-vs-A1**: diff Rev 2.0.1 vs Rev 1.2.0; for implementation reality diff `ip.psoc.rtl`
-  `iridium..main`.
+- **A2-vs-A1**: diff Rev 2.0.1 vs Rev 1.2.0; for implementation reality ask
+  Neo (`neo-ask --chip a2`) for the RTL delta.
 - **uC memories / config params**: in tables (Table 10-1 uC Memories, 10-2 Cortex-M7 params).

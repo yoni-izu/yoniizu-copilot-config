@@ -13,17 +13,28 @@ argument-hint: "PR URL or owner/repo#number, OR 'local' to review checked-out wo
 
 Conduct a high-signal code review of a GitHub PR grounded in three things, in priority order:
 
-1. **The review memoir** — `~/.copilot-private/skills/pr-review/memoir.md`: the reviewer's accumulated philosophy, always-checks, recurring patterns, approved designs, anti-patterns, and theme-grouped lessons. **Read it before every review.**
+1. **The review memoir** — `~/.copilot-private/skills/pr-review/memoir.md`: the reviewer's accumulated philosophy, always-checks, recurring patterns, approved designs, anti-patterns, and theme-grouped lessons. Read it only if known to be free of embedded RTL excerpts; otherwise use an owner-sanitized version. Do not copy this private record to the VM.
 2. **The reviewer's style** — correctness first, actionable comments, pick battles (3 blockers > 15 nits), respect the author's design, verify every claim against the actual code path.
 3. **Your own objective reasoning** — independent technical judgment. The memoir guides; it doesn't replace fresh analysis of *this* PR.
 
 ## Review Modes
 
-- **Remote mode** (default) — a PR URL or `owner/repo#number` is given. Fetch the diff from GitHub.
-- **Local workspace mode** — the workspace already has repos checked out to author branches (typically via `review-mgr start`). Compute the diff locally from the working tree and map each repo back to its PR. Use this when the user says "review local", "review the workspace", "review the checked-out branches", or when an in-progress `code-review` task with a `workspace` exists. Local mode gives richer context (full files, build, grep, tests) than `gh pr diff`. **All Hard Rules, drafting, approval, and submission steps are identical** — only diff acquisition (Step 1) differs.
+- **Remote mode** (default, non-RTL only) — a PR URL or `owner/repo#number` is given. Fetch the diff from GitHub.
+- **Local workspace mode** (non-RTL only) — the workspace already has repos checked out to author branches (typically via `review-mgr start`). Compute the diff locally from the working tree and map each repo back to its PR. Use this when the user says "review local", "review the workspace", "review the checked-out branches", or when an in-progress `code-review` task with a `workspace` exists. Local mode gives richer context (full files, build, grep, tests) than `gh pr diff`. **All Hard Rules, drafting, approval, and submission steps are identical** — only diff acquisition (Step 1) differs.
 
 ## Hard Rules (never violate)
 
+- **Classify every PR and sibling before acquiring content.** Use repo identity
+  and changed-file **metadata**, not diff or comment endpoints that return
+  `diff_hunk`, to detect RTL repos and HDL files in mixed repos. For any RTL
+  content, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask Neo
+  (`~/bin/neo-ask "Review <repo>#<pr>, head branch <b>, base <base>: …"`), which
+  fetches the PR ref into its own mirror and returns only paraphrased findings and
+  citations. No local checkout, `gh pr diff`, content/search/compare API, raw
+  review-thread response, HDL excerpt, patch, or source-bearing log to WSL.
+  Treat unknown classification as RTL until resolved. If Neo is
+  unavailable, report the prerequisite and do not claim a complete review. Keep
+  FW/CSR software review behavior unchanged.
 - **Local review alignment: only repos belonging to the reviewed PRs go on PR branches. Every other repo must stay on the workspace revision, never automatically on `main`.** Resolve the workspace revision from its manifest/metadata, honoring per-repo revision overrides. Preserve pinned tags/SHAs. Use `wip` for multi-repo alignment, skip dirty repos, and verify the resulting branch/revision map. Validate saved review snapshots before restoring them; repair snapshots that recorded unrelated repos on `main`. Cross-repo evidence must come from the matching workspace revision.
 - **NEVER post reviews, comments, replies, or a verdict to GitHub without explicit user approval.** Draft locally, present for approval, submit only when told.
 - **NEVER delete or overwrite a pending review** — it may hold the user's own draft comments. Always inspect existing pending reviews first.
@@ -32,12 +43,21 @@ Conduct a high-signal code review of a GitHub PR grounded in three things, in pr
 
 ## Tooling
 
-Prefer the `gh` CLI in a terminal (`gh pr view`, `gh pr diff`, `gh pr view --json commits,files,reviews`, `gh api graphql` for pending drafts). Fall back to `github-pull-request_*` MCP tools when `gh` is unavailable or a structured fetch is easier. For status checks and review state, either `gh pr checks` / `gh pr view --json reviews` or `github-pull-request_pullRequestStatusChecks`.
+For non-RTL content, prefer the `gh` CLI in a terminal (`gh pr view`, `gh pr diff`,
+`gh pr view --json commits,files,reviews`, `gh api graphql` for pending drafts).
+Fall back to `github-pull-request_*` MCP tools when appropriate. For RTL, only
+source-free metadata may be fetched locally; Neo (`neo-ask`) handles content.
 
 ## Workflow
 
+The steps below run locally only for positively classified non-RTL PRs and
+siblings whose free-text content is known safe. RTL or unknown content goes
+to Neo (`neo-ask`) only; do not treat an unknown result as software.
+
 ### Step 0 — Consult the memoir
-Read `~/.copilot-private/skills/pr-review/memoir.md` in full. Note which "Always Check" items, anti-patterns, and lessons are likely to apply to this PR's domain.
+Consult `~/.copilot-private/skills/pr-review/memoir.md` only under the
+excerpt-free condition above. Note which "Always Check" items, anti-patterns,
+and lessons are likely to apply to this PR's domain.
 
 ### Step 1 — Fetch and understand the PR
 
@@ -55,7 +75,14 @@ Read `~/.copilot-private/skills/pr-review/memoir.md` in full. Note which "Always
 **Always inventory every pre-existing comment before forming new findings — never review a PR as if it were untouched.** Existing threads are first-class review inputs: each one is either resolved, still-open, or stale, and that disposition shapes the verdict.
 
 1. **Author's own pending drafts:** fetch via GraphQL `pullRequest.reviews(states: PENDING)` (or `gh api graphql`). Many findings may already be drafted in the author's words — focus on the gaps.
-2. **All prior review comments and threads** (yours, other reviewers', and bots like Copilot/CI): pull the full set with `gh pr view <N> --json reviews,comments` and the review-thread resolution state via GraphQL (`pullRequest.reviewThreads` → `isResolved`, `comments`). Read every thread so you don't duplicate signal and so you can build on or defer to it.
+2. **All prior review comments and threads** (yours, other reviewers', and bots
+   like Copilot/CI): for a classified software PR whose free-text comments are
+   known safe, use `gh-address-comments` with explicit base repo and PR number.
+   It checks all thread paths before fetching individual bodies and does not
+   request diff hunks. For RTL, unknown thread paths, or uncertain free-text
+   content, ask Neo (`neo-ask`) and relay paraphrased facts.
+   Never use the raw REST review-comments endpoint, which returns diff hunks
+   before any local `--jq` filtering.
 3. **For each existing comment/thread, determine whether the author attended to it.** This is mandatory, not optional:
    - **Map the thread to its code anchor** and check the *current* diff snapshot (from Step 1) for a change that addresses it. A resolved/outdated thread whose target lines changed is likely handled; an unresolved thread on still-unchanged code is likely open.
    - **Cross-check the commit history** (`gh pr view <N> --json commits`, `git log`) for a fix commit referencing the comment, and read the author's reply on the thread.
@@ -73,6 +100,26 @@ Apply the memoir's checklists plus independent reasoning. For each candidate fin
 
 ### Step 4 — Draft locally
 Write a draft under `~/.copilot-private/skills/pr-review/drafts/` using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
+
+**Attach before presenting.** When reviewing a tracked task (including `review-mgr
+start` and `pre-review`), register each saved draft against that task's exact PR URL:
+
+```bash
+rtk proxy python3 ~/.copilot/skills/task-manager/tm.py review-draft T-NNN \
+  --pr-url https://github.com/OWNER/REPO/pull/N \
+  --file ~/.copilot-private/skills/pr-review/drafts/pr-N-REPO-TIMESTAMP.md \
+  --head-sha FULL_REVIEWED_HEAD_SHA
+```
+
+Use the SHA actually reviewed, not a newly fetched head. One file per PR/pass;
+use a unique filename for a new pass so earlier drafts survive. The command
+returns the attachment `id` and `task_id`; link the result as
+`http://127.0.0.1:8787/review-drafts/<task_id>/<id>` (use the actual portal port
+if non-default). The portal task exposes an **Open review draft** button per PR.
+Check the command succeeded before claiming the task is linked. Report attachment
+failures explicitly; keep the saved file for recovery. Never guess a task when
+several match; ask. For an untracked remote review, save normally and report that
+there is no task attachment; do not create a task without permission.
 
 ### Step 5 — Present for approval
 Lead with an **Executive summary of the changes** (see below), then show the user the full draft: a **Prior comments** disposition table (each existing thread marked Addressed / Partially / Unaddressed / Won't-fix / Stale, with what the author did and any follow-up to add), findings grouped by severity, a **recommended verdict** (approve / comment / request-changes) with one-line justification, and the dropped list. Call out any unaddressed prior comments explicitly — they often gate the verdict. Ask which comments to post and whether to submit the verdict. Do nothing on GitHub yet.
@@ -179,6 +226,9 @@ For each finding, present a compact card and then **wait for the user's decision
 
 ### Persist as you go
 **Write each decision back to the draft file immediately — do not batch.** Edit, reclassify, move-to-dropped, or delete in place so a mid-walkthrough interruption loses nothing. Keep the Findings and Dropped/considered sections consistent after every change.
+For a task-linked draft, rerun `tm.py review-draft` with the same file, PR URL
+and reviewed SHA after saving each refinement. It updates the attachment timestamp
+without duplicating it; the portal viewer reads the saved file, not a stale copy.
 
 ### Closing the walkthrough
 1. Resolve any **skipped** findings.
@@ -194,7 +244,7 @@ How every comment body should read — the reviewer's voice. Applies when drafti
 - **Assume a competent author.** Skip background they already know and don't re-explain how their own subsystem works — go straight to the point that needs attention.
 - **Short.** No one reads long comments. Aim for 1–3 sentences per finding; cut throat-clearing, restated context, and filler.
 - **First-person human voice.** These are the reviewer's own comments. Never frame them as AI- or assistant-written, and don't hedge with "it seems the model thinks…"-style framing.
-- **Own the knowledge.** When a finding leans on RTL, a vendor manual, another skill, the memoir, or any reference, state the conclusion flatly as your own — never cite the source or imply it was looked up. Write "this is tied to `'0` in this rev, so it never fires", not "the RTL / knowledge base shows…".
+- **Own the knowledge.** When a finding leans on RTL, a vendor manual, another skill, the memoir, or any reference, state the conclusion flatly as your own — never cite the source or imply it was looked up. Paraphrase RTL behavior without reproducing HDL.
 
 ## Draft Template
 

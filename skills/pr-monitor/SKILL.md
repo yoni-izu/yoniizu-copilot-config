@@ -11,6 +11,14 @@ argument-hint: "Action (log/status/check/remove/list/checkout/rebase/review-msg/
 
 # PR Monitor
 
+**RTL gate:** Metadata-only tracking is allowed. Before checkout, rebase,
+review, or a workspace-wide `wip` operation, classify every PR and workspace
+from source-free metadata. Do not run these local workflows on RTL repositories
+or PRs containing HDL; follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md) and
+ask Neo (`~/bin/neo-ask`) about RTL content. Never transfer HDL, patches,
+or source-bearing logs to WSL. If Neo is unavailable, report the
+prerequisite; non-RTL FW and CSR software workflows are unchanged.
+
 Track and monitor sets of GitHub PRs grouped by feature. Canonical state lives in
 `~/tasks/prs.db`, owned exclusively by `pm.py` (shared across workspaces).
 Use `pm.py` for every read/write; do not edit the database or legacy memory file.

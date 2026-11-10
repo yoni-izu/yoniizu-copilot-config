@@ -11,6 +11,14 @@ argument-hint: "Action (scan/add/list/start[--manual]/pre-review/stop/done/statu
 
 # Review Manager
 
+**RTL gate:** Classify every PR (including siblings and mixed-repo HDL changes)
+from source-free metadata before `start`, `--manual`, `pre-review`, snapshot
+restore, or dashboard auto-alignment. Never align or scan a local RTL checkout
+or fetch RTL diff hunks/threads on WSL. Follow
+[rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask Neo (`~/bin/neo-ask`) to review RTL
+PRs; it returns only paraphrased findings. If Neo is unavailable, report the prerequisite and skip the
+RTL work. Metadata-only queue tracking and non-RTL FW reviews remain normal.
+
 Own the **incoming PR-review queue** — the PRs *other people* ask you to review — from
 discovery to close-out. This skill is the lifecycle layer; it does not replace:
 
@@ -24,7 +32,7 @@ mutations are defined by `task-manager` / `tm.py`.
 
 > **HSI team cross-review.** All HSI team members review each other's PRs, so any PR
 > in your queue may already carry reviews from teammates. Whenever you **start** or
-> **resume** a review (`start`, and the re-review path after `blocked-scan`), first
+> **resume** a non-RTL review (`start`, and the re-review path after `blocked-scan`), first
 > pull the existing reviews and inline threads left by others and factor them into
 > your draft — don't duplicate what a teammate already raised, and weigh their
 > findings before adding your own.
@@ -41,7 +49,7 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `review-update <id> <review_status> [--pr N]` | Manual review-status update | Applies to all PR entries unless `--pr`. Auto-derives task status; the task is only `done` once **every** PR is `merged` (no purge — merged tasks persist as a record). |
 | `review-check` | Poll GitHub, mark merged PRs, drop closed PRs, mark fully-merged tasks `done` | Skips done/cancelled. A PR closed-without-merge is **removed from the task entirely**; a task left with no PRs is `cancelled`. Re-derives status; a task becomes `done` only when every PR has merged. |
 | `review-msg <id>` | Print a templated review-request message | |
-| `blocked-scan [--update] [--json]` | Check every `blocked` review task for author activity | For each PR: counts commits since `submitted_at`, groups thread replies, flags pushback (`won't fix`, `by design`, `next step`…) and addressed markers (`done`, `fixed`…). Compact output (~2–3 KB). `--update` auto-flips PRs with new commits to `waiting-for-re-review` and moves the task back to `todo`. |
+| `blocked-scan [--update] [--json]` | Check every `blocked` review task for author activity | Counts commits and, for source-free-classified software PRs, groups replies and flags pushback/addressed markers without fetching diff hunks. For RTL or incomplete classification it skips thread bodies and explicitly reports `threads_unchecked` when no other activity is known; this is not "no activity". `--update` transitions PRs with new commits. |
 
 Review statuses: `pending`, `in-progress`, `commented`, `changes-requested`, `waiting-for-re-review`, `approved`, `merged`.
 
@@ -98,11 +106,26 @@ Check the workspace's repos out to a review task's branches so you can review lo
 > **`--manual` stops here.** In no-AI mode, do **not** proceed to steps 8–9 — the workspace
 > is now aligned for the user's own manual review. Report the checkout summary and stop.
 
-8. **Check for existing HSI teammate reviews.** The whole HSI team now cross-reviews each other's PRs, so before drafting your own pass, pull what others already said. For each PR entry, run `gh pr view <pr> --json reviews,reviewThreads` (or `gh api /repos/<owner>/<repo>/pulls/<pr>/reviews` and `.../comments`) to fetch prior reviews and inline threads from other reviewers. Summarize per PR: who reviewed, their verdict (approved / changes-requested / commented), and the gist of their inline comments and any unresolved threads. **Feed this into the `pr-review` handoff** so your draft (a) doesn't duplicate points teammates already raised, (b) can agree with or push back on their findings, and (c) accounts for concerns the author may already be addressing. Skip resolved/outdated threads. Do **not** post anything — this is read-only context gathering.
+8. **Check for existing HSI teammate reviews.** For a source-free-classified
+   software PR whose free-text comments are also safe to fetch, use the
+   `gh-address-comments` helper with explicit base repo and PR number. It checks
+   all thread paths before fetching individual bodies and does not request diff
+   hunks. Do not use the raw REST review-comments endpoint: its responses
+   include diff hunks even when `--jq` filters them afterward. Summarize review
+   state and unresolved feedback for the `pr-review` handoff; do not post.
+   For RTL, unknown paths, or uncertain comment content, ask Neo
+   (`neo-ask`) or report that the prerequisite is unavailable.
 9. **Auto-invoke `pr-review local`** — starting a review always runs the review, never just aligns the workspace. Hand off to the **`pr-review`** skill in local workspace mode against the just-checked-out branches, passing along the teammate-review summary from step 8. Do **not** stop after the checkout; the checkout exists to be reviewed.
    - **Fresh vs. re-review is decided automatically** (never ask, never wait for a keyword). For each PR entry, look for a prior baseline in this order: (a) a `reviewed @ <repo>:<sha>` note in the task (recorded by `done`); (b) the head SHA in the most recent file under `~/.copilot-private/skills/pr-review/drafts/` for that PR; (c) the `commit.oid` of your last submitted GitHub review. If **no** baseline exists → **fresh review** (full local diff against the merge-base). If a baseline exists and the current head differs → **re-review** (diff `baseline..new-head`, triage only what changed). If a baseline exists and the head is identical → tell the user there are no new changes since the last review and skip the heavy pass (offer a re-read only if asked).
    - Multi-PR tasks: make the fresh/re-review decision per PR entry independently.
    - This stays drafts-only — `pr-review local` never posts to GitHub without explicit approval (its Hard Rules still apply).
+   - **Persist and attach every produced draft before reporting success.** Pass the
+     task ID and exact per-PR URLs to `pr-review`; require its Step 4
+     `tm.py review-draft` registration for every saved draft. Include the portal
+     draft links in the handoff summary. New passes keep older files/attachments;
+     refinements update the existing attachment. If there are no new changes,
+     reuse an existing linked draft rather than generating a duplicate. Missing
+     files or attachment failures must be reported, not marked as linked.
 
 ### PR upstream and VS Code review detection
 
@@ -159,8 +182,15 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
 1. **Select the new tasks.** Read the store; pick every active review task (status `todo`/`in-progress`, not done/cancelled) whose notes do **not** already contain the `initial auto review draft done` marker. These are the never-looked-at tasks. If none qualify, report "no new review tasks to pre-review" and stop. List the selected tasks (ids + PR counts) before starting.
 2. **Process one task at a time**, in order. For each task:
    a. **Align the workspace** using the `start` mechanics, including snapshot validation. PR repos go on their author branches; every other repo must match the workspace revision, including per-repo overrides and pins, never automatically `main`. Save only the verified alignment with `wip scan && wip save review-<task-id>`. Never create `pr-NNN` branches or use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
-   b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. First pull any existing reviews and inline threads left by HSI teammates (`gh pr view <pr> --json reviews,reviewThreads`) and feed that summary into the draft so it doesn't duplicate what others already raised. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
-   c. **Mark the task** by appending the note `initial auto review draft done` (with the date) via `tm.py`. Do **not** change `review_status` — this is a preliminary pass, not an actual review; leave the task's status untouched so the user's own review flow (`start` → `pr-review`) still runs normally.
+   b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. First gather source-free software reviews and threads as in step 8 above and feed that summary into the draft so it doesn't duplicate what others already raised. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
+   c. **Attach and mark the task.** Require `pr-review` Step 4 to register every
+      draft through `tm.py review-draft` using this task ID, exact PR URL and
+      reviewed head SHA. Verify attachment success for every PR before appending
+      the note `initial auto review draft done` (with the date) via `tm.py`.
+      Report a partial/failed attachment rather than setting the marker.
+      Do **not** change `review_status` — this is a preliminary pass, not an
+      actual review; leave the task's status untouched so the user's own review
+      flow (`start` → `pr-review`) still runs normally.
    d. Move to the next task.
 3. **Return to a clean state.** After the last task, run the `stop` mechanics: return every repo to the workspace revision (skip and report dirty repos; never force).
 4. **Report** a summary: which tasks were drafted, where each draft lives, which tasks/repos were skipped (and why), and confirm the workspace revision restored.
@@ -196,9 +226,15 @@ Combined `stop` + status update.
 For `blocked` review tasks, check whether the author acted. **Delegate the mechanical polling to `tm.py blocked-scan`** — do not fan out `github-pull-request_issue_fetch` calls (that dumps ~10–20 KB of file diffs per PR into context for state you don't need).
 
 1. Run `python3 ~/.copilot/skills/task-manager/tm.py blocked-scan --update` (or `--json` if you want to post-process). The CLI:
-   - For each `blocked` code-review task, for each unresolved PR entry, calls `gh pr view` (state / commits / HEAD / mergeable) and `gh api /pulls/N/comments` (threads).
-   - Counts commits since `submitted_at`, groups author replies to your inline threads, and flags each reply with a `pushback` heuristic (`won't fix`, `by design`, `next step`, `out of scope`, `intentional`, …) or an `addressed` heuristic (`done`, `fixed`, `addressed`, `applied`).
-   - Classifies each PR: `needs_re_review` (new commits) / `replies_only` / `no_activity` / `merged` / `closed`.
+   - Uses source-free GraphQL state and commit metadata. Commit headlines are
+     requested only for classified software; commit bodies are never requested.
+     For classified software, validates every thread path before fetching its
+     comments individually, without requesting diff hunks.
+   - Counts commits since `submitted_at`; for checked software threads, groups
+     author replies and flags pushback or addressed markers.
+   - Classifies each PR: `needs_re_review` (new commits) / `replies_only` /
+     `no_activity` / `threads_unchecked` / `merged` / `closed`. RTL or unknown
+     thread activity is explicitly unchecked, not evidence of no activity.
    - With `--update`: transitions PRs classified `needs_re_review` to `review_status: waiting-for-re-review` per-PR (multi-PR tasks: quiet PRs stay put) and moves the task back to `status: todo`.
 2. Read the summary. Your judgment is still required for:
    - **`replies_only`** PRs — decide whether the author's reply is convincing enough to close the thread, or whether you want a re-review.
@@ -213,7 +249,8 @@ For `blocked` review tasks, check whether the author acted. **Delegate the mecha
    ```
    Indicators: ⚠️ new commits, 💬 replies only, ✅ no changes, 🔀 merged, ❌ closed.
 
-Only fall back to `github-pull-request_issue_fetch` when you need the actual file diff for one specific PR — never for the sweep.
+Only fall back to `github-pull-request_issue_fetch` for a specific **non-RTL**
+PR when its actual file diff is needed — never for the sweep or an RTL PR.
 
 ## Rules
 
@@ -226,5 +263,5 @@ Only fall back to `github-pull-request_issue_fetch` when you need the actual fil
 7. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo — a second PR in the same repo is unreachable locally, causes confusion about which code is under review, and forces the reviewer to context-switch branches mid-review. When adding PRs (via `scan` or `add-review`), split any same-repo collisions into separate tasks. When inheriting a task that already violates this, split it before `start`.
 8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
 9. **`pre-review` is drafts-only.** The batch auto-draft pass produces local `pr-review` drafts and never writes to GitHub or transitions review status. It marks each processed task with the `initial auto review draft done` note so subsequent runs skip it; that note is the sole "already looked at" signal.
-10. **Consider teammate reviews.** The HSI team cross-reviews, so before drafting on any `start`/resume/`pre-review` pass, read the existing reviews and inline threads other reviewers left on the PR and factor them in — don't duplicate raised points, weigh their findings, and note concerns the author may already be handling. This is read-only; never post in response to a teammate's review without explicit approval.
+10. **Consider teammate reviews.** For non-RTL PRs, read existing reviews and inline threads before drafting on any `start`/resume/`pre-review` pass. For RTL, ask Neo (`neo-ask`) to assess them; never fetch their bodies or diff hunks to WSL. This is read-only; never post in response to a teammate's review without explicit approval.
 11. **`start --manual` is no-AI, no-credit.** Manual mode does the workspace alignment and occupancy (`start` steps 1–7) only, then stops — it never fetches teammate reviews (step 8) or hands off to `pr-review` (step 9). PR repos go on their author branches; everything else stays on the workspace revision. Same safety guarantees apply: safe checkout only, never destructive git, skip and report dirty repos, don't clobber an occupied slot.

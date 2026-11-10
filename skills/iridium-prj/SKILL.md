@@ -97,18 +97,23 @@ workspace/variant checkout. A typical workspace contains:
 | `fw/tools/fw_host_streaming_boot/` | Host-side streaming/flashless boot tooling |
 | `kmd/` | Kernel-mode driver(s) for the Iridium Linux stack |
 | `sim/`, `experiments/`, `evidence/`, `logs/` | Simulation, experiment runs, captured evidence |
-| `<repo>/.github/` | Per-repo skills / AI resources. **Every** repo in the workspace carries its own `.github/` with additional skills and AI context — consult them alongside this skill. |
+| `<repo>/.github/` | Per-repo skills / AI resources. Consult FW-repo guidance locally; RTL questions go to Neo (`~/bin/neo-ask`), never to the RTL repos. |
 
-**Local-first strategy** (this skill is global / user-level — the workspace may or may not
-contain the source):
-1. Prefer reading from a local checkout under `~/projects/iridium/<variant>/...`.
+**Source strategy** (this skill is global / user-level — the workspace may or may not
+contain the software source):
+1. Prefer reading FW and other non-RTL software from a local checkout under
+   `~/projects/iridium/<variant>/...`.
 2. Identify the deployment path of an IP driver via the project manifest
    (`project.iridium.sw.fw.infra.star` and other `.star`/`octl` manifests).
-3. If a needed repo is not local, use the GitHub search tools against the relevant
-   `Elmnt-Internal/ip.<ip>.*` repos (see the IP skills for exact repo URLs).
+3. If non-RTL software is not local, use GitHub search in its specific software
+   repository. For RTL, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md):
+   ask Neo — `~/bin/neo-ask --chip a1 "<question>"` (A1 = frozen RTL) — and
+   relay only its paraphrased findings and citations, never HDL or patches.
+   No local/VM checkout or GitHub RTL reads. If Neo is unavailable, report the
+   prerequisite and stop.
 4. The workspace is multi-repo, with its repo set and layout defined by the `octl` manifest.
-   Each repo has a `.github/` directory containing additional skills / AI resources — check
-   the relevant repo's `.github/` for project- or IP-specific guidance before/while researching.
+   Consult relevant non-RTL repo-local guidance locally; RTL questions go
+   to Neo only.
 
 ### Build / Workspace Conventions
 
@@ -128,25 +133,18 @@ NoC spec, or source tree.
 - **Index:** `~/.copilot/skills/iridium-prj/knowledge/INDEX.md` — catalog of recorded topics
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
 
-The knowledge base is **always consulted first** (Step 0) and **always updated after**
-non-trivial research (final step). This is what makes the skill grow into a true Iridium project
-expert over time.
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step).
 
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base (do this first)
 
-1. Read `~/.copilot/skills/iridium-prj/knowledge/INDEX.md` and scan the topic table.
-2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
-   `knowledge/` directory for the question's keywords:
-   ```python
-   import os, glob
-   kb = os.path.expanduser("~/.copilot/skills/iridium-prj/knowledge")
-   for f in glob.glob(os.path.join(kb, "*.md")):
-       txt = open(f, encoding="utf-8").read()
-       if "<keyword>" in txt.lower():
-           print(f"== {os.path.basename(f)} ==")
-   ```
+1. Use the topic names in this skill. Consult an index or note only if it is
+   already known not to contain HDL excerpts; do not bulk-search the knowledge
+   directory, which may contain historical source excerpts.
+2. If no verified source-free note is available, proceed using the external
+   specifications or ask Neo (`neo-ask`) for a paraphrased finding.
 3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
    **narrow** the search before diving into the docs/source.
 
@@ -170,8 +168,8 @@ Determine which source(s) are most relevant:
 
 ### Step 2: Search the Source
 
-Use `python-docx` for the `.docx` specs. Use the workspace search tools (grep/file/semantic)
-for the source tree.
+Use `python-docx` for the `.docx` specs and workspace search tools for non-RTL
+software. RTL questions go to Neo (`neo-ask`) only.
 
 #### DOCX keyword search across paragraphs:
 ```python
@@ -211,9 +209,9 @@ for t_idx, table in enumerate(doc.tables):
             print(f"Table {t_idx}, Row {r_idx}: {row_text}")
 ```
 
-For the **source tree**, prefer the workspace tools (`grep_search`, `file_search`,
-`semantic_search`, `read_file`) under `~/projects/iridium/<variant>/`. Fall back to GitHub
-search tools for repos not checked out locally.
+For **FW and non-RTL software**, prefer workspace tools under
+`~/projects/iridium/<variant>/`, with a GitHub fallback limited to software.
+RTL inspection and comparisons go to Neo (`neo-ask`) only, as above.
 
 ### Step 3: Extract and Answer
 
@@ -225,7 +223,8 @@ search tools for repos not checked out locally.
 4. The docx may contain diagrams that cannot be rendered — call out when a diagram would help.
 5. **Always cite** the source: PRM/NoC paragraph or table index, source file + path + symbol,
    or manifest/`.star` path.
-6. If the specs don't cover it, check the source tree (local first, then GitHub).
+6. If the specs don't cover it, check non-RTL software locally then on GitHub;
+   ask Neo (`neo-ask --chip a1`) for any RTL evidence.
 
 ### Step 4: Record Verified Findings (do this last)
 
@@ -267,6 +266,6 @@ Skip recording only for trivial lookups already fully covered by an existing ent
   PHY/protocol detail, defer to: `pcie-ep-ip`, `d2d-ip`, `su-ip`, `ras-manageability`.
 - For building Iridium FW, use the `build-fw` skill; for planning/tracking, the
   `jira-hsi-planning` / `team-planner` skills.
-- Source under `~/projects/iridium/` has multiple variant checkouts — confirm which variant a
-  finding came from, and prefer `main/` unless a specific variant is requested.
+- FW source under `~/projects/iridium/` has multiple variant checkouts — confirm
+  which variant a finding came from. RTL questions go to Neo only (rule above).
 - DOCX tables may contain merged cells — handle gracefully when parsing.

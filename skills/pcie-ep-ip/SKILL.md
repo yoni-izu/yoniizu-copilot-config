@@ -1,6 +1,6 @@
 ---
 name: pcie-ep-ip
-description: 'Answer PCIe EP IP design, usage, register, PHY, controller, and PIW questions using Synopsys IP documentation and RTL. Use when: PCIe endpoint, DWC PCIe EP controller, PCIe6 PHY, SerDes, PIPE, lane margining, LTSSM, equalization, PRBS, loopback, RAS DES, config space, TLP, DLLP, Flit mode, L0p, error injection, event counters, link training, PCIe EP registers, MSIX gateway, MSI-X interrupt coalescing, PIW.'
+description: 'Answer PCIe EP IP design, usage, register, PHY, controller, and PIW questions using Synopsys IP documentation, with RTL questions answered by Neo (neo-ask). Use when: PCIe endpoint, DWC PCIe EP controller, PCIe6 PHY, SerDes, PIPE, lane margining, LTSSM, equalization, PRBS, loopback, RAS DES, config space, TLP, DLLP, Flit mode, L0p, error injection, event counters, link training, PCIe EP registers, MSIX gateway, MSI-X interrupt coalescing, PIW.'
 argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or controller behavior'
 ---
 
@@ -109,16 +109,19 @@ PCIe EP responsibilities by stage (per the proposed driver-functionality split):
 > **RTL branch strategy:** In the RTL repo, the **`main`** branch holds the **latest
 > implementation for the most recent project** we are working on (currently **Atlantic**).
 > Each **previous** project is frozen on its own **freezed RTL** branch — e.g. **Iridium**'s
-> RTL lives on the Iridium *freezed rtl* branch, not on `main`. When researching RTL for a
-> specific project, check out the matching branch: `main` for Atlantic, the project's
-> freezed-RTL branch for Iridium (and any earlier project).
+> RTL lives on the Iridium *freezed rtl* branch, not on `main`. Neo knows both: ask
+> with `--chip a1` (Iridium freeze) or `--chip a2` (Atlantic/A2 `main`).
 
-**Local-first strategy**: These skills are global (user-level). The workspace may or may not contain the source code.
+**Source strategy**:
 1. Check if FW driver code exists locally — common workspace paths:
    - `fw/ip/pcie/` or `ip/pcie/`
    - Also check the project manifest (e.g., `.star` files or `octl` manifests) for the actual deployment path
-2. If found locally — read directly from the workspace (fastest, no network)
-3. If NOT found locally — use GitHub search tools to query the remote repos above
+2. Read FW and CSR software headers locally, or search their specific software repos on GitHub.
+3. For RTL, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
+   `~/bin/neo-ask --chip a1|a2 "<question>"` — and relay only its paraphrased
+   findings and citations (repo, path, symbol, mirror commit), never HDL or
+   patches. No local/VM checkout or GitHub RTL reads. If Neo is unavailable,
+   report the prerequisite and stop.
 
 ## Knowledge Base (Expert Memory)
 
@@ -131,9 +134,8 @@ controller/PHY docs, EP spec, PIW docs, or RTL.
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
   (seeded with `ds-term.md` and `phy-reset.md`, both verified from RTL)
 
-The knowledge base is **always consulted first** (Step 0) and **always updated after**
-non-trivial research (final step). This is what makes the skill grow into a true PCIe EP expert
-over time.
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step).
 
 > **Recording trigger — read this twice.** Record a finding whenever you **verify** a
 > non-trivial IP fact during this turn, regardless of *why* you were invoked. The
@@ -158,17 +160,15 @@ over time.
 
 ### Step 0: Consult the Knowledge Base (do this first)
 
-1. Read `~/.copilot/skills/pcie-ep-ip/knowledge/INDEX.md` and scan the topic table.
-2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
-   `knowledge/` directory for the question's keywords:
-   ```python
-   import os, glob
-   kb = os.path.expanduser("~/.copilot/skills/pcie-ep-ip/knowledge")
-   for f in glob.glob(os.path.join(kb, "*.md")):
-       txt = open(f, encoding="utf-8").read()
-       if "<keyword>" in txt.lower():
-           print(f"== {os.path.basename(f)} ==")
-   ```
+1. Use the topic names in this skill and the external specifications. Historical
+   knowledge files can contain HDL excerpts, including inline syntax; do not
+   bulk-search them or read an excerpt-bearing file.
+2. Known excerpt-bearing detail files include `piw-drain.md`,
+   `clocking-scheme-cc-srns-sris.md`, `flr-handling.md`,
+   `flr-handling-a1-vs-a2.md`, `ltssm-logger.md`, `ds-term.md`,
+   `delay-link-ltssm-hold.md`, and `elbi-mechanism.md`. Consult the index or
+   another note only when it is already known to be excerpt-free. Re-derive
+   needed facts through Neo (`neo-ask`) and request a paraphrased summary.
 3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
    **narrow** the search before diving into the docs/RTL.
 
@@ -187,7 +187,7 @@ Determine which document(s) are most relevant:
 | Internal EP spec | `PCIe EP Specification Rev 2.0.0.docx` (top-level) | |
 | MSIX gateway / interrupts | `PIW/MSIX_GW_uArch.docx` | `PCIe EP Specification Rev 2.0.0.docx` |
 | PCB/signal integrity | `dwc_SerDes_pcb_packaging_design_guide.pdf` | |
-| RTL implementation | GitHub repo | |
+| RTL implementation | Neo — `~/bin/neo-ask --chip a1\|a2 "…"` | |
 
 ### Step 2: Search the Document
 
@@ -229,7 +229,8 @@ for i, para in enumerate(doc.paragraphs):
 2. For register lookups: search the reference PDF by register name or offset
 3. For architectural questions: start with the databook, then cross-reference the register manual
 4. Always cite the source document and page number in your answer
-5. If the docs don't cover it, check RTL via GitHub search tools
+5. If the docs don't cover it, ask Neo (`~/bin/neo-ask`) for a paraphrased RTL
+   finding; never use GitHub, local or VM-worktree RTL reads.
 
 ### Step 4: Record Verified Findings (do this last)
 
@@ -266,8 +267,8 @@ Skip recording only for trivial lookups already fully covered by an existing ent
 
 ## Deep-Dive Findings (in the Knowledge Base)
 
-Detailed, RTL-verified deep dives have been recorded in the knowledge base — read these files
-before re-researching the same topics:
+Historical RTL-verified deep dives cover these topics. Do not read an
+excerpt-bearing note; ask Neo (`neo-ask`) for a paraphrased re-check:
 
 - **Downstream Termination (DS_TERM) datapath** — `knowledge/ds-term.md`
   (what each `PEP_CTRL_AUX_DS_TERM_CTRL` bit gates, SW vs RASDP triggers, ELBI one-way trapdoor,

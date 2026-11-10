@@ -1,6 +1,6 @@
 ---
 name: noc-ip
-description: 'Answer NoC (Network-on-Chip) / fabric IP design, address-map, routing, and FIU questions using the internal Atlantic2 NoC specification and NoC RTL. Use when: NoC, network on chip, fabric, address map, memory regions, NPA, device coordinates, MEM fabric, mRTR/pRTR, virtual channels, data merging, MNG/CTRL/DBG/TRC/ECT/TS fabrics, AxUSER, FIU, address decode/hashing, memory isolation, traffic rate limiting, reset isolation, channel selection, scale-up connectivity, rail, routing algorithm, CfgR/RR, region selection, DieID.'
+description: 'Answer NoC (Network-on-Chip) / fabric IP design, address-map, routing, and FIU questions using the internal Atlantic2 NoC specification, with RTL questions answered by Neo (neo-ask). Use when: NoC, network on chip, fabric, address map, memory regions, NPA, device coordinates, MEM fabric, mRTR/pRTR, virtual channels, data merging, MNG/CTRL/DBG/TRC/ECT/TS fabrics, AxUSER, FIU, address decode/hashing, memory isolation, traffic rate limiting, reset isolation, channel selection, scale-up connectivity, rail, routing algorithm, CfgR/RR, region selection, DieID.'
 argument-hint: 'Ask about the NoC/fabric IP — address map, routing, a specific fabric (MEM/MNG/CTRL/DBG/TRC/ECT/TS), FIU, or the RTL'
 ---
 
@@ -41,8 +41,8 @@ argument-hint: 'Ask about the NoC/fabric IP — address map, routing, a specific
 - The NoC spec here is the **Atlantic2 (A2)** fabric spec. NoC owner: **Maxim Leshin** (per the
   spec revision history). The RTL repo is **`Elmnt-Internal/ip.noc.rtl`**; SW/CSR/FW repos are
   `ip.noc.sw.csr` and `ip.noc.sw.fw`.
-- **A2 RTL = `main`**; **A1/Iridium RTL is frozen** on the `iridium` branch. To see A2 NoC RTL
-  changes, diff `origin/iridium..origin/main` (see the Procedure).
+- **A2 RTL = `main`**; **A1/Iridium RTL is frozen** on the `iridium` branch. For the delta,
+  ask Neo (`~/bin/neo-ask --chip a2`) for the delta (see the Procedure).
 - The A2 fabric is a set of **non-intrusive, low-latency fabrics**: one **MEM** data fabric plus
   the **MNG / CTRL / DBG / TRC / ECT / TS** sideband fabrics, glued to endpoints by the **FIU**.
 
@@ -79,19 +79,23 @@ Isolation, Credit Handling, Channel Selection) · `Performance` · `Trace and De
 - **Index:** `~/.copilot/skills/noc-ip/knowledge/INDEX.md`
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with citations.
 
-Consult it first (Step 0); update it after non-trivial research (final step).
+Consult source-free knowledge first when available (Step 0); update it with
+paraphrased findings after non-trivial research (final step).
 
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base
-Read `knowledge/INDEX.md`; full-text search `knowledge/` for the question's keywords.
+Use the topic names in this skill; consult an index or note only if it is
+already known not to contain HDL excerpts. Do not bulk-search the knowledge
+directory. If none is verified source-free, use the specification or ask Neo
+(`neo-ask`) for a paraphrased finding.
 
 ### Step 1: Classify the Question
 - Address map / regions / NPA → Address Map section (+ `csr-bot` for absolute addresses).
 - Routing / coordinates / region selection → Device Coordinates + Device Routing + routing algo.
 - A specific fabric → that fabric's section (MEM / MNG / CTRL / DBG / TRC / ECT / TS).
 - Isolation / rate-limit / reset-iso / security → FIU section.
-- RTL behavior → `ip.noc.rtl` (diff `iridium..main` for the A2 delta).
+- RTL behavior → ask Neo (`~/bin/neo-ask --chip a1|a2`).
 
 ### Step 2: Search the Spec (`python-docx`)
 ```python
@@ -105,13 +109,11 @@ for i,p in enumerate(doc.paragraphs):
 ```
 
 ### Step 3: Search the RTL
-```bash
-# A2 delta = what landed on main since the Iridium (A1) freeze:
-gh api repos/Elmnt-Internal/ip.noc.rtl/compare/iridium...main --jq '.files[].filename'
-# or, in a local checkout:
-git -C <ip.noc.rtl> log --oneline origin/iridium..origin/main
-git -C <ip.noc.rtl> diff origin/iridium..origin/main -- <path>
-```
+Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
+`~/bin/neo-ask --chip a1|a2 "<NoC question>"` (A1 = Iridium freeze, A2 = `main`).
+Relay only its paraphrased findings and citations, never HDL or patches. If Neo
+is unavailable, report the prerequisite and stop; no local, VM-worktree or
+GitHub RTL fallback.
 
 ### Step 4: Answer + cite (spec para/table index, RTL repo/branch/commit, FIU doc).
 
@@ -123,4 +125,4 @@ a finding is contradicted later, correct it.
 - **Acronyms**: spec has a Terminology/Acronyms section near the top.
 - **Tables**: address-map ranges and field/bit definitions live in tables — search both.
 - **A2-vs-A1 / recent changes**: read the spec **Revision History** table and diff Rev 1.2.0 vs
-  1.4.0; for implementation reality diff `ip.noc.rtl` `iridium..main`.
+  1.4.0; for implementation reality ask Neo (`neo-ask --chip a2`) for the RTL delta.

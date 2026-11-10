@@ -11,6 +11,21 @@ argument-hint: "Optional -t <target>, an operation (mirror/workspace/build/build
 
 # mctl — Multi-Machine Mirror-Workspace Work Offloading
 
+**RTL is not a mirror-workspace task.** Follow
+[rtl-vm-policy](../rtl-vm-policy/SKILL.md): every RTL question goes to
+Neo via `~/bin/neo-ask` (neo-brain on target `vm`, using its own mirrors).
+Never use `mctl sh`, `wip`, `pull-logs`, `jobs-sync`, or another transfer to
+send RTL source, patches, diff hunks, or source-bearing logs to WSL. If Neo is
+unavailable, report the prerequisite and stop. These
+restrictions do not change normal FW or software CSR workflows.
+
+**Mixed/unknown job targets:** `~/bin/mctl jobs-probe` returns the last line of
+every job log, and `jobs-sync` copies every remote job log. `vd.py refresh` and
+the portal's refresh invoke these operations. Do not run them for a target that
+may contain RTL or unclassified jobs; neither helper enforces this policy.
+For a verified software-only job, the per-job status, tail and pull workflows
+remain available only when their output is known not to contain RTL.
+
 Offload heavy FW work to **any reachable machine** — a personal EC2 VM (192
 cores) or a shared lab desktop — that hosts a **mirror workspace at the same
 path relative to `$HOME`**. All operations go through one script, `~/bin/mctl`
@@ -95,9 +110,9 @@ Prefix any command with `-t <target>` to pick a machine (or set a default with
 | Run workspace tests (detached) | `mctl test '<octl ws test args>' [ws]` |
 | Check the remote test run | `mctl test-status [ws]` |
 | Every job ever delegated, with its outcome | `mctl jobs` |
-| Machine-readable state of every remote job dir | `mctl -t <name> jobs-probe` |
-| Mirror every remote job log locally (so it survives a re-run) | `mctl -t <name> jobs-sync` |
-| Last N lines of one live remote job log | `mctl -t <name> jobs-tail <tag> [kind] [n]` |
+| State of every job dir, only on a verified source-free target | `mctl -t <name> jobs-probe` |
+| Mirror all job logs, only on a verified source-free target | `mctl -t <name> jobs-sync` |
+| Last N lines of one verified source-free software job | `mctl -t <name> jobs-tail <tag> [kind] [n]` |
 | EC2 power state of every instance | `vd.py vms` (wraps `octl vm list`) |
 | Clean up: return remote repos to baseline + sync | `mctl release [ws]` |
 | Guarded independent remote slot operations | `mctl -t NAME workspace status\|sync\|free\|mirror\|align /absolute/remote/path WS-R-uuid BASELINE [options-json]` |
@@ -138,10 +153,12 @@ external firmware — see "`.repo` is not mirrored" below.
 
 When reporting to the user, poll with `build-status` between turns (never
 `sleep`-loop). `STATE=RUNNING`/`DONE`, an `ERRORS=` count, and a log tail are
-printed each poll. For the full deduplicated error list after completion:
+printed each poll. Only poll a verified software-only job whose output is known
+to be source-free. For errors, inspect that job's log, never a glob over all
+jobs:
 
 ```bash
-mctl sh 'grep -E "error:" ~/.mctl/jobs/*/build.log | sed "s#.*/fw/##" | sort -u | head'
+mctl jobs-tail <verified-software-job-tag> build
 ```
 
 ## What `mirror` does (and the force-push caveat)
@@ -159,6 +176,12 @@ paths so it ports cleanly across machines with different homes):
    are not authoritative after a portal Free. Adopt an existing remote marker
    ID through workspace-manager's guarded status/identity reconciliation;
    never replace an unknown identity.
+   Resolve the mapped slot's real path on the target **before** roster lookup
+   or registration. Repeated mirrors through a symlink alias reuse the canonical
+   slot's existing ID, revision and reservation; they must not create another
+   record or displace its holder. Unresolvable paths and conflicting registered
+   machine identities fail closed. Workspace action-history lookup uses the same
+   canonicalization, so build/test/sh logging cannot recreate alias records.
    First-time remote registration inherits the source roster's manifest
    revision (for example `a1_power_on`), not the remote identity default
    `main`. Existing remote registrations retain their configured revision.
@@ -249,9 +272,9 @@ the only record that survives the next run.
 
 ```bash
 mctl jobs           # every job ever delegated, from the local log
-mctl jobs-probe     # one ssh round trip: TSV state of EVERY remote job dir
-mctl jobs-sync      # rsync every remote job log into ~/.mctl/jobs/<target>/
-mctl jobs-tail <tag> [kind] [n]   # last n lines of ONE live remote log
+mctl jobs-probe     # EVERY job dir, including last lines: source-free targets only
+mctl jobs-sync      # EVERY job log: source-free targets only
+mctl jobs-tail <tag> [kind] [n]   # ONE verified source-free software log
 ```
 
 `jobs-probe` emits `tag kind STATE rc pid log_mtime lines errors cmd last_line`,
@@ -271,7 +294,9 @@ python3 ~/.copilot/skills/vm-delegate/vd.py start|stop <instance-id>
 
 ### Refresh one machine, not the fleet
 
-`refresh` and `sync` both take an optional target name, and that is not a
+Only use `refresh` or `sync` when all logs on the target are known source-free;
+scoping to a target does not classify the jobs on it. Both take an optional
+target name, and that is not a
 convenience: **an unreachable target costs a 90 s ssh timeout**, so with two
 dead lab desktops registered a fleet refresh runs for minutes while
 `vd.py refresh vm` returns in about four seconds. Ask for the machine you care
@@ -297,9 +322,10 @@ The target name is validated against the registered target list before it
 reaches a shell, so an unknown or crafted name is refused outright rather than
 escaped.
 
-### Log retention — the remote clobbers, so mirror first
+### Log retention — source-free jobs only
 
-`refresh()` calls `sync_logs()` for every target it reached, which is
+Subject to the mixed/unknown-target restriction above, `refresh()` calls
+`sync_logs()` for every target it reached, which is
 `mctl jobs-sync`: an rsync of `~/.mctl/jobs/*/` on the target into
 `~/.mctl/jobs/<target>/`, keeping the previous copy as `<name>.log~` when a tag
 is re-run. **Without this a log is gone the moment its slot is reused**, which
@@ -399,12 +425,23 @@ This command does **not** call `find_ws` or `map_remote`: the absolute path is
 already the target's path. All calls require a stable remote ID and configured
 manifest baseline revision (`main` or a release branch/tag, **not a counter**).
 An optional final JSON argument is a mirror object or `null` for `mirror`;
-for other actions it is an options object allowing only a `prs` list. PR
-alignment is passed to the runtime; the transport never invokes remote `gh`.
+other actions accept a `prs` list. The portal's `free` action also accepts
+`{"portal_free":{"approved":null}}` for the initial check or a 64-character
+snapshot token after explicit confirmation. The remote runtime rechecks that
+snapshot and can return `approval_required` without changing the checkout.
+This option is invalid for other actions; ordinary `mctl release` retains its
+guarded behavior. PR alignment is passed to the runtime; the transport never
+invokes remote `gh`.
+
+Portal `sync` accepts `{"portal_sync":{"approved":null}}` or the confirmed
+snapshot token for **Force sync** on free independent workspaces only. It
+uses the same safe stashing and revision-return flow without releasing the
+workspace; occupancy and mirror guards are not bypassed.
 
 The local portable `workspace-manager/workspace_runtime.py` is base64-encoded
 and sent through existing `rlogin`/login-shell stdin, with shell-quoted JSON:
-`{action,path,id,rev,mirror?}` (or `prs` for review alignment). No remote
+`{action,path,id,rev,mirror?}` (or `prs` for review alignment, `portal_free`
+for a portal-confirmed return, and `portal_sync` for confirmed Sync). No remote
 installation beyond Python's standard library and the existing `wip`/`octl` for repository
 operations is needed, and no remote `rtk` is used. Stdout is the runtime's
 single JSON response `{ok,error?,status?,log?}`. Domain failures preserve JSON

@@ -17,6 +17,20 @@ When the user provides one or more GitHub pull request URLs and wants the corres
 
 ## Procedure
 
+**RTL gate:** Before checkout or a `wip` scan, classify every PR and the
+workspace from repository names and manifest/file metadata. Do not use a local
+RTL repository, a mixed workspace containing one, or a PR that changes HDL.
+Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): RTL review is done by asking
+Neo (`~/bin/neo-ask "Review <repo>#<pr> (branch <head>) …"`), which returns
+paraphrased findings only. If Neo is unavailable, report the prerequisite. FW and CSR software
+header checkouts retain this workflow.
+
+For a software PR, use the guarded `fw-workspace-git/scripts/pr_set.py`
+checkout where available: it classifies complete changed-file metadata and
+fetches the verified head SHA, rather than a floating branch. An unknown
+classification or unavailable guard stops checkout. Its filename heuristic
+is not proof that unmarked files or review text contain no HDL.
+
 ### 1. Parse PR URLs
 
 Extract from each URL:
@@ -52,28 +66,25 @@ gh pr view {PR_NUMBER} --repo {OWNER}/{REPO} --json headRefName -q '.headRefName
 
 Run these in parallel or chained with `&&` and `echo "---"` separators for efficiency.
 
-### 5. Checkout and pull each repo
+### 5. Check out the classified software PR set
 
-For each repo, fetch, checkout, and pull the PR branch:
+Use the guarded helper; it fetches the verified PR-head SHA, not a branch that
+could change after classification. If the helper or its guard is unavailable,
+stop rather than falling back to an unguarded local fetch.
 
 ```bash
-cd {WORKSPACE_ROOT}/{LOCAL_PATH} && git fetch origin {BRANCH} && git checkout {BRANCH} && git pull origin {BRANCH}
+python3 ~/.copilot/installed-plugins/ai-toolkit/fw-soc/general/skills/fw-workspace-git/scripts/pr_set.py checkout {PR_URLS} --ws {WORKSPACE_ROOT}
 ```
 
 ### 5b. Snapshot the aligned workspace (token savings)
 
 Whole-workspace checkouts should go through the [wip-workspace](../wip-workspace/SKILL.md)
-CLI so re-aligning the same PR set later costs **one** cheap command instead of
-re-parsing the manifest and re-querying `gh`. Once the repos are on their PR
-branches, record and snapshot the state:
+CLI so re-aligning the same PR set later costs **one** cheap command. Add
+`--save prset-<name>` to the guarded checkout; it preflights the whole WIP scan
+scope before invoking `wip`.
 
-```bash
-cd {WORKSPACE_ROOT}
-wip scan                    # record the current branch of every repo
-wip save prset-<name>       # snapshot -> ~/.wip/saved/prset-<name>.wip
-```
-
-To restore this exact set later (no `gh`, no manifest parse, no per-repo loop):
+Before restoring, independently verify that the saved snapshot and workspace
+still exclude RTL and mixed HDL. Then:
 
 ```bash
 wip load prset-<name> && wip all checkout

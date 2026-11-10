@@ -29,8 +29,9 @@ or post to Jira/GitHub without explicit approval (see Hard Rules).
 ## Grounding — in priority order
 
 1. **The debugging memoir** — `~/.copilot-private/skills/bug-triage/memoir.md`: accumulated failure signatures,
-   root-cause patterns, gotchas, "always check" items, and per-IP debugging lore. **Read it before every
-   investigation** (Step 0) and **fold new lessons back in** (final step).
+   root-cause patterns, gotchas, "always check" items, and per-IP debugging lore. Read it only if known
+   to be free of embedded RTL excerpts; otherwise use an owner-sanitized version. Fold new lessons back
+   in without RTL excerpts and never copy this private record to the VM.
 2. **The phenomenon registry** — `~/tasks/bugs.db` (phenomena table, via `bugdb.py`) via [`ph.py`](./ph.py): every failure actually
    *observed*, on every platform, from every channel. Match the new symptom against it **before**
    investigating — the fastest possible triage is "we have seen this, it is PH-007, here is the owner
@@ -42,6 +43,14 @@ or post to Jira/GitHub without explicit approval (see Hard Rules).
 
 ## Hard Rules (never violate)
 
+- **RTL questions go to Neo only.** Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md):
+  ask Neo (`~/bin/neo-ask --chip a1|a2 "<question>"`, neo-brain on `vm`) to
+  inspect or bisect RTL; relay only its paraphrased findings and citations, never
+  HDL, patches, or source-bearing logs. No local/VM-worktree or GitHub RTL reads.
+  If Neo is unavailable, report the prerequisite and leave the RTL question unverified.
+  Put only paraphrased, source-free RTL findings in the local registry, memoir,
+  and investigation notes. Local FW and CSR software headers retain their
+  normal workflows.
 - **NEVER post to Jira or GitHub without explicit user approval.** Draft comments/updates locally, present
   them, and submit only when told. (Consistent with the user's GitHub/Jira rules.)
 - **A report without a ticket is still a bug.** Never answer "there's no Jira ticket for this" — record the
@@ -71,7 +80,8 @@ console, or a sentence in a standup. **Normalize all of them into one intake.** 
 what's missing; infer the rest from context):
 
 - **Symptom**: crash / hang / assert / wrong result / perf / boot failure / link-down, and the exact
-  message, assert string, PC, or error code. *Keep the verbatim text* — it is the signature material.
+  message, assert string, PC, or error code. Keep verbatim signature text only when known not to
+  contain RTL source; otherwise use a source-free paraphrase from Neo.
 - **Platform**: `ci` · `sim` · `fpga` · `palladium` · `silicon-lab` · `production` · `unknown`.
   This is now a first-class axis: the same code fails differently on each, and a phenomenon that moves
   rightward along that list has **escaped a gate**.
@@ -245,14 +255,14 @@ ph.py set <PH-id> --severity <sev> --owner <who> --component <ip>
 ## Workflow
 
 ### Step 0 — Consult the memoir (always first)
-Read `~/.copilot-private/skills/bug-triage/memoir.md` in full. Note which failure signatures, "always
-check" items, and per-IP gotchas match this symptom. A matching signature often shortcuts the whole
-investigation.
+Consult `~/.copilot-private/skills/bug-triage/memoir.md` only under the excerpt-free condition above.
+Note which failure signatures, "always check" items, and per-IP gotchas match this symptom. A matching
+signature often shortcuts the whole investigation.
 
 ### Step 1 — Intake, match the registry, classify, and pin the repro
 1. Fill in the [intake](#intake--any-channel-any-platform) fields. Classify: **regression vs latent**,
    **which platform**, and **which IP/stage** owns it.
-2. **Match before anything else** — `ph.py match -t "<verbatim evidence>"`. If it hits a known
+2. **Match before anything else** — `ph.py match -t "<safe signature or paraphrase>"`. If it hits a known
    phenomenon, jump to [Known phenomenon](#a-known-phenomenon-the-fast-path): the triage is *confirm,
    attach, and inherit*, not a fresh investigation. This single step is the largest time saver in the
    skill.
@@ -273,9 +283,9 @@ local repro), pull and read the CI logs first — see [CI-Log Debugging](#ci-log
 whether it reproduces locally or is CI-environment-specific.
 
 ### Step 3 — Localize in code
-Find the code path. Use the workspace search tools (`grep_search`, `semantic_search`, `file_search`) on
-the local checkout first, then GitHub search against `Elmnt-Internal/ip.<ip>.*` repos if the code isn't
-local. Read the *path*, not just the failing line: callers, init order, the state the failing line
+Find the FW/software code path. Use workspace search tools on the local software
+checkout first, then GitHub search against the specific non-RTL software repo
+if needed. For RTL, ask Neo (`~/bin/neo-ask`) only. Read the *path*, not just the failing line: callers, init order, the state the failing line
 assumes. Map the symptom to a suspected module/function/register and form ranked hypotheses (label each
 *likely*/*unverified*).
 
@@ -524,9 +534,11 @@ first (`wip-workspace` → save). Never bisect over a dirty tree or the user's a
         <(git -C <manifests-repo> show <bad>:projects/<proj>/<variant>/<name>.xml)
    ```
    (`<manifests-repo>` = the CI/octl manifests repo resolved above; or diff the two `.repo/manifests/` snapshots.)
-4. **Bisect inside the offending repo.** With the repo's good and bad revisions from step 3, run
-   `git bisect` within that single repo (`git bisect start <bad> <good>`), building + reproducing at each
-   step, to land on the exact offending commit.
+4. **Bisect inside the offending repo.** For FW/software, use the good and bad
+   revisions with `git bisect` and reproduce at each step. If the offending repo
+   contains RTL, ask Neo (`neo-ask`) to bisect it in its mirror between the good
+   and bad revisions and return a paraphrased result; do not run local Git,
+   GitHub compare, or transfer patches.
 5. **Confirm.** Verify the identified commit is causal — revert it (or its key hunk) on the bad manifest and
    confirm the failure disappears. Only then call it *confirmed*.
 

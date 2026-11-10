@@ -1,6 +1,6 @@
 ---
 name: atlantic2-prj
-description: 'Project expert for the Atlantic2 (A2) project — the NEXT project (successor to Iridium/A1). Architecture, PRM/overview, NoC, address map, reset/boot flow, security, redundancy/binning, D2D (new 5nm + 3nm PHY), PCIe GEN7, SU PCIe-compliant mode, FW/SW integration, build & manifests, and — critically — WHAT CHANGED IN A2 vs A1 (Iridium). Use when: Atlantic2 / A2 project, A2 vs A1 changes, A2 PRM/overview, A2 NoC, A2 address map, A2 D2D new PHY (5nm/3nm, UCIe), PCIe GEN7, SU PCIe compliant mode, A2 initiatives, A2 Rev2.x specs, A2 RTL (main since A1 freeze tag), A2 HSI tickets, atlantic2 workspace/build.'
+description: 'Project expert for the Atlantic2 (A2) project — the NEXT project (successor to Iridium/A1). Architecture, PRM/overview, NoC, address map, reset/boot flow, security, redundancy/binning, D2D (new 5nm + 3nm PHY), PCIe GEN7, SU PCIe-compliant mode, FW/SW integration, build & manifests, and — critically — WHAT CHANGED IN A2 vs A1 (Iridium). Use when: Atlantic2 / A2 project, A2 vs A1 changes, A2 PRM/overview, A2 NoC, A2 address map, A2 D2D new PHY (5nm/3nm, UCIe), PCIe GEN7, SU PCIe compliant mode, A2 initiatives, A2 Rev2.x specs, A2 RTL questions (answered by Neo via neo-ask --chip a2), A2 HSI tickets, atlantic2 workspace/build.'
 argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium (A1), an IP/spec/RTL area, or the project plan'
 ---
 
@@ -27,7 +27,14 @@ argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium
 - A2 **HSI Jira** initiatives/epics (`ASIC Project == Atlantic2`) — plan, scope, ownership.
 - A2 **Rev2.x specs** (the Rev2 docs are A2; Rev1 docs are A1/Iridium).
 - A2 **RTL**: A1 froze on a specific tag; everything on the RTL `main` branch **since that tag**
-  is A2 work. Diff the IP RTL repos to see A2 implementations.
+  is A2 work. Ask Neo (`~/bin/neo-ask --chip a2`) for the delta.
+
+> **RTL access:** Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md). Every RTL
+> question goes to **Neo** (neo-brain on `vm`, A1 + A2 mirrors) via
+> `~/bin/neo-ask [--chip a1|a2] "<question>"`. Never read RTL from local/VM
+> checkouts or GitHub; relay only paraphrased, cited findings. If Neo is
+> unavailable, report the prerequisite and stop.
+> Local FW and CSR software headers are not RTL.
 
 > This is a **project-scope** skill. For deep single-IP questions, defer to the dedicated IP
 > skills (`pcie-ep-ip`, `d2d-ip`, `su-ip`, `noc-ip`, `psoc-ip`, `ras-manageability`) — which have been updated
@@ -107,16 +114,15 @@ The A2 project source (when checked out) is expected under `~/projects/atlantic2
 | `fw/` | Firmware tree (Zephyr apps + per-IP drivers under `fw/ip/<ip>/`) |
 | `fw/proj_infra/` | Project-specific A2 FW infra: build infra, post-build scripts, lua, regressions |
 | `kmd/` | Kernel-mode driver(s) |
-| `<repo>/.github/` | Per-repo skills / AI resources — consult alongside this skill |
+| `<repo>/.github/` | FW-repo skills / AI resources may be consulted locally; RTL questions go to Neo (`neo-ask`) only. |
 
 **RTL strategy (critical for A2):**
 - A1 (Iridium) **froze its RTL on a specific tag**. On each IP RTL repo, **everything on `main`
   since that A1 freeze tag is A2 work**.
-- To find A2 RTL changes: identify the A1 freeze tag/branch (see `iridium-prj` / the IP skills for
-  the freezed-RTL branch), then diff `main` against it:
-  `git log <a1-freeze-tag>..origin/main` and `git diff <a1-freeze-tag>..origin/main -- <path>`.
-- Prefer a local checkout; otherwise use the GitHub tools against `Elmnt-Internal/ip.<ip>.*`
-  repos (see the IP skills for exact repo URLs).
+- Ask Neo: `neo-ask --chip a2 "What changed in <IP> <feature> between the A1
+  freeze and current A2 main?"`. Relay its paraphrased delta and citations
+  (repo, path, symbol, mirror commit), never a diff or source text. No local,
+  VM-worktree or GitHub RTL fallbacks.
 
 ### Build / Workspace Conventions
 
@@ -133,15 +139,17 @@ This skill keeps an **expert memory** of everything researched/verified about A2
 - **Index:** `~/.copilot/skills/atlantic2-prj/knowledge/INDEX.md`
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations.
 
-Always consult it first (Step 0) and update it after non-trivial research (final step).
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step).
 
 ## Procedure
 
 ### Step 0: Consult the Knowledge Base (first)
 
-1. Read `~/.copilot/skills/atlantic2-prj/knowledge/INDEX.md` and scan the topic table.
-2. Full-text search `knowledge/` for the question's keywords. If a recorded finding answers it,
-   use it (cite it); otherwise use it to narrow the search.
+1. Use the topic names in this skill. Consult an index or note only if it is
+   already known not to contain HDL excerpts; do not bulk-search `knowledge/`.
+2. If a source-free finding answers the question, cite it; otherwise use the
+   specifications or ask Neo (`neo-ask`) for a paraphrased finding.
 
 ### Step 1: Classify the Question
 
@@ -161,8 +169,9 @@ Always consult it first (Step 0) and update it after non-trivial research (final
 
 - **DOCX** (Rev2 for A2, Rev1 for A1): use `python-docx` — heading map, paragraph search, table
   search (register/field defs live in tables). Diff Rev2 vs Rev1 for the A2 delta.
-- **RTL**: `git diff <a1-freeze-tag>..origin/main` in the IP repo (or GitHub tools).
-- **Source tree**: workspace tools under `~/projects/atlantic2/<variant>/` (fall back to GitHub).
+- **RTL**: ask Neo (`neo-ask --chip a2`) to compare the A1 freeze with A2 `main`.
+- **FW/software source**: workspace tools under `~/projects/atlantic2/<variant>/`
+  (fall back to GitHub for non-RTL content only).
 
 ### Step 3: Extract and Answer
 
@@ -184,5 +193,5 @@ Always consult it first (Step 0) and update it after non-trivial research (final
 - **A2-vs-A1**: always keep the Rev1 (A1) doc handy to diff against the Rev2 (A2) doc.
 - **Acronyms**: each spec has a Terminology/Acronyms section near the top.
 - **Address map / regions**: A2 NoC spec "Address Map".
-- **RTL delta**: diff `main` against the A1 freeze tag (per IP; see IP skill for the tag/branch).
+- **RTL delta**: ask Neo (`neo-ask --chip a2`) for the A1-freeze → A2-`main` delta per IP.
 - **Tables**: register/field/mapping defs are in tables — search paragraphs AND tables.

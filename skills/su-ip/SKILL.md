@@ -102,16 +102,19 @@ The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are sh
 > **RTL branch strategy:** In the RTL repo, the **`main`** branch holds the **latest
 > implementation for the most recent project** we are working on (currently **Atlantic**).
 > Each **previous** project is frozen on its own **freezed RTL** branch — e.g. **Iridium**'s
-> RTL lives on the Iridium *freezed rtl* branch, not on `main`. When researching RTL for a
-> specific project, check out the matching branch: `main` for Atlantic, the project's
-> freezed-RTL branch for Iridium (and any earlier project).
+> RTL lives on the Iridium *freezed rtl* branch, not on `main`. Neo knows both: ask
+> with `--chip a1` (Iridium freeze) or `--chip a2` (Atlantic/A2 `main`).
 
-**Local-first strategy**: These skills are global (user-level). The workspace may or may not contain the source code.
+**Source strategy**:
 1. Check if FW driver code exists locally — common workspace paths:
    - `fw/ip/se/` or `ip/se/`
    - Also check the project manifest (e.g., `.star` files or `octl` manifests) for the actual deployment path
-2. If found locally — read directly from the workspace (fastest, no network)
-3. If NOT found locally — use GitHub search tools to query the remote repos above
+2. Read FW and CSR software headers locally, or search their specific software repos on GitHub.
+3. For RTL, follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
+   `~/bin/neo-ask --chip a1|a2 "<question>"` — and relay only its paraphrased
+   findings and citations (repo, path, symbol, mirror commit), never HDL or
+   patches. No local/VM checkout or GitHub RTL reads. If Neo is unavailable,
+   report the prerequisite and stop.
 
 ## DM Controller vs EP Controller — Key Differences
 
@@ -134,10 +137,9 @@ controller docs, PHY docs, C2C spec, or RTL.
 - **Index:** `~/.copilot/skills/su-ip/knowledge/INDEX.md` — catalog of recorded topics
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
 
-The knowledge base is **always consulted first** (Step 0) and **always updated after**
-non-trivial research (final step). This is what makes the skill grow into a true Scale Up
-expert over time. (PHY facts equally true for the EP can also be recorded in the `pcie-ep-ip`
-knowledge base — the PHY is identical.)
+Consult source-free knowledge first when available (Step 0) and update it with
+paraphrased findings after non-trivial research (final step). PHY facts equally
+true for the EP can also be recorded in the `pcie-ep-ip` knowledge base.
 
 > **Recording trigger — read this twice.** Record a finding whenever you **verify** a
 > non-trivial IP fact during this turn, regardless of *why* you were invoked. The
@@ -162,17 +164,11 @@ knowledge base — the PHY is identical.)
 
 ### Step 0: Consult the Knowledge Base (do this first)
 
-1. Read `~/.copilot/skills/su-ip/knowledge/INDEX.md` and scan the topic table.
-2. If the question overlaps a recorded topic, read that detail file. Also full-text search the
-   `knowledge/` directory for the question's keywords:
-   ```python
-   import os, glob
-   kb = os.path.expanduser("~/.copilot/skills/su-ip/knowledge")
-   for f in glob.glob(os.path.join(kb, "*.md")):
-       txt = open(f, encoding="utf-8").read()
-       if "<keyword>" in txt.lower():
-           print(f"== {os.path.basename(f)} ==")
-   ```
+1. Use the topic names in this skill. Consult an index or note only if it is
+   already known not to contain HDL excerpts; do not bulk-search the knowledge
+   directory, which may contain historical source excerpts.
+2. If no verified source-free note is available, proceed using the specifications
+   or ask Neo (`neo-ask`) for a paraphrased finding.
 3. If a recorded finding fully answers the question, use it (cite it). Otherwise use it to
    **narrow** the search before diving into the docs/RTL.
 
@@ -192,7 +188,7 @@ Determine which document(s) are most relevant:
 | PHY architecture, PRBS, loopback | `dwc_pcie6phy_g2_tsmc5ff_x4ns_databook.pdf` | |
 | PCS wrapper | `dwc_pcie6_phy_pcs_wrapper_databook.pdf` | |
 | PHY firmware/calibration | `dwc_pcie6_phy_firmware_appnote.pdf` | |
-| RTL implementation | GitHub repo | |
+| RTL implementation | Neo — `~/bin/neo-ask --chip a1\|a2 "…"` | |
 
 ### Step 2: Search the Document
 
@@ -246,7 +242,8 @@ for t_idx, table in enumerate(doc.tables):
 3. For DM-specific features (RC mode, dual-mode switching): check the DM databook first
 4. For PHY questions: use the same PHY docs as PCIe EP (located under `~/docs/PCIe EP/phy/`)
 5. Always cite the source document and page number in your answer
-6. If the docs don't cover it, check RTL via GitHub search tools
+6. If the docs don't cover it, ask Neo (`~/bin/neo-ask`) for a paraphrased RTL
+   finding; never use GitHub, local or VM-worktree RTL reads.
 
 ### Step 4: Record Verified Findings (do this last)
 
