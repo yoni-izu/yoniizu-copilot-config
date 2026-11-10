@@ -105,19 +105,20 @@ assign lane_cmn_refclk_mode = cfg_use_ctrl_common_refclk_mode ? {PIPE_NL{mac_phy
   the PHY (FW-forced). **= Fixed method.**
 - **This is the OPPOSITE of the SV helper**, which set `USE_CTRL_*` on the APP/forced path.
   SV is wrong; RTL is truth. FLA.ROM agrees with RTL (force-mode clears `USE_CTRL_*=0`).
-- **`PHY_PLL0/1_CMN_REFCLK_MODE` and `PHY_PLL*_SSC_EN` CSR fields — WIRED on Iridium, UNWIRED on Atlantic-main.**
-  - **Iridium** (`iridium` + `iridium_rev2p4_be` branches, `ppw_wrap.v`): these DO reach the PHY macros —
-    `phy0_pll0_cmn_refclk_mode = cfg_phy_pll0_cmn_refclk_mode[1:0]`, `phy1_... = [3:2]` (one 4-bit CSR
-    field packs BOTH macros, 2 bits each); `phy0/1_pllX_ssc_en_i = cfg_phy_pllX_ssc_en[0/1]`. Per PHY
-    doc p69 the per-macro value is **1 for CC, 0 for SRIS/SRNS** ⇒ ROM's `PHY_PLL*_CMN_REFCLK_MODE=0x5`
-    (= `01` per macro = CC) **is meaningful on Iridium and must be written**.
-  - **Atlantic main**: same fields are `//TODO - remove` / not wired — there the ROM PLL writes are no-ops.
-  - Only the per-lane `cfg_lane_cmn_refclk_mode[7:0]` (lanes 0–3=phy0, 4–7=phy1) + `cfg_lane_sris_mode_en[7:0]`
-    go through the USE_CTRL mux above; the PLL fields bypass the mux and are always CSR-driven.
-  - `common_refclk_mode` CSR bit is "not in use" on both branches (ppw_wrap comment).
-  - **One PPW_CTRL per die packs both PHY macros** (LANE fields split 0–3/4–7; PLL field split [1:0]/[3:2])
-    → a per-PHY-instance apply must RMW only its own slice, and the two EP PHY nodes must agree
-    (build-assert). This is why clocking sits on the PHY node but PPW should eventually split out.
+- **Correction — active Iridium RTL clock-control path, checked 2026-10-27.**
+  - In the active source at `~/projects/iridium/rtl/ip/pcie/ppw_macro/rtl/ppw_wrap.v`,
+    `USE_CTRL_COMMON_REFCLK_MODE` and `USE_CTRL_SRIS_MODE` select the controller PIPE signals
+    or the per-lane CSR values. The actual PHY connections are
+    `pipe_laneX_cmn_refclk_mode` and `pipe_laneX_sris_mode_en`.
+  - `ppw_misc.v` wires the CSR outputs for the two `USE_CTRL_*` bits and the two per-lane
+    mode bitmaps into `ppw_wrap.v`. In this active source path, no corresponding consumer or
+    route was found for `PHY_PLL0/1_CMN_REFCLK_MODE`, `PHY_PLL0/1_SSC_EN`, or
+    `COMMON_REFCLK_MODE`; `ppw_macro.v` also labels the common-clock input as TODO. Thus the
+    firmware writes to those CSR fields are **not demonstrated to reach the PHY** in this
+    source snapshot. Do not rely on the older `ppw_macro.v.orig` file as active wiring.
+  - This supersedes the earlier statement that the PLL fields were wired on Iridium. Before
+    using these fields, reconcile the active RTL revision / generated CSR integration with
+    the wrapper implementation.
 
 ### Reset default decode (Iridium FW headers `ppw_ctrl_regs_attr.h`)
 `PPW_CTRL_PHY_CTRL__RST = 0x185` → bits{0,7,8}: `COMMON_REFCLK_MODE=1`,
@@ -133,17 +134,36 @@ PHY without a `pipe_rxX_standby` cycle. We apply the **fixed** scheme at bring-u
 PHY leaves reset/standby**, so the PHY samples `cfg_lane_*` naturally at POR — no force-apply
 needed. (User's conclusion confirmed; precise reason = bring-up-time apply, not "CC default".)
 
-## Corrected FIXED-method register sequence (doc Table 5-6 + Iridium RTL)
-Per EP PHY macro, on `PPW_CTRL` (one per die — RMW own slice), before LTSSM / before PHY out of reset:
+## Firmware writes vs. active RTL effects
+`el_ppw_ctrl_clk_apply()` read-modify-writes `PHY_CTRL` and `PHY_CTRL_1`:
+- Sets/clears `USE_CTRL_COMMON_REFCLK_MODE` and `USE_CTRL_SRIS_MODE` together
+  according to fixed vs. negotiated method.
+- Sets `COMMON_REFCLK_MODE` iff scheme is CC.
+- Clears and then configures both `PHY_PLL*_CMN_REFCLK_MODE` fields: CC writes
+  `0x5` to each combined field; SRNS/SRIS write zero.
+- Clears `LANE_CMN_REFCLK_MODE`, then sets all lanes for fixed CC only.
+- Clears `LANE_SRIS_MODE_EN`, then sets all lanes for fixed SRIS only.
+- Does **not** modify either `PHY_PLL*_SSC_EN` field.
+
+The actual active RTL path verified in `~/projects/iridium/rtl` only muxes
+`USE_CTRL_*` with the per-lane CSR mode fields into the PIPE mode pins. The
+other written fields above have no demonstrated consumer in this source snapshot
+(see correction above).
+
+## Fixed-method values implied by the databook's Table 5-6
+On `PPW_CTRL` (one per die), before the PHY is released for link training:
 1. `USE_CTRL_COMMON_REFCLK_MODE=0`, `USE_CTRL_SRIS_MODE=0` (select CSR/FW-forced path).
-2. Per Table 5-6 + PLL context (Iridium wires the PLL field; per-macro value 1=CC / 0=SR*):
+2. Per Table 5-6, set the per-lane mode inputs:
    - **CC**:   `LANE_CMN_REFCLK_MODE=0xFF`, `LANE_SRIS_MODE_EN=0x00`, `PHY_PLL0_CMN_REFCLK_MODE=0x5`, `PHY_PLL1_CMN_REFCLK_MODE=0x5`
    - **SRNS**: `LANE_CMN_REFCLK_MODE=0x00`, `LANE_SRIS_MODE_EN=0x00`, `PHY_PLL0/1_CMN_REFCLK_MODE=0x0`
    - **SRIS**: `LANE_CMN_REFCLK_MODE=0x00`, `LANE_SRIS_MODE_EN=0xFF`, `PHY_PLL0/1_CMN_REFCLK_MODE=0x0`
-   (0xFF/0x5 are all-8-lanes / both-macros; a strictly per-macro apply writes only its lane byte-half
-   and its 2-bit PLL slice.)
-3. `PHY_PLL*_SSC_EN`: leave at reset for CC/SRNS; for SRIS set per SSC source (0 = spread on input
-   refclk, 1 = PHY generates SSC on MPLL). Follow-up detail; ROM leaves it at reset.
+   The lane values reach the PIPE pins through the verified active RTL mux. The PLL values above
+   are the values the current FW helper writes to CSR; their effectiveness is **not verified**
+   in the active RTL source noted above. `0xFF` covers all eight PIPE lanes; `0x5` encodes
+   per-macro common-clock value `01` in the two 2-bit macro slices.
+3. `PHY_PLL*_SSC_EN` is not changed by `el_ppw_ctrl_clk_apply`. Synopsys requires the value
+   to match the SRIS spread source (0 = spread on input refclk, 1 = PHY generates SSC on MPLL);
+   confirm how this is programmed elsewhere before assuming SRIS is fully configured.
 4. EP-side only (not in shared PHY driver): for non-CC clear Slot-Clock-Config (DBI RO-write
    dance); for SRIS set `PEP_CTRL_AUX.APP_SRIS_MODE=1` so the controller advertises SRIS to the
    host (TS1 SRIS bit / `DO_DESKEW_FOR_SRIS`).
@@ -175,9 +195,9 @@ Three reference-clock architectures are supported end-to-end:
 
 | Scheme | Meaning | SDK `clk_arch` | Wrapper regs |
 |--------|---------|----------------|--------------|
-| **Common Clock (CC)** | Both link ends share one refclk. **Reset/default.** | `DWC_PCIE6_X4_NS_CLOCK_ARCH_COMMON` (0) | PLL cmn-refclk mode = CC, LANE_CMN = ALL, SRIS off |
-| **SRNS** | Separate Reference **No** Spread — independent refclks, no SSC. | `..._CLOCK_ARCH_SRNS` (2) | PLL cmn-refclk mode = 0 (not-common), SRIS off |
-| **SRIS** | Separate Reference **Independent** Spread — independent refclks, each with own SSC. | `..._CLOCK_ARCH_SRIS` (1) | PLL cmn-refclk = 0, `LANE_SRIS_MODE_EN`, `APP_SRIS_MODE` |
+| **Common Clock (CC)** | Both link ends share one refclk. **Reset/default.** | `DWC_PCIE6_X4_NS_CLOCK_ARCH_COMMON` (0) | `LANE_CMN = ALL`, SRIS off. FW also writes PLL common-refclk fields, but active RTL route is unverified. |
+| **SRNS** | Separate Reference **No** Spread — independent refclks, no SSC. | `..._CLOCK_ARCH_SRNS` (2) | Lane common-refclk/SRIS off. FW also writes PLL common-refclk fields, but active RTL route is unverified. |
+| **SRIS** | Separate Reference **Independent** Spread — independent refclks, each with own SSC. | `..._CLOCK_ARCH_SRIS` (1) | `LANE_SRIS_MODE_EN`, `APP_SRIS_MODE`; SSC selection and PLL route need verification. |
 
 > Note the SDK enum ordering is COMMON=0, **SRIS=1, SRNS=2** (not COMMON/SRNS/SRIS).
 > FW's own `enum el_pcie_ep_clk_mode_e` uses CC=0, SRIS=1, SRNS=2 as well

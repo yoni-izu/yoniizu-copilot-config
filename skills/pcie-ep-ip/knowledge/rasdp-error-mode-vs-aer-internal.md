@@ -12,6 +12,46 @@ the controller enters RAS DP Error Mode?
 
 ## Findings
 
+### 0. What RAS DP protects, and what its errors mean
+
+RAS DP is **Reliability, Availability, and Serviceability Data Protection**. It detects corruption
+inside the PCIe controller in protected RAMs and datapaths/interfaces, outside the separate ECRC/LCRC
+wire-protection mechanisms. RAM protection uses ECC on data and parity on addresses. Datapath
+protection uses ECC or parity on TLP headers, data, prefixes, and optionally the AXI interface
+(depending on configuration) (§29.2.1, p.669).
+
+Consequently, a RASDP error means a protection checker detected a mismatch; it does not by itself
+identify the physical root cause. Possible root causes include a memory/datapath fault or transient
+corruption, or a protection-code integration/generation/checking mismatch. The databook specifies
+the detected error classes, not which physical cause produced a particular event:
+- One-bit ECC error: correctable; logged and reported as a correctable internal error (p.681).
+- Multi-bit ECC error: uncorrectable; correction is not performed.
+- Parity error: uncorrectable (p.680 footnote 107 says the uncorrectable report covers 2-bit ECC
+  and all parity errors).
+
+This is distinct from ECRC/LCRC errors, which protect the wire/link portions of traffic (§29.1,
+p.668). Do not conclude that a RASDP event means the external PCIe link is corrupt.
+
+### Iridium RTL integration evidence
+
+The checked-in Iridium integration exposes separate single-cycle event inputs `ras_dp_unc_err`,
+`ras_dp_cor_err`, `ras_ram_unc_err`, and `ras_ram_cor_err` to the PEP control logic. The datapath
+events feed the RAS DP SEI interrupt causes; RAM events feed the SERR/DERR handling. The
+`element_labs_ep16sx4_gen7_axi4_subsys_wrap` outputs these signals from the Synopsys PCIe
+subsystem. Integration documentation places the RAS datapath protection in `u_app_layer_top`.
+
+The checked-in design therefore contains the integration points for both controller-RAM and
+datapath protection errors. It does **not** contain the linked Synopsys implementation or the
+project's effective `CX_RASDP*` parameter values in this checkout, so it cannot establish which
+optional checkers are enabled or identify a specific internal fault. The comments in
+`pcie_iip_device_wrap.v` about `PEP_CTRL_AUX` memories having `ecc_info: none` describe those CSR
+block memories, not the PCIe controller's own protected RAMs; the same comment explicitly routes
+controller RAM errors through the IIP RAS-DP outputs.
+
+The Synopsys databook also documents intentional RAS DP error injection (1-bit/2-bit per-TLP
+injection, configurable through `RASDP_ERROR_INJ_CTRL_OFF`, p.674–677). That is a possible cause
+in a test/injection setup, not evidence that the checked-in Iridium design has injected an error.
+
 ### 1. RASDP errors ARE the AER internal errors — do not count both
 
 RAS DP (Data Path / RAM protection) covers the parts of the controller outside ECRC/LCRC
@@ -79,12 +119,16 @@ Correctable RASDP errors have no such gating: "Errors Reported When Detected (Im
 ## Sources
 
 - Doc: `~/docs/PCIe EP/controller/DWC_pcie_ctl_ep_databook.pdf`
-  - p.667 §29 — RAS components overview (RAS DP one of four)
-  - p.669 §29.2.1 — RAS DP overview, RAM + datapath protection scope
+  - p.668 §29.1 — ECRC wire protection
+  - p.669 §29.2.1 — RAS DP overview, RAM + datapath protection scope and mechanisms
+  - pp.673–677 — RAS protection types, limitations, and error injection
   - p.679 §29.2.4 — Uncorrectable Error Handling; `AUTO_LINK_DOWN_EN` / `RASDP_ERROR_MODE_EN_OFF`
   - p.680 §29.2.4.1 — RAS DP Error Mode: TLP handling, credit inaccuracy, CDM/ELBI wire-access
     suspension, `RASDP_ERROR_MODE_CLEAR_OFF`, footnotes 104–108
   - p.681 §29.2.5 — Correctable Error Handling; correctable internal error reported to AER
+- Iridium RTL: `ip/pcie/pep_macro/rtl/element_labs_ep16sx4_gen7_axi4_subsys_wrap.v:458-462,1020-1024`,
+  `ip/pcie/pep_macro/rtl/pcie_iip_device_wrap.v:739-743,2896,2970-3018`,
+  `ip/pcie/pep_macro/misc/ELEMENT_LABS_EP_SUBSYS_WRAP_Micro_Architecture.md:286,944-951`.
 - Related: [aer-host-ownership-no-fw-clear.md](aer-host-ownership-no-fw-clear.md),
   [aer-handling-completeness.md](aer-handling-completeness.md),
   [ds-term.md](ds-term.md), [piw-irq-action-framework.md](piw-irq-action-framework.md)
