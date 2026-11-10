@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime
+import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,10 @@ import wm  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_store  # noqa: E402
+from private_paths import private_root  # noqa: E402
+
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/rtl-vm-policy"))
+import rtl_pr_guard  # noqa: E402
 
 # ----------------------------------------------------------------------------
 # Constants & helpers
@@ -73,6 +79,77 @@ def save(d: dict) -> None:
 
 def task_revision(task: dict) -> str:
     return task_store.domain_db.revision(task)
+
+
+def review_drafts_root() -> Path:
+    return private_root() / "skills" / "pr-review" / "drafts"
+
+
+def _review_draft_path(filename: str) -> Path:
+    root = review_drafts_root().resolve()
+    path = (root / filename).resolve()
+    if not path.is_relative_to(root) or path.suffix.lower() != ".md":
+        raise ValueError("review drafts must be Markdown files inside the private drafts directory")
+    return path
+
+
+def _read_review_draft(path: Path) -> str:
+    with path.open("rb") as source:
+        content = source.read(2_000_001)
+    if len(content) > 2_000_000:
+        raise ValueError("review draft exceeds the 2 MB limit")
+    return content.decode("utf-8")
+
+
+def attach_review_draft(ident: str, pr_url: str, filename: str, head_sha: str) -> dict:
+    """Register a saved draft on exactly one task PR; never change review status."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head_sha):
+        raise ValueError("head SHA must be a full Git commit hash")
+    path = _review_draft_path(str(Path(filename).expanduser().absolute()))
+    _read_review_draft(path)
+    relative = str(path.relative_to(review_drafts_root().resolve()))
+    now = datetime.now(timezone.utc).isoformat()
+    with task_store.transaction() as data:
+        task = find_task(data, ident)
+        if task is None or task.get("category") != "code-review":
+            raise ValueError("a matching code-review task is required")
+        matches = [r for r in pr_entries(task) if r.get("pr_url") == pr_url]
+        if len(matches) != 1:
+            raise ValueError("PR URL must match exactly one PR on the review task")
+        drafts = matches[0].setdefault("drafts", [])
+        draft = next((d for d in drafts if d["file"] == relative), None)
+        if draft is None:
+            draft = {"id": uuid.uuid4().hex, "file": relative, "created_at": now}
+            drafts.append(draft)
+        draft.update(head_sha=head_sha.lower(), updated_at=now)
+        task["updated"] = TODAY
+        result = dict(draft, task_id=task["id"], pr_url=pr_url)
+    return result
+
+
+def read_review_draft(ident: str, draft_id: str) -> dict:
+    """Resolve an attachment by task/opaque ID, never by a browser-supplied path."""
+    task = next((t for t in load()["tasks"] if t["id"] == ident), None)
+    if task is None or task.get("category") != "code-review":
+        raise ValueError("unknown review task")
+    for review in pr_entries(task):
+        for draft in review.get("drafts", []):
+            if draft["id"] == draft_id:
+                path = _review_draft_path(draft["file"])
+                return dict(draft, task_id=ident, title=task["title"],
+                            repo=review["repo"], pr_number=review["pr_number"],
+                            content=_read_review_draft(path))
+    raise ValueError("unknown review draft")
+
+
+def cmd_review_draft(args: argparse.Namespace) -> int:
+    try:
+        draft = attach_review_draft(args.id, args.pr_url, args.file, args.head_sha)
+    except (ValueError, OSError) as exc:
+        print(f"[tm] draft not attached: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(draft, ensure_ascii=False))
+    return 0
 
 
 def find_task(d: dict, ident: str) -> dict | None:
@@ -303,9 +380,9 @@ def resolve_branch(owner: str, repo: str, num: int, fallback_sha: str | None = N
 
 
 def fetch_pr_details(url: str) -> dict:
-    """Return dict with owner/repo/pr_number/author/branch/files_changed/additions/deletions/title/body."""
+    """Return review-intake metadata without fetching the unused PR body."""
     owner, repo, num = parse_pr_url(url)
-    fields = "title,body,author,headRefName,additions,deletions,changedFiles,state,mergedAt,closed"
+    fields = "title,author,headRefName,additions,deletions,changedFiles,state,mergedAt,closed"
     try:
         data = gh_pr_json(owner, repo, num, fields)
     except Exception as e:
@@ -327,7 +404,7 @@ def fetch_pr_details(url: str) -> dict:
         "additions": data.get("additions"),
         "deletions": data.get("deletions"),
         "title": data.get("title"),
-        "body": data.get("body") or "",
+        "body": "",
         "state": data.get("state"),
         "merged": bool(data.get("mergedAt")),
         "closed": bool(data.get("closed")),
@@ -1032,27 +1109,9 @@ def cmd_review_check(args: argparse.Namespace) -> int:
 # approves it, comments, requests changes, or the author re-pushes. This probes
 # every open review PR through `gh` (pure REST, no model/tokens), maps the live
 # GitHub state to the per-PR review_status, and re-derives each task's status.
-# Uses the REST API (not GraphQL) — REST has a far larger, separate rate budget,
-# so scanning dozens of PRs won't exhaust the tiny GraphQL points quota.
-
-def _gh_api_raw(path: str) -> Any:
-    """`gh api <path>` → parsed JSON, raising a concise error on failure."""
-    out = subprocess.run(
-        ["gh", "api", "-H", "Accept: application/vnd.github+json", path],
-        capture_output=True, text=True, check=False,
-    )
-    if out.returncode != 0:
-        raise RuntimeError((out.stderr.strip() or "gh api failed").splitlines()[-1][:160])
-    return json.loads(out.stdout) if out.stdout.strip() else None
-
-
 def _fetch_pr_review_state(owner: str, repo: str, num: int) -> tuple[dict, list]:
-    """Return (pr_object, reviews_list) for a PR via REST (2 cheap requests)."""
-    pr = _gh_api_raw(f"/repos/{owner}/{repo}/pulls/{num}")
-    if not isinstance(pr, dict):
-        raise RuntimeError("unexpected PR payload")
-    reviews = _gh_api_raw(f"/repos/{owner}/{repo}/pulls/{num}/reviews?per_page=100")
-    return pr, (reviews if isinstance(reviews, list) else [])
+    """Fetch review decisions and state without review bodies or diff hunks."""
+    return rtl_pr_guard.review_state(owner, repo, num)
 
 
 def _derive_pr_review_status(p: dict, pr: dict, reviews: list) -> tuple[str, str]:
@@ -1096,8 +1155,8 @@ def _derive_pr_review_status(p: dict, pr: dict, reviews: list) -> tuple[str, str
     return p.get("review_status") or "pending", "no change"
 
 
-def portal_review_scan(progress=None) -> dict:
-    """Re-probe every open review PR and update task statuses from live GitHub.
+def portal_review_scan(progress=None, task_ids=None) -> dict:
+    """Re-probe open review PRs and update task statuses from live GitHub.
 
     Returns a summary: scanned PR count, per-PR change lines, tasks that landed
     (merged→done), and any fetch errors. Mutates and saves the task store.
@@ -1106,12 +1165,29 @@ def portal_review_scan(progress=None) -> dict:
     status, detail)`` — once with ``status=None`` when a PR is about to be
     fetched, then once with the resolved status ("error"/"nochange"/the new
     review status) — so a caller can stream a live banner.
+
+    ``task_ids`` (optional) restricts the scan to selected task IDs. A selected
+    scan must include at least one active review task with an unresolved PR.
     """
+    selected_ids = None
+    if task_ids is not None:
+        if (not isinstance(task_ids, list) or not task_ids
+                or any(not isinstance(ident, str) or not ident for ident in task_ids)
+                or len(set(task_ids)) != len(task_ids)):
+            raise ValueError("task_ids must be a non-empty list of unique task IDs")
+        selected_ids = set(task_ids)
+
     d = load()
+    existing_ids = {t["id"] for t in d["tasks"]}
+    if selected_ids is not None and not selected_ids.issubset(existing_ids):
+        raise ValueError("one or more selected tasks no longer exist; reload before scanning")
     pairs = [(t, p) for t in d["tasks"]
+             if selected_ids is None or t["id"] in selected_ids
              if t.get("category") == "code-review"
              and t.get("status") not in ("done", "cancelled")
              for p in pr_entries(t) if not pr_resolved(p)]
+    if selected_ids is not None and not pairs:
+        raise ValueError("selected tasks have no active review PRs to scan")
     total = len(pairs)
     scanned = 0
     changed: list[str] = []
@@ -1187,6 +1263,117 @@ def portal_review_scan(progress=None) -> dict:
     save(d)
     return {"scanned": scanned, "changed": changed, "removed": removed,
             "completed": completed, "cancelled": cancelled, "errors": errors}
+
+
+def apply_task_edits(edits: list[dict]) -> tuple[bool, str]:
+    """Apply shared metadata to selected tasks in one owner transaction.
+
+    Bulk edits intentionally exclude workspace and review-status operations:
+    those have cross-store or PR-lifecycle side effects and remain per-task
+    operations.
+    """
+    allowed = {"status", "priority", "category", "complexity", "cost_hours"}
+    if not isinstance(edits, list) or not edits:
+        return False, "select at least one task to edit"
+
+    try:
+        with task_store.transaction() as data:
+            tasks = {task["id"]: task for task in data["tasks"]}
+            seen = set()
+            plans = []
+            for edit in edits:
+                if not isinstance(edit, dict):
+                    raise ValueError("each bulk edit must be an object")
+                ident = edit.get("id")
+                if not isinstance(ident, str) or not ident:
+                    raise ValueError("each bulk edit requires a task ID")
+                if ident in seen:
+                    raise ValueError(f"duplicate task ID: {ident}")
+                seen.add(ident)
+                task = tasks.get(ident)
+                if task is None:
+                    raise ValueError(f"task not found: {ident}")
+                if edit.get("expected_revision") != task_revision(task):
+                    raise ValueError(f"task revision conflict: {ident}; reload before saving")
+                payload = {key: value for key, value in edit.items()
+                           if key not in ("id", "expected_revision")}
+                unknown = set(payload) - allowed
+                if unknown:
+                    raise ValueError(
+                        f"unsupported bulk field(s): {', '.join(sorted(unknown))}")
+                if not payload:
+                    raise ValueError(f"no fields supplied for task: {ident}")
+
+                normalized = {}
+                if "status" in payload:
+                    value = payload["status"]
+                    if not isinstance(value, str) or value not in STATUSES:
+                        raise ValueError(f"invalid status for {ident}: {value}")
+                    if (value == "done" and task.get("category") == "code-review"
+                            and consolidate_review_status(pr_entries(task)) != "merged"):
+                        raise ValueError(
+                            f"code-review task {ident} cannot be marked done before all PRs merge")
+                    if value in ("done", "cancelled") and task_slot(ident):
+                        raise ValueError(
+                            f"{ident} occupies a workspace; edit it individually before "
+                            f"setting a terminal status")
+                    normalized["status"] = value
+                if "priority" in payload:
+                    value = payload["priority"]
+                    if not isinstance(value, str) or value not in PRIORITIES:
+                        raise ValueError(f"invalid priority for {ident}: {value}")
+                    normalized["priority"] = value
+                if "category" in payload:
+                    value = payload["category"]
+                    if not isinstance(value, str) or value not in CATEGORIES:
+                        raise ValueError(f"invalid category for {ident}: {value}")
+                    if value == "code-review" and task.get("category") != "code-review":
+                        raise ValueError(
+                            f"cannot convert {ident} to code-review via bulk edit")
+                    if task.get("category") == "code-review" and value != "code-review":
+                        raise ValueError(
+                            f"cannot drop code-review category from {ident}")
+                    normalized["category"] = value
+                if "complexity" in payload:
+                    value = payload["complexity"]
+                    if value == "":
+                        value = None
+                    if value is not None and (
+                            not isinstance(value, str) or value not in COMPLEXITIES):
+                        raise ValueError(f"invalid complexity for {ident}: {value}")
+                    normalized["complexity"] = value
+                if "cost_hours" in payload:
+                    try:
+                        value = float(payload["cost_hours"])
+                    except (TypeError, ValueError):
+                        raise ValueError(f"cost_hours must be a number for {ident}") from None
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError(
+                            f"cost_hours must be a finite non-negative number for {ident}")
+                    normalized["cost_hours"] = value
+
+                changes = [
+                    f"{key} {task.get(key)} → {value}"
+                    for key, value in normalized.items()
+                    if task.get(key) != value
+                ]
+                if changes:
+                    plans.append((task, normalized, changes))
+
+            if not plans:
+                raise ValueError("no changes")
+
+            for task, normalized, changes in plans:
+                for key, value in normalized.items():
+                    if task.get(key) != value:
+                        task[key] = value
+                if normalized.get("status") == "done":
+                    task["completed"] = TODAY
+                task["updated"] = TODAY
+                append_note(task, "dashboard bulk edit: " + "; ".join(changes))
+    except ValueError as exc:
+        return False, str(exc)
+    return True, f"updated {len(plans)} task(s)"
 
 
 # ----------------------------------------------------------------------------
@@ -1390,25 +1577,6 @@ def _reply_addressed(body: str) -> bool:
     return any(m in b.split() for m in _ADDRESSED_MARKERS)
 
 
-def _gh_api(path: str) -> Any:
-    """gh api <path> --paginate → parsed JSON (list or dict). Returns [] on failure."""
-    out = subprocess.run(
-        ["gh", "api", "-H", "Accept: application/vnd.github+json", "--paginate", path],
-        capture_output=True, text=True, check=False,
-    )
-    if out.returncode != 0:
-        return []
-    text = out.stdout.strip()
-    if not text:
-        return []
-    # --paginate concatenates JSON arrays as ][ — normalize.
-    text = text.replace("][", ",")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return []
-
-
 def _classify_pr(state: str, merged: bool, new_commits: int, threads_replied: int) -> str:
     if merged:
         return "merged"
@@ -1430,11 +1598,15 @@ def _scan_one_pr(me: str, owner: str, repo: str, num: int, submitted_at: str) ->
         "state": None, "mergeable": None, "head": None,
         "new_commits": 0, "recent_commits": [],
         "my_threads": 0, "threads_with_reply": 0, "replies": [],
+        "threads_checked": False, "thread_check_reason": None,
         "classification": "unknown", "transitioned": None,
     }
+    kind, reason, verified_head = rtl_pr_guard.classify_pr(owner, repo, num)
     try:
-        pr = gh_pr_json(owner, repo, num,
-                        "state,mergeable,isDraft,updatedAt,headRefOid,mergedAt,closed,commits")
+        pr = rtl_pr_guard.activity_state(
+            owner, repo, num, include_headline=kind == "software",
+            expected_head=verified_head if kind == "software" else None,
+        )
     except Exception as e:
         result["error"] = str(e)
         return result
@@ -1452,31 +1624,36 @@ def _scan_one_pr(me: str, owner: str, repo: str, num: int, submitted_at: str) ->
         for c in commits[-3:]
     ]
 
-    # Thread replies
-    comments = _gh_api(f"/repos/{owner}/{repo}/pulls/{num}/comments?per_page=100")
-    if isinstance(comments, list):
-        threads: dict[int, list[dict]] = {}
-        for c in comments:
-            rid = c.get("in_reply_to_id") or c.get("id")
-            threads.setdefault(rid, []).append(c)
-        for _, msgs in threads.items():
-            msgs.sort(key=lambda m: m.get("created_at", ""))
+    threads = None
+    if kind == "software":
+        try:
+            threads = rtl_pr_guard.review_threads(owner, repo, num, verified_head)
+        except rtl_pr_guard.MetadataError as exc:
+            result["thread_check_reason"] = str(exc)
+    else:
+        result["thread_check_reason"] = f"{kind}: {reason}; VM-hosted RTL agent required"
+    if threads is not None:
+        result["threads_checked"] = True
+        for thread in threads:
+            msgs = sorted(thread["comments"], key=lambda m: m.get("createdAt") or "")
+            if not msgs:
+                continue
             head = msgs[0]
-            if (head.get("user") or {}).get("login") != me:
+            if (head.get("author") or {}).get("login") != me:
                 continue
             result["my_threads"] += 1
             later = [m for m in msgs[1:]
-                     if (m.get("user") or {}).get("login") != me]
+                     if (m.get("author") or {}).get("login") != me]
             if later:
                 result["threads_with_reply"] += 1
                 last = later[-1]
                 body = (last.get("body") or "").replace("\r", " ").replace("\n", " ")
                 head_body = (head.get("body") or "").replace("\r", " ").replace("\n", " ")
                 result["replies"].append({
-                    "path": head.get("path"),
-                    "line": head.get("line") or head.get("original_line"),
-                    "by": (last.get("user") or {}).get("login"),
-                    "date": (last.get("created_at") or "")[:10],
+                    "path": thread.get("path"),
+                    "line": thread.get("line") or thread.get("originalLine"),
+                    "by": (last.get("author") or {}).get("login"),
+                    "date": (last.get("createdAt") or "")[:10],
                     "snippet": body[:140],
                     "my_snippet": head_body[:100],
                     "pushback": _reply_pushback(body),
@@ -1485,6 +1662,8 @@ def _scan_one_pr(me: str, owner: str, repo: str, num: int, submitted_at: str) ->
 
     result["classification"] = _classify_pr(
         result["state"] or "", merged, result["new_commits"], result["threads_with_reply"])
+    if not result["threads_checked"] and result["classification"] == "no_activity":
+        result["classification"] = "threads_unchecked"
     return result
 
 
@@ -1577,6 +1756,8 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
                   f"(blocked {entry['blocked_days']}d, "
                   f"+{pr_sum['new_commits']} commits since {pr_sum['submitted_at']}, "
                   f"HEAD {pr_sum['head']}){m}{tag}")
+            if not pr_sum.get("threads_checked"):
+                print(f"    threads not checked: {pr_sum.get('thread_check_reason') or pr_sum.get('error') or 'unknown'}")
             if show_replies and pr_sum["replies"]:
                 addr = sum(1 for r in pr_sum["replies"] if r.get("addressed"))
                 push = sum(1 for r in pr_sum["replies"] if r.get("pushback"))
@@ -1592,6 +1773,8 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
     _emit("Auto-transition candidates (new commits)", buckets["needs_re_review"], "⚠️")
     _emit("Replies only — needs your call", buckets["replies_only"], "💬")
     _emit("No activity", buckets["no_activity"], "✅", show_replies=False)
+    _emit("Thread activity unknown", buckets.get("threads_unchecked", []), "❔", show_replies=False)
+    _emit("Unable to assess", buckets.get("unknown", []), "❔", show_replies=False)
     _emit("Merged", buckets["merged"], "🔀", show_replies=False)
     _emit("Closed", buckets["closed"], "❌", show_replies=False)
     return 0
@@ -1925,6 +2108,13 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--context")
     a.add_argument("--jira")
     a.set_defaults(func=cmd_add_review)
+
+    a = sub.add_parser("review-draft", help="attach a private Markdown draft to a task PR")
+    a.add_argument("id")
+    a.add_argument("--pr-url", required=True)
+    a.add_argument("--file", required=True)
+    a.add_argument("--head-sha", required=True)
+    a.set_defaults(func=cmd_review_draft)
 
     # list
     a = sub.add_parser("list", help="list tasks")
