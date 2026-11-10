@@ -3,8 +3,48 @@
 // through the one `window.__PORTAL__` bootstrap object the page defines just
 // above this script; the fetches in init() then refresh them when served.
 const BOOT = window.__PORTAL__ || {};
+function validPortalDate(year, month, day){
+  if(year<1||year>9999||month<1||month>12) return false;
+  const leap=year%4===0&&(year%100!==0||year%400===0);
+  const days=[31,leap?29:28,31,30,31,30,31,31,30,31,30,31];
+  return day>=1&&day<=days[month-1];
+}
+function formatPortalDate(value){
+  const raw=String(value??"").trim();
+  const match=/^(\d{4})-(\d{2})-(\d{2})(.*)$/.exec(raw);
+  if(!match) return raw||"—";
+  const [,yearText,monthText,dayText,suffix]=match;
+  const year=Number(yearText), month=Number(monthText), day=Number(dayText);
+  if(!validPortalDate(year,month,day)) return raw||"—";
+  const date=`${dayText}/${monthText}/${yearText}`;
+  if(!suffix) return date;
+  const time=/^[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:?\d{2})?$/.exec(suffix);
+  return time?`${date} ${time[1]}${time[2]||""}`:raw;
+}
+function formatPortalDateInput(value){
+  const match=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value??"").trim());
+  if(!match || !validPortalDate(Number(match[1]),Number(match[2]),Number(match[3]))) return "";
+  return `${match[3]}/${match[2]}/${match[1]}`;
+}
+function parsePortalDateInput(value){
+  const raw=String(value??"").trim();
+  if(!raw) return "";
+  const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(raw);
+  if(!match) return null;
+  const [,dayText,monthText,yearText]=match;
+  const year=Number(yearText), month=Number(monthText), day=Number(dayText);
+  if(!validPortalDate(year,month,day)) return null;
+  return `${yearText}-${monthText}-${dayText}`;
+}
+window.PortalDates=Object.freeze({
+  display:formatPortalDate,
+  input:formatPortalDateInput,
+  parse:parsePortalDateInput,
+});
 let TASKS = BOOT.tasks || [];
 let WORKSPACES = BOOT.workspaces || {};
+const selectedTaskIds = new Set();
+let taskSelectionMessage = "";
 let BUGS = BOOT.bugs || {};
 let TRIAGE = BOOT.triage || {};
 let OVERVIEW = BOOT.overview || {};
@@ -152,11 +192,14 @@ function applyTableStandards(scope=document){
     const head = table.tHead && table.tHead.rows && table.tHead.rows[0];
     if(!head) return;
     [...head.cells].forEach((th,index)=>{
-      if(pref.widths && pref.widths[index]){
+      const savedIndex=th.dataset.stdIndex===undefined?index:Number(th.dataset.stdIndex);
+      if(Number.isInteger(savedIndex)&&savedIndex>=0&&pref.widths&&pref.widths[savedIndex]){
         table.style.tableLayout = "fixed";
-        th.style.width = pref.widths[index]+"px";
+        th.style.width = pref.widths[savedIndex]+"px";
       }
-      wireResizer(table, th, index, pref);
+      if(Number.isInteger(savedIndex)&&savedIndex>=0){
+        wireResizer(table, th, savedIndex, pref);
+      }
       const blocked = th.dataset.noSort!==undefined
         || !!th.querySelector("input,select,button")
         || TABLE_STD_SKIP_SORT.has(table.id);
@@ -212,11 +255,11 @@ const COLUMNS = [
   {key:"prs",     label:"PRs",       on:false},
   {key:"author",  label:"Author",    on:false},
   {key:"complexity",label:"Cx",      on:false},
-  {key:"cost",    label:"Est",       on:true},
-  {key:"jira",    label:"Jira",      on:true},
+  {key:"cost",    label:"Est",       on:false},
+  {key:"jira",    label:"Jira",      on:false},
   {key:"workspace",label:"WS",       on:false},
   {key:"age",     label:"Age",       on:true},
-  {key:"worked",  label:"Worked",    on:true},
+  {key:"worked",  label:"Worked",    on:false},
 ];
 
 // Column key -> how to extract a comparable value
@@ -274,10 +317,10 @@ function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;
 // ---- workspace alignment (manual-review checkout) progress banner ----
 // Tones map to classes in portal.css so the banner follows the theme; the
 // per-repo rows are the only place that needs a tone other than ok/warn/bad.
-const ALIGN_ICONS={"checked-out":"✓","skipped-dirty":"⚠","error":"✕","not-found":"✕","already":"✓"};
+const ALIGN_ICONS={"checked-out":"✓","skipped-dirty":"⚠","approval-required":"⚠","error":"✕","not-found":"✕","already":"✓"};
 function alignRepoRow(r){
   const ic=r.icon||ALIGN_ICONS[r.action]||"·";
-  const tone=r.tone||(r.action==="checked-out"?"ok":(r.action==="skipped-dirty"?"warn":"bad"));
+  const tone=r.tone||(r.action==="checked-out"?"ok":(["skipped-dirty","approval-required"].includes(r.action)?"warn":"bad"));
   const tag=r.role==="review"?' <b class="ab-tag">[PR]</b>':"";
   return `<div class="ab-row"><span class="ab-${tone}">${ic}</span> `
     +`<code>${esc(r.name)}</code>${tag} — ${esc(r.detail||r.action)}</div>`;
@@ -295,6 +338,70 @@ function wsStepRow(st){
   return `<div class="ab-row ab-step ab-step-${esc(st.state)}"><span class="ab-${tone}">${WS_STEP_ICONS[st.state]||"\u00b7"}</span> `
     +`${esc(st.label)}${count}${live}${errs}</div>`;
 }
+const ACTION_UI={jobs:[],selected:null,dismissed:false,refreshing:false};
+function actionLabel(job){
+  const labels={"pr-scan":"Scan PRs","review-scan":"Scan reviews","vm-refresh":"Refresh VM jobs",
+    align:"Align workspace",pldm:"Submit PLDM test"};
+  return (job.kind==="workspace-action"?job.action:labels[job.kind]||job.kind)+" · "+(job.slot||"");
+}
+function renderActionQueue(data){
+  ACTION_UI.jobs=data.actions;
+  const panel=document.getElementById("action-queue");
+  if(!panel) return;
+  const active=data.actions.filter(job=>["queued","running"].includes(job.status));
+  const opener=document.getElementById("action-queue-open");
+  if(opener){
+    opener.hidden=false;
+    opener.textContent=`Actions (${active.length})`;
+  }
+  if(!ACTION_UI.selected||!data.actions.some(job=>job.id===ACTION_UI.selected))
+    ACTION_UI.selected=(active[0]||data.actions[0])?.id||null;
+  const focused=document.activeElement?.closest?.("[data-action-id]")?.dataset.actionId;
+  panel.innerHTML=`<div class="ab-queue-count" role="status">${active.filter(job=>job.status==="running").length} running · ${active.filter(job=>job.status==="queued").length} waiting</div>`
+    +data.actions.map(job=>`<button type="button" class="ab-queue-item${job.id===ACTION_UI.selected?" selected":""}"
+      data-action-id="${esc(job.id)}" aria-pressed="${job.id===ACTION_UI.selected}">
+      <span>${esc(actionLabel(job))}</span><b class="${job.status==="error"?"ab-bad":""}">${esc(job.status==="queued"?"Waiting #"+job.queue_position:job.status==="approval_required"?"Approval required":job.status)}</b></button>`).join("");
+  if(focused) [...panel.querySelectorAll("[data-action-id]")].find(button=>button.dataset.actionId===focused)?.focus();
+  const selected=data.actions.find(job=>job.id===ACTION_UI.selected);
+  if(selected&&!ACTION_UI.dismissed&&(active.length||document.getElementById("align-banner").style.display==="block"))
+    renderAlign(selected);
+}
+async function refreshActionQueue(){
+  if(ACTION_UI.refreshing) return;
+  ACTION_UI.refreshing=true;
+  try{
+    const response=await fetch("/api/actions",{cache:"no-store"});
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.error||`request failed (${response.status})`);
+    if(data.error) throw new Error(data.error);
+    const finished=data.actions.filter(job=>!["queued","running"].includes(job.status)
+      &&ACTION_UI.jobs.some(previous=>previous.id===job.id&&["queued","running"].includes(previous.status)));
+    for(const job of finished) await refreshActionResult(job);
+    renderActionQueue(data);
+  }catch(error){
+    const panel=document.getElementById("action-queue");
+    if(panel) panel.textContent="Action queue unavailable: "+error.message;
+    const opener=document.getElementById("action-queue-open");
+    if(opener){ opener.hidden=false; opener.textContent="Actions (unavailable)"; }
+  }finally{ ACTION_UI.refreshing=false; }
+}
+async function refreshActionResult(job){
+  if(job.kind==="workspace-action"||job.kind==="align"){
+    await wsReload();
+  }else if(job.kind==="review-scan"){
+    const response=await fetch("/api/tasks",{cache:"no-store"});
+    if(!response.ok) throw new Error("Action finished, but tasks could not be refreshed");
+    const data=await response.json();
+    TASKS=data.tasks;
+    if(data.workspaces) WORKSPACES=data.workspaces;
+    buildFilters(); render();
+  }else if(job.kind==="pr-scan"&&job.result){
+    PRS=job.result; renderPrs();
+  }else if(job.kind==="vm-refresh"&&job.result){
+    vmAdoptPayload(job.result); renderVmlog();
+  }
+  buildSections();
+}
 function renderAlign(job){
   const banner=document.getElementById("align-banner");
   const spin=document.getElementById("align-spin");
@@ -302,20 +409,41 @@ function renderAlign(job){
   const body=document.getElementById("align-body");
   banner.style.display="block";
   const running=job.status==="running";
+  if(job.status==="queued"){
+    spin.style.display="none";
+    title.textContent=`Waiting${job.queue_position?" #"+job.queue_position:""} · ${actionLabel(job)}`;
+    body.textContent="Queued. This action will start after earlier actions finish.";
+    return;
+  }
   const reset=job.kind==="reset";
   const prScan=job.kind==="pr-scan";
   const sync=job.kind==="sync";
   const revScan=job.kind==="review-scan";
+  if(job.kind==="vm-refresh"||job.kind==="pldm"){
+    spin.style.display=running?"inline-block":"none";
+    title.textContent=`${actionLabel(job)} · ${running?(job.current||job.phase||"starting"):job.status}`;
+    body.innerHTML=(job.repos||[]).map(alignRepoRow).join("")
+      +(job.message?`<div class="ab-msg${job.status==="error"?" ab-bad":""}">${esc(job.message)}</div>`:"");
+    return;
+  }
   if(job.kind==="workspace-action"){
     spin.style.display=running?"inline-block":"none";
     const steps=job.steps||[];
     const cur=steps.length?steps[steps.length-1]:null;
     const count=s=>s&&s.total?` (${s.done||0}/${s.total})`:"";
+    const state=job.status==="approval_required"?"approval required":job.status;
     title.textContent=`${job.action} · ${job.slot} · `
-      +(running?(cur?cur.label+count(cur):"starting…"):job.status);
+      +(running?(cur?cur.label+count(cur):"starting…"):state);
+    const review=job.status==="approval_required"
+      ?`<button type="button" class="btn" data-workspace-approval="${esc(job.id)}">${job.action==="sync"?"Force sync":"Review confirmation"}</button>`:"";
+    const stashes=(job.stashes||[]).length
+      ?`<details class="ab-errs"><summary>Saved changes (${job.stashes.length} stashes)</summary>
+        <p>Restore the original branch, then apply the stash with <code>git stash apply --index &lt;stash-id&gt;</code>.</p>
+        <ul>${job.stashes.map(s=>`<li><code>${esc(s.path)}</code> · ${esc(s.branch||"detached HEAD")}
+          · <code>${esc(s.oid)}</code></li>`).join("")}</ul></details>`:"";
     body.innerHTML=steps.map(wsStepRow).join("")
       +(running?"":(job.repos||[]).map(alignRepoRow).join(""))
-      +(job.message?`<div class="ab-msg">${esc(wsErrorSummary(job.message))}</div>`:"");
+      +(job.message?`<div class="ab-msg">${esc(wsErrorSummary(job.message))}</div>`:"")+review+stashes;
     return;
   }
   spin.style.display=running?"inline-block":"none";
@@ -349,6 +477,8 @@ function renderAlign(job){
   if(running) body.scrollTop=body.scrollHeight;
 }
 async function pollAlign(jobId,label){
+  ACTION_UI.selected=jobId;
+  ACTION_UI.dismissed=false;
   const banner=document.getElementById("align-banner");
   banner.style.display="block";
   document.getElementById("align-spin").style.display="inline-block";
@@ -360,16 +490,41 @@ async function pollAlign(jobId,label){
       const r=await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"});
       if(!r.ok){ document.getElementById("align-title").textContent="Alignment status unavailable"; return null; }
       last=await r.json();
-      renderAlign(last);
-      done=last.status!=="running";
+      if(ACTION_UI.selected===jobId&&!ACTION_UI.dismissed) renderAlign(last);
+      done=!["queued","running"].includes(last.status);
     }catch(err){ document.getElementById("align-title").textContent="Network error during alignment"; return null; }
     if(!done) await new Promise(res=>setTimeout(res,900));
   }
   return last;
 }
 document.addEventListener("click",e=>{
-  if(e.target && e.target.id==="align-close")
+  const approvalId=e.target?.closest?.("[data-workspace-approval]")?.dataset.workspaceApproval;
+  if(approvalId) wsReviewApproval(approvalId).catch(error=>alert(error.message));
+  const actionId=e.target?.closest?.("[data-action-id]")?.dataset.actionId;
+  if(actionId){
+    ACTION_UI.selected=actionId;
+    ACTION_UI.dismissed=false;
+    renderActionQueue({actions:ACTION_UI.jobs});
+    const job=ACTION_UI.jobs.find(job=>job.id===actionId);
+    if(job) renderAlign(job);
+  }
+  if(e.target && e.target.id==="action-queue-open"){
+    ACTION_UI.dismissed=false;
+    document.getElementById("align-banner").style.display="block";
+    refreshActionQueue();
+  }
+  if(e.target && e.target.id==="align-toggle"){
+    const body=document.getElementById("align-body");
+    body.hidden=!body.hidden;
+    const queue=document.getElementById("action-queue");
+    if(queue) queue.hidden=body.hidden;
+    e.target.setAttribute("aria-expanded",String(!body.hidden));
+    e.target.textContent=body.hidden?"Expand":"Collapse";
+  }
+  if(e.target && e.target.id==="align-close"){
+    ACTION_UI.dismissed=true;
     document.getElementById("align-banner").style.display="none";
+  }
 });
 
 function feature(t){
@@ -521,15 +676,13 @@ function applyFilters(){
   const st=checkedVals("status"), cat=checkedVals("category"), pri=checkedVals("priority");
   const cpx=checkedVals("complexity"), ws=checkedVals("workspace");
   const rvst=checkedVals("reviewstatus"), auth=checkedVals("author");
-  const hideDone=document.getElementById("o-hidedone").checked;
+  const openOnly=document.getElementById("o-hidedone").checked;
   const needJira=document.getElementById("o-jira").checked;
   const needWs=document.getElementById("o-ws").checked;
   const reviewOnly=document.getElementById("o-review").checked;
 
   return TASKS.filter(t=>{
-    // "Hide done/cancelled" hides every finished task, merged review records
-    // included; uncheck it to see the merged code-review history.
-    if(hideDone && (t.status==="done"||t.status==="cancelled")) return false;
+    if(openOnly && (t.status==="done"||t.status==="cancelled")) return false;
     if(st.length && !st.includes(t.status)) return false;
     if(cat.length && !cat.includes(t.category)) return false;
     if(pri.length && !pri.includes(t.priority)) return false;
@@ -566,8 +719,9 @@ function sortTasks(arr){
 function cellFor(t,key){
   switch(key){
     case "id": return `<td class="id">${esc(t.id)}</td>`;
-    case "title": return `<td class="title-cell"><div>${esc(t.title)}</div>`+
-                         `<div class="feature">${esc(feature(t))}</div></td>`;
+    case "title": return `<td class="title-cell"><div class="title-line">`+
+      `<button class="task-toggle" aria-expanded="false" title="Expand task details">\u25b8</button>`+
+      `<span class="title-text">${esc(t.title)}</span></div></td>`;
     case "category": return `<td><span class="cat">${esc(t.category)}</span></td>`;
     case "priority": return `<td><span class="badge p-${esc(t.priority)}">${esc(t.priority)}</span></td>`;
     case "status": return `<td><span class="badge s-${esc(t.status)}">${esc(t.status)}</span></td>`;
@@ -619,24 +773,46 @@ function editorHtml(t){
   </div>`;
 }
 
+function reviewDraftsHtml(t,r){
+  const drafts=[...(r.drafts||[])].sort((a,b)=>(b.updated_at||"").localeCompare(a.updated_at||""));
+  if(!drafts.length) return "";
+  const link=(d,label)=>SERVED
+    ?`<a class="btn review-draft-link" href="/review-drafts/${encodeURIComponent(t.id)}/${encodeURIComponent(d.id)}" target="_blank" rel="noopener">${label}</a>`
+    :`<span>${label} (open the served portal to read)</span>`;
+  const row=(d,label)=>`${link(d,label)} <small>Saved ${esc(formatPortalDate(d.updated_at))} · head <code>${esc(d.head_sha||"")}</code></small>`;
+  return `<div class="review-drafts">${row(drafts[0],"Open review draft")}`+
+    (drafts.length>1?`<details><summary>Earlier drafts (${drafts.length-1})</summary><ul>`+
+      drafts.slice(1).map(d=>`<li>${row(d,"Open earlier draft")}</li>`).join("")+`</ul></details>`:"")+`</div>`;
+}
+
 function detailRow(t,ncols){
   const p=prs(t);
   const prHtml = p.length ? `<div><h4>Pull Requests <span class="badge rv-${esc(consolidateReviewStatus(p))}">overall: ${esc(consolidateReviewStatus(p))}</span></h4><div class="pr-list">`+
     p.map(r=>`<div class="pr"><a href="${esc(r.pr_url)}" target="_blank">${esc(r.repo)}#${esc(r.pr_number)}</a> `+
       `by ${esc(r.author||"?")} · <code>${esc(r.branch||"?")}</code> · ${r.files_changed||0} files `+
-      `+${r.additions||0}/-${r.deletions||0} · <b>${esc(r.review_status||"")}</b>${r.merged?" · merged":""}</div>`).join("")+
+      `+${r.additions||0}/-${r.deletions||0} · <b>${esc(r.review_status||"")}</b>${r.merged?" · merged":""}${reviewDraftsHtml(t,r)}</div>`).join("")+
     `</div></div>` : "";
-  const notesHtml=(t.notes||[]).length?`<div><h4>Notes</h4><ul class="notes">`+
-    t.notes.map(n=>`<li>${esc(n)}</li>`).join("")+`</ul></div>`:"";
+  // Notes and the editor fold into collapsed disclosures so the expanded row
+  // leads with the description, metadata and (for reviews) the PR list.
+  const notesHtml=(t.notes||[]).length?`<details class="task-notes"><summary>Notes <span class="muted">(${t.notes.length})</span></summary><ul class="notes">`+
+    t.notes.map(n=>`<li>${esc(n)}</li>`).join("")+`</ul></details>`:"";
+  const editHtml=SERVED
+    ?`<details class="task-edit-wrap"><summary>Edit task</summary>${editorHtml(t)}</details>`
+    :editorHtml(t);
   return `<tr class="detail"><td colspan="${ncols}"><div class="detail-box">`+
-    (t.description?`<div><h4>Description</h4>${esc(t.description)}</div>`:"")+
+    (t.description?`<div><h4>Description</h4>${esc(t.description)}</div>`
+                  :`<div class="feature">${esc(feature(t))}</div>`)+
     `<div class="kv">`+
       (t.context?`<span><b>Context:</b> ${esc(t.context)}</span>`:"")+
-      `<span><b>Created:</b> ${esc(t.created||"—")}</span>`+
-      `<span><b>Updated:</b> ${esc(t.updated||"—")}</span>`+
-      (t.due?`<span><b>Due:</b> ${esc(t.due)}</span>`:"")+
-      (t.completed?`<span><b>Completed:</b> ${esc(t.completed)}</span>`:"")+
-    `</div>`+ prHtml + notesHtml + editorHtml(t) +
+      `<span><b>Created:</b> ${esc(formatPortalDate(t.created))}</span>`+
+      `<span><b>Updated:</b> ${esc(formatPortalDate(t.updated))}</span>`+
+      (t.due?`<span><b>Due:</b> ${esc(formatPortalDate(t.due))}</span>`:"")+
+      (t.completed?`<span><b>Completed:</b> ${esc(formatPortalDate(t.completed))}</span>`:"")+
+      (t.jira?`<span><b>Jira:</b> <a href="${JIRA_BASE+encodeURIComponent(t.jira)}" target="_blank" rel="noopener">${esc(t.jira)}</a></span>`:"")+
+      (t.cost_hours!=null?`<span><b>Est:</b> ${t.cost_hours}h</span>`:"")+
+      (t.workspace?`<span><b>WS:</b> ${esc(t.workspace)}</span>`:"")+
+      `<span><b>Worked:</b> ${esc(workedLabel(t))}</span>`+
+    `</div>`+ prHtml + notesHtml + editHtml +
     `</div></td></tr>`;
 }
 
@@ -673,15 +849,130 @@ function wireEditor(detEl,t){
     el.addEventListener("click",e=>e.stopPropagation()));
 }
 
+function taskHasOpenReview(t){
+  return t.category==="code-review" && !["done","cancelled"].includes(t.status) &&
+    prs(t).some(p=>!p.merged&&!p.closed&&p.review_status!=="merged"&&p.review_status!=="closed");
+}
+
+function selectedVisibleTasks(tasks){
+  return tasks.filter(task=>selectedTaskIds.has(task.id));
+}
+
+function pruneTaskSelection(tasks){
+  const visibleIds=new Set(tasks.map(task=>task.id));
+  for(const id of selectedTaskIds) if(!visibleIds.has(id)) selectedTaskIds.delete(id);
+}
+
+function openReviewTaskIds(tasks){
+  return selectedVisibleTasks(tasks).filter(taskHasOpenReview).map(task=>task.id);
+}
+
+function taskBulkEdits(tasks, values){
+  return selectedVisibleTasks(tasks).map(task=>({id:task.id,expected_revision:task.revision,...values}));
+}
+
+function taskBulkDialog(tasks){
+  if(!SERVED) return;
+  const selected=selectedVisibleTasks(tasks);
+  if(!selected.length) return;
+  const optionList=values=>'<option value="" selected disabled>Choose…</option>'+
+    values.map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join("");
+  const field=(key,label,control)=>`<div class="task-bulk-field">
+    <label><input type="checkbox" data-bulk-enabled="${key}"> Apply ${label}</label>${control}</div>`;
+  const overlay=document.createElement("div");
+  overlay.className="task-bulk-overlay";
+  overlay.innerHTML=`<form class="task-bulk-dialog" role="dialog" aria-modal="true" aria-labelledby="task-bulk-title">
+    <h3 id="task-bulk-title">Edit ${selected.length} selected tasks</h3>
+    <p>Check each field to apply its chosen value to every selected task.</p>
+    <div class="task-bulk-fields">
+      ${field("status","Status",`<select aria-label="Status" data-bulk-value="status" disabled>${optionList(STATUS_ORDER)}</select>`)}
+      ${field("priority","Priority",`<select aria-label="Priority" data-bulk-value="priority" disabled>${optionList(PRI_ORDER)}</select>`)}
+      ${field("category","Category",`<select aria-label="Category" data-bulk-value="category" disabled>${optionList(CATEGORIES.filter(value=>value!=="code-review"))}</select>`)}
+      ${field("complexity","Complexity",`<select aria-label="Complexity" data-bulk-value="complexity" disabled>
+        <option value="" selected disabled>Choose…</option><option value="__clear__">Clear</option>
+        ${CPX_ORDER.map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join("")}</select>`)}
+      ${field("cost_hours","Estimated hours",'<input type="number" min="0" step="0.5" aria-label="Estimated hours" data-bulk-value="cost_hours" disabled>')}
+    </div>
+    <details class="task-bulk-preview"><summary>Review the ${selected.length} affected tasks</summary>
+      <ul>${selected.map(task=>`<li><code>${esc(task.id)}</code> ${esc(task.title||"")}</li>`).join("")}</ul>
+    </details>
+    <div class="task-bulk-actions"><button type="button" class="btn" data-bulk-cancel>Cancel</button>
+      <span class="task-bulk-error" role="status"></span>
+      <button type="submit" class="primary" data-bulk-save>Save selected</button></div>
+  </form>`;
+  document.body.appendChild(overlay);
+  const form=overlay.querySelector("form");
+  overlay.querySelectorAll("[data-bulk-enabled]").forEach(input=>{
+    input.addEventListener("change",()=>{
+      const control=form.querySelector(`[data-bulk-value="${input.dataset.bulkEnabled}"]`);
+      control.disabled=!input.checked;
+      if(input.checked) control.focus();
+    });
+  });
+  const close=()=>overlay.remove();
+  overlay.querySelector("[data-bulk-cancel]").addEventListener("click",close);
+  overlay.addEventListener("click",event=>{ if(event.target===overlay) close(); });
+  form.addEventListener("submit",async event=>{
+    event.preventDefault();
+    const error=overlay.querySelector(".task-bulk-error");
+    const save=overlay.querySelector("[data-bulk-save]");
+    const values={};
+    for(const input of form.querySelectorAll("[data-bulk-enabled]:checked")){
+      const key=input.dataset.bulkEnabled;
+      const control=form.querySelector(`[data-bulk-value="${key}"]`);
+      if(key==="cost_hours"){
+        if(control.value===""||!Number.isFinite(Number(control.value))||Number(control.value)<0){
+          error.textContent="Estimated hours must be a non-negative number.";
+          control.focus();
+          return;
+        }
+        values[key]=Number(control.value);
+      }else if(!control.value){
+        error.textContent=`Choose a value for ${key}.`;
+        control.focus();
+        return;
+      }else{
+        values[key]=key==="complexity"&&control.value==="__clear__"?"":control.value;
+      }
+    }
+    if(!Object.keys(values).length){
+      error.textContent="Select at least one field to update.";
+      return;
+    }
+    const edits=taskBulkEdits(selected,values);
+    save.disabled=true;
+    error.textContent="Saving…";
+    try{
+      const response=await fetch("/api/tasks/bulk-edit",{
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({edits})});
+      const result=await response.json();
+      if(!response.ok) throw new Error(result.error||`request failed (${response.status})`);
+      TASKS=result.tasks;
+      selectedTaskIds.clear();
+      taskSelectionMessage=result.message||`Updated ${selected.length} task(s).`;
+      buildFilters();
+      render();
+      close();
+    }catch(err){
+      error.textContent="Save failed: "+err.message;
+      save.disabled=false;
+    }
+  });
+}
+
 function render(){
-  document.getElementById("review-scan").style.display = SERVED ? "" : "none";
+  const bulkButton=document.getElementById("task-bulk-edit");
+  const reviewScan=document.getElementById("review-scan");
+  bulkButton.style.display=SERVED?"":"none";
+  reviewScan.style.display=SERVED?"":"none";
   const cols=COLUMNS.filter(c=>c.on);
-  document.getElementById("head").innerHTML=cols.map(c=>{
+  document.getElementById("head").innerHTML='<th class="th-nosort task-select-head" data-std-index="-1" scope="col">Select</th>'+
+    cols.map((c,index)=>{
     const active=sortState.key===c.key;
     const arr=active?(sortState.dir>0?"▲":"▼"):"";
-    return `<th data-key="${c.key}">${esc(c.label)}<span class="arr">${arr}</span></th>`;
+    return `<th class="th-sortable" data-std-index="${index}" data-key="${c.key}">${esc(c.label)}<span class="arr">${arr}</span></th>`;
   }).join("");
-  document.querySelectorAll("#head th").forEach(th=>{
+  document.querySelectorAll("#head th[data-key]").forEach(th=>{
     th.addEventListener("click",()=>{
       const k=th.dataset.key;
       if(sortState.key===k){ sortState.dir*=-1; }
@@ -693,22 +984,71 @@ function render(){
     });
   });
   const data=sortTasks(applyFilters());
+  pruneTaskSelection(data);
+  const selectedCount=selectedTaskIds.size;
+  const eligibleCount=openReviewTaskIds(data).length;
+  const selectionBar=document.getElementById("task-selectionbar");
+  selectionBar.innerHTML=`<label><input type="checkbox" id="task-select-visible" aria-label="Select all visible tasks">
+    Select visible</label><span id="task-selection-count" role="status">${selectedCount} selected</span>
+    <button type="button" class="btn" id="task-deselect" ${selectedCount?"":"disabled"}>Deselect</button>
+    <span id="task-selection-message" role="status">${esc(taskSelectionMessage)}</span>`;
+  const allSelected=data.length>0&&selectedCount===data.length;
+  const visibleToggle=document.getElementById("task-select-visible");
+  visibleToggle.checked=allSelected;
+  visibleToggle.indeterminate=selectedCount>0&&!allSelected;
+  visibleToggle.disabled=!data.length;
+  visibleToggle.addEventListener("change",()=>{
+    selectedTaskIds.clear();
+    if(visibleToggle.checked) data.forEach(task=>selectedTaskIds.add(task.id));
+    taskSelectionMessage="";
+    render();
+  });
+  const deselect=document.getElementById("task-deselect");
+  deselect.addEventListener("click",()=>{
+    selectedTaskIds.clear();
+    taskSelectionMessage="";
+    render();
+  });
+  bulkButton.disabled=!selectedCount;
+  bulkButton.onclick=()=>taskBulkDialog(data);
+  reviewScan.disabled=!eligibleCount;
+  reviewScan.title=eligibleCount
+    ?`Scan unresolved PRs for ${eligibleCount} selected active review task(s) only.`
+    :"Select at least one active code-review task with an unresolved PR.";
+  reviewScan.textContent=`↻ Scan selected reviews${eligibleCount?` (${eligibleCount})`:""}`;
   const body=document.getElementById("body");
   body.innerHTML="";
-  if(!data.length){ body.innerHTML=`<tr><td class="empty" colspan="${cols.length}">No tasks match the current filters.</td></tr>`; }
+  if(!data.length){ body.innerHTML=`<tr><td class="empty" colspan="${cols.length+1}">No tasks match the current filters.</td></tr>`; }
   data.forEach(t=>{
     const tr=document.createElement("tr"); tr.className="task"; tr.dataset.id=t.id;
-    tr.innerHTML=cols.map(c=>cellFor(t,c.key)).join("");
+    tr.innerHTML=`<td class="task-select-cell"><input type="checkbox" class="task-row-select"
+      data-task-select="${esc(t.id)}" aria-label="Select ${esc(t.id)}" ${selectedTaskIds.has(t.id)?"checked":""}></td>`+
+      cols.map(c=>cellFor(t,c.key)).join("");
     const det=document.createElement("template");
-    det.innerHTML=detailRow(t,cols.length);
+    det.innerHTML=detailRow(t,cols.length+1);
     const detEl=det.content.firstChild; detEl.style.display="none";
-    tr.addEventListener("click",()=>{
+    tr.addEventListener("click",event=>{
+      if(event.target.closest(".task-row-select")) return;
       const show=detEl.style.display==="none";
       detEl.style.display = show?"":"none";
+      const toggle=tr.querySelector(".task-toggle");
+      if(toggle){
+        toggle.textContent=show?"\u25be":"\u25b8";
+        toggle.title=(show?"Collapse":"Expand")+" task details";
+        toggle.setAttribute("aria-expanded",String(show));
+      }
       if(show) wireEditor(detEl,t);
+    });
+    const checkbox=tr.querySelector(".task-row-select");
+    checkbox.addEventListener("click",event=>event.stopPropagation());
+    checkbox.addEventListener("change",()=>{
+      if(checkbox.checked) selectedTaskIds.add(t.id); else selectedTaskIds.delete(t.id);
+      taskSelectionMessage="";
+      render();
     });
     body.appendChild(tr); body.appendChild(detEl);
   });
+  taskSelectionMessage="";
   document.getElementById("count").textContent=`Showing ${data.length} of ${TASKS.length} tasks`;
   renderStats();
   applyTableStandards(document.getElementById("sec-work"));
@@ -730,17 +1070,22 @@ function ago(iso){ if(!iso) return ""; const n=daysSince(iso); return n==null?""
 const WS_ADHOC_TAGS=["monitor","debug","development","experiment","other"];
 
 // POST a slot occupy/free to the workspace API, then refresh the whole view.
-async function wsSlotPost(slot, payload, msgEl){
-  if(!SERVED){ if(msgEl) msgEl.textContent="Read-only — run portal.py serve to edit."; return; }
+async function wsSlotPost(slot, payload, msgEl, onAccepted){
+  if(!SERVED){ if(msgEl) msgEl.textContent="Read-only — run portal.py serve to edit."; return null; }
   if(msgEl) msgEl.textContent="Saving…";
   try{
     const res=await fetch("/api/workspace/"+encodeURIComponent(slot),{
       method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     const data=await res.json();
-    if(!res.ok){ if(msgEl) msgEl.textContent="Error: "+(data.error||res.status); return; }
-    if(data.align_job) await pollAlign(data.align_job);
-    await wsReload();
-  }catch(err){ if(msgEl) msgEl.textContent="Network error: "+err; }
+    if(!res.ok){ if(msgEl) msgEl.textContent="Error: "+(data.error||res.status); return null; }
+    if(!data.align_job) throw new Error("Workspace action returned no job");
+    if(onAccepted) onAccepted();
+    const job=await pollAlign(data.align_job);
+    if(!job) throw new Error("Action status unavailable; check Actions before retrying");
+    try{ await wsReload(); }
+    catch(error){ alert("Action finished, but workspace data could not be reloaded: "+error.message); }
+    return job;
+  }catch(err){ if(msgEl) msgEl.textContent="Workspace action error: "+err.message; return null; }
 }
 
 async function wsSyncSlot(slot){
@@ -749,8 +1094,11 @@ async function wsSyncSlot(slot){
     const res=await fetch("/api/ws-sync/"+encodeURIComponent(slot),{method:"POST"});
     const data=await res.json();
     if(!res.ok){ alert("Sync failed: "+(data.error||res.status)); return; }
-    if(data.align_job) await pollAlign(data.align_job, `Syncing ${slot}…`);
+    if(!data.align_job) throw new Error("Sync returned no job");
+    const job=await pollAlign(data.align_job, `Syncing ${slot}…`);
+    if(!job) throw new Error("Sync status unavailable; check Actions before retrying");
     await wsReload();
+    if(job.status==="approval_required") wsReturnApprovalDialog(slot,job);
   }catch(err){ alert("Network error: "+err); }
 }
 
@@ -782,11 +1130,84 @@ async function wsShowLog(slot){
   ov.className="ws-modal-ov";
   ov.innerHTML=`<div class="ws-modal ws-history"><h3>Workspace action log</h3>
     <p class="ro-note">Latest 200 controller and 200 last-fetched machine events. Full logs remain on disk.</p>
-    <pre>${esc(data.events.map(e=>`${e.at} · ${e.origin||"controller"} · ${e.action} · ${e.outcome}\n${e.detail||""}`).join("\n\n")||"No actions recorded yet.")}</pre>
+    <pre>${esc(data.events.map(e=>`${formatPortalDate(e.at)} · ${e.origin||"controller"} · ${e.action} · ${e.outcome}\n${e.detail||""}`).join("\n\n")||"No actions recorded yet.")}</pre>
     <button class="btn">Close</button></div>`;
   document.body.appendChild(ov);
   ov.querySelector("button").addEventListener("click",()=>ov.remove());
   ov.addEventListener("click",e=>{ if(e.target===ov) ov.remove(); });
+}
+
+function wsReturnApprovalDialog(slot, job){
+  if(!SERVED) return;
+  const workspace=wsRoster().find(s=>s.slot===slot);
+  if(!workspace){ alert("Workspace is no longer tracked. Refresh the workspace list."); return; }
+  const approval=job.approval;
+  const syncing=job.action==="sync";
+  const action=syncing?"sync":"free";
+  const blockers=approval.blockers||[];
+  const ov=document.createElement("div");
+  ov.className="ws-modal-ov";
+  ov.innerHTML=`<form class="ws-modal ws-history ws-return-dialog" role="dialog" aria-modal="true"
+      aria-labelledby="ws-return-title" aria-describedby="ws-return-warning">
+    <h3 id="ws-return-title">${syncing?"Force sync":"Return"} ${esc(workspace.label||slot)}?</h3>
+    <p id="ws-return-warning">This workspace is not clean. Approval stashes staged, unstaged and
+      untracked files, then checks out each manifest revision and syncs. Ignored files are not stashed.
+      Existing branches and their commits are retained; no hard reset is performed.</p>
+    <p class="ro-note">${esc(workspace.target?"Remote · "+workspace.target:"Local")} ·
+      <code>${esc(workspace.path||slot)}</code> · default revision <code>${esc(approval.revision)}</code></p>
+    <ul>${(approval.repos||[]).map(r=>`<li><code>${esc(r.path)}</code> ·
+      ${esc(r.branch||("detached "+String(r.head||"").slice(0,12)))} → <code>${esc(r.revision)}</code>
+      <br>${esc((r.reasons||[]).join("; "))}</li>`).join("")}</ul>
+    ${blockers.length?`<p><b>Cannot safely return until these issues are resolved:</b></p>
+      <ul>${blockers.map(reason=>`<li>${esc(reason)}</li>`).join("")}</ul>`:""}
+    <p class="ro-note">${syncing?"Force sync is only available while this workspace is free and independent. It does not occupy or release the workspace.":"The hold or mirror stays in place if return or verification fails."}
+      Stash IDs and original branches are recorded in the action log.</p>
+    <div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>
+      <button type="button" class="ws-modal-cancel">Cancel</button>
+      <button type="submit" class="primary ws-modal-ok"${blockers.length?" disabled":""}>${syncing?"Force sync":"Stash and return"}</button></div>
+  </form>`;
+  const previousFocus=document.activeElement;
+  document.body.appendChild(ov);
+  const form=ov.querySelector("form");
+  const submit=ov.querySelector(".ws-modal-ok");
+  const msg=ov.querySelector(".ws-modal-msg");
+  let saving=false;
+  const close=()=>{ if(!saving){ ov.remove(); previousFocus?.focus(); } };
+  ov.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  ov.addEventListener("click",e=>{ if(e.target===ov) close(); });
+  ov.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+    if(e.key==="Tab"){
+      const controls=[...form.querySelectorAll("button")].filter(button=>!button.disabled);
+      const first=controls[0], last=controls[controls.length-1];
+      if(e.shiftKey&&document.activeElement===first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey&&document.activeElement===last){ e.preventDefault(); first.focus(); }
+    }
+  });
+  ov.querySelector(".ws-modal-cancel").focus();
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(saving||blockers.length) return;
+    saving=true;
+    submit.disabled=true;
+    let accepted=false;
+    const next=await wsSlotPost(slot,{action,force:true,approval_job:job.id},msg,()=>{
+      accepted=true;
+      saving=false;
+      close();
+    });
+    if(!accepted){ saving=false; submit.disabled=false; return; }
+    if(next?.status==="approval_required") wsReturnApprovalDialog(slot,next);
+  });
+}
+
+async function wsReviewApproval(jobId){
+  const res=await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"});
+  const job=await res.json();
+  if(!res.ok) throw new Error(job.error||"Could not read workspace approval");
+  if(job.status!=="approval_required"||!job.approval)
+    throw new Error("Workspace approval is no longer available");
+  wsReturnApprovalDialog(job.slot,job);
 }
 
 function wsTaskCard(t, holder){
@@ -893,6 +1314,7 @@ function wsCard(s){
   const missing = s.exists===false
     ? `<span class="ws-rev ws-missing" title="${esc(s.path||"")}">missing</span>` : "";
   const tools = SERVED ? `<span class="ws-cardtools">
+      <button class="ws-mini ws-edit" data-slot="${esc(s.slot)}" title="Edit workspace" aria-label="Edit ${esc(s.label||s.slot)}">Edit</button>
       <button class="ws-mini ws-refresh" data-slot="${esc(s.slot)}" title="Refresh ${s.target?"remote":"local"} workspace status" aria-label="Refresh ${esc(s.label||s.slot)} status">&#8635;</button>
       <button class="ws-mini ws-log" data-slot="${esc(s.slot)}" title="Action log" aria-label="Action log for ${esc(s.label||s.slot)}">&#9776;</button>
       <button class="ws-mini ws-group-btn" data-slot="${esc(s.slot)}" title="Group">\u25c7</button>
@@ -907,7 +1329,7 @@ function wsCard(s){
       <div class="ws-location"><span class="badge">${s.target?"Remote · "+esc(s.target):"Local"}</span>
         <code class="ws-id">${esc(s.id||"")}</code></div>
       <div class="ws-path">${esc(s.path||"")}</div>
-      <div class="ro-note">Last checked: ${reading.checked?esc(new Date(reading.checked).toLocaleString()):"never"}
+      <div class="ro-note">Last checked: ${reading.checked?esc(formatPortalDate(reading.checked)):"never"}
         ${reading.checked?" · "+(reading.clean?"clean baseline":reading.exists===false?"missing":"not clean baseline"):""}</div>
       ${reading.error?`<div class="ws-error">Check/operation failed: ${esc(wsErrorSummary(reading.error))}. ${reading.checked?"Last successful reading retained.":"No successful reading yet."}</div>`:""}
       ${bodyHtml}
@@ -940,6 +1362,132 @@ async function wsRosterPost(path, payload){
   if(data.tasks) TASKS=data.tasks;
   renderWorkspaces();
   return data;
+}
+
+function wsUntrackDialog(slot){
+  if(!SERVED) return;
+  const workspace=wsRoster().find(s=>s.slot===slot);
+  if(!workspace){ alert("Workspace is no longer tracked. Refresh the workspace list."); return; }
+  const ov=document.createElement("div");
+  ov.className="ws-modal-ov";
+  ov.innerHTML=`<form class="ws-modal" role="dialog" aria-modal="true" aria-labelledby="ws-untrack-title">
+    <h3 id="ws-untrack-title">Stop tracking ${esc(workspace.label||slot)}?</h3>
+    <p class="ro-note">${esc(workspace.path||slot)}. The directory itself is left untouched.</p>
+    <label class="ws-untrack-override"><input name="force" type="checkbox" aria-describedby="ws-untrack-warning">
+      Override occupancy/mirror checks</label>
+    <p id="ws-untrack-warning" class="ro-note">Override removes only the roster entry. Task holds, mirror state and history remain intact.
+      It does not free the workspace or release its mirror. Active-operation locks still apply.</p>
+    <div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>
+      <button type="button" class="ws-modal-cancel">Cancel</button>
+      <button type="submit" class="primary ws-modal-ok">Stop tracking</button></div>
+  </form>`;
+  const previousFocus=document.activeElement;
+  document.body.appendChild(ov);
+  const form=ov.querySelector("form");
+  const submit=ov.querySelector(".ws-modal-ok");
+  const msg=ov.querySelector(".ws-modal-msg");
+  let saving=false;
+  const close=()=>{ if(!saving){ ov.remove(); previousFocus?.focus(); } };
+  ov.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  ov.addEventListener("click",e=>{ if(e.target===ov) close(); });
+  ov.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+    if(e.key==="Tab"){
+      const controls=[...form.querySelectorAll("input, button")];
+      const first=controls[0], last=controls[controls.length-1];
+      if(e.shiftKey&&document.activeElement===first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey&&document.activeElement===last){ e.preventDefault(); first.focus(); }
+    }
+  });
+  ov.querySelector(".ws-modal-cancel").focus();
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(saving) return;
+    saving=true;
+    submit.disabled=true;
+    msg.textContent="Stopping tracking...";
+    try{
+      const result=await wsRosterPost("/api/ws-untrack/"+encodeURIComponent(slot),
+        {force:form.elements.namedItem("force").checked});
+      saving=false;
+      if(result) close();
+      else msg.textContent="Untracking failed. Review the error or explicitly override the checks and retry.";
+    }catch(error){
+      saving=false;
+      msg.textContent="Untracking failed: "+error.message;
+    }finally{
+      submit.disabled=false;
+    }
+  });
+}
+
+function wsEditDialog(slot){
+  if(!SERVED) return;
+  const workspace=wsRoster().find(s=>s.slot===slot);
+  if(!workspace){ alert("Workspace is no longer tracked. Refresh the workspace list."); return; }
+  const revisionLocked=!!wsHolder(slot)||!!workspace.status?.mirror;
+  const values={label:workspace.label||slot, badge:workspace.badge||"",
+    group:workspace.group||"", rev:workspace.rev||"main"};
+  const ov=document.createElement("div");
+  ov.className="ws-modal-ov";
+  ov.innerHTML=`<form class="ws-modal" role="dialog" aria-modal="true" aria-labelledby="ws-edit-title">
+    <h3 id="ws-edit-title">Edit workspace</h3>
+    <p class="ro-note">${esc(workspace.path||slot)}. Metadata only; saving does not sync or change checkout branches.</p>
+    <label>Label<input name="label" type="text" value="${esc(values.label)}" required></label>
+    <div class="ws-modal-row">
+      <label>Badge<input name="badge" type="text" value="${esc(values.badge)}" maxlength="4" required></label>
+      <label>Revision<input name="rev" type="text" value="${esc(values.rev)}" required ${revisionLocked?"disabled":""}></label>
+    </div>
+    ${revisionLocked?'<p class="ro-note">Free the workspace or release its mirror before changing revision.</p>':""}
+    <label>Group<select name="group"><option value="">— ungrouped —</option>
+      ${wsGroups().map(g=>`<option value="${esc(g.id)}"${g.id===values.group?" selected":""}>${esc(g.name)}</option>`).join("")}</select></label>
+    <div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>
+      <button type="button" class="ws-modal-cancel">Cancel</button>
+      <button type="submit" class="primary ws-modal-ok">Save</button></div>
+  </form>`;
+  const previousFocus=document.activeElement;
+  document.body.appendChild(ov);
+  const form=ov.querySelector("form");
+  const save=ov.querySelector(".ws-modal-ok");
+  const msg=ov.querySelector(".ws-modal-msg");
+  let saving=false;
+  const close=()=>{ if(!saving){ ov.remove(); previousFocus?.focus(); } };
+  ov.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  ov.addEventListener("click",e=>{ if(e.target===ov) close(); });
+  ov.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+    if(e.key==="Tab"){
+      const controls=[...form.querySelectorAll("input:not(:disabled), select, button")];
+      const first=controls[0], last=controls[controls.length-1];
+      if(e.shiftKey&&document.activeElement===first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey&&document.activeElement===last){ e.preventDefault(); first.focus(); }
+    }
+  });
+  form.elements.namedItem("label").focus();
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(saving||!form.reportValidity()) return;
+    const changes={};
+    for(const key of Object.keys(values)){
+      const control=form.elements.namedItem(key);
+      if(!control.disabled&&control.value.trim()!==values[key]) changes[key]=control.value.trim();
+    }
+    if(!Object.keys(changes).length){ close(); return; }
+    saving=true;
+    save.disabled=true;
+    msg.textContent="Saving…";
+    try{
+      const result=await wsRosterPost("/api/ws-meta/"+encodeURIComponent(slot),changes);
+      saving=false;
+      if(result) close();
+      else msg.textContent="Save failed. Your edits have been kept; correct the issue and retry.";
+    }catch(error){
+      saving=false;
+      msg.textContent="Save failed: "+error.message;
+    }finally{
+      save.disabled=false;
+    }
+  });
 }
 
 // Modal for "+ Track workspace". A path is all that's required; the slot name
@@ -1102,6 +1650,7 @@ function renderWorkspaces(){
   // roster: track / untrack / group
   const trackBtn=box.querySelector(".ws-track-btn");
   if(trackBtn) trackBtn.addEventListener("click",wsTrackDialog);
+  box.querySelectorAll(".ws-edit").forEach(b=>b.addEventListener("click",()=>wsEditDialog(b.dataset.slot)));
   box.querySelectorAll(".ws-refresh, .ws-refresh-local, .ws-check-vm").forEach(b=>b.addEventListener("click",async()=>{
     b.disabled=true;
     try{ await wsRefresh(b.dataset.slot||null,b.classList.contains("ws-check-vm")?"remote":"local"); }
@@ -1113,10 +1662,7 @@ function renderWorkspaces(){
   }));
   const groupsBtn=box.querySelector(".ws-groups-btn");
   if(groupsBtn) groupsBtn.addEventListener("click",()=>{ wsGroupPanelOpen=!wsGroupPanelOpen; renderWorkspaces(); });
-  box.querySelectorAll(".ws-untrack").forEach(b=>b.addEventListener("click",()=>{
-    if(!confirm(`Stop tracking '${b.dataset.slot}'? The directory itself is left untouched.`)) return;
-    wsRosterPost("/api/ws-untrack/"+encodeURIComponent(b.dataset.slot),{});
-  }));
+  box.querySelectorAll(".ws-untrack").forEach(b=>b.addEventListener("click",()=>wsUntrackDialog(b.dataset.slot)));
   box.querySelectorAll(".ws-group-btn").forEach(b=>b.addEventListener("click",e=>{
     e.stopPropagation();
     const menu=b.closest(".ws-head").parentElement.querySelector(".ws-gmenu");
@@ -1148,10 +1694,14 @@ function renderWorkspaces(){
     wsRosterPost("/api/ws-groups",{action:"add", name, color:row.querySelector(".ws-gcolor").value});
   });
   // wire controls
-  box.querySelectorAll(".ws-free").forEach(b=>b.addEventListener("click",()=>{
-    if(!confirm("Return every repository to its manifest revision and sync before freeing this workspace? Uncommitted changes or local-only commits will block the operation.")) return;
+  box.querySelectorAll(".ws-free").forEach(b=>b.addEventListener("click",async()=>{
+    if(!confirm("Return every repository to its manifest revision and sync before freeing this workspace? You will be asked before stashing changes or returning an unexpected branch.")) return;
     const msg=b.closest(".ws-actions").querySelector(".ws-msg");
-    wsSlotPost(b.dataset.slot,{action:"free"},msg);
+    b.disabled=true;
+    try{
+      const job=await wsSlotPost(b.dataset.slot,{action:"free"},msg);
+      if(job?.status==="approval_required") wsReturnApprovalDialog(b.dataset.slot,job);
+    }finally{ b.disabled=false; }
   }));
   box.querySelectorAll(".ws-sync").forEach(b=>b.addEventListener("click",()=>wsSyncSlot(b.dataset.slot)));
   box.querySelectorAll(".ws-occupy-task").forEach(b=>b.addEventListener("click",()=>{
@@ -1376,36 +1926,45 @@ async function scanBugs(){
 }
 document.getElementById("bug-scan").addEventListener("click",scanBugs);
 
-// Server-side gh probe of every open review PR — approvals, comments,
-// change-requests, re-pushes, merges — then re-derive each task status.
-// Runs as a background job with a live progress banner (pollAlign).
+// Server-side gh probe of selected open review PRs, then re-derive only their
+// task statuses. Runs as a background job with a live progress banner.
 async function scanReviews(){
   const btn=document.getElementById("review-scan"), note=document.getElementById("review-scan-note");
   if(!SERVED){ note.style.display=""; note.textContent="Run portal.py serve to scan."; return; }
+  const taskIds=openReviewTaskIds(applyFilters());
+  if(!taskIds.length){ note.style.display=""; note.textContent="Select an active review task with an unresolved PR."; return; }
   btn.disabled=true; btn.innerHTML='<span class="spin">↻</span> Scanning…';
-  note.style.display=""; note.textContent="probing PRs via gh…";
+  note.style.display=""; note.textContent=`probing selected reviews for ${taskIds.length} task(s) via gh…`;
   try{
-    const r=await fetch("/api/review-scan",{method:"POST"});
+    const r=await fetch("/api/review-scan",{
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task_ids:taskIds})});
     const data=await r.json();
     if(!r.ok||data.error) throw new Error(data.error||"scan failed");
     const job=await pollAlign(data.align_job,"Scanning reviews…");
-    // Pull the freshly-updated task store back into the table.
-    try{
-      const tr=await fetch("/api/tasks",{cache:"no-store"});
-      const td=await tr.json();
-      if(td.tasks){ TASKS=td.tasks; if(td.workspaces) WORKSPACES=td.workspaces;
-        buildFilters(); render(); }
-    }catch(_){}
+    if(!job||job.status!=="done") throw new Error(job?.message||"review scan failed");
+    const tr=await fetch("/api/tasks",{cache:"no-store"});
+    if(!tr.ok) throw new Error("scan completed, but task data could not be refreshed");
+    const td=await tr.json();
+    if(!td.tasks) throw new Error("scan completed, but refreshed task data was missing");
+    TASKS=td.tasks;
+    if(td.workspaces) WORKSPACES=td.workspaces;
+    selectedTaskIds.clear();
+    buildFilters();
+    render();
     const res=(job&&job.result)||{};
     const bits=[(res.scanned||0)+" PR(s) checked"];
     if((res.changed||[]).length) bits.push("<b>"+res.changed.length+" changed</b>");
+    if((res.removed||[]).length) bits.push(res.removed.length+" closed→removed");
     if((res.completed||[]).length) bits.push(res.completed.length+" merged→done");
+    if((res.cancelled||[]).length) bits.push(res.cancelled.length+" emptied→cancelled");
     if((res.errors||[]).length) bits.push('<span class="stale-note">'+res.errors.length+" error(s)</span>");
     note.innerHTML=bits.join(" · ");
   }catch(e){
-    note.innerHTML='<span class="stale-note">Scan failed: '+esc(e.message)+'</span>';
+    note.innerHTML='<span class="stale-note">'+esc(e.message)+'</span>';
   }finally{
-    btn.disabled=false; btn.textContent="↻ Scan reviews";
+    const remaining=openReviewTaskIds(applyFilters()).length;
+    btn.disabled=!remaining;
+    btn.textContent=`↻ Scan selected reviews${remaining?` (${remaining})`:""}`;
   }
 }
 document.getElementById("review-scan").addEventListener("click",scanReviews);
@@ -1488,14 +2047,14 @@ function bugCell(b,key){
     case "pings": { const n=b.oded_pings||0;
       const man=b.manual_pings||0;
       const src=man?` (${b.jira_pings||0} in Jira + ${man} manual)`:"";
-      return `<td title="Pings from Oded${src}${b.last_ping?` · last ${esc(b.last_ping)}`:""}"${
+      return `<td title="Pings from Oded${src}${b.last_ping?` · last ${esc(formatPortalDate(b.last_ping))}`:""}"${
         n?' style="font-weight:700;color:#c2410c;"':''}>${n||"—"}</td>`; }
     case "ci": { const runs=b.ci_runs||[], r=runs[0];
       if(!r) return `<td>—</td>`;
       const more=runs.length>1?`<span class="feature">+${runs.length-1}</span>`:"";
       return `<td><a href="${esc(r.url)}" target="_blank" rel="noopener"`
         +` onclick="event.stopPropagation()"`
-        +` title="${esc(r.at+(r.station?" · "+r.station:""))}">run</a>${more}</td>`; }
+        +` title="${esc(formatPortalDate(r.at)+(r.station?" · "+r.station:""))}">run</a>${more}</td>`; }
     case "triage": { const s=bugTri(b).state||"untriaged";
       const v=bugTri(b).verdict;
       return `<td><span class="badge tr-${esc(s)}">${esc(s)}</span>${v?`<div class="feature">${esc(v)}</div>`:""}</td>`; }
@@ -1553,26 +2112,26 @@ function bugDetail(b,span){
       <span><b>Milestone</b> ${esc(b.milestone||"—")}</span>
       <span><b>Sprint</b> ${esc((b.sprints||[]).join(", ")||"—")}</span>
       <span><b>Estimate</b> ${b.estimate_h?esc(b.estimate_h)+"h":"—"}</span>
-      <span><b>Due</b> ${esc(b.duedate||"—")}</span>
-      <span><b>Created</b> ${esc(b.created||"—")}</span>
-      <span><b>First seen</b> ${esc(b.first_seen||"—")}</span>
+      <span><b>Due</b> ${esc(formatPortalDate(b.duedate))}</span>
+      <span><b>Created</b> ${esc(formatPortalDate(b.created))}</span>
+      <span><b>First seen</b> ${esc(formatPortalDate(b.first_seen))}</span>
     </div>
     <div class="kv">
-      <span><b>Last activity</b> ${esc(b.last_activity||"—")} (${b.idle_days==null?"—":b.idle_days+"d idle"})</span>
-      <span><b>Comments</b> ${esc(a.comment_count||0)}${a.last_comment?` (last ${esc(a.last_comment)} by ${esc(a.last_comment_by||"—")})`:""}</span>
+      <span><b>Last activity</b> ${esc(formatPortalDate(b.last_activity))} (${b.idle_days==null?"—":b.idle_days+"d idle"})</span>
+      <span><b>Comments</b> ${esc(a.comment_count||0)}${a.last_comment?` (last ${esc(formatPortalDate(a.last_comment))} by ${esc(a.last_comment_by||"—")})`:""}</span>
       <span><b>Field changes</b> ${esc(a.change_count||0)}</span>
-      <span><b>Last status change</b> ${esc(a.last_status_change||"—")}</span>
+      <span><b>Last status change</b> ${esc(formatPortalDate(a.last_status_change))}</span>
       <span><b>Pings from Oded</b> ${b.oded_pings||0}${
         b.manual_pings?` (${b.jira_pings||0} in Jira + ${b.manual_pings} manual)`:""}${
-        b.last_ping?` (last ${esc(b.last_ping)}${b.days_since_ping==null?"":`, ${b.days_since_ping}d ago`})`:""}</span>
+        b.last_ping?` (last ${esc(formatPortalDate(b.last_ping))}${b.days_since_ping==null?"":`, ${b.days_since_ping}d ago`})`:""}</span>
     </div>
     ${(b.ci_runs||[]).length?`<div><h4>CI runs <span class="feature">scraped from Jira comments</span></h4><div class="kv">${
-      b.ci_runs.map(r=>`<span><a href="${esc(r.url)}" target="_blank" rel="noopener">run ${esc(r.run_id)}</a> ${esc(r.at)}${r.station?` · ${esc(r.station)}`:""}</span>`).join("")}</div></div>`:""}
+      b.ci_runs.map(r=>`<span><a href="${esc(r.url)}" target="_blank" rel="noopener">run ${esc(r.run_id)}</a> ${esc(formatPortalDate(r.at))}${r.station?` · ${esc(r.station)}`:""}</span>`).join("")}</div></div>`:""}
     ${(b.links||[]).length?`<div><h4>Jira links</h4><div class="kv">${
       b.links.map(l=>`<span>${esc(l.type||"relates")} <a href="${JIRA_BASE}${esc(l.key)}" target="_blank" rel="noopener">${esc(l.key)}</a></span>`).join("")}</div></div>`:""}
     ${b.description?`<div><h4>Description</h4><pre style="white-space:pre-wrap;margin:0;font-size:12px;">${esc(b.description)}</pre></div>`:""}
     ${(b.changes||[]).length?`<div><h4>Observed changes</h4><ul class="notes">${
-      b.changes.slice(-6).reverse().map(c=>`<li>${esc(c.at)}: ${esc(c.diff.join("; "))}</li>`).join("")}</ul></div>`:""}
+      b.changes.slice(-6).reverse().map(c=>`<li>${esc(formatPortalDate(c.at))}: ${esc(c.diff.join("; "))}</li>`).join("")}</ul></div>`:""}
     ${(b.notes||[]).length?`<div><h4>Notes</h4><ul class="notes">${
       b.notes.slice(-8).reverse().map(n=>`<li>${esc(n)}</li>`).join("")}</ul></div>`:""}
     ${bugTriageBlock(b)}
@@ -1656,7 +2215,7 @@ function renderFamilies(){
         <span>${esc(f.status||"open")}</span>
         <span>${openN} open / ${(f.members||[]).length} members</span>
         <span>primary ${esc(f.primary||"—")}</span>
-        ${f.created?`<span>since ${esc(f.created)}</span>`:""}
+        ${f.created?`<span>since ${esc(formatPortalDate(f.created))}</span>`:""}
       </div>
       ${f.root_cause?`<div style="font-size:13px;"><b style="color:var(--muted);">Root cause</b> ${esc(f.root_cause)}</div>`:""}
       <div class="fam-members">${(f.members||[]).map(k=>{
@@ -1679,7 +2238,7 @@ const PH_SIGNALS = ["hot","active","slow","quiet","fixed","closed","unknown"];
 const PH_CLOSED = ["closed","not-a-bug","not-ours","merged"];
 const PH_ALARM = ["escaped","regressed","unexplained-recurring"];
 const SRC_LABEL = {explicit:"linked", filename:"by file name", mention:"mentioned"};
-let phFilter = {q:"", status:[], platform:[], flag:[], signal:[], origin:[], closed:false};
+let phFilter = {q:"", status:[], platform:[], flag:[], signal:[], origin:[], openOnly:true};
 const phOpenRows = new Set();
 const bugOpenKeys = new Set();
 
@@ -1735,7 +2294,7 @@ function bugTriageBlock(b){
       <div class="ph-card-m">
         <span>${esc((p.platforms||[]).join(", ")||"—")}</span>
         <span>${p.count||0} sighting${p.count===1?"":"s"}</span>
-        ${p.last_seen?`<span>last ${esc(p.last_seen)}</span>`:""}
+        ${p.last_seen?`<span>last ${esc(formatPortalDate(p.last_seen))}</span>`:""}
         ${(p.flags||[]).map(f=>`<span class="flag${PH_ALARM.includes(f)?" warn":""}">${esc(f)}</span>`).join("")}
       </div>
       ${p.root_cause?`<div class="ph-card-rc"><b>Root cause</b> ${esc(p.root_cause)}</div>`:""}
@@ -1744,7 +2303,7 @@ function bugTriageBlock(b){
   const noteRows=notes.map(n=>{
     const m=invMeta(n.name);
     return `<li class="${n.source==="mention"?"weak":""}"><button class="note-open" data-note="${esc(n.name)}">📄 ${esc(m.title||n.name)}</button>
-      ${srcBadge(n.source)}<span class="feature">${esc(m.date||"")}</span></li>`;}).join("");
+      ${srcBadge(n.source)}<span class="feature">${esc(formatPortalDate(m.date))}</span></li>`;}).join("");
   return `<div class="tri-block">
     <h4>🔬 Bug-triage <span class="feature">bugs.db · shared with the bug-triage skill</span></h4>
     ${ph.length?`<div class="ph-cards">${cards}</div>`:`<div class="ro-note">No phenomenon linked.</div>`}
@@ -1794,7 +2353,7 @@ function wireTriageBlock(root, b){
 function goPhenomenon(id){
   phOpenRows.add(id);
   const p=phById(id);
-  if(p && !phIsOpen(p)) phFilter.closed=true;
+  if(p && !phIsOpen(p)) phFilter.openOnly=false;
   phFilter.q=""; ["status","platform","flag","signal","origin"].forEach(k=>{ phFilter[k]=[]; });
   const bar=document.querySelector("#phview .ph-bar");
   if(bar) delete bar.dataset.built;
@@ -1812,7 +2371,7 @@ function goBug(key){
 // ---- Phenomena tab ----
 function phMatches(p){
   const f=phFilter;
-  if(!f.closed && !phIsOpen(p)) return false;
+  if(f.openOnly && !phIsOpen(p)) return false;
   if(!msHas(f.status, p.status)) return false;
   if(!msHas(f.signal, p.signal)) return false;
   if(!msAny(f.platform, p.platforms)) return false;
@@ -1846,14 +2405,14 @@ function buildPhBar(box){
     <select class="ph-f" data-filter data-k="platform">${opt(plats,phFilter.platform,"Any platform")}</select>
     <select class="ph-f" data-filter data-k="flag">${opt(flags,phFilter.flag,"Any flag")}</select>
     <select class="ph-f" data-filter data-k="origin">${opt(["customer","internal"],phFilter.origin,"Any origin")}</select>
-    <label class="chip${phFilter.closed?" on":""}"><input type="checkbox" class="ph-closed"${phFilter.closed?" checked":""}> Show closed</label>
+    <label class="chip${phFilter.openOnly?" on":""}"><input type="checkbox" class="ph-openonly"${phFilter.openOnly?" checked":""}> Open only</label>
     <span class="ro-note ph-count"></span>`;
   bar.querySelector(".ph-q").addEventListener("input",e=>{ phFilter.q=e.target.value.toLowerCase().trim(); renderPhRows(); });
   msAuto(bar);
   bar.querySelectorAll(".ph-f").forEach(s=>{
     s.addEventListener("change",()=>{ phFilter[s.dataset.k]=msVals(s); renderPhRows(); }); });
-  const cb=bar.querySelector(".ph-closed");
-  cb.addEventListener("change",()=>{ phFilter.closed=cb.checked; cb.closest(".chip").classList.toggle("on",cb.checked); renderPhRows(); });
+  const cb=bar.querySelector(".ph-openonly");
+  cb.addEventListener("change",()=>{ phFilter.openOnly=cb.checked; cb.closest(".chip").classList.toggle("on",cb.checked); renderPhRows(); });
   bar.dataset.built="1";
 }
 function renderPhenomena(){
@@ -1900,7 +2459,7 @@ function renderPhRows(){
       <td><span class="badge phs-${esc(p.status)}">${esc(p.status)}</span></td>
       <td>${esc((p.platforms||[]).join(", ")||"—")}</td>
       <td>${p.count||0}×</td>
-      <td>${esc(p.last_seen||"—")}${p.idle_days!=null?`<div class="feature">${p.idle_days}d ago</div>`:""}</td>
+      <td>${esc(formatPortalDate(p.last_seen))}${p.idle_days!=null?`<div class="feature">${p.idle_days}d ago</div>`:""}</td>
       <td>${esc(p.owner||"—")}</td>
       <td>${(p.flags||[]).map(f=>`<span class="flag${PH_ALARM.includes(f)||f==="no-owner"?" warn":""}">${esc(f)}</span>`).join("")||"—"}</td>
       <td>${jira.length?jira.map(k=>`<span class="ev-n${bugKeys.has(k)?"":" weak"}">${esc(k)}</span>`).join(" "):"—"}</td>`;
@@ -1931,14 +2490,14 @@ function phDetail(p, span){
   const notes=(ev.investigations||[]).map(n=>{
     const m=invMeta(n.name);
     return `<li class="${n.source==="mention"?"weak":""}"><button class="note-open" data-note="${esc(n.name)}">📄 ${esc(m.title||n.name)}</button>
-      ${srcBadge(n.source)}<span class="feature">${esc(m.date||"")}</span>${
+      ${srcBadge(n.source)}<span class="feature">${esc(formatPortalDate(m.date))}</span>${
       n.source==="explicit"&&SERVED?`<button class="ghost-x ph-unnote" data-note="${esc(n.name)}" title="Unlink note">×</button>`:""}</li>`;}).join("");
   const sightings=(p.sightings||[]).slice().reverse().map(s=>`<tr>
-      <td class="id">${esc(s.id)}</td><td>${esc(s.at||"—")}</td><td>${esc(s.platform||"—")}</td>
+      <td class="id">${esc(s.id)}</td><td>${esc(formatPortalDate(s.at))}</td><td>${esc(s.platform||"—")}</td>
       <td>${esc(s.where||"—")}</td><td>${esc(s.fw||"—")}${s.after_fix?' <span class="flag warn">after-fix</span>':""}</td>
       <td>${esc(s.reporter||s.source||"—")}</td>
       <td>${esc(s.note||"")}${s.raw?`<details><summary>raw evidence</summary><pre class="ph-raw">${esc(s.raw)}</pre></details>`:""}</td></tr>`).join("");
-  const sigs=(p.signatures||[]).map(s=>`<div class="ph-sig"><span class="feature">${esc(s.label||"")} · ${esc(s.fp||"")} · ${esc(s.added||"")}</span><pre class="ph-raw">${esc(s.text||"")}</pre></div>`).join("");
+  const sigs=(p.signatures||[]).map(s=>`<div class="ph-sig"><span class="feature">${esc(s.label||"")} · ${esc(s.fp||"")} · ${esc(formatPortalDate(s.added))}</span><pre class="ph-raw">${esc(s.text||"")}</pre></div>`).join("");
   const invOpts=(TRIAGE.investigations||[]).filter(i=>!(ev.investigations||[]).some(n=>n.name===i.name&&n.source==="explicit"))
     .map(i=>`<option value="${esc(i.name)}">${esc((i.title||i.name).slice(0,70))}</option>`).join("");
   const opt=(list,cur,blank)=>(blank?'<option value="">—</option>':"")+list.map(v=>`<option value="${esc(v)}"${v===cur?" selected":""}>${esc(v)}</option>`).join("");
@@ -1948,8 +2507,8 @@ function phDetail(p, span){
       <span><b>Origin</b> ${originBadge(p.origin,p.origin_why)} <span class="feature">${esc(p.origin_why||"")}${p.origin_why&&p.origin_why.startsWith("tagged")?"":" · tag customer/internal to override"}</span></span>
       <span><b>Component</b> ${esc(p.component||"—")}</span>
       <span><b>Owner</b> ${esc(p.owner||"—")}</span>
-      <span><b>Created</b> ${esc(p.created||"—")}</span>
-      <span><b>First / last seen</b> ${esc(p.first_seen||"—")} → ${esc(p.last_seen||"—")}</span>
+      <span><b>Created</b> ${esc(formatPortalDate(p.created))}</span>
+      <span><b>First / last seen</b> ${esc(formatPortalDate(p.first_seen))} → ${esc(formatPortalDate(p.last_seen))}</span>
       <span><b>Sightings</b> ${p.count||0}</span>
       <span><b>Sources</b> ${esc((p.sources||[]).join(", ")||"—")}</span>
       <span><b>Tags</b> ${esc((p.tags||[]).join(", ")||"—")}</span>
@@ -1960,7 +2519,7 @@ function phDetail(p, span){
       ${fix.pr?`<span><b>PR</b> <a href="${esc(fix.pr)}" target="_blank" rel="noopener">${esc(fix.pr.replace(/^https:\/\/github.com\//,""))}</a></span>`:""}
       ${fix.commit?`<span><b>Commit</b> <code>${esc(fix.commit.slice(0,12))}</code></span>`:""}
       ${fix.repo?`<span><b>Repo</b> ${esc(fix.repo)}</span>`:""}
-      ${fix.at?`<span><b>Fixed</b> ${esc(fix.at)}</span>`:""}</div></div>`:""}
+      ${fix.at?`<span><b>Fixed</b> ${esc(formatPortalDate(fix.at))}</span>`:""}</div></div>`:""}
     <div><h4>Linked bugs</h4>${linkedBugs?`<div class="kv">${linkedBugs}</div>`:'<span class="ro-note">none</span>'}</div>
     ${notes?`<div><h4>Investigation notes</h4><ul class="inv-list">${notes}</ul></div>`:""}
     ${sightings?`<div><h4>Sightings</h4><div class="tbl-scroll"><table class="ph-sight"><thead><tr>
@@ -2102,7 +2661,7 @@ async function openNote(name){
   ov.className="ws-modal-ov";
   ov.innerHTML=`<div class="note-modal" role="dialog" aria-label="${esc(name)}">
     <div class="note-h"><div><div class="note-t">${esc(meta.title||name)}</div>
-      <div class="feature">${esc(name)}${meta.date?" · "+esc(meta.date):""}${
+      <div class="feature">${esc(name)}${meta.date?" · "+esc(formatPortalDate(meta.date)):""}${
         (meta.phs||[]).length?" · "+meta.phs.map(esc).join(", "):""}${
         (meta.keys||[]).length?" · "+meta.keys.map(esc).join(", "):""}</div></div>
       <button class="ghost-x note-x" title="Close (Esc)">✕</button></div>
@@ -2374,7 +2933,7 @@ function svgStackedArea(labels, series, w, h){
   const step=Math.max(1,Math.floor(n/6));
   const xlab=labels.map((d,i)=>(i%step===0||i===n-1)
     ? '<text x="'+X(i)+'" y="'+(T+ih+17)+'" text-anchor="middle" style="font:10px system-ui;fill:var(--muted);">'
-      +d.slice(5).replace("-","/")+'</text>' : "").join("");
+      +esc(formatPortalDate(d))+'</text>' : "").join("");
   return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;">'
     +'<defs>'+defs.join("")+'</defs>'+ticks+bands.join("")+caps.join("")
     +'<line x1="'+L+'" y1="'+(T+ih)+'" x2="'+(w-R)+'" y2="'+(T+ih)+'" stroke="var(--border)"/>'
@@ -2416,7 +2975,7 @@ function renderChanges(){
   const st=chgState(), seen=new Set(st.seen||[]);
   const all=chgEntries().filter(e=>e.d>=st.since&&!seen.has(e.h));
   document.getElementById("ov-chg-cap").innerHTML=
-    "Bug field changes, pr-monitor notes and task notes dated on or after <b>"+esc(st.since)+"</b>"
+    "Bug field changes, pr-monitor notes and task notes dated on or after <b>"+esc(formatPortalDate(st.since))+"</b>"
     +" that you have not marked seen \u00b7 "+all.length+" new"
     +(all.length?' <button class="ci-btn" id="chg-seen" title="Acknowledge everything listed">\u2713 mark all seen</button>':"")
     +' <button class="ci-btn" id="chg-back" title="Show the last 7 days again">\u21ba last 7 days</button>';
@@ -2424,13 +2983,13 @@ function renderChanges(){
   const rows=chgShowAll?all:all.slice(0,10);
   let day="";
   box.innerHTML=all.length?'<div class="chg-list">'+rows.map(e=>{
-    const head=e.d!==day?'<div class="chg-day">'+esc(e.d)+'</div>':""; day=e.d;
+    const head=e.d!==day?'<div class="chg-day">'+esc(formatPortalDate(e.d))+'</div>':""; day=e.d;
     return head+'<div class="chg-it chg-'+e.k+(e.isNew?" chg-new":"")+'" data-k="'+e.k+'" data-id="'+esc(e.id)+'">'
       +'<span class="chg-ico">'+icon[e.k]+'</span><span class="chg-tag">'+esc(e.tag)+'</span>'
       +'<span class="chg-txt">'+esc(e.txt)+'</span><span class="chg-ctx">'+esc(e.ctx||"")+'</span></div>';
   }).join("")+'</div>'
     +(all.length>10?'<button class="ci-btn" id="chg-more">'+(chgShowAll?"show fewer":"+"+(all.length-10)+" more")+'</button>':"")
-    :'<div class="empty">Nothing new since '+esc(st.since)+'.</div>';
+    :'<div class="empty">Nothing new since '+esc(formatPortalDate(st.since))+'.</div>';
   box.querySelectorAll(".chg-it").forEach(el=>el.addEventListener("click",()=>goItem(el.dataset.k,el.dataset.id)));
   const more=document.getElementById("chg-more");
   if(more) more.onclick=()=>{ chgShowAll=!chgShowAll; renderChanges(); };
@@ -2693,10 +3252,10 @@ function renderOverview(){
   document.getElementById("ov-kpis").innerHTML=[
     kpi({c:po!=null&&po<21?PBI.red:(po!=null&&po<45?PBI.orange:PBI.blue), label:"Power-on",
          n:po==null?"\u2014":po, unit:"days", pct:span,
-         sub:esc(prog.power_on||"date unknown")+" \u00b7 A1 silicon"}),
+         sub:esc(prog.power_on?formatPortalDate(prog.power_on):"date unknown")+" \u00b7 A1 silicon"}),
     kpi({c:a1!=null&&a1<45?PBI.orange:PBI.navy, label:"A1 big delivery",
          n:a1==null?"\u2014":a1, unit:"days",
-         sub:esc(prog.a1_delivery||"date unknown")+" \u00b7 end of MS8"}),
+         sub:esc(prog.a1_delivery?formatPortalDate(prog.a1_delivery):"date unknown")+" \u00b7 end of MS8"}),
     kpi({c:attention.length?PBI.orange:PBI.green, label:"Open bugs", n:open.length,
          sub:attention.length+" need attention",
          pct:open.length?100*attention.length/open.length:0,
@@ -2841,7 +3400,7 @@ function renderOverview(){
         +'<td>'+esc(r.owner||"\u2014")+'</td>'
         +'<td class="num">'+(r.score||"\u2014")+'</td>'
         +'<td class="num"'+((r.due&&r.due<today)?' style="color:'+PBI.red+';"':'')+'>'
-        +esc(r.due||"\u2014")+'</td></tr>').join("")
+        +esc(formatPortalDate(r.due))+'</td></tr>').join("")
       +'</tbody></table>'
       +(raidSorted.length>8?'<div class="ro-note" style="margin-top:8px;">+'+(raidSorted.length-8)+' more open rows</div>':'')
     : '<div class="empty">No open RAID rows.</div>';
@@ -2850,7 +3409,7 @@ function renderOverview(){
   const feed=[];
   attention.forEach(b=>{
     const why=[], pings=b.oded_pings||0;
-    if(pings) why.push("Oded pinged \u00d7"+pings+(b.last_ping?" (last "+b.last_ping+")":""));
+    if(pings) why.push("Oded pinged \u00d7"+pings+(b.last_ping?" (last "+formatPortalDate(b.last_ping)+")":""));
     if(["stalled","dormant"].includes(b.signal)) why.push(b.signal+" \u2014 "+b.idle_days+"d idle");
     if((bugTri(b).state||"untriaged")==="untriaged") why.push("untriaged");
     if(!b.assignee) why.push("unassigned");
@@ -2862,7 +3421,7 @@ function renderOverview(){
   // RAID is capped so a long-standing risk backlog can't crowd out live bugs.
   raidSorted.filter(r=>r.rag==="red"||(r.due&&r.due<today)).slice(0,3).forEach(r=>feed.push({
     rank:r.rag==="red"?0:2, kind:"raid", label:r.id, text:r.title||"",
-    why:((r.due&&r.due<today)?"overdue since "+r.due:"red risk")+" \u00b7 "+(r.owner||"unowned"),
+    why:((r.due&&r.due<today)?"overdue since "+formatPortalDate(r.due):"red risk")+" \u00b7 "+(r.owner||"unowned"),
     when:r.score?"score "+r.score:"", sortv:r.score||0}));
   ovReviewTasks().forEach(t=>{
     const p=prs(t); if(!p.length) return;
@@ -2878,7 +3437,7 @@ function renderOverview(){
     const hit=(p.flags||[]).filter(f=>PH_ALARM.includes(f));
     feed.push({rank:hit.some(f=>f!=="unexplained-recurring")?0:1, kind:"phenom", label:p.id,
       text:p.title||"", why:hit.join(" \u00b7 ")+" \u00b7 "+(p.count||0)+" sighting"+(p.count===1?"":"s"),
-      when:p.last_seen?"seen "+p.last_seen:"", goph:p.id, sortv:p.count||0});
+      when:p.last_seen?"seen "+formatPortalDate(p.last_seen):"", goph:p.id, sortv:p.count||0});
   });
   TASKS.filter(t=>t.status==="blocked").forEach(t=>feed.push({
     rank:2, kind:"task", label:t.id, text:t.title||"", why:"blocked",
@@ -3096,11 +3655,41 @@ const PR_COLLAPSED=new Set();
 let PR_COLLAPSE_INIT=false;
 // Feature ids whose "Edit feature" editor is expanded; collapsed by default.
 const PR_EDIT_OPEN=new Set();
+const PR_DETAIL_OPEN=new Set();
 // Ticked feature ids for "Scan selected PRs"; survives re-renders and filtering.
 const PR_SELECTED=new Set();
 // Each multi-select filter holds the ticked values; an empty set means "all".
 const PR_FILTERS={ q:"", feature:new Set(), priority:new Set(), pldm:new Set(), repo:new Set(),
-  prStatus:new Set(), wired:false };
+  prStatus:new Set(), openOnly:false, wired:false };
+function installOpenOnlyControls(){
+  const taskLabel=document.getElementById("o-hidedone").closest(".chip");
+  taskLabel.lastChild.textContent=" Open only";
+
+  const makeOpenOnly=id=>{
+    const label=document.createElement("label");
+    label.className="chip";
+    const input=document.createElement("input");
+    input.type="checkbox";
+    input.id=id;
+    label.append(input,document.createTextNode(" Open only"));
+    return label;
+  };
+  document.querySelector(".pr-controls .row").append(makeOpenOnly("pr-openonly"));
+
+  document.getElementById("vm-livefirst").closest("label").after(makeOpenOnly("vm-openonly"));
+  const vmCount=document.createElement("div");
+  vmCount.className="count";
+  vmCount.id="vm-count";
+  document.getElementById("vm-tbl").before(vmCount);
+
+  const raidInput=document.getElementById("raid-showclosed");
+  const raidLabel=raidInput.closest(".chip");
+  raidInput.id="raid-openonly";
+  raidInput.checked=true;
+  raidLabel.classList.add("on");
+  raidLabel.lastChild.textContent=" Open only";
+}
+installOpenOnlyControls();
 // The submit flow stamps the dispatched GitHub Actions run URL into pldm_details;
 // pull it back out so the badge can deep-link to that specific CI run, not a portal.
 function pldmRunUrl(det){
@@ -3161,6 +3750,12 @@ function renderPrs(){
   document.querySelectorAll("#pr-body details.pr-edit-wrap").forEach(d=>{
     d.addEventListener("toggle",()=>{
       if(d.open) PR_EDIT_OPEN.add(d.dataset.fid); else PR_EDIT_OPEN.delete(d.dataset.fid);
+    });
+    document.querySelectorAll("#pr-body details[data-pr-disclosure]").forEach(d=>{
+      d.addEventListener("toggle",()=>{
+        if(d.open) PR_DETAIL_OPEN.add(d.dataset.prDisclosure);
+        else PR_DETAIL_OPEN.delete(d.dataset.prDisclosure);
+      });
     });
   });
   const live=new Set(feats.map(f=>String(f.id)));
@@ -3276,6 +3871,12 @@ function wirePrFilters(){
   });
   const ctl=document.querySelector(".pr-controls");
   ctl.addEventListener("change",e=>{
+    if(e.target.id==="pr-openonly"){
+      PR_FILTERS.openOnly=e.target.checked;
+      e.target.closest(".chip").classList.toggle("on",e.target.checked);
+      renderPrs();
+      return;
+    }
     const key=e.target.dataset.prf;
     if(!key) return;
     e.target.checked?PR_FILTERS[key].add(e.target.value):PR_FILTERS[key].delete(e.target.value);
@@ -3292,19 +3893,28 @@ function wirePrFilters(){
 
 function prFeatureMatchesFilters(f){
   const F=PR_FILTERS;
+  const prs=prVisibleRows(f);
   if(F.feature.size && !F.feature.has(prFeatureState(f))) return false;
   if(F.priority.size && !F.priority.has(f.priority||"medium")) return false;
   if(F.pldm.size && !F.pldm.has(f.pldm||"not-tested")) return false;
-  if(F.repo.size && !(f.prs||[]).some(p=>F.repo.has(p.repo))) return false;
-  if(F.prStatus.size && !(f.prs||[]).some(p=>F.prStatus.has(p.status))) return false;
+  if(F.openOnly && !prs.length) return false;
+  if(F.repo.size && !prs.some(p=>F.repo.has(p.repo))) return false;
+  if(F.prStatus.size && !prs.some(p=>F.prStatus.has(p.status))) return false;
   if(PR_FILTERS.q){
     const hay=[f.name||"",f.summary||"",f.description||"",...(f.jira||[]),
       ...(f.notes||[]).map(n=>(n.label||"")+" "+(n.text||"")),
-      ...(f.prs||[]).flatMap(p=>[p.repo||"",p.title||"",String(p.number||"")])]
+      ...prs.flatMap(p=>[p.repo||"",p.title||"",String(p.number||"")])]
       .join(" ").toLowerCase();
     if(!hay.includes(PR_FILTERS.q)) return false;
   }
   return true;
+}
+
+function prVisibleRows(f){
+  const prs=f.prs||[];
+  return PR_FILTERS.openOnly
+    ? prs.filter(p=>p.status!=="merged"&&p.status!=="closed")
+    : prs;
 }
 
 // CI never runs on its own here — it fires on a `/ci` comment — so "not run" is
@@ -3322,7 +3932,7 @@ function ciCell(p){
 }
 
 function prRows(f){
-  return f.prs.map(p=>{
+  return prVisibleRows(f).map(p=>{
     const sc=PR_STATUS_COLOR[p.status]||PBI.grey;
     let detail="\u2014";
     if(p.checks_fail) detail='<b>'+p.checks_fail+'F</b>/'+(p.checks_pass||0)+'P';
@@ -3348,8 +3958,8 @@ function prRows(f){
       ? ' <a class="pr-x pe-pipe" href="'+esc(pePr(p.url))+'" target="_blank" rel="noopener" '
         +'title="Where this PR is in the pipeline: CI, merge queue, integration, CD, delivery (pipeline explorer)">\u21e2</a>' : "";
     return '<tr><td><a href="'+esc(p.url||"#")+'" target="_blank" rel="noopener" title="'+esc(p.title||"")+'">'
-      +esc(p.repo)+' #'+p.number+'</a>'+pipe+ciBtn+rmBtn+'</td>'
-      +'<td title="'+esc(p.title||"")+'">'+esc(p.title||"")+'</td>'
+      +esc(p.repo)+' #'+p.number+'</a><span class="pr-row-tools">'+pipe+ciBtn+rmBtn+'</span></td>'
+      +'<td class="pr-title" title="'+esc(p.title||"")+'">'+esc(p.title||"")+'</td>'
       +'<td>'+ci+why+'</td>'
       +'<td class="chk">'+detail+'</td>'
       +'<td class="chk">'+esc(gate)+'</td>'
@@ -3358,9 +3968,9 @@ function prRows(f){
 }
 
 function prFeatureRow(f){
+  const visiblePrs=prVisibleRows(f);
   const c=PR_STATUS_COLOR[f.worst]||PBI.grey;
   const complete=f.total&&f.merged===f.total;
-  const pct=f.total?100*f.merged/f.total:0;
   const pldm=pldmBadge(f);
   const testable=SERVED&&f.prs.some(p=>p.status!=="closed");
   const pldmBtn=testable
@@ -3381,7 +3991,7 @@ function prFeatureRow(f){
       +'feature">\uff0b PR</button>' : "";
   const dropBtn=SERVED
     ? '<button class="prf-untrack" data-prdrop="'+f.id+'" data-prdrop-name="'+esc(f.name)+'" '
-      +'title="Drop this feature from active tracking">\u2715</button>' : "";
+      +'title="Drop this feature from active tracking">Stop tracking feature</button>' : "";
   const collapsed=prCollapsed(f.id);
   const state=complete?"complete":f.worst;
   const prio=f.priority||"medium";
@@ -3417,35 +4027,38 @@ function prFeatureRow(f){
   const lastAct=notes.length?notes[0].date:(f.logged||"\u2014");
   const fullDesc=f.description&&f.description!==f.summary
     ? '<details class="prf-desc"><summary>Technical description</summary><p>'+mdInline(f.description)+'</p></details>' : "";
-  const summaryHtml='<div class="prf-sec"><h4>Summary'
-    +(f.summary_derived&&f.summary?' <span class="muted" title="Derived from the first sentence of the description \u2014 set one in the editor below">(auto)</span>':'')
-    +'</h4><p class="prf-summary">'+(f.summary?mdInline(f.summary):'<span class="muted">No summary yet.</span>')+'</p>'
-    +fullDesc+'</div>';
+  const summaryHtml='<div class="prf-context">'
+    +(f.summary?'<p class="prf-summary">'+mdInline(f.summary)
+      +(f.summary_derived?' <span class="muted" title="Derived from the description">(auto)</span>':'')+'</p>':'')
+    +'<div class="prf-context-links">'+jiraHtml+pldm+'</div></div>';
   const kvHtml='<div class="kv prf-kv">'
-    +'<span><b>Priority:</b> '+prioPill+'</span>'
-    +'<span><b>Jira:</b> '+jiraHtml+'</span>'
     +'<span><b>Logged:</b> '+esc(f.logged||"\u2014")+'</span>'
     +'<span><b>Last activity:</b> '+esc(lastAct)+'</span>'
-    +'<span><b>Progress:</b> '+f.merged+' / '+f.total+' merged'
-    +(complete?' \u2014 retires on the next scan':'')
-    +' <span class="prog mini"><i style="width:'+pct.toFixed(0)+'%"></i></span></span>'
-    +'<span><b>PLDM:</b> '+pldm+(f.pldm_details?' <span class="muted">'+mdInline(f.pldm_details)+'</span>':'')+'</span>'
+    +(complete?'<span>All PRs merged \u2014 retires on the next scan</span>':'')
+    +(f.pldm_details?'<span><b>PLDM:</b> '+mdInline(f.pldm_details)+'</span>':'')
     +'</div>';
-  const prsHtml='<div class="prf-sec"><h4>Pull Requests <span class="st" style="--sk:'+c+'">overall: '+esc(state)+'</span></h4>'
-    +'<div class="prf-actions">'+ciAll+ciFail+addBtn+pldmBtn+dropBtn+'</div>'
-    +'<div class="ci-note" id="ci-note-'+f.id+'"></div>'
-    +'<table class="pr-tbl"><thead><tr><th style="width:23%">Repo / PR</th><th style="width:31%">Title</th>'
-    +'<th style="width:10%">CI</th><th style="width:10%">Checks</th>'
-    +'<th style="width:12%">Gate</th><th style="width:14%">Status</th>'
-    +'</tr></thead><tbody>'+prRows(f)+'</tbody></table>'
+  const prsHtml='<div class="prf-sec prf-prs"><div class="prf-toolbar"><h4>Pull requests <span class="prf-count">'+visiblePrs.length+'</span></h4>'
+    +(SERVED?'<details class="prf-actions-menu"><summary>Actions</summary>'
+      +'<div class="prf-actions">'+ciAll+ciFail+addBtn+pldmBtn+dropBtn+'</div></details>':'')
+    +'</div><div class="ci-note" id="ci-note-'+f.id+'" role="status" aria-live="polite"></div>'
+    +'<div class="pr-table-scroll" role="region" aria-label="Pull requests for '+esc(f.name)+'" tabindex="0">'
+    +'<table class="pr-tbl"><thead><tr><th style="width:21%">Repo / PR</th><th style="width:37%">Title</th>'
+    +'<th style="width:14%">CI</th><th style="width:7%">Checks</th>'
+    +'<th style="width:10%">Gate</th><th style="width:11%">Status</th>'
+    +'</tr></thead><tbody>'+(visiblePrs.length?prRows(f):'<tr><td colspan="6" class="empty">'
+      +(f.prs.length?"No PRs match the current filters.":"No PRs tracked yet.")+'</td></tr>')+'</tbody></table></div>'
     +'<div class="pldm-box" id="pldm-box-'+f.id+'" hidden></div></div>';
-  const notesHtml='<div class="prf-sec"><h4>Notes <span class="muted">activity history \u00b7 '+notes.length+'</span></h4>'
+  const notesHtml='<details class="prf-history" data-pr-disclosure="'+f.id+':history"'
+    +(PR_DETAIL_OPEN.has(f.id+":history")?' open':'')+'><summary>Activity history <span class="muted">('+notes.length+')</span></summary>'
     +(notes.length
-      ? '<ul class="notes prf-notes">'+notes.map(n=>'<li><b>'+esc(n.date||"\u2014")+'</b>'
+      ? '<ul class="notes prf-notes">'+notes.map(n=>'<li><b>'+esc(formatPortalDate(n.date))+'</b>'
           +(n.label?' <span class="note-tag">'+esc(n.label)+'</span>':'')
           +' \u2014 '+mdInline(n.text||"")+'</li>').join("")+'</ul>'
       : '<div class="ro-note">No activity recorded yet.</div>')
-    +'</div>';
+    +'</details>';
+  const detailsHtml='<details class="prf-more" data-pr-disclosure="'+f.id+':context"'
+    +(PR_DETAIL_OPEN.has(f.id+":context")?' open':'')+'><summary>Feature details</summary>'
+    +kvHtml+fullDesc+'</details>';
   return '<tr class="prf-row'+(collapsed?" collapsed":"")+'" data-fid="'+esc(f.id)+'" style="--fk:'+c+'">'
     +'<td class="prf-sel"><input type="checkbox" class="prf-pick" data-fid="'+esc(f.id)+'"'
     +(PR_SELECTED.has(String(f.id))?" checked":"")+' title="Select for \u201cScan selected PRs\u201d"></td>'
@@ -3464,8 +4077,25 @@ function prFeatureRow(f){
     +'</tr>'
     +'<tr class="prf-detail" data-fid="'+esc(f.id)+'"'+(collapsed?" hidden":"")+'>'
     +'<td colspan="6"><div class="prf-detail-box">'
-    +summaryHtml+kvHtml+prsHtml+notesHtml+edit+'</div></td></tr>';
+    +prsHtml+summaryHtml+'<div class="prf-secondary">'+detailsHtml+notesHtml+edit+'</div></div></td></tr>';
 }
+
+document.addEventListener("click",e=>{
+  document.querySelectorAll(".prf-actions-menu[open]").forEach(menu=>{
+    if(!menu.contains(e.target)) menu.open=false;
+    else if(e.target.closest("button")){
+      menu.open=false;
+      menu.querySelector("summary").focus();
+    }
+  });
+});
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape") return;
+  document.querySelectorAll(".prf-actions-menu[open]").forEach(menu=>{
+    menu.open=false;
+    menu.querySelector("summary").focus();
+  });
+});
 
 // Memoir notes carry light markdown; render only **bold** and `code`, after escaping.
 function mdInline(s){
@@ -3558,16 +4188,17 @@ async function pollPldm(jobId,id){
     if(!j||j.error) break;
     const log=(j.repos||[]).map(r=>'<div class="pl-row '+r.action+'">'+esc(r.name)
       +' <span>'+esc(r.detail||r.action)+'</span></div>').join("");
-    const head=j.status==="running"
+    const pending=["queued","running"].includes(j.status);
+    const head=j.status==="queued" ? "<b>Waiting in action queue</b>" : j.status==="running"
       ? '<b>'+esc(PHASE[j.phase]||j.phase||"working")+'</b>'
         +(j.current?' \u00b7 '+esc(j.current):"")
       : (j.status==="done"?'<b class="ok">Queued.</b> '+esc(j.message||"")
           +(j.run_url?' \u00b7 <a href="'+esc(j.run_url)+'" target="_blank" rel="noopener">Actions run</a>':"")
         : '<b class="bad">Failed.</b> '+esc(j.message||""));
     box.innerHTML='<div class="pldm-prog">'+head+'</div>'+log
-      +(j.status==="running"?"":'<div class="pldm-act">'
+      +(pending?"":'<div class="pldm-act">'
         +'<button class="cancel" data-cancel="'+id+'">Close</button></div>');
-    if(j.status!=="running"){
+    if(!pending){
       if(j.status==="done") scanPrs();
       break;
     }
@@ -3983,15 +4614,16 @@ function vmStaleTitle(j){
   if(!j.stale) return "";
   const was=j.demoted_from
     ? "last seen "+j.demoted_from+", but nothing has confirmed that since "
-      +(j.checked||"?")+" \u2014 it has most likely finished or died while the "
+      +formatPortalDate(j.checked||"?")+" \u2014 it has most likely finished or died while the "
       +"target was unreachable"
-    : "not reconfirmed since "+(j.checked||"?");
+    : "not reconfirmed since "+formatPortalDate(j.checked||"?");
   return was+(j.note?" \u2014 "+j.note:"");
 }
 let vmTarget="", vmTargets=[];   // vmTarget = the single picked target (scopes refresh)
 function vmJobs(){
   let js=(VMLOG.jobs||[]).slice();
   if(vmTargets.length) js=js.filter(j=>vmTargets.includes(j.target));
+  if(document.getElementById("vm-openonly").checked) js=js.filter(j=>j.status==="running");
   const live=document.getElementById("vm-livefirst");
   if(!live||live.checked){
     const rank=j=>j.status==="running"?0:1;
@@ -4021,7 +4653,7 @@ function vmLiveCard(j){
     +' \u00b7 '+esc(j.kind)+'</div>'
     +'<h4>'+esc(j.ws_label||j.tag)+'</h4>'
     +(j.cmd?'<code>'+esc(j.cmd)+'</code>':"")
-    +'<div class="vm-live-m">started '+esc(j.started)
+    +'<div class="vm-live-m">started '+esc(formatPortalDate(j.started))
     +(j.pid?' \u00b7 pid '+j.pid:"")
     +(j.lines?' \u00b7 '+j.lines+' log lines':"")
     +(j.errors?' \u00b7 <b style="color:'+PBI.red+'">'+j.errors+' error line(s)</b>':"")+'</div>'
@@ -4093,6 +4725,8 @@ function renderVmlog(){
   ].join("");
 
   const js=vmJobs();
+  document.getElementById("vm-count").textContent=
+    js.length+" of "+all.length+" delegated job"+(all.length===1?"":"s")+" shown";
   document.getElementById("vm-body").innerHTML=js.length
     ? js.map(vmRow).join("")
     : '<tr><td colspan="8"><div class="empty">No delegated jobs recorded yet. '
@@ -4277,7 +4911,7 @@ function vmRow(j){
     +'<td class="vm-cmd">'+(j.cmd?'<code>'+esc(j.cmd)+'</code>'
       :'<span class="muted" title="This job predates the dispatch log, so the command was '
        +'never recorded. Jobs delegated from now on carry it.">not recorded</span>')+'</td>'
-    +'<td>'+esc(j.started||"\u2014")+'</td>'
+    +'<td>'+esc(formatPortalDate(j.started))+'</td>'
     // A confirmed-running row ticks with the live card, so the two cannot
     // disagree; anything else shows its settled (or last-verified) duration.
     +'<td>'+((j.status==="running"&&!j.stale&&j.started_ts)
@@ -4368,7 +5002,7 @@ async function vmLogPoll(){
       if(atEnd||live) body.scrollTop=body.scrollHeight;
     }
     sub.textContent=live
-      ? "live \u00b7 "+(j.source||"")+" \u00b7 updated "+(j.at||"")
+      ? "live \u00b7 "+(j.source||"")+" \u00b7 updated "+formatPortalDate(j.at)
       : (j.truncated?"last "+Math.round((j.text||"").length/1024)+" KB of ":"")
         +Math.round((j.bytes||0)/1024)+" KB \u00b7 "+(j.source||"")
         +(j.provenance?" \u00b7 "+j.provenance:"")
@@ -4467,14 +5101,15 @@ document.getElementById("vm-target").addEventListener("change",e=>{
   vmTargets=msVals(e.target); vmTarget=vmTargets.length===1?vmTargets[0]:""; renderVmlog();
 });
 document.getElementById("vm-livefirst").addEventListener("change",renderVmlog);
+document.getElementById("vm-openonly").addEventListener("change",renderVmlog);
 
 const RAG_COLOR={red:PBI.red, orange:PBI.orange, yellow:PBI.gold, green:PBI.green};
 const RAID_TYPES=[["risk","Risk"],["assumption","Assumption"],["issue","Issue"],["dependency","Dependency"]];
 let raidOpenRow=null;
 
 function raidRows(){
-  const showClosed=document.getElementById("raid-showclosed").checked;
-  return (RAID.rows||[]).filter(r=>showClosed||!r.closed);
+  const openOnly=document.getElementById("raid-openonly").checked;
+  return (RAID.rows||[]).filter(r=>!openOnly||!r.closed);
 }
 
 function renderRaid(){
@@ -4504,7 +5139,7 @@ function renderRaid(){
           +'<td class="ttl">'+esc(r.title||"\u2014")+'</td>'
           +'<td><span class="ragp" style="--rk:'+(RAG_COLOR[r.rag]||PBI.grey)+'">'+esc(r.rag||"\u2014")+'</span></td>'
           +'<td>'+r.score+'</td><td>'+esc(r.owner||"\u2014")+'</td>'
-          +'<td'+(overdue?' class="od"':'')+'>'+esc(r.due||"\u2014")+'</td>'
+          +'<td'+(overdue?' class="od"':'')+'>'+esc(formatPortalDate(r.due))+'</td>'
           +'<td class="stt">'+esc(r.closed?"closed":(r.status||"open"))+'</td></tr>'
           +'<tr class="detail" data-for="'+esc(r.id)+'" style="display:none;"><td colspan="7"></td></tr>';
       }).join("")
@@ -4563,7 +5198,9 @@ function raidDetail(r){
         +'<label>P'+sel("p",num(),r.p)+'</label>'
         +'<label>I'+sel("i",num(),r.i)+'</label>'
         +'<label>RAG'+sel("rag",["green","yellow","orange","red"],r.rag)+'</label>'
-        +'<label>Due'+inp("due",r.due_raw!=null?r.due_raw:r.due,' placeholder="YYYY-MM-DD"')+'</label>'
+        +'<label>Due<input data-f="due" data-orig="'+esc(r.due_raw!=null?r.due_raw:r.due||"")+'" value="'
+          +esc(formatPortalDateInput(r.due_raw!=null?r.due_raw:r.due))+'" type="text" inputmode="numeric" autocomplete="off"'
+          +' placeholder="dd/mm/yyyy" pattern="[0-9]{2}/[0-9]{2}/[0-9]{4}" title="Enter date as dd/mm/yyyy"'+(ro?" disabled":"")+'></label>'
       +'</div>'
       +'<div class="re-row">'
         +'<label>Mitigation<input data-f="mitigation" placeholder="leave blank to keep" '+(ro?"disabled":"")+'></label>'
@@ -4600,13 +5237,27 @@ function wireRaidEditor(id){
   };
   root.querySelector('[data-a="save"]').addEventListener("click",()=>{
     const body={};
+    let invalidDue=false;
     root.querySelectorAll("[data-f]").forEach(el=>{
-      const v=(el.value||"").trim();
+      let v=(el.value||"").trim();
+      if(el.dataset.f==="due"){
+        const iso=parsePortalDateInput(v);
+        if(v&&!iso){
+          el.setCustomValidity("Enter a valid date as dd/mm/yyyy.");
+          el.reportValidity();
+          invalidDue=true;
+          return;
+        }
+        el.setCustomValidity("");
+        v=iso;
+      }
       if(!v) return;
       const orig=el.dataset.orig;
       if(orig!==undefined && v===orig.trim()) return;   // untouched
       body[el.dataset.f]=v;
     });
+    if(invalidDue){ msg.textContent="Enter a valid due date as dd/mm/yyyy."; return; }
+    msg.textContent="";
     if(!Object.keys(body).length){ msg.textContent="Nothing changed"; return; }
     post(body);
   });
@@ -4638,7 +5289,8 @@ function raidNewForm(){
     +'<label>Owner<input id="nr-owner" value="Team lead"></label>'
     +'<label>P<select id="nr-p">'+[1,2,3,4,5].map(v=>'<option'+(v===3?" selected":"")+'>'+v+'</option>').join("")+'</select></label>'
     +'<label>I<select id="nr-i">'+[1,2,3,4,5].map(v=>'<option'+(v===3?" selected":"")+'>'+v+'</option>').join("")+'</select></label>'
-    +'<label>Due<input id="nr-due" placeholder="YYYY-MM-DD"></label>'
+    +'<label>Due<input id="nr-due" type="text" inputmode="numeric" autocomplete="off" placeholder="dd/mm/yyyy"'
+      +' pattern="[0-9]{2}/[0-9]{2}/[0-9]{4}" title="Enter date as dd/mm/yyyy"></label>'
     +'</div>'
     +'<div class="re-row"><label style="flex:1 1 100%;">Description<input id="nr-desc" placeholder="Context, blast radius, who is affected"></label></div>'
     +'<div class="re-act"><button class="btn primary" id="nr-save">Create</button><span class="ro-note" id="nr-msg"></span></div>';
@@ -4646,14 +5298,23 @@ function raidNewForm(){
   document.getElementById("nr-save").addEventListener("click",async()=>{
     const m=document.getElementById("nr-msg");
     const title=document.getElementById("nr-title").value.trim();
+    const dueInput=document.getElementById("nr-due");
+    const due=parsePortalDateInput(dueInput.value);
     if(!title){ m.textContent="Title is required"; return; }
+    if(dueInput.value.trim()&&!due){
+      dueInput.setCustomValidity("Enter a valid date as dd/mm/yyyy.");
+      dueInput.reportValidity();
+      m.textContent="Enter a valid due date as dd/mm/yyyy.";
+      return;
+    }
+    dueInput.setCustomValidity("");
     m.textContent="creating\u2026";
     try{
       const res=await fetch("/api/raid-new",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({type:document.getElementById("nr-type").value, title:title,
           fw_owner:document.getElementById("nr-owner").value.trim(),
           p:document.getElementById("nr-p").value, i:document.getElementById("nr-i").value,
-          due:document.getElementById("nr-due").value.trim(),
+          due:due,
           description:document.getElementById("nr-desc").value.trim()})});
       const j=await res.json();
       if(!res.ok||j.error) throw new Error(j.error||"create failed");
@@ -4663,11 +5324,16 @@ function raidNewForm(){
   });
 }
 document.getElementById("raid-new").addEventListener("click",raidNewForm);
-document.getElementById("raid-showclosed").addEventListener("change",renderRaid);
+document.getElementById("raid-openonly").addEventListener("change",e=>{
+  e.target.closest(".chip").classList.toggle("on",e.target.checked);
+  renderRaid();
+});
 
 async function refreshData(){
   const btn=document.getElementById("refresh");
   const note=document.getElementById("refresh-note");
+  selectedTaskIds.clear();
+  taskSelectionMessage="";
   if(btn){ btn.disabled=true; btn.classList.add("spinning"); }
   try{
     if(activeSection==="team" && window.TeamUI){
@@ -4787,6 +5453,10 @@ async function init(){
   renderRaid();
   if(!applyHash()) selectSection(activeSection);
   const ck=document.getElementById("cmdk-open"); if(ck) ck.addEventListener("click",openCmdk);
+  if(SERVED){
+    refreshActionQueue();
+    setInterval(refreshActionQueue,1500);
+  }
 }
 
 // ---- ⌘K command palette + deep-link URL state ----
@@ -4818,13 +5488,27 @@ function goItem(kind,id){
     setHash("task/"+id); return;
   }
   if(kind==="pr"){
+    const feature=(PRS.features||[]).find(f=>String(f.id)===String(id));
+    if(PR_FILTERS.openOnly && feature
+      && !(feature.prs||[]).some(p=>p.status!=="merged"&&p.status!=="closed")){
+      PR_FILTERS.openOnly=false;
+      const openOnly=document.getElementById("pr-openonly");
+      openOnly.checked=false; openOnly.closest(".chip").classList.remove("on");
+    }
     selectSection("prs");
     setPrCollapsed(id,false);
     const tr=document.querySelector('tr.prf-row[data-fid="'+CSS.escape(String(id))+'"]');
     if(tr) tr.scrollIntoView({block:"center"});
     setHash("pr/"+id); return;
   }
-  if(kind==="raid"){ raidOpenRow=id; selectSection("raid"); setHash("raid/"+id); return; }
+  if(kind==="raid"){
+    const row=(RAID.rows||[]).find(r=>r.id===id);
+    if(row?.closed){
+      const openOnly=document.getElementById("raid-openonly");
+      openOnly.checked=false; openOnly.closest(".chip").classList.remove("on");
+    }
+    raidOpenRow=id; selectSection("raid"); setHash("raid/"+id); return;
+  }
 }
 function applyHash(){
   const h=decodeURIComponent(location.hash.slice(1)); if(!h) return false;

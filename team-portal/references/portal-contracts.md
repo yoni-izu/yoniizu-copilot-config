@@ -21,6 +21,16 @@ a single page with a top-level section nav:
 | **RAID** | `~/tasks/raid.db` | `team-planner` | live |
 | **Team** | `~/tasks/team.db` via `team-manager` | `team-manager` | live: Overview / Plan / Members |
 
+### Date presentation standard
+
+All user-visible date fields use `dd/mm/yyyy`, independent of browser locale.
+Date-time fields use `dd/mm/yyyy` followed by the existing time and timezone
+suffix. Editable date fields accept only `dd/mm/yyyy`; invalid calendar dates
+are rejected with a validation message. The portal converts valid input to ISO
+`yyyy-mm-dd` before calling owner APIs, and keeps ISO dates in payloads,
+storage, sorting and date-range comparisons. Generated log titles retain their
+existing `YYYY-MM-DD` form for compatibility; they are titles, not date fields.
+
 ### Team section
 
 Team includes the lead and all engineers. Member pages show focus assignments,
@@ -36,13 +46,20 @@ Member goals and meeting entries follow their owner-defined visibility.
 
 The mode control sits at the top-right of Team, with green Presentation and red
 Private fill, without a sensitive-data warning banner. Focus is an editable
-status-free field on the member header card, not a tab. The Tasks tab contains
-managerial assignments and linked session action items.
+status-free field on the member header card, not a tab. The Items tab contains
+every tracked log row, with Task as one type alongside decisions, discussion,
+feedback, roadblocks, growth, personal and freeform/legacy notes. Existing Tasks
+subtab routes remain compatible.
 Edit focus and Edit profile share a horizontal action row. Profile editing uses
 the same Save/Cancel popup form as focus, with main IP, country, goals and goals
 visibility prefilled; no browser prompt sequence. Saves remain revision-checked.
 
-Member tasks display their stable IDs, category, priority, status and due date.
+Member items display stable item IDs, type, priority, status, owner, due date,
+follow-up and expandable meeting/update history. Type/status/priority/follow-up
+filters, search, Open only and visible-row selection operate on all item types.
+Private mode supports common tracking edits, append-only updates and atomic bulk
+status/priority/due/follow-up edits. Tasks retain their separate Edit details form
+for task category, description and artifact references.
 Create/edit forms support descriptions, Jira, PR URLs and typed cross-domain
 references. Add note appends a visibility-controlled progress entry. Session
 action rows expose the same metadata under Task details & links; saving them is
@@ -55,31 +72,69 @@ titles become `1:1 with <name> - <YYYY-MM-DD>` using the resolved date. Custom
 and historical titles are preserved. Each entry belongs to one member.
 
 Log creation/editing uses a near-full-screen modal in the workspace-dialog
-style. Topic is optional; blank date means today. Typed item rows occupy the
-largest area; freeform notes are a compact 3-row box below them. A toolbar adds
+style. Type, Topic, Date and Topic visibility share a row when space permits.
+The selects fit their longest choices, the date fits `dd/mm/yyyy`, and Topic
+uses the remaining space; narrow screens wrap the fields. Topic is optional;
+blank date means today. Typed item rows occupy the largest area; freeform notes
+are a compact 3-row box below them. Notes start
+expanded, with a visible Expand/Collapse control and a single-line preview of
+the current text and priority. The native disclosure is keyboard-operable, and
+collapsing it preserves its values for saving. A toolbar adds
 rows of any type served in `log_item_types` (Action item, Decision, Discussion
 point, Status update, Roadblock, Feedback given, Feedback received,
-Growth/career, Personal); each row has a colored type badge, its own fields,
-a visibility select (defaulted per type; Personal is always private) and a
-remove button. Party selects show the member's name; on the lead's own page
-the counterpart is the manager (`manager_name`, e.g. "Manager") and
-blank 1:1 titles use the manager's name. Notes, topic and individual items
-have visibility controls. State and session-level visibility are not form fields. Presentation
-shows a session only if it has presentation-visible notes/entries; topic
-visibility independently controls whether its title is disclosed. Private notes
-remain filtered. Legacy workflow metadata is retained internally; ordinary edits
-need no state transition selection.
+Growth/career, Personal); rows can be collapsed individually. New rows open
+with their short summary visible; optional detail fields are under an expandable
+"More details" section. Each item has a changeable type/category, priority
+(Critical, High, Medium or Low; default Medium) and visibility. Action-item
+priority is the linked task's priority and is edited in Items after creation.
+Each row, including Notes and legacy rows, has common tracking status, optional
+owner/due date and Follow up next 1:1 controls. These are distinct from a status
+update's optional task-status change and received feedback's follow-up text.
+Existing non-task statuses remain Unspecified; new non-task rows start Open.
+Topic, notes, legacy entries and typed items default to Presentation; editing
+preserves each entry's saved visibility. Party selects show the member's name;
+on the lead's own page the counterpart is the manager (`manager_name`, e.g.
+"Manager") and blank 1:1 titles use the manager's name. State and session-level
+visibility are not form fields. Presentation shows a session only if it has
+presentation-visible notes/entries; topic visibility independently controls
+whether its title is disclosed. Private notes remain filtered. Legacy workflow
+metadata is retained internally; ordinary edits need no state transition
+selection.
+Save collects typed items only from their dedicated row container; freeform
+notes and legacy entries are serialized separately, once each.
 Saving creates/updates each item's linked record atomically with the session:
-action → member task (once; later edits happen in Tasks and the row is
-read-only with a task link), status update → task progress note and optional
-status change, roadblock → roadblock record, feedback → feedback record.
-Removing a roadblock/feedback/status row deletes its record; tasks are never
-deleted. Saved roadblock rows offer "Promote to RAID", which creates a RAID
+action → member task (once; task-detail edits happen in Items and the row is
+read-only with a task link), status update with a task → task progress note and
+optional status change; without a task → standalone progress entry with an
+optional activity name and no task mutation, roadblock → roadblock record,
+feedback → feedback record.
+Removing the last roadblock/feedback/status occurrence deletes its linked record
+and cancels its item; records still used by another active meeting remain intact.
+Tasks are never deleted. Saved roadblock rows offer "Promote to RAID", which creates a RAID
 issue through `/api/raid-new` and links it with `roadblock-raid-link`; linked
 rows show a RAID chip instead. The Log tab renders items with type badges and
 key fields and has an "Item type" multi-select filter (a session matches if it
-contains any selected type). Legacy untyped entries remain editable under
-"Other entries".
+contains any selected type). Log items are grouped by type and sorted by
+priority within each type (Critical, High, Medium, Low; ties preserve entry
+order); each displayed item can be collapsed or expanded. Legacy untyped entries
+remain editable under "Other entries".
+
+Creating a new 1:1 requests an owner-prepared draft and automatically includes
+checked items from earlier 1:1s with that member, marked Follow-up from
+`dd/mm/yyyy`. These references reuse item/task identities and preserve past
+meeting text. Follow-ups repeat until cleared or Done/Cancelled; new Conversation,
+Meeting and Note entries do not carry them. Changing the new meeting's date/type
+reloads eligibility without replacing edits to still-eligible rows; removing
+edited rows requires confirmation. Load failures are shown and block saving the
+unprepared draft. Removing a carried row skips it only in that draft; clearing
+its follow-up flag stops future carry-forward. Existing saved meetings are not
+automatically rewritten. Private carried content never enters Presentation mode.
+
+Presentation mode permits editing a log entry's shared-visible content without
+loading private-only entries. The owner API revision-checks the edit, preserves
+all hidden private entries and hidden topics unchanged, rejects private rows in
+the request, and returns only the shared projection. Creating/editing other team
+records remains Private-only.
 
 Activity has an explicit private-mode Scan Jira & GitHub button. Scans never run
 on render, refresh or navigation. Each source uses its last successful scan
@@ -100,14 +155,22 @@ copying selected source links (deduplicated); its Jira/GitHub observations remai
 read-only, without local annotations.
 
 Private mode keeps Edit details on Tasks and adds Edit inline on Log, plus Edit
-selected field. Task rows no longer expose inline task editing. Edit details
-retains the full task/link and log-entry forms. Log note edits preserve every other entry
-and its existing visibility. Bulk task fields are category, priority, status and
+selected field. Presentation mode offers Edit shared log for existing log rows.
+Task rows no longer expose inline task editing. Edit details retains the full
+task/link and log-entry forms. Log note edits preserve every other entry and its
+existing visibility. Bulk task fields are category, priority, status and
 due date (blank clears it); bulk log fields are type, date and topic visibility.
 Bulk editing previews record titles and count in a confirmation form before
 Save. The owner applies one member's batch atomically, checks every revision,
 retains log amendment history and rejects the whole batch on conflict.
-Bulk operations cannot replace titles or note bodies. Presentation is read-only.
+Bulk operations cannot replace titles or note bodies. Tasks, Activity and bulk
+operations remain read-only in Presentation; the scoped shared-log edit described
+above is the only Presentation-mode mutation.
+Private-mode Log rows also offer Delete entry. Deletion requires confirmation,
+checks the displayed revision, hides the session from both audiences, and
+preserves its immutable revision history. Linked progress, roadblock and
+feedback records are removed using the existing item-removal rules; linked task
+assignments remain in Tasks.
 Leaving Private also clears inline drafts and filter values.
 Member Tasks columns include Created, Age (days since Created), and Due. If a
 task has no creation timestamp, Created/Age show `—`.
@@ -120,7 +183,32 @@ unknown metrics are shown explicitly, not inferred or converted to zero.
 The current Plan view is a recorded delivery summary, not a complete Jira
 planning dashboard or target-hit forecast.
 
-### Workspace controls (local and remote)
+### Action queue
+
+All progress-popup jobs use one durable server-side FIFO: workspace status
+checks, Sync, occupy/free, automatic review alignment, PR/review scans, VM job
+refreshes and PLDM submissions. Only one queued action executes at a time.
+Busy actions wait rather than being rejected because another queued action
+holds their resource. Owner validation and resource locks still apply at
+execution; failed actions show an error and the queue advances.
+
+The top-bar **Actions** button reopens the popup. Its list shows running,
+waiting positions and the latest 20 finished actions; select an entry to see
+its progress/result. Collapse hides the list and details while retaining the
+selected action's header. Dismiss does not cancel or clear the queue. Reloading
+reattaches to the queue and completed observed actions refresh saved section
+data without starting external scans.
+
+`GET /api/actions` returns active jobs and recent history; existing submission
+URLs and `GET /api/align/<id>` remain supported. Job states are `queued`,
+`running`, `done` and `error`; clients must keep polling while queued or running.
+Pending jobs survive server restarts in the private portal queue database.
+Interrupted running jobs become explicit errors, never automatic retries.
+Check the external state before submitting an interrupted action again.
+Inline actions outside the popup (for example Jira scans and `/ci` posting)
+and automatic watchdog sweeps are unchanged.
+
+### Workspace lifecycle
 
 Workspaces use the [workspace-manager lifecycle](../../skills/workspace-manager/SKILL.md#local-and-remote-workspace-lifecycle):
 stable `WS-L-…` / `WS-R-…` IDs, machine badges, machine selection in Track
@@ -136,11 +224,33 @@ checking locals or starting machines. These labels stay fixed while running
 Live checks save owner readings and reload the display after completion; errors
 remain explicit rather than making an old reading look freshly verified.
 
+Each served workspace card has an **Edit** button for its saved label, badge,
+group and revision. The form is prefilled and saves only changed fields through
+the workspace owner's metadata API. Revision is locked while occupied or
+mirrored; label, badge and group remain editable. Saving metadata does not run
+a checkout, Sync or status check. Paths, machine targets, IDs, occupancy and
+live readings are not editable in this form. Static exports remain read-only.
+
+**Stop tracking** opens a confirmation dialog with an unchecked **Override
+occupancy/mirror checks** option. `POST /api/ws-untrack/<slot>` accepts a boolean
+`force` (default false). Normal untracking refuses held workspaces and mirrors.
+The explicit override removes only the roster entry: checkout files, task/ad-hoc
+holds, saved readings, mirror state and history remain intact. It does not Free
+or release a mirror, contact machines, or bypass active-operation locks or
+workspace validation. API failures keep the dialog open for an explicit retry.
+
 Refresh does not Sync. Sync and occupancy enforce a fresh clean-checkout guard;
 independent occupied slots cannot Sync. Mirrors retain their development
 branches on Sync and cannot be independently occupied. Free returns to
 **manifest revisions**, then Syncs and verifies, retaining the hold/relation on
 failure. It does not indiscriminately reset repositories to `main`.
+
+For a **free, independent** workspace, Sync blocked by dirty files or unexpected
+branches offers a **Force sync** confirmation. It reuses the snapshot-bound
+stash-and-return safeguards below, then syncs to manifest revisions without
+occupying or releasing the workspace. Occupancy is checked again when the
+confirmed job executes. Mirrors retain normal Sync behavior and cannot be
+force-synced; network/authentication failures do not offer this override.
 
 Workspace actions run as background `/api/align/<id>` jobs. Endpoints:
 `POST /api/ws-refresh` (local only), `POST /api/ws-check-vm` (remote only),
@@ -149,6 +259,24 @@ Workspace actions run as background `/api/align/<id>` jobs. Endpoints:
 `GET /api/workspaces` (cached), `GET /api/workspace-log/<slot>` (cached history).
 Roster payloads include `id`, `target`, `location`, `status` and registered
 `targets`. Re-read data after job completion; accepting a job is not success.
+
+For **Return & free**, **Set free**, and **Release mirror**, a fresh check in
+the queued job identifies non-clean repositories before any checkout change.
+The job finishes as `approval_required` and shows their branches, manifest
+revisions, reasons, and any safety blockers. Cancel leaves the checkout and
+hold unchanged. Explicit confirmation submits a new job linked to that
+approval; a changed checkout is checked again and requires fresh confirmation.
+The approval remains available in Actions after a page reload or portal restart.
+
+An approved return stashes staged, unstaged, and untracked files, preserves
+existing named branches and their commits, and returns to each manifest
+revision (including pins), not unconditionally `main`. Ignored files are not
+stashed; Git refuses to overwrite them during checkout or fast-forward. Stash
+IDs and original branches appear in the action and workspace logs. Local-only
+or unverifiable commits on a target branch or detached HEAD, ambiguous
+manifests, incomplete repository coverage, and failed stashes block the
+operation. The hold or mirror clears only after return, sync, and verification
+succeed; a partial failure reports saved stashes for recovery.
 
 The section badge counts are *attention* counts, not totals: **Overview** shows bugs needing
 attention plus hot RAID rows, **Tasks** shows active tasks, **Workspaces** shows occupied
@@ -164,9 +292,33 @@ preferences are remembered per table in browser local storage. Selection/action
 columns are not sortable.
 **Tasks** is one unified table with no category tabs: use the multi-select **Category** filter
 to narrow it, and **Columns** to choose visible fields without category-specific layout resets.
+Task rows are lean single-line rows: the default-on columns are ID, Title, Category, Priority,
+Status and Age; Est, Jira and Worked are off by default but remain available through **Columns**.
+The title carries an expand caret (▸/▾, `aria-expanded`), and the expanded detail keeps the
+essentials in front — description (or the derived feature line when none exists), metadata
+including the hidden-column values (Jira link, Est, WS, Worked), and the PR list for review
+tasks — while **Notes (n)** and **Edit task** fold into collapsed disclosures (the editor
+disclosure only when served).
 Review status and author filters remain available in this view; **Scan reviews** is available
-when served. Selecting a single category adds its specialised summary cards. Done/cancelled
-tasks remain hidden by default. The existing `#work` and `#task/<id>` links still work.
+when served and requires selected review tasks. Selecting a single category adds its specialised
+summary cards. Done/cancelled tasks remain hidden by default; its **Open only** checkbox controls
+that filter.
+The Tasks table has row checkboxes plus **Select visible** and **Deselect**. Selection contains
+only currently filtered rows and hidden rows are pruned when filters change. **Edit selected**
+previews the affected tasks and can apply any combination of status, priority, category,
+complexity or estimated hours through one revision-checked task-owner transaction. Category
+changes cannot convert tasks to or from code-review; a terminal status change is rejected if a
+selected task still holds a workspace. Workspace assignment, manual review status, titles and
+notes remain per-task operations. **Scan selected reviews** probes unresolved PRs belonging only
+to selected active code-review tasks; it is disabled when no selected row qualifies and never
+scans unselected tasks. A completed scan clears the selection because review/task revisions may
+have changed. Static exports remain read-only.
+Status-bearing tables expose an independent **Open only** checkbox: outgoing PRs exclude merged
+and closed PR rows, member tasks exclude done and cancelled assignments, phenomena exclude
+closed/not-a-bug/not-ours/merged records, RAID excludes closed rows, and VM job history shows
+only running jobs. Bugs already have an **Open only** filter. Each view preserves its existing
+default visibility; workspaces are an occupancy roster rather than a completed/closed record list
+and do not get this lifecycle filter. The existing `#work` and `#task/<id>` links still work.
 **Every filter dropdown is multi-select** (Tasks, PRs, Bugs, Phenomena, VM target): tick any
 number of values; a row passes when it matches **any** ticked value of that dropdown (OR within a
 field, AND across fields), and an empty dropdown means *All*. This is a **portal design
@@ -296,11 +448,18 @@ opposed to the incoming review queue that lives under Tasks.
 - A KPI band (blocked features, CI failing, needs rebase, changes requested, approved,
   merge queue, merged) over a compact **feature table**. Each feature is a collapsible summary
   row (feature, **priority** pill, state, merged/total — PLDM status only in the expanded view) that expands inline, laid out like the
-  code-review detail: a short **summary** (marked *auto* when derived) with the technical
-  description folded underneath, a key/value strip (**Jira** links, logged, last activity,
-  progress, PLDM), the **Pull Requests** block (action buttons, then the PR table — repo/PR,
-  title, **CI**, check counts, review-or-merge gate, status), the full dated **activity
-  history** (newest first, scrolls), and an editable metadata form folded under a
+  PR-first detail: a compact **Pull requests** heading/count and folded **Actions**
+  menu above the PR table (repo/PR, wrapping title, **CI**, check counts,
+  review-or-merge gate, status). The table has a keyboard-focusable horizontal
+  scroll region on narrow screens. Feature-wide CI, add PR, PLDM test and stop
+  tracking actions retain their original handlers; the menu closes on selection,
+  outside click or Escape (which returns focus to its summary).
+  A subdued short **summary** (marked *auto* when derived), **Jira** links and PLDM
+  badge follow the table. Priority, overall status and merged/total remain in the
+  feature header instead of being repeated. **Feature details** folds dates,
+  PLDM details and the technical description away; **Activity history (N)** folds
+  the full dated notes (newest first, scrolls). These disclosures retain their open
+  state per feature across re-renders within the page session, alongside the metadata form under a
   collapsible **Edit feature** disclosure (collapsed by default; its open state is kept
   per feature across re-renders within the page session).
 - Feature metadata editing is local to the pr-monitor database: expanded rows can edit
@@ -512,6 +671,26 @@ Styling rules worth keeping:
 - Validate edits with `node --check assets/portal.js` and a `{`/`}` count on the CSS.
 
 
+### Review draft documents
+
+Each PR in an expanded review task may show an **Open review draft** button,
+the saved timestamp and full reviewed head SHA. Earlier passes are available
+under **Earlier drafts**; PRs without an attachment show no button. Drafts are
+registered through task-manager's `review-draft` CLI, never inferred from
+filenames or free-text notes. Review workflows must register new drafts before
+reporting success; manual workspace assignment still runs no AI review.
+
+The served portal opens `/review-drafts/<task-id>/<attachment-id>` in a new tab.
+The viewer renders GitHub-flavored Markdown (including tables, fenced code,
+strikethrough, task lists and automatic links) in the portal's dark palette,
+labels the draft as local/unsubmitted, and links back to the task. Raw HTML is
+escaped and unsafe link schemes are not made clickable. Content is loaded on
+demand through `tm.read_review_draft`, restricted to registered private Markdown
+documents; missing/unreadable files report errors. No arbitrary path-serving
+endpoint, browser cache or external rendering service is used.
+The static export shows metadata and a served-portal hint rather than a broken
+relative link. It does not embed private draft contents.
+
 ### Auto-alignment on code-review assignment (manual-review checkout)
 
 When you assign a **`code-review`** task to a workspace slot from the served dashboard —
@@ -524,6 +703,11 @@ either the **Workspaces** section's *Occupy with a task* control or the task edi
 - It runs as a **background job** (git fetch/checkout is slow) so the POST returns
   immediately with an `align_job` id; the UI polls `GET /api/align/<job>` and shows a
   floating banner with **live per-repo progress** and a **done/error indicator**.
+- The shared operation banner has a keyboard-accessible **Collapse / Expand**
+  button beside Dismiss. Collapsing hides only the details, keeping the live
+  title/spinner visible; polling and completion/error updates continue. The
+  choice survives updates and new operations within the current page, but a
+  reload starts expanded. Dismiss remains separate and does not cancel a job.
 - It is **non-destructive**: dirty repos are skipped and reported, never reset. Repos the
   task references but that aren't present in the workspace are reported as *not-found*.
 - **PR recognition requires upstream verification, not just checkout.** After dashboard,

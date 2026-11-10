@@ -14,14 +14,6 @@ import portal as tm
 import workspace_store
 
 
-class ImmediateThread:
-    def __init__(self, target, **kwargs):
-        self.target = target
-
-    def start(self):
-        self.target()
-
-
 class WorkspaceJobTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -42,9 +34,14 @@ class WorkspaceJobTests(unittest.TestCase):
                                 self.local if slot == "one" else self.remote)
         self.rec.start()
         self.addCleanup(self.rec.stop)
-        self.thread = patch.object(tm._threading, "Thread", ImmediateThread)
-        self.thread.start()
-        self.addCleanup(self.thread.stop)
+        def execute(job):
+            job.update(id="synthetic-job", status="running")
+            tm.ALIGN_JOBS[job["id"]] = job
+            tm.run_workspace_job(job)
+            return job["id"]
+        self.enqueue = patch.object(tm, "enqueue_action", side_effect=execute)
+        self.enqueue.start()
+        self.addCleanup(self.enqueue.stop)
         self.log = patch.object(tm.wm, "log_action")
         self.log.start()
         self.addCleanup(self.log.stop)
@@ -115,7 +112,8 @@ class WorkspaceJobTests(unittest.TestCase):
         self.assertEqual(tm.ALIGN_JOBS[jid]["status"], "done")
 
     def test_free_reports_live_steps_including_release(self):
-        def physical(slot, action, progress=None):
+        def physical(slot, action, progress=None, **options):
+            self.assertEqual(options, {"portal_free": {"approved": None}})
             progress({"step": "return", "label": "Returning", "done": 1, "total": 2,
                       "current": "repo-a", "error": "fetch denied"})
             progress({"step": "return", "label": "Returning", "done": 2, "total": 2,
@@ -133,7 +131,7 @@ class WorkspaceJobTests(unittest.TestCase):
         self.assertEqual(steps[1]["detail"], "Fetching...")
 
     def test_failed_step_is_marked_error(self):
-        def physical(slot, action, progress=None):
+        def physical(slot, action, progress=None, **options):
             progress({"step": "inspect", "label": "Checking repositories"})
             raise ValueError("dirty")
         with patch.object(tm.wm, "workspace_request", side_effect=physical), \
@@ -142,6 +140,138 @@ class WorkspaceJobTests(unittest.TestCase):
         apply.assert_not_called()
         self.assertEqual([s["state"] for s in tm.ALIGN_JOBS[jid]["steps"]], ["error"])
 
+    def test_free_requires_confirmation_without_releasing_or_claiming_success(self):
+        approval = {"token": "a" * 64, "repos": [{"path": "/repo"}], "blockers": []}
+        with patch.object(tm.wm, "workspace_request", return_value={
+                "clean": False, "approval_required": approval}) as request, \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            jid = tm.start_workspace_job("free", "remote", {"action": "free"})
+        apply.assert_not_called()
+        self.assertEqual(request.call_args.kwargs["portal_free"], {"approved": None})
+        self.assertEqual(tm.ALIGN_JOBS[jid]["status"], "approval_required")
+        self.assertEqual(tm.ALIGN_JOBS[jid]["approval"], approval)
+        self.assertIn("has not been returned or freed", tm.ALIGN_JOBS[jid]["message"])
+
+    def test_sync_requires_confirmation_then_syncs_without_releasing(self):
+        approval = {"token": "a" * 64, "repos": [{"path": "/repo"}], "blockers": []}
+        with patch.object(tm.wm, "workspace_request", return_value={
+                "clean": False, "approval_required": approval}) as request, \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            jid = tm.start_workspace_job("sync", "one")
+        apply.assert_not_called()
+        self.assertEqual(request.call_args.kwargs["portal_sync"], {"approved": None})
+        self.assertEqual(tm.ALIGN_JOBS[jid]["status"], "approval_required")
+        self.assertIn("Sync was blocked", tm.ALIGN_JOBS[jid]["message"])
+        stash = {"path": "/repo", "branch": "dev/test", "oid": "b" * 40}
+        with patch.object(tm.wm, "workspace_request",
+                          return_value={"clean": True, "stashes": [stash]}) as request, \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            confirmed = tm.start_workspace_job("sync", "one", {
+                "force": True, "approval_job": jid})
+        apply.assert_not_called()
+        self.assertEqual(request.call_args.kwargs["portal_sync"], {"approved": "a" * 64})
+        self.assertEqual(tm.ALIGN_JOBS[confirmed]["status"], "done")
+        self.assertEqual(tm.ALIGN_JOBS[confirmed]["stashes"], [stash])
+
+    def test_force_sync_rejects_return_approval_and_invalid_force(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "one",
+                    "status": "approval_required",
+                    "approval": {"token": "a" * 64, "blockers": []}}
+        with patch.dict(tm.ALIGN_JOBS, {"return-job": previous}), \
+                patch.object(tm, "enqueue_action") as enqueue:
+            for payload in ({"force": True, "approval_job": "return-job"},
+                            {"force": "true"}, {"force": True}):
+                with self.assertRaises(ValueError):
+                    tm.start_workspace_job("sync", "one", payload)
+        enqueue.assert_not_called()
+
+    def test_sync_error_is_not_converted_into_force_confirmation(self):
+        with patch.object(tm.wm, "workspace_request", side_effect=ValueError("network failure")), \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            jid = tm.start_workspace_job("sync", "one")
+        apply.assert_not_called()
+        self.assertEqual(tm.ALIGN_JOBS[jid]["status"], "error")
+        self.assertNotIn("approval", tm.ALIGN_JOBS[jid])
+
+    def test_explicit_free_approval_passes_saved_snapshot_and_releases_after_return(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "remote",
+                    "status": "approval_required",
+                    "approval": {"token": "b" * 64, "blockers": []}}
+        stash = {"path": "/repo", "branch": "dev/test", "oid": "c" * 40}
+        with patch.dict(tm.ALIGN_JOBS, {"approval-job": previous}), \
+                patch.object(tm.wm, "workspace_request",
+                             return_value={"clean": True, "stashes": [stash]}) as request, \
+                patch.object(tm, "apply_workspace_edit", return_value=(True, "freed")) as apply:
+            jid = tm.start_workspace_job("free", "remote", {
+                "action": "free", "force": True, "approval_job": "approval-job"})
+            job = dict(tm.ALIGN_JOBS[jid])
+        self.assertEqual(request.call_args.kwargs["portal_free"], {"approved": "b" * 64})
+        apply.assert_called_once()
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["stashes"], [stash])
+
+    def test_stale_free_approval_requires_fresh_confirmation(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "remote",
+                    "status": "approval_required",
+                    "approval": {"token": "a" * 64, "blockers": []}}
+        updated = {"token": "b" * 64, "repos": [], "blockers": []}
+        with patch.dict(tm.ALIGN_JOBS, {"approval-job": previous}), \
+                patch.object(tm.wm, "workspace_request",
+                             return_value={"clean": False, "approval_required": updated}), \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            jid = tm.start_workspace_job("free", "remote", {
+                "action": "free", "force": True, "approval_job": "approval-job"})
+            job = dict(tm.ALIGN_JOBS[jid])
+        apply.assert_not_called()
+        self.assertEqual(job["status"], "approval_required")
+        self.assertEqual(job["approval"], updated)
+
+    def test_free_retains_stash_details_when_releasing_the_hold_fails(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "remote",
+                    "status": "approval_required",
+                    "approval": {"token": "a" * 64, "blockers": []}}
+        stash = {"path": "/repo", "branch": "dev/test", "oid": "c" * 40}
+        with patch.dict(tm.ALIGN_JOBS, {"approval-job": previous}), \
+                patch.object(tm.wm, "workspace_request",
+                             return_value={"clean": True, "stashes": [stash]}), \
+                patch.object(tm, "apply_workspace_edit",
+                             return_value=(False, "could not release hold")):
+            jid = tm.start_workspace_job("free", "remote", {
+                "action": "free", "force": True, "approval_job": "approval-job"})
+            job = dict(tm.ALIGN_JOBS[jid])
+        self.assertEqual(job["status"], "error")
+        self.assertIn("could not release hold", job["message"])
+        self.assertEqual(job["stashes"], [stash])
+
+    def test_free_force_rejects_invalid_or_unrelated_approvals(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "one",
+                    "status": "approval_required",
+                    "approval": {"token": "a" * 64, "blockers": []}}
+        invalid = [
+            {"force": "true"},
+            {"force": True},
+            {"force": True, "approval_job": "missing"},
+            {"force": True, "approval_job": "other-slot"},
+            {"force": False, "approval_job": "other-slot"},
+        ]
+        with patch.dict(tm.ALIGN_JOBS, {"other-slot": previous}), \
+                patch.object(tm, "enqueue_action") as enqueue:
+            for payload in invalid:
+                with self.subTest(payload=payload), self.assertRaises(ValueError):
+                    tm.start_workspace_job("free", "remote", payload)
+        enqueue.assert_not_called()
+
+    def test_free_force_rejects_approval_with_safety_blockers(self):
+        previous = {"kind": "workspace-action", "action": "free", "slot": "remote",
+                    "status": "approval_required",
+                    "approval": {"token": "a" * 64, "blockers": ["local target commits"]}}
+        with patch.dict(tm.ALIGN_JOBS, {"approval-job": previous}), \
+                patch.object(tm, "enqueue_action") as enqueue:
+            with self.assertRaisesRegex(ValueError, "safety blockers"):
+                tm.start_workspace_job("free", "remote", {
+                    "force": True, "approval_job": "approval-job"})
+        enqueue.assert_not_called()
+
     def test_multi_slot_steps_are_prefixed_per_workspace(self):
         job = {"steps": []}
         tm.record_job_step(job, {"step": "inspect", "label": "Checking"}, prefix="one")
@@ -149,15 +279,19 @@ class WorkspaceJobTests(unittest.TestCase):
         self.assertEqual([s["label"] for s in job["steps"]], ["one · Checking", "two · Checking"])
         self.assertEqual(job["steps"][0]["state"], "done")
 
-    def test_occupy_checks_clean_before_metadata_and_no_busy_overlap(self):
+    def test_occupy_checks_clean_before_metadata(self):
         with patch.object(tm.wm, "require_clean", side_effect=ValueError("not at revision")), \
                 patch.object(tm, "apply_workspace_edit") as apply:
             jid = tm.start_workspace_job("occupy", "remote", {"task_id": "T-1"})
         apply.assert_not_called()
         self.assertEqual(tm.ALIGN_JOBS[jid]["status"], "error")
+
+    def test_busy_workspace_can_be_submitted_for_later_execution(self):
         tm.WORKSPACE_BUSY.add("remote")
-        with self.assertRaisesRegex(ValueError, "already running"):
-            tm.start_workspace_job("sync", "remote")
+        with patch.object(tm, "enqueue_action", return_value="queued-job") as enqueue:
+            jid = tm.start_workspace_job("sync", "remote")
+        self.assertEqual(jid, "queued-job")
+        self.assertEqual(enqueue.call_args.args[0]["request"]["slots"], ["remote"])
 
     def test_remote_slots_never_used_for_local_pldm(self):
         self.assertEqual(tm.viable_slots(), ["one"])
@@ -181,6 +315,100 @@ class WorkspaceJobTests(unittest.TestCase):
             code, body = handler.do_GET()
         self.assertEqual(code, 200)
         self.assertEqual([r["action"] for r in body["events"]], ["local", "remote"])
+
+
+class WorkspaceReturnIntegrationTests(unittest.TestCase):
+    def test_force_sync_rechecks_free_state_before_stashing(self):
+        import test_workspaces
+
+        for occupied in (False, True):
+            with self.subTest(occupied=occupied):
+                fixture = test_workspaces.RuntimeTests()
+                fixture.setUp()
+                try:
+                    with patch.object(tm.wm, "STORE", fixture.home / "tasks/workspaces.db"), \
+                            patch.object(workspace_store, "LEGACY", fixture.home / "absent.json"), \
+                            patch.dict(tm.ALIGN_JOBS, {}, clear=True):
+                        tm.wm.save({"version": 1, "slots": {}, "groups": [], "tracked": {"slot": {
+                            "id": fixture.request["id"], "path": str(fixture.slot),
+                            "label": "Temporary slot", "rev": "main", "target": ""}}})
+                        fixture.dev()
+                        (fixture.repo / "untracked").write_text("keep")
+                        sequence = iter(("sync-preflight", "sync-confirmed"))
+
+                        def enqueue(job):
+                            job.update(id=next(sequence), status="running")
+                            tm.ALIGN_JOBS[job["id"]] = job
+                            tm.run_workspace_job(job)
+                            return job["id"]
+
+                        with patch.object(tm, "enqueue_action", side_effect=enqueue):
+                            first = tm.start_workspace_job("sync", "slot")
+                            self.assertEqual(tm.ALIGN_JOBS[first]["status"], "approval_required")
+                            self.assertIsNone(tm.wm.get_holder("slot"))
+                            if occupied:
+                                with patch.object(tm.wm, "require_clean"):
+                                    self.assertTrue(tm.wm.occupy_adhoc("slot", "new hold")[0])
+                            second = tm.start_workspace_job("sync", "slot", {
+                                "force": True, "approval_job": first})
+                            job = tm.ALIGN_JOBS[second]
+                            if occupied:
+                                self.assertEqual(job["status"], "error")
+                                self.assertIn("occupied", job["message"])
+                                self.assertIsNotNone(tm.wm.get_holder("slot"))
+                                self.assertEqual(fixture.git(fixture.repo, "stash", "list"), "")
+                                self.assertFalse((fixture.home / "octl-calls").exists())
+                            else:
+                                self.assertEqual(job["status"], "done", job["message"])
+                                self.assertIsNone(tm.wm.get_holder("slot"))
+                                self.assertEqual(fixture.git(fixture.repo, "branch", "--show-current"), "main")
+                                self.assertEqual(len(job["stashes"]), 1)
+                finally:
+                    fixture.doCleanups()
+
+    def test_confirmed_return_preserves_work_then_releases_real_temporary_hold(self):
+        import test_workspaces
+
+        fixture = test_workspaces.RuntimeTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        store = fixture.home / "tasks/workspaces.db"
+        with patch.object(tm.wm, "STORE", store), \
+                patch.object(workspace_store, "LEGACY", fixture.home / "absent.json"), \
+                patch.dict(tm.ALIGN_JOBS, {}, clear=True):
+            tm.wm.save({"version": 1, "slots": {}, "groups": [], "tracked": {"slot": {
+                "id": fixture.request["id"], "path": str(fixture.slot),
+                "label": "Temporary slot", "rev": "main", "target": ""}}})
+            with patch.object(tm.wm, "workspace_request", return_value={"clean": True}):
+                self.assertTrue(tm.wm.occupy_adhoc("slot", "test return")[0])
+            fixture.dev()
+            (fixture.repo / "untracked").write_text("preserve me")
+            branch_head = fixture.git(fixture.repo, "rev-parse", "HEAD")
+            sequence = iter(("preflight-job", "confirmed-job"))
+
+            def enqueue(job):
+                job.update(id=next(sequence), status="running")
+                tm.ALIGN_JOBS[job["id"]] = job
+                tm.run_workspace_job(job)
+                return job["id"]
+
+            with patch.object(tm, "enqueue_action", side_effect=enqueue):
+                first = tm.start_workspace_job("free", "slot", {"action": "free"})
+                self.assertEqual(tm.ALIGN_JOBS[first]["status"], "approval_required")
+                self.assertIsNotNone(tm.wm.get_holder("slot"))
+                self.assertEqual(fixture.git(fixture.repo, "stash", "list"), "")
+                self.assertFalse((fixture.home / "octl-calls").exists())
+
+                second = tm.start_workspace_job("free", "slot", {
+                    "action": "free", "force": True, "approval_job": first})
+                job = tm.ALIGN_JOBS[second]
+                self.assertEqual(job["status"], "done", job.get("message"))
+                self.assertIsNone(tm.wm.get_holder("slot"))
+                self.assertEqual(fixture.git(fixture.repo, "branch", "--show-current"), "main")
+                self.assertEqual(fixture.git(fixture.repo, "rev-parse", "dev/test"), branch_head)
+                stash = job["stashes"][0]
+                self.assertIn(stash["oid"], fixture.git(fixture.repo, "stash", "list", "--format=%H"))
+                self.assertIn(stash["oid"], tm.wm.action_log("slot")[-2]["detail"])
 
 
 if __name__ == "__main__":

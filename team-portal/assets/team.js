@@ -10,22 +10,41 @@
   let view = {tab:"overview", member:null, subtab:"tasks", logTypes:[]};
   const state = readState();
   const filters = {
-    tasks:{query:"",category:[],priority:[],status:[]},
+    tasks:{query:"",category:[],priority:[],status:[],openOnly:false},
+    items:{query:"",item_type:[],priority:[],status:[],follow_up:[],openOnly:false},
     activity:{query:"",source:[],kind:[],from:"",to:""},
     log:{query:"",items:[],from:"",to:""},
   };
-  const selected = {tasks:new Set(), activity:new Set(), log:new Set()};
-  const visibleRows = {tasks:[], activity:[], log:[]};
+  const selected = {tasks:new Set(), items:new Set(), activity:new Set(), log:new Set()};
+  const visibleRows = {tasks:[], items:[], activity:[], log:[]};
   let inlineEdit = null;
   const taskStatuses = ["todo","backlog","in-progress","blocked","done","cancelled","assigned","open","deferred"];
   const DAY_MS = 24*60*60*1000;
   const bulkFields = {
     tasks:{category:"Category",priority:"Priority",status:"Status",target_date:"Due date"},
+    items:{priority:"Priority",status:"Status",target_date:"Due date",follow_up:"Follow up"},
     log:{session_type:"Type",meeting_date:"Date",title_visibility:"Topic visibility"},
   };
 
   function esc(s){ return String(s??"").replace(/[&<>"]/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[m])); }
-  function fmtDate(s){ if(!s) return "—"; try{ const d = new Date(s); return d.toLocaleDateString(); }catch{ return s; } }
+  function fmtDate(s){ return window.PortalDates.display(s); }
+  function dateInput(name,value,attributes=""){
+    return `<input type="text" ${name?`name="${esc(name)}"`:""} data-date-field inputmode="numeric" autocomplete="off" placeholder="dd/mm/yyyy" pattern="[0-9]{2}/[0-9]{2}/[0-9]{4}" title="Enter date as dd/mm/yyyy" value="${esc(window.PortalDates.input(value))}" ${attributes}>`;
+  }
+  function normalizedDateFormData(form){
+    const data=new FormData(form);
+    form.querySelectorAll("[data-date-field]").forEach(input=>{
+      const iso=window.PortalDates.parse(input.value);
+      if(input.value.trim()&&!iso){
+        input.setCustomValidity("Enter a valid date as dd/mm/yyyy.");
+        input.reportValidity();
+        throw new Error("Enter valid dates as dd/mm/yyyy.");
+      }
+      input.setCustomValidity("");
+      data.set(input.name,iso);
+    });
+    return data;
+  }
   function ageDays(s){
     if(!s) return null;
     const ts = Date.parse(s);
@@ -49,7 +68,7 @@
     const day=String(value||"").slice(0,10);
     return !!day && (!filter.from || day>=filter.from) && (!filter.to || day<=filter.to);
   }
-  function filterToolbar(tab, groups, count, total, dates=false){
+  function filterToolbar(tab, groups, count, total, dates=false, openOnly=false){
     const filter=filters[tab];
     return `<div class="team-filterbar" data-filter-tab="${tab}">
       <label class="team-filter-search">Search ${tab==="log"?"log":tab}<input type="search" data-team-search="${tab}" value="${esc(filter.query)}" placeholder="Search visible records…"></label>
@@ -61,14 +80,15 @@
           ${values.map(value=>`<label><input type="checkbox" ${logTypes?`data-log-type="${esc(value)}"`:`data-team-filter="${field}" data-value="${esc(value)}"`} ${selected.includes(value)?"checked":""}> ${esc(labels?.[value]||value)}</label>`).join("")||"<span>No values</span>"}
         </div></details>`;
       }).join("")}
-      ${dates?`<label>From<input type="date" data-team-date="from" value="${esc(filter.from)}"></label><label>Through<input type="date" data-team-date="to" value="${esc(filter.to)}"></label>`:""}
+      ${dates?`<label>From${dateInput("",filter.from,`data-team-date="from"`)}</label><label>Through${dateInput("",filter.to,`data-team-date="to"`)}</label>`:""}
+      ${openOnly?`<div><label class="chip${filter.openOnly?" on":""}"><input type="checkbox" data-team-open-only ${filter.openOnly?"checked":""}> Open only</label></div>`:""}
       <button class="btn" data-team-clear="${tab}">Clear filters</button>
       <span class="cap team-filter-count" role="status">${count} / ${total} matching</span>
       ${dates&&filter.from&&filter.to&&filter.from>filter.to?'<span role="alert">From date must not be after Through date.</span>':""}
     </div>`;
   }
   function rowId(tab, row){
-    return tab==="tasks"?row.assignment_id:tab==="log"?row.meeting_id:
+    return tab==="items"?row.item_id:tab==="tasks"?row.assignment_id:tab==="log"?row.meeting_id:
       JSON.stringify([row.source,row.kind,row.at,row.url,row.label]);
   }
   function applyTableStandards(){
@@ -104,8 +124,10 @@
     return row[field]??(field==="category"?"misc":field==="priority"?"medium":"");
   }
   function valueControl(tab,field,value){
-    const choices=field==="category"?(TEAM.task_categories||["development","debug","research","planning","testing","code-review","track","misc"]):
-      field==="priority"?["critical","high","medium","low"]:field==="status"?taskStatuses:
+    const choices=field==="follow_up"?{true:"Follow up next 1:1",false:"No follow-up"}:
+      field==="category"?(TEAM.task_categories||["development","debug","research","planning","testing","code-review","track","misc"]):
+      field==="priority"?["critical","high","medium","low"]:field==="status"?
+        (tab==="items"?[...new Set([...(TEAM.item_statuses||[]),...taskStatuses])]:taskStatuses):
       field==="session_type"?(TEAM.log_types||{one_on_one:"1:1",conversation:"Conversation",meeting:"Meeting",note:"Note"}):
       field==="title_visibility"?{private:"Private",shared:"Presentation"}:null;
     if(choices){
@@ -115,7 +137,8 @@
     if(field==="description"||field==="new-notes"||field.startsWith("entry:")){
       return `<textarea name="value" data-team-edit-value>${esc(value)}</textarea>`;
     }
-    return `<input name="value" data-team-edit-value type="${field.endsWith("_date")?"date":"text"}" value="${esc(value)}" ${field==="meeting_date"?"required":""}>`;
+    if(field.endsWith("_date")) return dateInput("value",value,`data-team-edit-value ${field==="meeting_date"?"required":""}`);
+    return `<input name="value" data-team-edit-value type="text" value="${esc(value)}">`;
   }
   function inlineEditor(tab,row){
     const id=rowId(tab,row);
@@ -134,15 +157,17 @@
     const items=rows.map(row=>({id:rowId(tab,row),revision:row.revision}));
     const fields=bulkFields[tab];
     const first=Object.keys(fields)[0];
-    formDialog(`Edit ${rows.length} selected ${tab==="log"?"log entries":"tasks"}`,`
+    formDialog(`Edit ${rows.length} selected ${tab==="log"?"log entries":tab==="items"?"items":"tasks"}`,`
       <p>Apply one field to all ${rows.length} selected records for ${esc(memberByKey(view.member)?.display_name||view.member)}. No hidden rows will change.</p>
       <ul class="team-bulk-preview">${rows.map(row=>`<li>${esc(row.title||rowId(tab,row))}</li>`).join("")}</ul>
       <label>Field<select name="field">${Object.entries(fields).map(([key,label])=>`<option value="${key}">${label}</option>`).join("")}</select></label>
       <label class="team-bulk-value">New value${valueControl(tab,first,fieldValue(tab,rows[0],first))}</label>
       <p class="cap">Save confirms this change. A stale record cancels the entire batch; reload and reselect after a conflict.</p>`,
       async data=>{
-        await mutate("bulk-set",{entity_type:tab==="tasks"?"assignment":"meeting",member_key:rows[0].member_key,
-          items,field:data.get("field"),value:data.get("value")||(data.get("field")==="target_date"?null:"")});
+        const field=data.get("field");
+        await mutate("bulk-set",{entity_type:tab==="items"?"item":tab==="tasks"?"assignment":"meeting",member_key:view.member,
+          items,field,value:field==="follow_up"?data.get("value")==="true":
+            data.get("value")||(field==="target_date"?null:"")});
       },{setup:form=>{
         form.querySelector('[name="field"]').onchange=event=>{
           const field=event.target.value;
@@ -209,7 +234,7 @@
   }
 
   function memberTabs(m){
-    const tabs = [["tasks","Tasks"],["activity","Activity"],["oneonone","Log"],["reviews","Reviews"]];
+    const tabs = [["tasks",TEAM.items?"Items":"Tasks"],["activity","Activity"],["oneonone","Log"],["reviews","Reviews"]];
     return `<div class="tabs">${tabs.map(([id,label])=>`<button class="tab ${view.subtab===id?"on":""}" data-member-tab="${id}">${esc(label)}</button>`).join("")}</div>`;
   }
   function memberHeader(m){
@@ -228,16 +253,20 @@
   function rowEditBtns(type,id,rev){
     return isPrivate()
       ? `${type==="meeting"?`<button class="btn team-inline" data-type="${type}" data-id="${esc(id)}">Edit inline</button>`:""}
+        ${type==="meeting"?`<button class="btn danger team-delete-meeting" data-id="${esc(id)}" data-rev="${esc(rev||"")}">Delete entry</button>`:""}
         <button class="btn team-edit" data-type="${type}" data-id="${esc(id)}" data-rev="${esc(rev||"")}">Edit details</button>`
-      : "";
+      : type==="meeting"
+        ? `<button class="btn team-edit" data-type="${type}" data-id="${esc(id)}" data-rev="${esc(rev||"")}">Edit shared log</button>`
+        : "";
   }
   function memberTasks(m){
     const all = memberAssignments(m.member_key), filter=filters.tasks;
     const list=all.filter(a=>matchesText(a,filter.query) &&
       matchesChoices(a.category||"misc",filter.category) &&
-      matchesChoices(a.priority||"medium",filter.priority) && matchesChoices(a.status,filter.status));
+      matchesChoices(a.priority||"medium",filter.priority) && matchesChoices(a.status,filter.status) &&
+      (!filter.openOnly || !["done","cancelled"].includes(a.status)));
     return `<div class="tile"><h3>Tasks ${isPrivate()?'<button class="btn primary team-new-assignment" data-member="'+esc(m.member_key)+'">New task</button>':""}</h3>
-      ${filterToolbar("tasks",[["category","Category",all.map(a=>a.category||"misc")],["priority","Priority",all.map(a=>a.priority||"medium")],["status","Status",all.map(a=>a.status)]],list.length,all.length)}
+      ${filterToolbar("tasks",[["category","Category",all.map(a=>a.category||"misc")],["priority","Priority",all.map(a=>a.priority||"medium")],["status","Status",all.map(a=>a.status)]],list.length,all.length,false,true)}
       ${selectionBar("tasks",list)}
       <table data-table-key="team-member-tasks"><thead><tr><th aria-label="Selection" data-no-sort></th><th>ID</th><th>Task</th><th>Category</th><th>Priority</th><th>Status</th><th data-sort-type="date">Created</th><th data-sort-type="number">Age</th><th data-sort-type="date">Due</th><th data-no-sort></th></tr></thead><tbody>
       ${list.map(a=>`<tr><td class="team-select-cell">${rowCheckbox("tasks",a)}</td><td><code>${esc(a.assignment_id)}</code></td><td><b>${esc(a.title)}</b>
@@ -248,6 +277,38 @@
       ${isPrivate()?`<button class="btn team-task-note" data-id="${esc(a.assignment_id)}">Add note</button>`:""}</td></tr>
       `).join("")}
       ${list.length?"":'<tr><td colspan="10">No matching tasks.</td></tr>'}</tbody></table></div>`;
+  }
+  function memberItems(m){
+    if(!TEAM.items) return memberTasks(m);
+    const all=TEAM.items.filter(i=>i.member_key===m.member_key||i.owner_key===m.member_key);
+    const filter=filters.items;
+    const labels=Object.fromEntries(Object.keys(itemTypes()).map(tag=>[tag,itemLabel(tag)]));
+    labels.action="Task";
+    const list=all.filter(i=>matchesText(i,filter.query)&&
+      matchesChoices(i.item_type,filter.item_type)&&matchesChoices(i.priority,filter.priority)&&
+      matchesChoices(i.status,filter.status)&&matchesChoices(String(i.follow_up),filter.follow_up)&&
+      (!filter.openOnly||!["done","cancelled"].includes(i.status)));
+    const history=i=>`<details class="team-item-history"><summary>History (${(i.occurrences||[]).length} log rows, ${(i.updates||[]).length} updates)</summary>
+      <ul>${(i.occurrences||[]).map(o=>`<li><button class="btn team-item-meeting" data-member="${esc(i.member_key)}" data-meeting="${esc(o.meeting_id)}">${fmtDate(o.meeting_date)} · ${esc(o.title)}</button> ${esc(o.body)}</li>`).join("")}
+      ${(i.updates||[]).map(u=>`<li>${fmtDate(u.created_at)}: ${esc(u.note)}</li>`).join("")}</ul></details>`;
+    return `<div class="tile"><h3>Items ${isPrivate()?`<button class="btn primary team-new-assignment" data-member="${esc(m.member_key)}">New task</button>
+      <button class="btn team-new-meeting" data-member="${esc(m.member_key)}">New 1:1 entry</button>`:""}</h3>
+      <p class="cap">Tasks are one item type. Checked follow-ups carry into the next 1:1 until cleared or completed.</p>
+      ${filterToolbar("items",[["item_type","Type",all.map(i=>i.item_type),labels],["priority","Priority",all.map(i=>i.priority)],
+        ["status","Status",all.map(i=>i.status)],["follow_up","Follow up",["true","false"],{true:"Needed",false:"Not needed"}]],list.length,all.length,false,true)}
+      ${selectionBar("items",list)}
+      <table data-table-key="team-member-items"><thead><tr><th aria-label="Selection" data-no-sort></th><th>ID</th><th>Type</th><th>Item</th><th>Status</th><th>Priority</th><th>Owner</th><th data-sort-type="date">Due</th><th>Follow up</th><th data-no-sort></th></tr></thead><tbody>
+      ${list.map(i=>`<tr><td>${rowCheckbox("items",i)}</td><td><code>${esc(i.item_id)}</code></td>
+        <td><span class="badge">${esc(labels[i.item_type]||itemLabel(i.item_type))}</span></td>
+        <td><b>${esc(i.body)}</b>${i.fields?`<div class="team-item-meta">${itemDetails(i.member_key,{tag:i.item_type,fields:i.fields})}</div>`:""}${history(i)}</td>
+        <td>${esc(i.status)}</td><td>${esc(i.priority)}</td>
+        <td>${esc(i.owner_label==="manager"?(TEAM.manager_name||"Manager"):i.owner_key?
+          (memberByKey(i.owner_key)?.display_name||i.owner_key):i.owner?partyLabel(i.member_key,i.owner):"Unassigned")}</td>
+        <td data-sort-value="${esc(i.target_date||"")}">${fmtDate(i.target_date)}</td>
+        <td>${i.follow_up?"Needed":"—"}</td><td>${isPrivate()?`<button class="btn team-edit-item" data-id="${esc(i.item_id)}">Edit tracking</button>
+          <button class="btn team-item-note" data-id="${esc(i.item_id)}">Add update</button>
+          ${i.assignment_id?rowEditBtns("assignment",i.assignment_id,i.assignment_revision):""}`:""}</td></tr>`).join("")}
+      ${list.length?"":'<tr><td colspan="10">No matching items.</td></tr>'}</tbody></table></div>`;
   }
   function referenceLink(ref){
     const id=String(ref.target_id||"");
@@ -270,7 +331,7 @@
     const rows = activity.map(a=>`<tr><td class="team-select-cell">${rowCheckbox("activity",a)}</td><td>${fmtDate(a.at)}</td><td>${esc(a.kind)}</td><td>${a.url?`<a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.label)}</a>`:esc(a.label)}</td><td>${esc(a.source||"")}</td></tr>`).join("");
     return `<div class="tile"><h3>Activity ${isPrivate()?`<button class="btn primary team-scan" data-member="${esc(m.member_key)}">Scan Jira &amp; GitHub</button>`:""}</h3>
       <p class="cap">Scans continue from each source's last successful scan; first scan covers seven days.</p>
-      <p class="cap">${Object.entries(scanned.sources||{}).map(([source,s])=>`${esc(source)}: ${s.last_success_at?esc(s.last_success_at):"not scanned"}`).join(" · ")}</p>
+      <p class="cap">${Object.entries(scanned.sources||{}).map(([source,s])=>`${esc(source)}: ${s.last_success_at?fmtDate(s.last_success_at):"not scanned"}`).join(" · ")}</p>
       <div class="team-scan-message" role="status">${(scanned.errors||[]).map(e=>esc(e.source+": "+e.message)).join("; ")}</div>
       ${filterToolbar("activity",[["source","Source",all.map(a=>a.source)],["kind","Activity type",all.map(a=>a.kind)]],activity.length,all.length,true)}
       ${selection}
@@ -289,25 +350,45 @@
   function itemDetails(member, e){
     const spec=itemTypes()[e.tag];
     if(!spec) return "";
-    return spec.fields.filter(f=>f.key!==spec.summary && e.fields[f.key]!==undefined && e.fields[f.key]!=="" && e.fields[f.key]!==false)
+    return spec.fields.filter(f=>f.key!==spec.summary && f.key!=="priority" &&
+      !(e.tag==="discussion"&&f.key==="follow_up") &&
+      e.fields[f.key]!==undefined && e.fields[f.key]!=="" && e.fields[f.key]!==false)
       .map(f=>{
         let v=e.fields[f.key];
         if(f.input==="checkbox") v="yes";
         else if(f.input==="task") v=taskTitle(v);
         else if(f.input==="select" && ["owner","raised_by","decided_by","unblocker"].includes(f.key)) v=partyLabel(member,v);
+        else if(f.input==="date") v=fmtDate(v);
         return `<span class="team-item-kv"><b>${esc(f.label)}:</b> ${esc(v)}</span>`;
       }).join("");
   }
+  function priorityLabel(value){
+    const priority=value||"medium";
+    return priority.charAt(0).toUpperCase()+priority.slice(1);
+  }
   function meetingEntries(mt){
-    const entries = mt.entries || [];
+    const entries = (mt.entries || []).map((entry,index)=>({entry,index})).sort((a,b)=>{
+      const category=itemLabel(a.entry.tag).localeCompare(itemLabel(b.entry.tag));
+      const priority=["critical","high","medium","low"].indexOf(a.entry.priority||"medium")-
+        ["critical","high","medium","low"].indexOf(b.entry.priority||"medium");
+      return category||priority||a.index-b.index;
+    }).map(item=>item.entry);
     return entries.map(e=>{
       const typed=isTypedEntry(e);
       const raid=e.raid_id?` <span class="chip team-raid-chip">RAID ${esc(e.raid_id)}</span>`:
         (isPrivate() && e.tag==="roadblock" && e.record_id?` <button class="btn team-promote-raid" data-meeting="${esc(mt.meeting_id)}" data-entry="${esc(e.entry_id)}">Promote to RAID</button>`:"");
       const task=e.tag==="action" && e.record_id?` <a href="#" class="team-item-task" data-task="${esc(e.record_id)}">task</a>`:"";
-      return `<li class="team-item team-item-${esc(e.tag||"note")}"><span class="badge team-item-badge" data-item-type="${esc(e.tag||"note")}">${esc(itemLabel(e.tag))}</span> ${esc(e.body)}${task}${raid}
-        ${typed?`<div class="team-item-meta">${itemDetails(mt.member_key,e)}</div>`:""}
-        ${isPrivate()?`<i class="cap">(${esc(e.visibility==="shared"?"presentation":"private")})</i>`:""}</li>`;
+      return `<li class="team-item team-item-${esc(e.tag||"note")}"><details class="team-item-view">
+        <summary><span class="badge team-item-badge" data-item-type="${esc(e.tag||"note")}">${esc(itemLabel(e.tag))}</span>
+          <span class="team-item-view-summary">${esc(e.body)}</span>
+          <span class="chip team-priority">Priority: ${esc(priorityLabel(e.priority))}</span>
+          ${e.tracking?`<span class="chip">${esc(e.tracking.status)}</span>`:""}
+          ${e.follow_up_from?`<span class="chip team-follow-up-label">Follow-up from ${fmtDate(e.follow_up_from)}</span>`:""}
+          ${e.tracking?.follow_up?'<span class="chip team-follow-up-label">Follow up next 1:1</span>':""}</summary>
+        <div class="team-item-view-details">${task}${raid}
+          ${typed?`<div class="team-item-meta">${itemDetails(mt.member_key,e)}</div>`:""}
+          ${isPrivate()?`<i class="cap">(${esc(e.visibility==="shared"?"presentation":"private")})</i>`:""}
+        </div></details></li>`;
     }).join("");
   }
   function memberOneOnOne(m){
@@ -327,7 +408,7 @@
       ${selectionBar("log",meetings)}
       ${meetings.length?"":'<p class="empty">No matching log entries.</p>'}
       ${meetings.map(mt=>`<div class="team-meeting team-log-row"><div class="team-select-cell">${rowCheckbox("log",mt)}</div><div><h4><span class="badge">${esc(types[mt.session_type]||"1:1")}</span> ${esc(mt.title||"Session")} · ${fmtDate(mt.meeting_date)}</h4>
-      <p class="cap">${esc(mt.shared_summary||mt.private_summary||"")}</p><ul>${meetingEntries(mt)}</ul>${rowEditBtns("meeting",mt.meeting_id,mt.revision)}${inlineEditor("log",mt)}</div></div>`).join("")}
+      <p class="cap">${esc(mt.shared_summary||mt.private_summary||"")}</p><ul>${meetingEntries(mt)}</ul>${rowEditBtns("meeting",mt.meeting_id,mt.revision||mt.edit_token)}${inlineEditor("log",mt)}</div></div>`).join("")}
     </div>`;
   }
   function memberReviews(m){
@@ -342,7 +423,7 @@
     const member = memberByKey(view.member || members[0]?.member_key);
     if(!member) return `<div class="empty">No team members available.</div>`;
     view.member = member.member_key;
-    let body = memberTasks(member);
+    let body = memberItems(member);
     if(view.subtab==="activity") body = memberActivity(member);
     else if(view.subtab==="oneonone") body = memberOneOnOne(member);
     else if(view.subtab==="reviews") body = memberReviews(member);
@@ -367,10 +448,13 @@
     return true;
   }
   async function mutate(action, data){
-    if(!isPrivate()) throw new Error("Enable private mode to edit team records.");
+    const sharedEdit=action==="meeting-shared-save";
+    if(!isPrivate()&&!sharedEdit) throw new Error("Enable private mode to edit team records.");
+    const headers={"Content-Type":"application/json"};
+    if(!sharedEdit) headers["X-Team-Private"]="1";
     const res = await fetch("/api/team", {
       method:"POST",
-      headers:{"Content-Type":"application/json","X-Team-Private":"1"},
+      headers,
       body:JSON.stringify({action,data}),
     });
     const body = await res.json();
@@ -383,6 +467,11 @@
   }
   function visibilitySelect(name, value="private", label="Visibility"){
     return `<label>${label}<select name="${name}"><option value="private" ${value==="private"?"selected":""}>Private</option><option value="shared" ${value==="shared"?"selected":""}>Presentation</option></select></label>`;
+  }
+  function prioritySelect(name,value="medium"){
+    const priorities=TEAM.log_item_priorities||["critical","high","medium","low"];
+    return `<label>Priority<select name="${name}">${priorities.map(priority=>
+      `<option value="${esc(priority)}" ${priority===value?"selected":""}>${esc(priorityLabel(priority))}</option>`).join("")}</select></label>`;
   }
   function taskFields(current={}){
     const categories=TEAM.task_categories||["development","debug","research","planning","testing","code-review","track","misc"];
@@ -426,7 +515,7 @@
       const save = form.querySelector('[type="submit"]');
       save.disabled = true;
       try{
-        await onSave(new FormData(form), form);
+        await onSave(normalizedDateFormData(form), form);
         close();
         await refresh();
       }catch(err){
@@ -453,7 +542,7 @@
       <label>Description<textarea name="description">${esc(current?.description||"")}</textarea></label>
       ${current?`<p>ID: <code>${esc(current.assignment_id)}</code></p>`:""}
       <div class="ws-modal-row"><label>Status<select name="status">${["todo","backlog","in-progress","blocked","done","cancelled","assigned","open","deferred"].map(s=>`<option ${s===current?.status?"selected":""}>${s}</option>`).join("")}</select></label>
-      <label>Due date<input type="date" name="target_date" value="${esc(current?.target_date||"")}"></label></div>
+      <label>Due date${dateInput("target_date",current?.target_date||"")}</label></div>
       ${taskFields(current||{})}
       ${visibilitySelect("visibility",current?.visibility)}`, async (data,form)=>{
       const fields = Object.fromEntries(data);
@@ -471,118 +560,379 @@
     const current=meetingById(id);
     if(current) meetingDialog(current.member_key,current);
   }
-  async function newMeeting(member){
-    meetingDialog(member);
+  async function deleteMeeting(id, revision){
+    if(!isPrivate()) throw new Error("Enable private mode to delete team records.");
+    const current=meetingById(id);
+    if(!current) throw new Error("Log entry is no longer available; refresh and try again.");
+    const title=current.title||"this log entry";
+    if(!confirm(`Delete "${title}"? Linked progress, roadblock, and feedback records will be removed; task assignments will remain.`)) return;
+    await mutate("meeting-delete",{id,revision});
+    await refresh();
   }
-  function itemFieldInput(member, field, value){
+  async function newMeeting(member){
+    if(!TEAM.items) return meetingDialog(member);
+    const draft=(await mutate("meeting-prepare",{member_key:member})).entity;
+    if(!isPrivate()) throw new Error("Enable private mode to prepare a 1:1.");
+    meetingDialog(member,null,draft);
+  }
+  function trackingControls(member,entry={},full=false){
+    if(!TEAM.items) return "";
+    const tracking=entry.tracking||{
+      status:entry.tracking_status,owner:entry.tracking_owner,target_date:entry.tracking_due,
+      follow_up:entry.follow_up,
+    };
+    const task=!entry.generic&&(entry.assignment_id||entry.item_type==="action"&&entry.fields?.title||
+      entry.tag==="action"&&(entry.fields===undefined||entry.fields?.title||entry.record_id||entry.locked));
+    const statuses=task?taskStatuses:(TEAM.item_statuses||["unspecified","open","in-progress","blocked","done","cancelled","deferred"]);
+    const status=tracking.status||(task?"todo":"open");
+    return `<div class="team-tracking-fields">
+      <label>Tracking status<select name="tracking_status">${statuses.map(s=>`<option value="${esc(s)}" ${s===status?"selected":""}>${esc(s==="unspecified"?"Unspecified":s)}</option>`).join("")}</select></label>
+      ${!task||full?`<label>Owner (optional)<select name="tracking_owner">${(task?["me","member"]:["","me","member"]).map(owner=>
+        `<option value="${owner}" ${owner===(tracking.owner||"")?"selected":""}>${esc(owner?partyLabel(member,owner):"Unassigned")}</option>`).join("")}</select></label>
+        <label>Due (optional)${dateInput("tracking_due",tracking.target_date||"")}</label>`:""}
+      <label class="team-item-check"><input type="checkbox" name="follow_up" ${tracking.follow_up?"checked":""}> Follow up next 1:1</label>
+    </div>`;
+  }
+  function trackingValues(container,original=null){
+    const follow=container.querySelector('[name="follow_up"]');
+    if(!follow) return {};
+    const status=container.querySelector('[name="tracking_status"]');
+    const owner=container.querySelector('[name="tracking_owner"]');
+    const due=container.querySelector('[name="tracking_due"]');
+    const values={follow_up:follow.checked,tracking_status:status.value};
+    if(owner) values.tracking_owner=owner.value||null;
+    if(due){
+      const day=window.PortalDates.parse(due.value);
+      if(due.value.trim()&&!day) throw new Error("Enter a valid due date as dd/mm/yyyy.");
+      values.tracking_due=day||null;
+    }
+    if(original?.item_id){
+      const before=original.tracking||{status:original.tracking_status,owner:original.tracking_owner,
+        target_date:original.tracking_due};
+      if(values.tracking_status===before.status) delete values.tracking_status;
+      if(values.tracking_owner===before.owner) delete values.tracking_owner;
+      if(values.tracking_due===before.target_date) delete values.tracking_due;
+      values.item_id=original.item_id;
+      values.item_revision=original.item_revision||original.item_edit_token;
+    }
+    return values;
+  }
+  function editItem(ident){
+    const item=(TEAM.items||[]).find(i=>i.item_id===ident);
+    if(!item) throw new Error("Tracked item not found; refresh Team.");
+    formDialog("Edit item tracking",`<p><code>${esc(item.item_id)}</code> · ${esc(item.item_type==="action"?"Task":itemLabel(item.item_type))}</p>
+      <h4>${esc(item.body)}</h4>${trackingControls(item.member_key,{...item,tracking:item},true)}
+      ${prioritySelect("priority",item.priority)}${visibilitySelect("visibility",item.visibility)}
+      <p class="cap">This updates the tracked item. Previous 1:1 text stays in its history.</p>`,
+      async(data,form)=>{
+        const values=trackingValues(form);
+        await mutate("item-set",{id:item.item_id,revision:item.revision,
+          status:values.tracking_status,owner:values.tracking_owner,target_date:values.tracking_due,
+          follow_up:values.follow_up,priority:data.get("priority"),visibility:data.get("visibility")});
+      });
+  }
+  function itemFieldInput(member, field, value, linkedStatusTask=false){
     const name=`f:${field.key}`;
     const req=field.required?"required":"";
-    if(field.input==="textarea") return `<label class="team-item-wide">${esc(field.label)}<textarea name="${name}" rows="2" ${req}>${esc(value||"")}</textarea></label>`;
+    const statusMode=field._tag==="status"&&field.key==="activity"?"standalone":
+      field._tag==="status"&&field.key==="status"?"linked":null;
+    const modeAttrs=statusMode?` data-status-mode="${statusMode}" ${statusMode==="standalone"&&linkedStatusTask||statusMode==="linked"&&!linkedStatusTask?"hidden":""}`:"";
+    if(field.input==="textarea") return `<label class="team-item-wide">${esc(field.label)}<textarea name="${name}" rows="${field._detail?5:2}" ${req}>${esc(value||"")}</textarea></label>`;
     if(field.input==="checkbox") return `<label class="team-item-check"><input type="checkbox" name="${name}" ${value?"checked":""}> ${esc(field.label)}</label>`;
-    if(field.input==="date") return `<label>${esc(field.label)}<input type="date" name="${name}" value="${esc(value||"")}" ${req}></label>`;
+    if(field.input==="date") return `<label>${esc(field.label)}${dateInput(name,value||"",req)}</label>`;
     if(field.input==="task"){
       const tasks=memberAssignments(member);
-      return `<label>${esc(field.label)}<select name="${name}" ${req}><option value="">— choose task —</option>${tasks.map(t=>`<option value="${esc(t.assignment_id)}" ${t.assignment_id===value?"selected":""}>${esc(t.title)} (${esc(t.status||"")})</option>`).join("")}</select></label>`;
+      return `<label>${esc(field.label)}<select name="${name}" ${req}><option value="">— no task (standalone update) —</option>${tasks.map(t=>`<option value="${esc(t.assignment_id)}" ${t.assignment_id===value?"selected":""}>${esc(t.title)} (${esc(t.status||"")})</option>`).join("")}</select></label>`;
     }
     if(field.input==="select"){
       const party=["owner","raised_by","decided_by","unblocker"].includes(field.key);
-      return `<label>${esc(field.label)}<select name="${name}">${field.options.map(o=>`<option value="${esc(o)}" ${o===(value??field.options[0])?"selected":""}>${esc(o===""?"(unchanged)":party?partyLabel(member,o):o)}</option>`).join("")}</select></label>`;
+      const disabled=field._tag==="status"&&field.key==="status"&&!linkedStatusTask?"disabled":"";
+      return `<label${modeAttrs}>${esc(field.label)}<select name="${name}" ${disabled}>${field.options.map(o=>`<option value="${esc(o)}" ${o===(value??field.options[0])?"selected":""}>${esc(o===""?"(unchanged)":party?partyLabel(member,o):o)}</option>`).join("")}</select></label>`;
     }
-    return `<label class="${field.key===itemTypes()[field._tag]?.summary?"team-item-main":""}">${esc(field.label)}<input name="${name}" value="${esc(value||"")}" ${req}></label>`;
+    return `<label${modeAttrs} class="${field.key===itemTypes()[field._tag]?.summary?"team-item-main":""}">${esc(field.label)}<input name="${name}" value="${esc(value||"")}" ${req}></label>`;
   }
-  function itemRow(member, tag, entry=null){
+  function itemRowTitle(tag, fields, entry){
     const spec=itemTypes()[tag];
+    if(!spec) return entry?.body||"New item";
+    if(tag==="status")
+      return fields.assignment_id?taskTitle(fields.assignment_id):
+        fields.activity||fields[spec.summary]||"New item";
+    return entry?.body||fields[spec.summary]||"New item";
+  }
+  function itemRow(member, tag, entry=null, sharedOnly=false){
+    const known=itemTypes()[tag]&&(!entry||entry.fields)?itemTypes()[tag]:null;
+    const spec=known||{label:itemLabel(tag),summary:"body",fields:[]};
     const fields=entry?.fields||{};
-    const locked=tag==="action" && entry?.record_id;
-    const visibility=spec.always_private?`<span class="cap">Always private</span>`:
-      visibilitySelect("visibility",entry?.visibility||spec.default_visibility||"private");
-    const body=locked
+    const linkedStatusTask=tag==="status"&&!!fields.assignment_id;
+    const locked=tag==="action" && !!(entry?.record_id||entry?.locked);
+    const priority=entry?.priority||fields.priority||"medium";
+    const priorities=TEAM.log_item_priorities||["critical","high","medium","low"];
+    const categories=Object.entries(itemTypes());
+    if(!known) categories.push([tag,spec]);
+    const visibility=sharedOnly?`<span class="cap">Presentation</span>`:
+      spec.always_private?`<span class="cap">Always private</span>`:
+        visibilitySelect("visibility",entry?.visibility||spec.default_visibility||"shared");
+    const mainKeys=tag==="status"?["activity",spec.summary]:[spec.summary];
+    const mainFields=spec.fields.filter(f=>mainKeys.includes(f.key));
+    const detailFields=spec.fields.filter(f=>!mainFields.includes(f)&&f.key!=="priority"&&
+      !(tag==="discussion"&&f.key==="follow_up"));
+    const body=!known?`<label>Entry<textarea name="body" rows="3">${esc(entry?.body||"")}</textarea></label>`:locked
       ? `<div class="team-item-locked"><b>${esc(fields.title||entry.body)}</b> ${itemDetails(member,entry)}
-          <span class="cap">Saved as task <code>${esc(entry.record_id)}</code> — edit it in Tasks.</span></div>`
-      : `<div class="team-item-fields">${spec.fields.map(f=>itemFieldInput(member,{...f,_tag:tag},fields[f.key])).join("")}</div>`;
+          <span class="cap">Saved as task${entry.record_id?` <code>${esc(entry.record_id)}</code>`:""} — edit it in Tasks.</span></div>`
+      : `${mainFields.length?`<div class="team-item-summary-field">${mainFields.map(f=>itemFieldInput(member,{...f,_tag:tag},fields[f.key],linkedStatusTask)).join("")}</div>`:""}
+        ${detailFields.length?`<details class="team-item-extra"><summary>More details</summary>
+          <div class="team-item-fields">${detailFields.map(f=>itemFieldInput(member,{...f,_tag:tag,_detail:true},fields[f.key],linkedStatusTask)).join("")}</div>
+        </details>`:""}`;
     const raid=tag!=="roadblock"?"":entry?.raid_id?`<span class="chip team-raid-chip">RAID ${esc(entry.raid_id)}</span>`:
       entry?.record_id?`<button type="button" class="btn team-promote-raid" data-meeting="${esc(entry.meeting_id||"")}" data-entry="${esc(entry.entry_id)}">Promote to RAID</button>`:
       `<span class="cap">Save to enable RAID promotion</span>`;
-    return `<div class="team-item-row" data-item-tag="${esc(tag)}" data-item-type="${esc(tag)}" ${entry?.entry_id?`data-entry-id="${esc(entry.entry_id)}"`:""}>
-      <div class="team-item-head"><span class="badge team-item-badge" data-item-type="${esc(tag)}">${esc(spec.label)}</span>
-        ${visibility}${raid}<button type="button" class="btn team-item-remove" aria-label="Remove ${esc(spec.label)}">−</button></div>
-      ${body}</div>`;
+    return `<details class="team-item-row" data-item-tag="${esc(tag)}" data-item-type="${esc(tag)}"
+        ${!known?'data-item-generic="true"':""}
+        ${entry?.follow_up_from?`data-follow-up-item="${esc(entry.item_id)}"`:""}
+        ${entry?.entry_id?`data-entry-id="${esc(entry.entry_id)}"`:""} ${entry?"":"open"}>
+      <summary class="team-item-row-summary"><span class="badge team-item-badge" data-item-type="${esc(tag)}">${esc(spec.label)}</span>
+        <span class="team-item-row-title">${esc(itemRowTitle(tag,fields,entry))}</span>
+        <span class="chip team-priority">Priority: ${esc(priorityLabel(priority))}</span>
+        ${entry?.follow_up_from?`<span class="chip team-follow-up-label">Follow-up from ${fmtDate(entry.follow_up_from)}</span>`:""}</summary>
+      <div class="team-item-row-content">
+        <div class="team-item-head"><label>Category<select name="item_tag" ${entry?.follow_up_from?"disabled":""}>${categories.map(([key,item])=>
+          `<option value="${esc(key)}" ${key===tag?"selected":""}>${esc(item.label)}</option>`).join("")}</select></label>
+          <label>Priority<select name="priority" ${locked?"disabled":""}>${priorities.map(value=>
+            `<option value="${esc(value)}" ${value===priority?"selected":""}>${esc(priorityLabel(value))}</option>`).join("")}</select></label>
+          ${locked?'<span class="cap">Change task priority in Tasks.</span>':""}${visibility}${raid}
+          <button type="button" class="btn team-item-remove" aria-label="Remove ${esc(spec.label)}">−</button></div>
+        ${body}${trackingControls(member,{...entry,tag,generic:!known})}</div></details>`;
   }
   function itemRowValue(row, entryById){
-    const tag=row.dataset.itemTag, id=row.dataset.entryId;
-    const spec=itemTypes()[tag];
+    const id=row.dataset.entryId;
+    const tag=row.querySelector('[name="item_tag"]').value;
+    const spec=row.dataset.itemGeneric?null:itemTypes()[tag];
     const original=id?entryById[id]:null;
     let fields;
-    if(tag==="action" && original?.record_id) fields={...original.fields};
+    if(!spec) fields=null;
+    else if(tag==="action" && original?.tag==="action" && (original?.record_id||original?.locked))
+      fields={...original.fields};
     else{
       fields={};
-      spec.fields.forEach(f=>{
+      spec.fields.filter(f=>f.key!=="priority"&&!(tag==="discussion"&&f.key==="follow_up")).forEach(f=>{
         const input=row.querySelector(`[name="f:${f.key}"]`);
         if(!input) return;
         if(f.input==="checkbox") fields[f.key]=input.checked;
-        else if(input.value.trim()) fields[f.key]=input.value.trim();
+        else if(f.input==="date"){
+          const iso=window.PortalDates.parse(input.value);
+          if(input.value.trim()&&!iso) throw new Error("Enter a valid date as dd/mm/yyyy.");
+          if(iso) fields[f.key]=iso;
+        }else if(input.value.trim()) fields[f.key]=input.value.trim();
       });
     }
+    const priority=row.querySelector('[name="priority"]').value||"medium";
+    if(tag==="action"&&fields) fields.priority=priority;
     const vis=row.querySelector('[name="visibility"]');
-    return {...(id?{entry_id:id}:{}),tag,fields,visibility:spec.always_private?"private":(vis?.value||"private")};
+    return {...(id?{entry_id:id}:{}),tag,...(fields===null?{body:row.querySelector('[name="body"]').value}:{fields}),priority,
+      ...trackingValues(row,original?.tag===tag?original:null),
+      visibility:spec?.always_private?"private":(vis?.value||"shared")};
   }
-  function meetingDialog(member, current=null){
-    const existing = current?.entries||[];
-    const note = existing.find(e=>e.tag==="notes" || e.tag==="note");
-    const typed = existing.filter(e=>e!==note && isTypedEntry(e));
-    const legacy = existing.filter(e=>e!==note && !isTypedEntry(e));
+  function meetingDialog(member, current=null, draft=null){
+    const presentationEdit=!!current&&!isPrivate();
+    const existing = current?.entries||draft?.entries||[];
+    const note = current?existing.find(e=>e.tag==="notes" || e.tag==="note"):null;
+    const typed = existing.filter(e=>e!==note && (!current||isTypedEntry(e)));
+    const legacy = current?existing.filter(e=>e!==note && !isTypedEntry(e)):[];
     const entryById=Object.fromEntries(existing.map(e=>[e.entry_id,{...e,meeting_id:current?.meeting_id}]));
-    const legacyFields=(entry,index)=>`<div class="team-entry" data-entry-index="${index}">
-      <label>Type<input name="tag" value="${esc(entry.tag)}" required></label>
-      <label>Entry<textarea name="body" rows="2">${esc(entry.body)}</textarea></label>${visibilitySelect("visibility",entry.visibility)}</div>`;
+    const legacyFields=(entry,index)=>`<details class="team-item-row team-entry" data-entry-index="${index}" open>
+      <summary class="team-item-row-summary"><span class="badge">${esc(itemLabel(entry.tag))}</span>
+        <span class="team-item-row-title">${esc(entry.body)}</span>
+        <span class="chip team-priority">Priority: ${esc(priorityLabel(entry.priority))}</span></summary>
+      <div class="team-item-row-content"><label>Category<input name="tag" value="${esc(entry.tag)}" required></label>
+        <label>Entry<textarea name="body" rows="2">${esc(entry.body)}</textarea></label>
+        ${prioritySelect("priority",entry.priority||"medium")}
+        ${presentationEdit?"":visibilitySelect("visibility",entry.visibility||"shared")}
+        ${trackingControls(member,entry)}</div></details>`;
     const types=TEAM.log_types||{one_on_one:"1:1",conversation:"Conversation",meeting:"Meeting",note:"Note"};
     const counterpart=isLeadKey(member)?(TEAM.manager_name||"Manager"):(memberByKey(member)?.display_name||member);
+    const showTopic=!presentationEdit||current.title_visibility==="shared";
     formDialog(current?"Edit log entry":"New log entry", `
       <div class="team-session-meta">
         <label>Type<select name="session_type">${Object.entries(types).map(([key,label])=>`<option value="${key}" ${key===(current?.session_type||"one_on_one")?"selected":""}>${esc(label)}</option>`).join("")}</select></label>
-        <label>Topic (optional)<input name="title" value="${esc(current?.title||"")}" placeholder="1:1 with ${esc(counterpart)} - YYYY-MM-DD"></label>
-        <label>Date (blank = today)<input type="date" name="meeting_date" value="${esc(current?.meeting_date||"")}"></label>
-        ${visibilitySelect("title_visibility",current?.title_visibility,"Topic visibility")}
+        ${showTopic?`<label>Topic (optional)<input type="text" name="title" value="${esc(current?.title||"")}" placeholder="1:1 with ${esc(counterpart)} - YYYY-MM-DD"></label>`
+          :'<p class="cap">Topic is hidden and will remain unchanged in Presentation mode.</p>'}
+        <label>Date (blank = today)${dateInput("meeting_date",current?.meeting_date||"")}</label>
+        ${!presentationEdit||showTopic?visibilitySelect("title_visibility",current?.title_visibility||"shared","Topic visibility"):""}
       </div>
       <div class="team-item-toolbar" role="group" aria-label="Add item">${Object.entries(itemTypes()).map(([tag,spec])=>
         `<button type="button" class="btn team-add-item" data-item-type="${esc(tag)}">+ ${esc(spec.label)}</button>`).join("")}</div>
-      <div class="team-item-rows">${typed.map(e=>itemRow(member,e.tag,entryById[e.entry_id])).join("")}</div>
+      ${!current&&TEAM.items?'<p class="cap">Checked items below are follow-ups from previous 1:1s. Clear their follow-up checkbox to stop carrying them. Removing a carried row only skips it in this draft.</p><button type="button" class="btn team-reload-follow-ups">Reload follow-ups</button>':""}
+      <div class="team-item-rows">${typed.map(e=>itemRow(member,e.tag,entryById[e.entry_id],presentationEdit)).join("")}</div>
       <p class="cap team-item-empty" ${typed.length?"hidden":""}>Add items with the buttons above: actions, decisions, roadblocks, feedback…</p>
       ${legacy.length?`<details class="team-legacy-entries"><summary>Other entries (${legacy.length})</summary>${legacy.map(legacyFields).join("")}</details>`:""}
-      <div class="team-notes-box"><label>Notes<textarea name="notes" rows="3" placeholder="Short freestyle notes (optional)…">${esc(note?.body||"")}</textarea></label>
-      ${visibilitySelect("notes_visibility",note?.visibility,"Notes visibility")}</div>
-      ${current?`<p class="cap">Removing a roadblock or feedback row deletes its record; saved action items stay as tasks.</p>`:""}`,
+      <details class="team-item-row team-notes-row" open>
+        <summary class="team-item-row-summary"><span class="badge">Notes</span>
+          <span class="team-item-row-title">${esc(note?.body||"Add a short note…")}</span>
+          <span class="chip team-priority">Priority: ${esc(priorityLabel(note?.priority))}</span>
+          <span class="team-notes-toggle" aria-hidden="true"><span class="team-notes-expand">&#9656; Expand</span><span class="team-notes-collapse">&#9662; Collapse</span></span></summary>
+        <div class="team-notes-box"><label>Notes<textarea name="notes" rows="3" placeholder="Short freestyle notes (optional)…">${esc(note?.body||"")}</textarea></label>
+          ${prioritySelect("notes_priority",note?.priority||"medium")}
+          ${presentationEdit?"":visibilitySelect("notes_visibility",note?.visibility||"shared","Notes visibility")}
+          ${trackingControls(member,note||{})}</div>
+      </details>
+      ${current?`<p class="cap">Removing or reclassifying a roadblock, feedback or status row deletes its linked record; saved action items remain in Tasks.</p>`:""}`,
       async (data,form)=>{
         const entries=[];
         if(data.get("notes") || note){
-          entries.push({...(note?{entry_id:note.entry_id}:{}),tag:note?.tag||"notes",body:data.get("notes"),visibility:data.get("notes_visibility")});
+          entries.push({...(note?{entry_id:note.entry_id}:{}),tag:note?.tag||"notes",body:data.get("notes"),
+            ...trackingValues(form.querySelector(".team-notes-row"),note),
+            priority:data.get("notes_priority")||"medium",
+            visibility:presentationEdit?"shared":data.get("notes_visibility")});
         }
-        form.querySelectorAll(".team-item-row").forEach(row=>entries.push(itemRowValue(row,entryById)));
+        form.querySelectorAll(".team-item-rows .team-item-row").forEach(row=>entries.push(itemRowValue(row,entryById)));
         form.querySelectorAll(".team-entry").forEach(row=>{
           const original=legacy[Number(row.dataset.entryIndex)];
           entries.push({entry_id:original.entry_id,tag:row.querySelector('[name="tag"]').value,
-            body:row.querySelector('[name="body"]').value,visibility:row.querySelector('[name="visibility"]').value});
+            body:row.querySelector('[name="body"]').value,
+            priority:row.querySelector('[name="priority"]').value,
+            ...trackingValues(row,original.tag===row.querySelector('[name="tag"]').value?original:null),
+            visibility:presentationEdit?"shared":row.querySelector('[name="visibility"]').value});
         });
-        const fields={title:data.get("title"),meeting_date:data.get("meeting_date"),
-          session_type:data.get("session_type"),title_visibility:data.get("title_visibility"),entries};
-        await mutate(current?"meeting-save":"meeting-create",current
-          ?{id:current.meeting_id,revision:current.revision,...fields}:{member_key:member,...fields});
+        const fields={meeting_date:data.get("meeting_date"),session_type:data.get("session_type"),entries};
+        if(!presentationEdit||showTopic){
+          fields.title=data.get("title");
+          fields.title_visibility=data.get("title_visibility");
+        }
+        await mutate(presentationEdit?"meeting-shared-save":current?"meeting-save":"meeting-create",current
+          ?{id:current.meeting_id,revision:current.revision||current.edit_token,...fields}:{member_key:member,...fields});
       },{large:true,setup:form=>{
         const rows=form.querySelector(".team-item-rows");
         const sync=()=>{ form.querySelector(".team-item-empty").hidden=!!rows.children.length; };
+        const noteRow=form.querySelector(".team-notes-row");
+        const notes=noteRow.querySelector('[name="notes"]');
+        const notePriority=noteRow.querySelector('[name="notes_priority"]');
+        const updateNotesPreview=()=>{
+          noteRow.querySelector(".team-item-row-title").textContent=notes.value||"Add a short note…";
+          noteRow.querySelector(".team-priority").textContent=`Priority: ${priorityLabel(notePriority.value)}`;
+        };
+        notes.addEventListener("input",updateNotesPreview);
+        notePriority.addEventListener("change",updateNotesPreview);
         const wire=row=>{
           row.querySelector(".team-item-remove").onclick=()=>{ row.remove(); sync(); };
+          const category=row.querySelector('[name="item_tag"]');
+          category.onchange=()=>{
+            const oldTag=row.dataset.itemTag, oldSpec=itemTypes()[oldTag]||{summary:"body"}, newTag=category.value;
+            const newSpec=itemTypes()[newTag];
+            const oldSummary=row.querySelector(`[name="f:${oldSpec.summary}"]`)||row.querySelector('[name="body"]');
+            const summary=oldSummary?.value||entryById[row.dataset.entryId]?.body||"";
+            const priority=row.querySelector('[name="priority"]').value||"medium";
+            const visibility=presentationEdit?"shared":row.querySelector('[name="visibility"]')?.value||"shared";
+            const tracking=trackingValues(row);
+            const entry={...(row.dataset.entryId?{entry_id:row.dataset.entryId}:{}),
+              body:summary,fields:{[newSpec.summary]:summary},priority,visibility,
+              tracking:{status:newTag==="action"?"todo":tracking.tracking_status,owner:tracking.tracking_owner,
+                target_date:tracking.tracking_due,follow_up:tracking.follow_up}};
+            const holder=document.createElement("div");
+            holder.innerHTML=itemRow(member,newTag,entry,presentationEdit);
+            const replacement=holder.firstElementChild;
+            row.replaceWith(replacement); wire(replacement);
+            replacement.open=true;
+            replacement.querySelector(".team-item-summary-field input,.team-item-summary-field textarea")?.focus();
+          };
+          const updatePreview=()=>{
+            const tag=row.dataset.itemTag, spec=itemTypes()[tag]||{summary:"body"};
+            const linkedTask=tag==="status"?row.querySelector('[name="f:assignment_id"]')?.value:"";
+            const activity=tag==="status"?(row.querySelector('[name="f:activity"]')?.value||"").trim():"";
+            const summary=linkedTask?taskTitle(linkedTask):
+              activity||row.querySelector(`[name="f:${spec.summary}"]`)?.value||
+              row.querySelector('[name="body"]')?.value||"New item";
+            row.querySelector(".team-item-row-title").textContent=summary;
+            row.querySelector(".team-priority").textContent=
+              `Priority: ${priorityLabel(row.querySelector('[name="priority"]').value)}`;
+          };
+          row.querySelectorAll(".team-item-summary-field input,.team-item-summary-field textarea")
+            .forEach(el=>el.addEventListener("input",updatePreview));
+          row.querySelector('[name="body"]')?.addEventListener("input",updatePreview);
+          if(row.dataset.followUpItem){
+            const dirty=()=>{ row.dataset.followUpDirty="true"; };
+            row.addEventListener("input",dirty);
+            row.addEventListener("change",dirty);
+          }
+          row.querySelector('[name="priority"]').addEventListener("change",updatePreview);
+          if(row.dataset.itemTag==="status"){
+            const task=row.querySelector('[name="f:assignment_id"]');
+            const activity=row.querySelector('[name="f:activity"]');
+            const taskStatus=row.querySelector('[name="f:status"]');
+            const activityLabel=row.querySelector('[data-status-mode="standalone"]');
+            const statusLabel=row.querySelector('[data-status-mode="linked"]');
+            // Guards tolerate a served spec older/newer than this asset.
+            const syncStatusFields=()=>{
+              const linked=!!task.value;
+              if(activityLabel) activityLabel.hidden=linked;
+              if(activity){ activity.disabled=linked; if(linked) activity.value=""; }
+              if(statusLabel) statusLabel.hidden=!linked;
+              if(taskStatus){ taskStatus.disabled=!linked; if(!linked) taskStatus.value=""; }
+              updatePreview();
+            };
+            if(task){ task.onchange=syncStatusFields; syncStatusFields(); }
+          }
           const promote=row.querySelector(".team-promote-raid");
           if(promote) promote.onclick=()=>promoteRoadblock(entryById[promote.dataset.entry]);
         };
         rows.querySelectorAll(".team-item-row").forEach(wire);
         form.querySelectorAll(".team-add-item").forEach(btn=>btn.onclick=()=>{
           const holder=document.createElement("div");
-          holder.innerHTML=itemRow(member,btn.dataset.itemType);
+          holder.innerHTML=itemRow(member,btn.dataset.itemType,null,presentationEdit);
           const row=holder.firstElementChild;
           rows.append(row); wire(row); sync();
-          row.querySelector(".team-item-fields input,.team-item-fields textarea,.team-item-fields select")?.focus();
+          row.querySelector(".team-item-summary-field input,.team-item-summary-field textarea")?.focus();
         });
+        if(!current&&TEAM.items){
+          let prepareVersion=0;
+          const dayInput=form.querySelector('[name="meeting_date"]');
+          const typeInput=form.querySelector('[name="session_type"]');
+          const save=form.querySelector('[type="submit"]');
+          const message=form.querySelector(".ws-modal-msg");
+          let previousDay=dayInput.value, previousType=typeInput.value;
+          const reload=async()=>{
+            const version=++prepareVersion;
+            save.disabled=true;
+            message.textContent="Loading follow-ups…";
+            try{
+              const day=window.PortalDates.parse(dayInput.value);
+              if(dayInput.value.trim()&&!day) throw new Error("Enter a valid date as dd/mm/yyyy.");
+              const result=await mutate("meeting-prepare",{member_key:member,meeting_date:day||"",
+                session_type:typeInput.value});
+              if(version!==prepareVersion||!form.isConnected||!isPrivate()) return;
+              const carried=result.entity.entries;
+              const ids=new Set(carried.map(e=>e.item_id));
+              const oldRows=[...rows.querySelectorAll("[data-follow-up-item]")];
+              const removed=oldRows.filter(row=>!ids.has(row.dataset.followUpItem));
+              if(removed.some(row=>row.dataset.followUpDirty)&&
+                !confirm("Changing the date/type removes edited follow-up rows from this draft. Continue?")){
+                dayInput.value=previousDay; typeInput.value=previousType;
+                message.textContent="Date/type change cancelled; your follow-up edits remain.";
+                save.disabled=false;
+                return;
+              }
+              removed.forEach(row=>row.remove());
+              const retained=new Set(oldRows.filter(row=>ids.has(row.dataset.followUpItem)).map(row=>row.dataset.followUpItem));
+              carried.filter(entry=>!retained.has(entry.item_id)).forEach(entry=>{
+                entryById[entry.entry_id]={...entry};
+                const holder=document.createElement("div");
+                holder.innerHTML=itemRow(member,entry.tag,entry,false);
+                const row=holder.firstElementChild;
+                rows.prepend(row); wire(row);
+              });
+              previousDay=dayInput.value; previousType=typeInput.value;
+              sync();
+              message.textContent=`${carried.length} follow-up item${carried.length===1?"":"s"} available for this 1:1.`;
+              save.disabled=false;
+            }catch(error){
+              if(version===prepareVersion&&form.isConnected){
+                message.textContent=`Follow-ups could not be loaded: ${error.message}`;
+              }
+            }
+          };
+          dayInput.onchange=reload;
+          typeInput.onchange=reload;
+          form.querySelector(".team-reload-follow-ups").onclick=reload;
+        }
       }});
   }
   function findEntry(meetingId, entryId){
@@ -599,7 +949,7 @@
       <div class="ws-modal-row"><label>FW owner<input name="fw_owner" required value="${esc(owner)}"></label>
       <label>P<select name="p">${[1,2,3,4,5].map(v=>`<option ${v===3?"selected":""}>${v}</option>`).join("")}</select></label>
       <label>I<select name="i">${[1,2,3,4,5].map(v=>`<option ${v===3?"selected":""}>${v}</option>`).join("")}</select></label>
-      <label>Due<input type="date" name="due"></label></div>
+      <label>Due${dateInput("due","")}</label></div>
       <label>Description<textarea name="description">${esc(f.impact||"")}</textarea></label>
       <p class="cap">Creates a RAID issue and links it to this roadblock.</p>`, async data=>{
         if(!isPrivate()) throw new Error("Enable private mode to edit team records.");
@@ -640,7 +990,7 @@
     el.querySelectorAll("[data-team-tab]").forEach(b=>b.onclick=()=>{ view.tab=b.dataset.teamTab; saveState(); render(); });
     el.querySelectorAll("[data-member]").forEach(b=>b.onclick=()=>{ resetSelection(); view.tab="members"; view.member=b.dataset.member; saveState(); render(); });
     el.querySelectorAll("[data-member-tab]").forEach(b=>b.onclick=()=>{ inlineEdit=null; view.subtab=b.dataset.memberTab; saveState(); render(); });
-    const activeFilterTab=view.subtab==="oneonone"?"log":view.subtab;
+    const activeFilterTab=view.subtab==="oneonone"?"log":view.subtab==="tasks"&&TEAM.items?"items":view.subtab;
     el.querySelectorAll("[data-team-search]").forEach(input=>input.oninput=()=>{
       const tab=input.dataset.teamSearch, caret=input.selectionStart;
       filters[tab].query=input.value;
@@ -660,13 +1010,29 @@
       filters[activeFilterTab][field]=input.checked?[...new Set([...values,input.dataset.value])]:values.filter(x=>x!==input.dataset.value);
       renderKeepingGroup(field);
     });
-    el.querySelectorAll("[data-team-date]").forEach(input=>input.onchange=()=>{
-      filters[activeFilterTab][input.dataset.teamDate]=input.value;
+    el.querySelectorAll("[data-team-open-only]").forEach(input=>input.onchange=()=>{
+      filters[activeFilterTab].openOnly=input.checked;
       render();
+    });
+    el.querySelectorAll("[data-team-date]").forEach(input=>{
+      input.oninput=()=>input.setCustomValidity("");
+      input.onchange=()=>{
+        const iso=window.PortalDates.parse(input.value);
+        if(input.value.trim()&&!iso){
+          input.setCustomValidity("Enter a valid date as dd/mm/yyyy.");
+          input.reportValidity();
+          return;
+        }
+        filters[activeFilterTab][input.dataset.teamDate]=iso;
+      render();
+      };
     });
     el.querySelectorAll("[data-team-clear]").forEach(button=>button.onclick=()=>{
       const tab=button.dataset.teamClear;
-      Object.keys(filters[tab]).forEach(key=>{filters[tab][key]=Array.isArray(filters[tab][key])?[]:"";});
+      Object.keys(filters[tab]).forEach(key=>{
+        const value=filters[tab][key];
+        filters[tab][key]=Array.isArray(value)?[]:typeof value==="boolean"?false:"";
+      });
       if(tab==="log"){view.logTypes=[];saveState();}
       render();
     });
@@ -733,7 +1099,11 @@
         const data={id,revision:row.revision,meeting_date:row.meeting_date,title:row.title,entries};
         if(field.startsWith("entry:")) entries.find(e=>e.entry_id===field.slice(6)).body=value;
         else if(field==="new-notes") entries.push({tag:"notes",body:value,visibility:"private"});
-        else data[field]=value;
+        else if(field.endsWith("_date")){
+          const iso=window.PortalDates.parse(value);
+          if(value.trim()&&!iso) throw new Error("Enter a valid date as dd/mm/yyyy.");
+          data[field]=iso;
+        }else data[field]=value;
         await mutate("meeting-save",data);
         inlineEdit=null;
         await refresh();
@@ -752,16 +1122,37 @@
     if(refreshBtn) refreshBtn.onclick = ()=>refresh();
     const guarded = action => async()=>{ try{ await action(); }catch(err){ alert("Team save failed: "+err.message); } };
     el.querySelectorAll(".team-edit").forEach(b=>b.onclick=guarded(async()=>{
-      if(!isPrivate()) return alert("Enable private mode to edit team records.");
-      if(b.dataset.type==="assignment") return editAssignment(b.dataset.id, b.dataset.rev);
+      if(b.dataset.type==="assignment"){
+        if(!isPrivate()) return alert("Enable private mode to edit team records.");
+        return editAssignment(b.dataset.id, b.dataset.rev);
+      }
       if(b.dataset.type==="meeting") return editMeeting(b.dataset.id, b.dataset.rev);
     }));
+    el.querySelectorAll(".team-delete-meeting").forEach(b=>
+      b.onclick=guarded(()=>deleteMeeting(b.dataset.id,b.dataset.rev)));
     el.querySelectorAll(".team-new-assignment").forEach(b=>b.onclick=guarded(()=>newAssignment(b.dataset.member)));
     el.querySelectorAll(".team-new-meeting").forEach(b=>b.onclick=guarded(()=>newMeeting(b.dataset.member)));
     el.querySelectorAll(".team-promote-raid").forEach(b=>b.onclick=guarded(()=>promoteRoadblock(findEntry(b.dataset.meeting,b.dataset.entry))));
     el.querySelectorAll(".team-item-task").forEach(a=>a.onclick=e=>{
       e.preventDefault();
-      view.subtab="tasks"; filters.tasks.query=a.dataset.task; saveState(); render();
+      view.subtab="tasks";
+      if(TEAM.items){
+        const item=TEAM.items.find(i=>i.assignment_id===a.dataset.task);
+        if(item) view.member=item.member_key;
+        filters.items.query=a.dataset.task;
+      }else filters.tasks.query=a.dataset.task;
+      saveState(); render();
+    });
+    el.querySelectorAll(".team-item-meeting").forEach(b=>b.onclick=()=>{
+      view.member=b.dataset.member; view.subtab="oneonone"; filters.log.query=b.dataset.meeting;
+      saveState(); render();
+    });
+    el.querySelectorAll(".team-edit-item").forEach(b=>b.onclick=guarded(()=>editItem(b.dataset.id)));
+    el.querySelectorAll(".team-item-note").forEach(b=>b.onclick=()=>{
+      const item=(TEAM.items||[]).find(i=>i.item_id===b.dataset.id);
+      formDialog("Add item update",`<label>Update<textarea name="note" required></textarea></label>${visibilitySelect("visibility")}`,
+        async data=>mutate("item-note",{id:item.item_id,revision:item.revision,
+          note:data.get("note"),visibility:data.get("visibility")}));
     });
     el.querySelectorAll(".team-edit-member").forEach(b=>b.onclick=()=>editMember(b.dataset.member));
     el.querySelectorAll(".team-edit-focus").forEach(b=>b.onclick=()=>editFocus(b.dataset.member));

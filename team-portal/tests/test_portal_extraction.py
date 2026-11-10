@@ -30,14 +30,16 @@ class ExtractionTests(unittest.TestCase):
 
     def test_portal_runtime_moved_out_of_tm(self):
         for name in ("cmd_serve", "render_dashboard_html", "start_workspace_job", "apply_task_edit",
+                     "apply_task_edits",
                      "PID_FILE", "ALIGN_JOBS"):
             self.assertTrue(hasattr(portal, name), name)
-            if name not in ("cmd_serve", "apply_task_edit"):
+            if name not in ("cmd_serve", "apply_task_edit", "apply_task_edits"):
                 self.assertFalse(hasattr(tm, name), name)
 
     def test_tm_task_api_present(self):
         for name in ("load", "save", "cmd_add", "cmd_add_review", "edit_task",
-                     "edit_task_fields", "apply_task_edit", "cmd_edit", "cmd_serve", "cmd_dashboard", "STORE"):
+                     "edit_task_fields", "apply_task_edit", "apply_task_edits", "cmd_edit",
+                     "cmd_serve", "cmd_dashboard", "STORE"):
             self.assertTrue(hasattr(tm, name), name)
 
     def test_defaults(self):
@@ -48,6 +50,16 @@ class ExtractionTests(unittest.TestCase):
             Path.home() / ".copilot-private" / "team-portal" / "state")
         self.assertEqual(portal.ASSETS, PORTAL_DIR / "assets")
 
+    def test_dashboard_generated_timestamp_uses_portal_date_format(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "asset_text", return_value=""), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            html = portal.render_dashboard_html([], inline=True)
+        self.assertRegex(html, r"Generated \d{2}/\d{2}/\d{4} \d{2}:\d{2}")
+        self.assertIn('id="task-selectionbar"', html)
+        self.assertIn('id="task-bulk-edit"', html)
+        self.assertIn('id="review-scan"', html)
+
     def test_legacy_cli_delegates(self):
         with patch.object(tm, "_portal") as p:
             p.return_value.cmd_serve.return_value = 0
@@ -57,6 +69,50 @@ class ExtractionTests(unittest.TestCase):
             tm.cmd_dashboard(ns)
             p.return_value.cmd_serve.assert_called_once_with(ns)
             p.return_value.cmd_dashboard.assert_called_once_with(ns)
+
+    def test_operation_banner_disclosure_in_served_and_static_html(self):
+        for inline in (False, True):
+            with self.subTest(inline=inline), \
+                    patch.object(portal.wm, "load", return_value={}), \
+                    patch.object(portal, "asset_text", return_value=""), \
+                    patch.object(portal, "boot_payload", return_value="{}"):
+                html = portal.render_dashboard_html([], inline=inline)
+            self.assertIn('id="align-toggle" type="button"', html)
+            self.assertIn('aria-expanded="true" aria-controls="align-body action-queue"', html)
+            self.assertIn('id="action-queue"', html)
+            self.assertIn('id="action-queue-open"', html)
+            self.assertIn('id="align-close"', html)
+            self.assertIn('<div id="align-body"></div>', html)
+
+    def test_team_notes_disclosure_assets_in_served_and_static_html(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        self.assertIn('class="team-notes-toggle"', static)
+        self.assertIn('.team-notes-row[open] .team-notes-collapse', static)
+        self.assertRegex(served, r'src="/assets/team\.js\?v=\d+"')
+        self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
+
+    def test_team_log_metadata_assets_in_served_and_static_html(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        self.assertIn(".team-session-meta { display:flex; flex-wrap:wrap; gap:12px; }", static)
+        self.assertIn('<input type="text" name="title"', static)
+        self.assertRegex(served, r'src="/assets/team\.js\?v=\d+"')
+        self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
+
+    def test_tracked_items_and_follow_up_assets_are_included(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        for expected in ("function memberItems(", 'mutate("meeting-prepare"',
+                         "Follow up next 1:1", ".team-tracking-fields"):
+            self.assertIn(expected, static)
+        self.assertRegex(served, r'src="/assets/team\.js\?v=\d+"')
 
     def test_legacy_loader_resolves_standalone_portal(self):
         self.assertIs(tm._portal(), portal)

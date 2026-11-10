@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import uuid
 from datetime import date, datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -27,6 +29,12 @@ sys.path.insert(0, str(PORTAL_ROOT.parent / "lib"))
 from private_paths import load_private_json, private_root  # noqa: E402
 
 STATE_DIR = private_root() / "team-portal" / "state"
+_DEPENDENCIES = private_root() / "team-portal" / "python"
+if _DEPENDENCIES.is_dir():
+    sys.path.insert(0, str(_DEPENDENCIES))
+from markdown_it import MarkdownIt  # noqa: E402
+from mdit_py_plugins.tasklists import tasklists_plugin  # noqa: E402
+
 JIRA_SITE = os.environ.get(
     "JIRA_SITE", load_private_json("config/jira.json").get("site", "")).rstrip("/")
 JIRA_BASE = f"{JIRA_SITE}/browse/" if JIRA_SITE else ""
@@ -37,6 +45,7 @@ import tm  # noqa: E402
 
 import wm  # noqa: E402
 import team_api  # noqa: E402
+from action_queue import ActionQueue  # noqa: E402
 
 # bug-monitor owns the HSI bug store. The portal dashboard renders its Bugs
 # section from it; the portal never touches ~/tasks/bugs.json directly.
@@ -108,8 +117,10 @@ __STYLES__
   <div class="ab-head">
     <span id="align-spin" class="ab-spin"></span>
     <b id="align-title">Aligning workspace…</b>
+    <button id="align-toggle" type="button" class="ab-toggle" aria-expanded="true" aria-controls="align-body action-queue">Collapse</button>
     <button id="align-close" class="ab-close" aria-label="Dismiss">&times;</button>
   </div>
+  <div id="action-queue"></div>
   <div id="align-body"></div>
 </div>
 <div class="portal-shell" id="portal-shell">
@@ -140,6 +151,7 @@ __STYLES__
     </div>
   </div>
   <div class="topbar-tools">
+    <button class="refresh" id="action-queue-open" type="button" hidden>Actions</button>
     <div class="clock-chip"><span aria-hidden="true">◷</span><time id="local-clock"></time><small>LOCAL</small></div>
     <div class="refresh-wrap">
       <button class="refresh cmdk-btn" id="cmdk-open" title="Jump to anything (Ctrl/⌘+K)"><span class="ico">⌕</span> Jump <kbd>⌘K</kbd></button>
@@ -322,7 +334,8 @@ __STYLES__
       </div>
     </div>
     <div class="toolbar">
-      <button id="review-scan" class="btn" style="display:none;" title="Re-probe every open review PR through the gh CLI — approvals, comments, change-requests, re-pushes, merges — and update each task's status. No model, no tokens.">↻ Scan reviews</button>
+      <button id="task-bulk-edit" class="btn" style="display:none;" disabled>Edit selected…</button>
+      <button id="review-scan" class="btn" style="display:none;" disabled title="Scan unresolved PRs belonging only to selected active code-review tasks.">↻ Scan selected reviews</button>
       <span class="ro-note" id="review-scan-note" style="display:none;"></span>
       <div class="grp" style="flex-direction:row; align-items:center; gap:8px;">
         <span class="lbl" style="color:var(--muted);font-size:11px;">Columns</span>
@@ -335,6 +348,7 @@ __STYLES__
     </div>
   </div>
 
+  <div id="task-selectionbar" class="task-selectionbar" aria-live="polite"></div>
   <div class="count" id="count"></div>
   <table id="tbl">
     <thead><tr id="head"></tr></thead>
@@ -964,7 +978,7 @@ def render_dashboard_html(tasks: list[dict], inline: bool = False) -> str:
             .replace("__STYLES__", styles)
             .replace("__BOOTDATA__", boot_payload(tasks, wd))
             .replace("__SCRIPTS__", scripts)
-            .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M")))
+            .replace("__GENERATED__", datetime.now().strftime("%d/%m/%Y %H:%M")))
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -977,6 +991,61 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_review_draft(draft: dict) -> str:
+    title = escape(f'{draft["task_id"]} - {draft["repo"]}#{draft["pr_number"]}')
+    content = (MarkdownIt("gfm-like", {"html": False, "linkify": True})
+               .use(tasklists_plugin)
+               .render(draft["content"]))
+    return (
+        '<!doctype html><html lang="en"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>Review draft - {title}</title>'
+        '<style>'
+        ':root{color-scheme:dark;--bg:#090d1a;--panel:#11172a;--border:#28304c;'
+        '--text:#e8e9f5;--muted:#a0a8c5;--accent:#b69aff;--info:#79c5ff}'
+        '*{box-sizing:border-box}'
+        'body{max-width:1000px;margin:0 auto;padding:2rem 1rem;'
+        'font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;'
+        'color:var(--text);background:radial-gradient(ellipse at 70% -12%,'
+        'rgba(112,94,205,.18),transparent 42rem),var(--bg)}'
+        'a{color:var(--info)}'
+        '.review-header{margin:1rem 0 1.5rem}'
+        '.review-header h1{font-size:1.5rem;line-height:1.3}'
+        '.review-meta{color:var(--muted);font-size:.875rem}'
+        '.review-content{overflow-wrap:anywhere;padding:clamp(1rem,4vw,2rem);'
+        'border:1px solid var(--border);border-radius:12px;background:var(--panel)}'
+        '.review-content>:first-child{margin-top:0}'
+        '.review-content>:last-child{margin-bottom:0}'
+        '.review-content h1,.review-content h2,.review-content h3,'
+        '.review-content h4,.review-content h5,.review-content h6{line-height:1.3}'
+        '.review-content pre{overflow:auto;padding:1rem;border:1px solid var(--border);'
+        'border-radius:8px;background:var(--bg)}'
+        '.review-content pre code{padding:0;border:0;background:transparent}'
+        '.review-content :not(pre)>code{padding:.12em .35em;border:1px solid var(--border);'
+        'border-radius:4px;background:var(--bg)}'
+        '.review-content blockquote{margin-left:0;padding:.1rem 1rem;'
+        'border-left:3px solid var(--accent);color:var(--muted)}'
+        '.review-content table{display:block;max-width:100%;overflow-x:auto;'
+        'border-collapse:collapse}'
+        '.review-content th,.review-content td{padding:.4rem .65rem;'
+        'border:1px solid var(--border);text-align:left}'
+        '.review-content th{background:var(--bg)}'
+        '.review-content hr{border:0;border-top:1px solid var(--border)}'
+        '.review-content img{max-width:100%;height:auto}'
+        '.task-list-item{list-style:none}'
+        '.task-list-item-checkbox{margin:0 .45rem 0 -1.15rem}'
+        '@media(max-width:600px){body{padding:1rem .75rem}}'
+        '</style>'
+        f'<body><a href="/#task/{escape(draft["task_id"], quote=True)}">'
+        'Back to review task</a>'
+        f'<header class="review-header"><h1>Review draft: {title}</h1>'
+        '<p class="review-meta">Local draft only - not submitted to GitHub.</p>'
+        f'<p class="review-meta">Saved: {escape(draft["updated_at"])}<br>'
+        f'Head reviewed: <code>{escape(draft["head_sha"])}</code></p></header>'
+        f'<main class="review-content">{content}</main></body></html>'
+    )
+
+
 # --- editing applied by the local server (reuses store rules) ----------------
 
 PID_FILE = STATE_DIR / ".dashboard.pid"
@@ -985,6 +1054,11 @@ PID_FILE = STATE_DIR / ".dashboard.pid"
 def apply_task_edit(ident: str, payload: dict) -> tuple[bool, str]:
     """Delegate task mutations to the task-manager domain owner."""
     return tm.apply_task_edit(ident, payload)
+
+
+def apply_task_edits(edits: list[dict]) -> tuple[bool, str]:
+    """Delegate a revision-checked bulk edit to the task-manager owner."""
+    return tm.apply_task_edits(edits)
 
 
 def apply_workspace_edit(slot: str, payload: dict, *, validated: bool = False) -> tuple[bool, str]:
@@ -1069,6 +1143,45 @@ import threading as _threading  # noqa: E402
 
 ALIGN_JOBS: dict[str, dict] = {}
 ALIGN_LOCK = _threading.Lock()
+ACTION_QUEUE: ActionQueue | None = None
+
+
+def enqueue_action(job: dict) -> str:
+    if ACTION_QUEUE is None:
+        raise RuntimeError("Portal action queue is not available")
+    return ACTION_QUEUE.enqueue(job)
+
+
+def execute_action(job: dict, store_lock=None) -> None:
+    kind = job["kind"]
+    if kind == "workspace-action":
+        return run_workspace_job(job, store_lock)
+    if kind == "align":
+        holder = wm.get_holder(job["slot"])
+        if not holder or holder.get("task_id") != job["task_id"]:
+            raise ValueError("Workspace assignment changed while alignment was queued")
+        return run_workspace_alignment(job, store_lock)
+    if kind == "pr-scan":
+        PR_SCAN_LOCK.acquire()
+        return run_pr_scan(job, job["request"].get("only"))
+    if kind == "review-scan":
+        REVIEW_SCAN_LOCK.acquire()
+        return run_review_scan(job)
+    if kind == "vm-refresh":
+        VM_REFRESH_LOCK.acquire()
+        return run_vm_refresh(job)
+    if kind == "pldm":
+        with PLDM_LOCK:
+            feature = next((f for f in pm.records() if f["id"] == job["feature_id"]), None)
+            if feature is None:
+                raise ValueError("PLDM feature no longer exists")
+            prepared, message = prepare_pldm_job(feature, job["request"])
+            if prepared is None:
+                raise ValueError(message)
+            with ALIGN_LOCK:
+                job.update(prepared)
+            return run_pldm_submit(job)
+    raise ValueError(f"Unknown queued action kind: {kind}")
 # Serialises the PR scan so a double-click can't launch two gh storms.
 PR_SCAN_LOCK = _threading.Lock()
 
@@ -1078,7 +1191,7 @@ PR_CI_LOCK = _threading.Lock()
 # Same for the Jira mirror refresh.
 BUG_SCAN_LOCK = _threading.Lock()
 
-# Serialises the review scan (gh probe of every open review PR).
+# Serialises the review scan (gh probe of selected open review PRs).
 REVIEW_SCAN_LOCK = _threading.Lock()
 
 # the RAID owner (rd.py) does not lock across processes.
@@ -1688,8 +1801,8 @@ def run_pldm_submit(job: dict) -> None:
         upd(held=False)
 
 
-def start_pldm_job(feature: dict, opts: dict) -> tuple[str | None, str]:
-    """Reserve a slot and launch a PLDM submission job. Returns (job_id, message).
+def prepare_pldm_job(feature: dict, opts: dict) -> tuple[dict | None, str]:
+    """Validate and reserve a PLDM workspace at execution time.
 
     ``opts["dry"]`` resolves and validates everything, then reports the plan
     without reserving a slot, touching a checkout or dispatching a build.
@@ -1732,23 +1845,32 @@ def start_pldm_job(feature: dict, opts: dict) -> tuple[str | None, str]:
             return None, msg
         held = True
 
-    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
     job = {
-        "id": jid, "kind": "pldm", "slot": slot, "held": held,
+        "kind": "pldm", "slot": slot, "held": held,
         "feature_id": feature["id"], "feature": feature["name"],
         "display_name": display,
         "image_type": opts.get("image_type") or PLDM_IMAGE_TYPES[0],
         "group": opts.get("group", "default"),
         "timeout": max(1, min(120, int(opts.get("timeout") or 20))),
         "args": opts.get("args", ""),
-        "prs": prs, "status": "running", "phase": "align",
-        "started": tm.NOW, "finished": None, "current": None, "total": 0,
+        "prs": prs, "phase": "align",
+        "current": None, "total": 0,
         "message": "", "repos": [], "run_url": "",
     }
-    with ALIGN_LOCK:
-        ALIGN_JOBS[jid] = job
-    _threading.Thread(target=run_pldm_submit, args=(job,), daemon=True).start()
-    return jid, f"{display} → {slot}"
+    return job, f"{display} → {slot}"
+
+
+def start_pldm_job(feature: dict, opts: dict) -> tuple[str | None, str]:
+    # Validate without reserving or touching a checkout until execution starts.
+    _, message = prepare_pldm_job(feature, {**opts, "dry": True})
+    if opts.get("dry") or not message.startswith("dry run OK"):
+        return None, message
+    jid = enqueue_action({
+        "kind": "pldm", "slot": opts.get("slot") or "auto",
+        "feature_id": feature["id"], "feature": feature["name"],
+        "request": opts, "repos": [], "total": 0, "message": "",
+    })
+    return jid, "PLDM submission queued"
 
 
 PR_SCAN_ICONS = {
@@ -1761,11 +1883,7 @@ PR_SCAN_ICONS = {
 
 
 def run_pr_scan(job: dict, only=None) -> None:
-    """Re-probe every tracked PR, streaming one row per PR into the job.
-
-    Runs on a worker thread and releases PR_SCAN_LOCK, which the request handler
-    acquired, so a second scan can't start while this one is in flight.
-    """
+    """Probe tracked PRs and release the execution-time PR store lock."""
     try:
         _run_pr_scan(job, only)
     finally:
@@ -1813,17 +1931,12 @@ def _run_pr_scan(job: dict, only=None) -> None:
 
 
 def start_pr_scan_job(only=None) -> str:
-    """Register + launch a background PR scan (all features, or ``only`` ids)."""
-    jid = f"prscan-{int(datetime.now().timestamp() * 1000)}"
+    """Queue a PR scan (all features, or ``only`` ids)."""
     job = {
-        "id": jid, "kind": "pr-scan", "slot": "PRs",
-        "status": "running", "started": tm.NOW, "finished": None,
+        "kind": "pr-scan", "slot": "PRs", "request": {"only": only},
         "current": None, "total": 0, "message": "", "repos": [],
     }
-    with ALIGN_LOCK:
-        ALIGN_JOBS[jid] = job
-    _threading.Thread(target=run_pr_scan, args=(job, only), daemon=True).start()
-    return jid
+    return enqueue_action(job)
 
 
 def run_vm_refresh(job: dict) -> None:
@@ -1922,18 +2035,13 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
 
 
 def start_vm_refresh_job(target: str | None = None) -> str:
-    """Register + launch a background VM probe; return its id."""
-    jid = f"vmrefresh-{int(datetime.now().timestamp() * 1000)}"
+    """Queue a VM probe and return its id."""
     job = {
-        "id": jid, "kind": "vm-refresh", "slot": f"VM jobs \u00b7 {target}" if target else "VM jobs",
+        "kind": "vm-refresh", "slot": f"VM jobs \u00b7 {target}" if target else "VM jobs",
         "target": target or "",
-        "status": "running", "started": tm.NOW, "finished": None,
         "current": None, "total": 0, "message": "", "repos": [],
     }
-    with ALIGN_LOCK:
-        ALIGN_JOBS[jid] = job
-    _threading.Thread(target=run_vm_refresh, args=(job,), daemon=True).start()
-    return jid
+    return enqueue_action(job)
 
 
 # gh review state → (banner icon, tone) for each streamed review-scan row.
@@ -1947,10 +2055,10 @@ REVIEW_SCAN_ICONS = {
 
 
 def run_review_scan(job: dict) -> None:
-    """Background worker: gh-probe every open review PR, streaming one row per
-    changed/errored PR into the job so the UI banner can narrate progress.
+    """Background worker: gh-probe selected open review PRs, streaming one row
+    per changed/errored PR into the job so the UI banner can narrate progress.
 
-    Releases REVIEW_SCAN_LOCK (acquired by the request handler) when done.
+    Releases REVIEW_SCAN_LOCK (acquired at execution time) when done.
     """
     def upd(**kw):
         with ALIGN_LOCK:
@@ -1971,7 +2079,8 @@ def run_review_scan(job: dict) -> None:
                   "icon": icon, "tone": tone, "detail": detail})
 
     try:
-        result = tm.portal_review_scan(progress=progress)
+        result = tm.portal_review_scan(
+            progress=progress, task_ids=job.get("task_ids"))
     except Exception as e:
         upd(status="error", finished=tm.NOW, current=None, message=str(e))
         return
@@ -1993,34 +2102,23 @@ def run_review_scan(job: dict) -> None:
         message=" \u00b7 ".join(parts))
 
 
-def start_review_scan_job() -> str:
-    """Register + launch a background review scan; return its id."""
-    jid = f"revscan-{int(datetime.now().timestamp() * 1000)}"
+def start_review_scan_job(task_ids: list[str]) -> str:
+    """Queue a review scan for selected tasks."""
     job = {
-        "id": jid, "kind": "review-scan", "slot": "reviews",
-        "status": "running", "started": tm.NOW, "finished": None,
+        "kind": "review-scan", "slot": "reviews",
+        "task_ids": task_ids,
         "current": None, "total": 0, "scanned": 0, "message": "", "repos": [],
     }
-    with ALIGN_LOCK:
-        ALIGN_JOBS[jid] = job
-    _threading.Thread(target=run_review_scan, args=(job,), daemon=True).start()
-    return jid
+    return enqueue_action(job)
 
 
 def start_alignment_job(task_id: str, slot_root: str, store_lock=None) -> str:
-    """Register + launch a background alignment job; return its id."""
-    jid = f"align-{int(datetime.now().timestamp() * 1000)}"
+    """Queue workspace alignment and return its id."""
     job = {
-        "id": jid, "task_id": task_id, "slot": slot_root, "kind": "align",
-        "status": "running", "started": tm.NOW, "finished": None,
+        "task_id": task_id, "slot": slot_root, "kind": "align",
         "current": None, "total": 0, "message": "", "repos": [],
     }
-    with ALIGN_LOCK:
-        ALIGN_JOBS[jid] = job
-    th = _threading.Thread(
-        target=run_workspace_alignment, args=(job, store_lock), daemon=True)
-    th.start()
-    return jid
+    return enqueue_action(job)
 
 
 def start_reset_job(slot_root: str, store_lock=None) -> str:
@@ -2061,16 +2159,46 @@ def start_workspace_job(action: str, slot: str | None = None,
                  if bool(r["target"]) == (scope == "remote")]
     else:
         raise ValueError("a workspace is required")
-    jid = "workspace-" + uuid.uuid4().hex
+    if action in {"free", "sync"}:
+        payload = payload or {}
+        force = payload.get("force", False)
+        if not isinstance(force, bool):
+            raise ValueError("force must be a boolean")
+        approval_job = payload.get("approval_job")
+        approved = None
+        if force:
+            if not isinstance(approval_job, str) or not approval_job:
+                raise ValueError("an approval job is required for a forced return")
+            with ALIGN_LOCK:
+                previous = ALIGN_JOBS.get(approval_job)
+                if (not previous or previous.get("kind") != "workspace-action"
+                        or previous.get("action") != action
+                        or previous.get("slot") != slots[0]
+                        or previous.get("status") != "approval_required"):
+                    raise ValueError("workspace approval is no longer available")
+                approval = previous.get("approval") or {}
+                approved = approval.get("token")
+                if not isinstance(approved, str) or not re.fullmatch(r"[0-9a-f]{64}", approved):
+                    raise ValueError("invalid workspace approval")
+                if approval.get("blockers"):
+                    raise ValueError("resolve the reported safety blockers before returning")
+        elif approval_job is not None:
+            raise ValueError("workspace approval requires force=true")
+        payload = {"action": action, "force": force, "approved": approved}
+    return enqueue_action({
+        "kind": "workspace-action", "action": action,
+        "slot": slots[0] if slot else f"{scope} workspaces", "current": None,
+        "total": len(slots), "message": "", "repos": [], "steps": [],
+        "request": {"slots": slots, "payload": payload or {}},
+    })
+
+
+def run_workspace_job(job: dict, store_lock=None) -> None:
+    slots = job["request"]["slots"]
+    payload = job["request"]["payload"]
+    action = job["action"]
     with ALIGN_LOCK:
-        if any(s in WORKSPACE_BUSY for s in slots):
-            raise ValueError("a workspace operation is already running")
         WORKSPACE_BUSY.update(slots)
-        job = {"id": jid, "kind": "workspace-action", "action": action,
-               "slot": slot or f"{scope} workspaces", "status": "running",
-               "started": wm.stamp(), "finished": None, "current": None,
-               "total": len(slots), "message": "", "repos": [], "steps": []}
-        ALIGN_JOBS[jid] = job
 
     def step(event: dict, current: str) -> None:
         with ALIGN_LOCK:
@@ -2093,8 +2221,16 @@ def start_workspace_job(action: str, slot: str | None = None,
                 if alignment["status"] == "error":
                     raise ValueError(alignment["message"])
             return wm.workspace_request(current, progress=progress)
+        option = {"free": "portal_free", "sync": "portal_sync"}.get(action)
+        options = ({option: {"approved": payload.get("approved")}} if option else {})
         reading = wm.workspace_request(
-            current, "status" if action == "refresh" else action, progress=progress)
+            current, "status" if action == "refresh" else action, progress=progress,
+            **options)
+        if reading.get("approval_required"):
+            return reading
+        if reading.get("stashes"):
+            with ALIGN_LOCK:
+                job["stashes"] = reading["stashes"]
         if action == "free":
             progress({"step": "release", "label": "Releasing workspace holder"})
             with (store_lock or _threading.Lock()):
@@ -2105,16 +2241,23 @@ def start_workspace_job(action: str, slot: str | None = None,
 
     def worker():
         errors = []
+        approval = None
         try:
             for current in slots:
                 try:
                     with ALIGN_LOCK:
                         job["current"] = wm.record(current)["label"]
                     reading = operate(current)
-                    detail = ("missing" if reading.get("exists") is False else
-                              "clean" if reading.get("clean") else "checked; not at clean baseline")
-                    row = {"name": wm.record(current)["label"], "role": "workspace",
-                           "action": "checked-out", "detail": detail}
+                    approval = reading.get("approval_required")
+                    if approval:
+                        row = {"name": wm.record(current)["label"], "role": "workspace",
+                               "action": "approval-required",
+                               "detail": "Confirmation required; no checkout changes made"}
+                    else:
+                        detail = ("missing" if reading.get("exists") is False else
+                                  "clean" if reading.get("clean") else "checked; not at clean baseline")
+                        row = {"name": wm.record(current)["label"], "role": "workspace",
+                               "action": "checked-out", "detail": detail}
                 except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as e:
                     errors.append(str(e))
                     wm.log_action(current, action, "error", str(e))
@@ -2126,14 +2269,20 @@ def start_workspace_job(action: str, slot: str | None = None,
                     job["repos"].append(row)
             with ALIGN_LOCK:
                 finish_job_steps(job, "done")
-                job.update(status="error" if errors else "done", current=None,
-                           finished=wm.stamp(), message="; ".join(errors) or f"{action} complete")
+                if approval and not errors:
+                    job.update(status="approval_required", approval=approval, current=None,
+                               finished=wm.stamp(),
+                               message=("Confirmation required; Sync was blocked by workspace issues"
+                                        if action == "sync" else
+                                        "Confirmation required; the workspace has not been returned or freed"))
+                else:
+                    job.update(status="error" if errors else "done", current=None,
+                               finished=wm.stamp(), message="; ".join(errors) or f"{action} complete")
         finally:
             with ALIGN_LOCK:
                 WORKSPACE_BUSY.difference_update(slots)
 
-    _threading.Thread(target=worker, daemon=True).start()
-    return jid
+    worker()
 
 
 JOB_STEP_ERRORS_MAX = 100
@@ -2212,6 +2361,7 @@ def _server_running() -> int | None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    global ACTION_QUEUE
     import signal
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2249,12 +2399,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.send_header("Content-Length", str(len(data)))
             if self.path.startswith("/api/team") or self.path in ("/", "/index.html"):
                 self.send_header("Cache-Control", "no-store")
+            if self.path.startswith("/review-drafts/"):
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; style-src 'unsafe-inline'; "
+                                 "frame-ancestors 'none'; base-uri 'none'")
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
             if self.path == "/health":
                 return self._send(200, "ok", "text/plain")
+            if self.path.startswith("/review-drafts/"):
+                match = re.fullmatch(r"/review-drafts/(T-[0-9]+)/([0-9a-f]{32})",
+                                     urlparse(self.path).path)
+                if not match:
+                    return self._send(404, json.dumps({"error": "unknown review draft"}))
+                try:
+                    with lock:
+                        draft = tm.read_review_draft(*match.groups())
+                    return self._send(200, render_review_draft(draft), "text/html; charset=utf-8")
+                except FileNotFoundError:
+                    return self._send(404, json.dumps({"error": "Saved draft file is missing"}))
+                except ValueError as exc:
+                    return self._send(400, json.dumps({"error": str(exc)}))
+                except OSError as exc:
+                    print(f"[portal/review-draft] read failed: {exc}", file=sys.stderr)
+                    return self._send(500, json.dumps({"error": "Draft could not be read; check service logs"}))
             if self.path.startswith("/assets/"):
                 name = self.path[len("/assets/"):].split("?")[0]
                 ctype = ASSET_TYPES.get(Path(name).suffix)
@@ -2329,11 +2501,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, json.dumps(pldmq_payload(), ensure_ascii=False))
             if self.path == "/api/vm-jobs":
                 return self._send(200, json.dumps(vmlog_payload(), ensure_ascii=False))
+            if self.path == "/api/actions":
+                if ACTION_QUEUE is None:
+                    return self._send(503, json.dumps({"error": "Action queue unavailable"}))
+                try:
+                    snapshot = ACTION_QUEUE.snapshot()
+                except (sqlite3.Error, OSError) as e:
+                    return self._send(503, json.dumps({"error": f"Action queue storage unavailable: {e}"}))
+                return self._send(503 if snapshot.get("error") else 200,
+                                  json.dumps(snapshot, ensure_ascii=False))
             if self.path.startswith("/api/align/"):
                 jid = self.path[len("/api/align/"):]
                 with ALIGN_LOCK:
                     job = ALIGN_JOBS.get(jid)
-                    body = json.dumps(job, ensure_ascii=False) if job else None
+                    body = json.dumps({k: v for k, v in job.items() if k != "request"},
+                                      ensure_ascii=False) if job else None
+                if job and job["status"] == "queued" and ACTION_QUEUE is not None:
+                    queued = next((j for j in ACTION_QUEUE.snapshot()["actions"]
+                                   if j["id"] == jid), None)
+                    if queued:
+                        body = json.dumps(queued, ensure_ascii=False)
                 if body is None:
                     return self._send(404, json.dumps({"error": "unknown job"}))
                 return self._send(200, body)
@@ -2345,7 +2532,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if self.path == "/api/team":
                 origin = self.headers.get("Origin")
                 expected = f"http://{self.headers.get('Host')}"
-                if self.headers.get("X-Team-Private") != "1" or (origin and origin != expected):
+                if origin and origin != expected:
                     return self._send(403, json.dumps({"error": "Enable private mode to edit team records"}))
                 try:
                     size = int(self.headers.get("Content-Length") or 0)
@@ -2354,6 +2541,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     data = json.loads(self.rfile.read(size))
                     if not isinstance(data, dict) or not isinstance(data.get("action"), str):
                         raise ValueError("action and data are required")
+                    if (self.headers.get("X-Team-Private") != "1"
+                            and data["action"] != "meeting-shared-save"):
+                        return self._send(403, json.dumps({
+                            "error": "Enable private mode to edit team records"
+                        }))
                     if data["action"] == "activity-scan":
                         result = team_api.mutate(data["action"], data.get("data"))
                     else:
@@ -2383,12 +2575,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         return self._send(400, json.dumps({"error": "feature_ids must be a list of ids"}))
                     if only is not None and not only:
                         return self._send(400, json.dumps({"error": "no features selected"}))
-                if not PR_SCAN_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps({"error": "a PR scan is already running"}))
                 try:
                     jid = start_pr_scan_job(only)
                 except Exception as e:
-                    PR_SCAN_LOCK.release()
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "job": jid}))
 
@@ -2422,21 +2611,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
 
-            # The review scan probes every open review PR through gh (bodyless,
-            # slow-ish). Runs as a background job that streams progress into
-            # ALIGN_JOBS so the UI can show a live banner; the worker mutates the
-            # task store and releases REVIEW_SCAN_LOCK when done.
-            if self.path == "/api/review-scan":
-                if not REVIEW_SCAN_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps(
-                        {"error": "a review scan is already running"}))
-                try:
-                    jid = start_review_scan_job()
-                except Exception as e:
-                    REVIEW_SCAN_LOCK.release()
-                    return self._send(500, json.dumps({"error": str(e)}))
-                return self._send(200, json.dumps({"ok": True, "align_job": jid}))
-
             # The PLDM queue scan follows every active tracked job through the
             # gh CLI (bodyless, slow-ish, zero tokens). It returns the refreshed
             # payload directly so the section can re-render in place.
@@ -2458,6 +2632,39 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._send(400, json.dumps({"error": "invalid JSON"}))
+            if not isinstance(payload, dict):
+                return self._send(400, json.dumps({"error": "request body must be an object"}))
+
+            # Only selected task IDs may enter a review scan. The task-manager
+            # owner applies its own eligibility and unresolved-PR rules.
+            if self.path == "/api/review-scan":
+                task_ids = payload.get("task_ids")
+                if (not isinstance(task_ids, list) or not task_ids
+                        or any(not isinstance(ident, str) or not ident for ident in task_ids)
+                        or len(set(task_ids)) != len(task_ids)):
+                    return self._send(400, json.dumps(
+                        {"error": "select one or more unique task IDs to scan"}))
+                try:
+                    jid = start_review_scan_job(task_ids)
+                except Exception as e:
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, "align_job": jid}))
+
+            if self.path == "/api/tasks/bulk-edit":
+                edits = payload.get("edits")
+                with lock:
+                    try:
+                        ok, msg = apply_task_edits(edits)
+                    except ValueError as e:
+                        return self._send(400, json.dumps({"error": str(e)}))
+                    if not ok:
+                        status = 409 if "revision conflict" in msg.lower() else 400
+                        return self._send(status, json.dumps({"error": msg}))
+                    wd = wm.load()
+                    tasks = _annotate_tasks(tm.load()["tasks"], wd)
+                return self._send(200, json.dumps(
+                    {"ok": True, "message": msg, "tasks": tasks,
+                     "workspaces": ws_ui_payload(wd)}, ensure_ascii=False))
 
             if self.path == "/api/ws-check-vm":
                 try:
@@ -2499,15 +2706,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
 
-            # Manual `octl ws sync`, independent of occupy/free — usable on an
-            # occupied or a free slot alike.
+            # Sync uses the owner's occupancy and mirror guards.
             if self.path.startswith("/api/ws-sync/"):
                 slot = unquote(self.path[len("/api/ws-sync/"):])
                 root = wm.normalize_slot(slot)
                 if not root:
                     return self._send(400, json.dumps({"error": f"invalid slot: {slot!r}"}))
                 try:
-                    jid = start_workspace_job("sync", root, store_lock=lock)
+                    jid = start_workspace_job("sync", root, payload, store_lock=lock)
                 except ValueError as e:
                     return self._send(409, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "align_job": jid}))
@@ -2526,12 +2732,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 only = str(payload.get("target") or "") or None
                 if only and not vd.is_target(only):
                     return self._send(400, json.dumps({"error": f"unknown target: {only}"}))
-                if not VM_REFRESH_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps({"error": "a VM refresh is already running"}))
                 try:
                     jid = start_vm_refresh_job(only)
                 except Exception as e:
-                    VM_REFRESH_LOCK.release()
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "job": jid}))
 
@@ -2595,8 +2798,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
             if self.path.startswith("/api/ws-untrack/"):
                 slot = unquote(self.path[len("/api/ws-untrack/"):])
+                force = payload.get("force", False)
+                if not isinstance(force, bool):
+                    return self._send(400, json.dumps({"error": "force must be a boolean"}))
                 try:
-                    ok, msg = wm.untrack(slot)
+                    ok, msg = wm.untrack(slot, force=force)
                 except ValueError as e:
                     return self._send(409, json.dumps({"error": str(e)}))
                 if not ok:
@@ -2777,6 +2983,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     PID_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     httpd = Server(("127.0.0.1", args.port), Handler)
+    ACTION_QUEUE = ActionQueue(
+        STATE_DIR / "action-queue.db",
+        lambda job: execute_action(job, lock), ALIGN_JOBS, ALIGN_LOCK)
+    ACTION_QUEUE.start()
     PID_FILE.write_text(str(os.getpid()))
 
     # Run the request loop in a background thread so the main thread can call
@@ -2797,6 +3007,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        ACTION_QUEUE.stop()
         httpd.shutdown()
         httpd.server_close()
         PID_FILE.unlink(missing_ok=True)

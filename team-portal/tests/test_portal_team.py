@@ -74,6 +74,49 @@ class TeamApiTests(unittest.TestCase):
         self.assertEqual(body, {"result": {"ok": True}})
         mutate.assert_called_once_with("member-set", {"member_key": "akshay"})
 
+    def test_tracking_and_preparation_actions_require_private_mode(self):
+        for action in ("meeting-prepare", "item-set", "item-note"):
+            with self.subTest(action=action):
+                payload = {"action": action, "data": {"id": "item-1", "revision": "r1"}}
+                with patch.object(portal.team_api, "mutate", return_value={"ok": True}) as mutate:
+                    handler = self._handler("/api/team", body=payload, headers={"Host": "127.0.0.1:8787"})
+                    self.assertEqual(handler.do_POST()[0], 403)
+                    mutate.assert_not_called()
+                    handler = self._handler("/api/team", body=payload, headers={
+                        "Host": "127.0.0.1:8787", "X-Team-Private": "1",
+                    })
+                    self.assertEqual(handler.do_POST()[0], 200)
+                    mutate.assert_called_once_with(action, payload["data"])
+
+    def test_meeting_delete_requires_private_mode_and_forwards_revision(self):
+        payload = {"action": "meeting-delete", "data": {"id": "m1", "revision": "r1"}}
+        with patch.object(portal.team_api, "mutate", return_value={"ok": True}) as mutate:
+            handler = self._handler("/api/team", body=payload, headers={"Host": "127.0.0.1:8787"})
+            status, body = handler.do_POST()
+            self.assertEqual(status, 403)
+            mutate.assert_not_called()
+
+            handler = self._handler("/api/team", body=payload, headers={
+                "X-Team-Private": "1", "Host": "127.0.0.1:8787"})
+            status, body = handler.do_POST()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"result": {"ok": True}})
+        mutate.assert_called_once_with("meeting-delete", {"id": "m1", "revision": "r1"})
+
+    def test_team_post_allows_only_scoped_shared_log_edit_without_private_header(self):
+        payload = {"action": "meeting-shared-save", "data": {"id": "m1"}}
+        handler = self._handler("/api/team", body=payload, headers={"Host": "127.0.0.1:8787"})
+        with patch.object(portal.team_api, "mutate", return_value={"ok": True}) as mutate:
+            status, body = handler.do_POST()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"result": {"ok": True}})
+        mutate.assert_called_once_with("meeting-shared-save", {"id": "m1"})
+        handler = self._handler("/api/team", body=payload, headers={
+            "Host": "127.0.0.1:8787", "Origin": "https://other.test"})
+        with patch.object(portal.team_api, "mutate") as mutate:
+            self.assertEqual(handler.do_POST()[0], 403)
+            mutate.assert_not_called()
+
     def test_bulk_requires_private_and_same_origin_and_reports_conflicts(self):
         command = {"action": "bulk-set", "data": {
             "entity_type": "assignment", "member_key": "test", "items": [

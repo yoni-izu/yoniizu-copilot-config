@@ -16,6 +16,7 @@ NFS or share them between machines without a supported database service.
 | Local PLDM tracking | `pldm-job-queue/pjq.py` | `~/tasks/pldm.db` |
 | Delegation observations/history | `vm-delegate/vd.py` | `~/tasks/delegation.db` |
 | Website maintenance actions | `../team-portal/maintenance.py` | `~/.copilot-private/team-portal/state/portal-maintenance.db` |
+| Portal action scheduling | `../team-portal/action_queue.py`, `portal.py` | `~/.copilot-private/team-portal/state/action-queue.db` |
 
 Paths in the API column are relative to `~/.copilot/skills/`.
 Use the owning skill's supported CLI/API; never directly mutate SQLite.
@@ -50,10 +51,25 @@ workspace, feature, bug and job IDs. Audit mutations transactionally; report
 stale/conflicting edits explicitly instead of overwriting intervening changes.
 Across databases, use stable typed references, not cross-file foreign keys.
 
+Incoming review PR entries may reference private Markdown draft documents using
+task-owner attachment IDs and metadata. `tm.py review-draft` registers them;
+`tm.read_review_draft` is the portal's only document resolver. Draft bodies remain
+under the private `skills/pr-review/drafts/` directory, not in portal storage or
+tracked skills. The portal serves only registered attachments by task/opaque ID.
+
 Physical workspace/job operations cannot be rolled back by a SQL transaction.
 Record outcomes, preserve holds on failure, and make interrupted actions
 recoverable. Portal locks coordinate HTTP jobs; they do not replace owner
 storage concurrency control for independent CLI processes.
+
+The portal's action queue owns execution order and job readings, not domain
+records. A single worker executes FIFO descriptors through the existing owner
+APIs. Submission is durable before acknowledgement. Pending descriptors resume
+after a restart; an interrupted running action is marked failed, never replayed
+automatically, because its external side effects may already have occurred.
+Domain locks and checkout guards are acquired/rechecked at execution, not while
+waiting. Inline mutations and the automatic VM watchdog retain their existing
+owner locks and are not part of this user-action FIFO.
 
 Imports must be backed up, repeat-safe and verified against their source.
 Common import backups live under `~/tasks/migration-backups/<database>/`.
