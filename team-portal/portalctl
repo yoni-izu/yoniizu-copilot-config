@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+service=task-dashboard.service
+url=http://127.0.0.1:8787
+
+usage() {
+    echo "Usage: portal {start|stop|restart|status|logs}"
+}
+
+manager_ready() {
+    if ! systemctl --user show-environment >/dev/null; then
+        echo "portal: cannot reach the systemd user manager." >&2
+        echo "Inspect: systemctl status user@$(id -u).service --no-pager" >&2
+        echo "If failed, restore it: sudo systemctl start user@$(id -u).service" >&2
+        return 1
+    fi
+}
+
+wait_ready() {
+    local attempt body
+    for ((attempt=0; attempt<30; attempt++)); do
+        if systemctl --user is-active --quiet "$service"; then
+            if body=$(curl --noproxy '*' --fail --silent --show-error --max-time 2 "$url/health"); then
+                if [[ "$body" == "ok" ]]; then
+                    echo "portal: ready at $url"
+                    return 0
+                fi
+                echo "portal: unexpected health response" >&2
+            fi
+        fi
+        sleep 1
+    done
+    echo "portal: readiness timed out; inspect 'portal logs'." >&2
+    systemctl --user status "$service" --no-pager --full >&2 || return 1
+    return 1
+}
+
+if [[ $# != 1 ]]; then
+    usage >&2
+    exit 2
+fi
+case "$1" in
+    -h|--help|help) usage ;;
+    start|restart)
+        manager_ready
+        systemctl --user "$1" "$service"
+        wait_ready
+        ;;
+    stop)
+        manager_ready
+        systemctl --user stop "$service"
+        echo "portal: stopped"
+        ;;
+    status)
+        manager_ready
+        systemctl --user status "$service" --no-pager --full
+        body=$(curl --noproxy '*' --fail --silent --show-error --max-time 2 "$url/health")
+        if [[ "$body" != "ok" ]]; then
+            echo "portal: unexpected health response" >&2
+            exit 1
+        fi
+        echo "portal: ready at $url"
+        ;;
+    logs)
+        exec journalctl --user -u "$service" -n 50 --no-pager
+        ;;
+    *) usage >&2; exit 2 ;;
+esac

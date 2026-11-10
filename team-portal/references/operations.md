@@ -2,6 +2,33 @@
 
 ## Entry points
 
+Install the server-control command once (do not overwrite an existing command):
+
+```bash
+chmod +x ~/.copilot/team-portal/portalctl
+ln -s ~/.copilot/team-portal/portalctl ~/bin/portal
+portal restart
+portal status
+portal logs
+portal stop
+portal start
+```
+
+`portal` controls the existing `task-dashboard.service`; it never launches a
+second unmanaged server. Start/restart wait for an active service and an exact
+`ok` health response, returning nonzero on failure. Status checks both service
+state and HTTP health. Logs shows the last 50 journal entries without a pager.
+The readiness loop makes up to 30 attempts with a two-second HTTP timeout
+and a one-second interval. The command targets the unit's port 8787.
+
+If the user manager is unavailable, the command prints recovery instructions.
+Inspect `systemctl status user@$(id -u).service --no-pager`; if it has failed,
+run `sudo systemctl start user@$(id -u).service`, then `portal restart`.
+Restoring the user manager may start other enabled user services; it is an
+explicit operator action, never an automatic privileged fallback.
+
+Low-level entry points (do not start directly while the managed service runs):
+
 ```bash
 rtk proxy python3 ~/.copilot/team-portal/portal.py serve --status
 rtk proxy python3 ~/.copilot/team-portal/portal.py serve --port 8787
@@ -30,8 +57,56 @@ Python/owner-module edits require `systemctl --user restart task-dashboard`.
 CSS/JS are loaded from disk with cache-busting; reload the page for asset-only
 changes. Verify readiness and check logs if startup fails. Do not mask failures
 with an empty dataset or claim a successful deploy from an accepted job alone.
+Portal Python dependencies are listed in `team-portal/requirements.txt`; install
+them into the portal's private runtime directory with
+`python3 -m pip install --target ~/.copilot-private/team-portal/python -r ~/.copilot/team-portal/requirements.txt`.
+
+## Action queue recovery
+
+User-initiated progress jobs are durably scheduled in
+`~/.copilot-private/team-portal/state/action-queue.db`. The managed portal is
+the only queue worker; do not run a second portal process against that store.
+The **Actions** button and read-only `GET /api/actions` show pending/running
+work and the latest 20 results. The database retains older results.
+
+Before deploying, check that no action is running. Stop/restart retains queued
+work, which resumes FIFO. A running action interrupted by restart is marked
+failed on startup and is never automatically retried. Inspect the affected
+owner's status/history and external system before resubmitting; a failed action
+may already have performed side effects. Do not repair a queue by editing SQL
+or deleting its database. Queue infrastructure/storage failures are logged and
+reported in the API/UI, and stop accepting new submissions until repaired.
+Tests use temporary queue databases and mock all owner/external operations:
+
+```bash
+rtk proxy python3 -m unittest discover \
+  -s ~/.copilot/team-portal/tests -p 'test_action_queue.py'
+```
+
+An `approval_required` workspace return is a completed preflight, not a
+successful free. Reopen it from **Actions** to review and confirm; it does not
+occupy the worker while awaiting a decision. A queued approved return rechecks
+the workspace snapshot and asks again if a non-clean checkout changed.
+
+The same approval flow supports **Force sync** for free, independent
+workspaces whose Sync is blocked by checkout issues. It never overrides
+occupancy or mirror guards, and it does not release a hold or mirror.
+
+An approved return saves staged, unstaged, and untracked changes in named Git
+stashes. The action result and workspace log list each repository, original
+branch, and stash commit ID, including on partial failures. After returning to
+the original branch, recover a particular stash deliberately with
+`rtk proxy git -C <repo> stash apply --index <stash-id>`; inspect
+`rtk proxy git -C <repo> stash list` if an interrupted operation did not
+finish recording its result. Do not automatically pop or discard the stash.
 
 ## Validation
+
+Control-command tests use mocked systemd/HTTP commands and never touch live services:
+
+```bash
+bash ~/.copilot/team-portal/tests/test_portalctl.sh
+```
 
 Use the smallest relevant tests, with temporary paths/mocked external calls:
 
@@ -50,6 +125,22 @@ After deployment, read `/health` and the affected read-only API endpoints,
 then check the actual page with browser tools. Verify counts and representative
 fields against owner APIs without exposing personal content in chat.
 Do not click refresh/scan/action buttons during a read-only smoke test.
+
+## Remote workspace SSH authentication
+
+Remote workspace operations resolve a key-bearing SSH agent through
+`vm-delegate/vd.py` before each `mctl workspace` invocation, including the
+progress-streaming path. They revalidate rather than reuse the VM-jobs probe
+cache, so an empty or replaced service-inherited agent can be bypassed without
+restarting the portal or importing a login-specific socket into systemd.
+Local workspace operations retain their inherited environment.
+
+This does not load keys or provision credentials. If no agent holds identities,
+SSH may still use its configured identity files; a failed SSH connection includes
+the missing-agent diagnostic and retains the previous successful workspace
+reading. Load the authorized key into an agent and retry. A loaded identity is
+not proof that the target accepts it, and failed operations are never
+automatically replayed.
 
 ## Migration/cutover
 
