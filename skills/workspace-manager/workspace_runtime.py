@@ -135,7 +135,7 @@ def octl_progress(label):
 
 # Run once per repository through wip forall, never through a second repo loop.
 REPO_WORKER = r'''
-import json, os, pathlib, subprocess, sys
+import hashlib, json, os, pathlib, stat, subprocess, sys
 data=json.loads(sys.argv[1])
 p=str(pathlib.Path.cwd().resolve())
 def git(*args, optional=False):
@@ -143,6 +143,51 @@ def git(*args, optional=False):
     if r.returncode and not optional:
         raise RuntimeError((r.stderr or r.stdout).strip())
     return r.stdout.strip() if not r.returncode else None
+def git_bytes(*args):
+    r=subprocess.run(["git",*args],capture_output=True,timeout=180)
+    if r.returncode:
+        raise RuntimeError(os.fsdecode(r.stderr or r.stdout).strip())
+    return r.stdout
+def working_digest(status):
+    h=hashlib.sha256(status.encode())
+    if not status:
+        return h.hexdigest()
+    h.update(git_bytes("diff","--cached","--raw","-z","--no-ext-diff","--no-abbrev"))
+    changed=set(git_bytes("diff","--name-only","-z","--no-ext-diff").split(b"\0"))-{b""}
+    untracked=set(git_bytes("ls-files","--others","--exclude-standard","-z").split(b"\0"))-{b""}
+    for name in sorted(changed|untracked):
+        h.update(name+b"\0")
+        filename=os.fsdecode(name)
+        try:
+            before=os.lstat(filename)
+        except FileNotFoundError:
+            if name in untracked:
+                raise RuntimeError("untracked file changed during inspection: "+filename)
+            h.update(b"missing")
+            continue
+        h.update(str(before.st_mode).encode()+b"\0")
+        file_hash=hashlib.sha256()
+        if stat.S_ISLNK(before.st_mode):
+            file_hash.update(os.fsencode(os.readlink(filename)))
+            after=os.lstat(filename)
+        elif stat.S_ISREG(before.st_mode):
+            fd=os.open(filename,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+            with os.fdopen(fd,"rb") as f:
+                opened=os.fstat(f.fileno())
+                if (before.st_dev,before.st_ino)!=(opened.st_dev,opened.st_ino):
+                    raise RuntimeError("file changed during inspection: "+filename)
+                for chunk in iter(lambda:f.read(1024*1024),b""):
+                    file_hash.update(chunk)
+                after=os.fstat(f.fileno())
+        else:
+            raise RuntimeError("cannot safely stash a nested repository or special file: "+filename)
+        final=os.lstat(filename)
+        identity=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+        if identity(before)!=identity(after) or identity(before)!=identity(final):
+            raise RuntimeError("file changed during inspection: "+filename)
+        h.update(file_hash.digest())
+    return h.hexdigest()
+stash=None
 try:
     spec=data["repos"].get(p)
     if spec is None:
@@ -152,12 +197,18 @@ try:
     rev=spec["revision"]
     branch=git("symbolic-ref","--quiet","--short","HEAD",optional=True)
     head=git("rev-parse","HEAD")
-    dirty=bool(git("status","--porcelain","--untracked-files=normal"))
+    status=git("status","--porcelain","--untracked-files=all")
+    dirty=bool(status)
+    status_digest=working_digest(status)
     ref=git("rev-parse","--verify","refs/remotes/origin/"+rev+"^{commit}",optional=True)
     ref=ref or git("rev-parse","--verify",rev+"^{commit}",optional=True)
     baseline=(branch==rev) if branch else bool(ref and head==ref)
     current=git("rev-parse","--verify","refs/remotes/origin/"+branch+"^{commit}",optional=True) if branch else ref
     ahead=git("rev-list",current+"..HEAD","--count") if current else None
+    target=spec.get("target") or rev
+    target_ref=git("rev-parse","--verify","refs/heads/"+target+"^{commit}",optional=True)
+    target_remote=git("rev-parse","--verify","refs/remotes/origin/"+target+"^{commit}",optional=True)
+    target_ahead=git("rev-list",target_remote+".."+target_ref,"--count") if target_ref and target_remote else None
     safe=not dirty and ahead=="0"
     reasons=[]
     if dirty: reasons.append("uncommitted or untracked changes")
@@ -165,26 +216,53 @@ try:
     elif ahead!="0": reasons.append(ahead+" local-only commit(s)")
     if not baseline: reasons.append("on "+(branch or head[:12])+", expected "+rev)
     action=data["action"]
-    if action!="status":
-        if not safe: raise RuntimeError("; ".join(reasons))
-        target=spec.get("target") or rev
+    state={"revision":rev,"branch":branch,"head":head,"status_digest":status_digest,
+           "current_ref":current,"target_ref":target_ref,"target_remote":target_remote}
+    if action=="stash":
+        if spec.get("expected") != state:
+            raise RuntimeError("repository changed after approval; review it again")
+        if dirty:
+            previous=git("rev-parse","--verify","refs/stash",optional=True)
+            git("stash","push","--include-untracked","--message",
+                "team-portal return "+(branch or "detached")+" "+head[:12])
+            saved=git("rev-parse","--verify","refs/stash",optional=True)
+            if not saved or saved==previous:
+                raise RuntimeError("git did not create a stash for the uncommitted changes")
+            stash={"path":p,"branch":branch,"head":head,"oid":saved}
+            if git("status","--porcelain","--untracked-files=all"):
+                raise RuntimeError("working tree remains dirty after stashing; check submodules")
+    elif action!="status":
+        if action=="force-update":
+            if dirty: raise RuntimeError("working tree changed after stashing")
+            if ahead!="0" and (not branch or branch==target):
+                raise RuntimeError("local commits on the target or detached HEAD cannot be safely returned")
+        elif not safe:
+            raise RuntimeError("; ".join(reasons))
         git("fetch","origin")
         remote="refs/remotes/origin/"+target
         if git("rev-parse","--verify",remote+"^{commit}",optional=True):
-            if git("show-ref","--verify","refs/heads/"+target,optional=True) is None:
-                git("checkout","-b",target,"--track","origin/"+target)
-            else: git("checkout",target)
-            git("merge","--ff-only",remote)
+            local_target=git("rev-parse","--verify","refs/heads/"+target+"^{commit}",optional=True)
+            if local_target and git("rev-list",remote+".."+local_target,"--count")!="0":
+                raise RuntimeError("target branch "+target+" has local-only commits")
+            if not local_target:
+                git("checkout","--no-overwrite-ignore","-b",target,"--track","origin/"+target)
+            else: git("checkout","--no-overwrite-ignore",target)
+            git("merge","--ff-only","--no-overwrite-ignore",remote)
         else:
             git("fetch","origin",target)
-            git("checkout","--detach","FETCH_HEAD")
+            git("checkout","--no-overwrite-ignore","--detach","FETCH_HEAD")
+        if git("status","--porcelain","--untracked-files=all"):
+            raise RuntimeError("working tree changed during checkout; refusing to sync")
         branch=git("symbolic-ref","--quiet","--short","HEAD",optional=True)
         head=git("rev-parse","HEAD")
-    result={"path":p,"revision":rev,"branch":branch,"head":head,"dirty":dirty,
+    result={"path":p,**state,"revision":rev,"branch":branch,"head":head,"dirty":dirty,
             "remote":git("remote","get-url","origin",optional=True),
-            "baseline":baseline,"safe":safe,"clean":safe and baseline,"reasons":reasons}
+            "baseline":baseline,"safe":safe,"clean":safe and baseline,"reasons":reasons,
+            "ahead":ahead,"target_ahead":target_ahead}
 except Exception as e:
     result={"path":p,"error":str(e),"clean":False,"safe":False,"reasons":[str(e)]}
+if stash:
+    result["stash"]=stash
 print("WS_RESULT:"+json.dumps(result))
 '''
 
@@ -243,7 +321,7 @@ def manifest_repos(root, revision):
     return out
 
 
-def repo_batch(root, repos, action="status", step=None, label=None):
+def repo_batch(root, repos, action="status", step=None, label=None, on_result=None):
     wip = shutil.which("wip") or str(Path.home() / "bin/wip")
     # wip scan writes a shared state file in the slot; serialize sibling roots.
     lockdir = root.parent / ".wip"
@@ -264,7 +342,8 @@ def repo_batch(root, repos, action="status", step=None, label=None):
                 base64.b64encode(REPO_WORKER.encode()).decode()) + "))"
             command = shlex.join(["python3", "-c", code, payload])
             output = run([wip, "forall", "ws", command], root, 900,
-                         repo_progress(root, len(repos), step, label) if step else None)
+                         repo_progress(root, len(repos), step, label, on_result)
+                         if step or on_result else None)
         finally:
             if scanned is not None and statefile.read_bytes() != scanned:
                 raise ValueError("WIP state changed concurrently; newer state preserved")
@@ -289,7 +368,7 @@ def repo_batch(root, repos, action="status", step=None, label=None):
     return results
 
 
-def repo_progress(root, total, step, label):
+def repo_progress(root, total, step, label, on_result=None):
     """Per-repository progress from wip forall's '== ws:path ==' headers and WS_RESULT lines."""
     done = [0]
 
@@ -299,11 +378,23 @@ def repo_progress(root, total, step, label):
                      current=line[3:-3].split(":", 1)[-1])
         elif line.startswith("WS_RESULT:"):
             row = json.loads(line[len("WS_RESULT:"):])
+            if on_result:
+                on_result(row)
             done[0] += 1
             progress(step, label, done=done[0], total=total,
                      current=os.path.relpath(row.get("path", ""), root),
-                     error=row.get("error"))
+                     error=row.get("error"),
+                     detail=("Saved stash " + row["stash"]["oid"] if row.get("stash") else ""))
     return on_line
+
+
+def repo_single(path, spec, action="status"):
+    payload = json.dumps({"repos": {str(path.resolve()): spec}, "action": action})
+    output = run(["python3", "-c", REPO_WORKER, payload], path)
+    lines = [line for line in output.splitlines() if line.startswith("WS_RESULT:")]
+    if len(lines) != 1:
+        raise ValueError(f"invalid repository response: {path}")
+    return json.loads(lines[0][len("WS_RESULT:"):])
 
 
 def inspect(path, revision, step=None, label=None):
@@ -321,14 +412,101 @@ def inspect(path, revision, step=None, label=None):
         rows.extend(repo_batch(root, repos, "status", step, label))
         manifests = root / ".repo/manifests"
         if str(manifests.resolve()) not in repos:
-            payload = json.dumps({"repos": {str(manifests.resolve()): {"revision": "main"}},
-                                  "action": "status"})
-            output = run(["python3", "-c", REPO_WORKER, payload], manifests)
-            rows.append(json.loads(output.split("WS_RESULT:", 1)[1]))
+            rows.append(repo_single(manifests, {"revision": "main"}))
     return {"exists": True, "checked": now(), "repos": rows,
             "clean": all(r["clean"] for r in rows),
             "safe": all(r["safe"] for r in rows),
             "reasons": [f"{r['path']}: {why}" for r in rows for why in r["reasons"]]}
+
+
+RETURN_STATE_FIELDS = ("revision", "branch", "head", "status_digest",
+                       "current_ref", "target_ref", "target_remote")
+
+
+def return_state(row):
+    return {key: row.get(key) for key in RETURN_STATE_FIELDS}
+
+
+def return_token(wid, path, revision, reading, mirror):
+    state = {"id": wid, "path": str(path), "revision": revision, "mirror": mirror,
+             "repos": [{"path": row["path"], **return_state(row)}
+                       for row in sorted(reading["repos"], key=lambda item: item["path"])]}
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def return_blockers(reading):
+    blockers = []
+    for row in reading["repos"]:
+        prefix = row["path"] + ": "
+        if row.get("error"):
+            blockers.append(prefix + row["error"])
+        elif row.get("ahead") != "0" and (not row.get("branch")
+                                           or row["branch"] == row["revision"]):
+            blockers.append(prefix + "local commits on the target branch or detached HEAD "
+                            "cannot be safely returned")
+        elif row.get("target_ref") and row.get("target_ahead") != "0":
+            blockers.append(prefix + "target branch has local-only or unverifiable commits")
+    return blockers
+
+
+def stash_summary(stashes):
+    return "; ".join(f"{s['path']}: stash {s['oid']} from {s['branch'] or 'detached HEAD'} "
+                     f"at {s['head']}" for s in stashes)
+
+
+def prepare_forced_return(path, revision, reading, stashes):
+    blockers = return_blockers(reading)
+    if blockers:
+        raise ValueError("; ".join(blockers))
+    all_roots = roots(path)
+    manifests = {root: manifest_repos(root, revision) for root in all_roots}
+    before = {row["path"]: row for row in reading["repos"]}
+    expected_paths = set()
+    for root, specs in manifests.items():
+        expected_paths.update(specs)
+        expected_paths.add(str((root / ".repo/manifests").resolve()))
+        if any(repo not in before or before[repo].get("revision") != spec["revision"]
+               for repo, spec in specs.items()):
+            raise ValueError("manifest changed after approval; review the workspace again")
+    if expected_paths != set(before):
+        raise ValueError("repository coverage changed after approval; review the workspace again")
+
+    def save_stash(row):
+        if row.get("stash"):
+            stashes.append(row["stash"])
+
+    def collect(rows, streamed=False):
+        if not streamed:
+            for row in rows:
+                save_stash(row)
+        failures = [f"{row['path']}: {row['error']}" for row in rows if row.get("error")]
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    for root in all_roots:
+        where = f" ({root.name})" if len(all_roots) > 1 else ""
+        specs = {repo: dict(spec, expected=return_state(before[repo]))
+                 for repo, spec in manifests[root].items()}
+        collect(repo_batch(root, specs, "stash", "stash",
+                           "Stashing uncommitted changes" + where, on_result=save_stash),
+                streamed=True)
+        manifest_path = (root / ".repo/manifests").resolve()
+        if str(manifest_path) not in specs:
+            progress("stash", "Stashing uncommitted manifest changes" + where)
+            collect([repo_single(manifest_path, {
+                "revision": "main", "expected": return_state(before[str(manifest_path)])
+            }, "stash")])
+
+    for root in all_roots:
+        if manifest_repos(root, revision) != manifests[root]:
+            raise ValueError("manifest changed after stashing; review its saved changes before retrying")
+        manifest_path = (root / ".repo/manifests").resolve()
+        if str(manifest_path) not in manifests[root] and not before[str(manifest_path)]["baseline"]:
+            progress("return", "Returning the manifest repository to its revision")
+            collect([repo_single(manifest_path, {"revision": "main"}, "force-update")])
+            if manifest_repos(root, revision) != manifests[root]:
+                raise ValueError("manifest changed after checkout; review the workspace before retrying")
+    return manifests
 
 
 def execute(request):
@@ -338,6 +516,18 @@ def execute(request):
     action = request["action"]
     if action not in {"status", "sync", "free", "mirror", "align"}:
         raise ValueError(f"unsupported workspace action: {action}")
+    portal_approval = None
+    for option, required_action in (("portal_free", "free"), ("portal_sync", "sync")):
+        if option not in request:
+            continue
+        value = request[option]
+        if action != required_action or not isinstance(value, dict) or set(value) != {"approved"}:
+            raise ValueError(f"{option} requires a {required_action} action and an approved snapshot")
+        approved = value["approved"]
+        if approved is not None and (not isinstance(approved, str)
+                                     or not re.fullmatch(r"[0-9a-f]{64}", approved)):
+            raise ValueError("invalid workspace approval snapshot")
+        portal_approval = value
     raw = request["path"]
     if not (raw.startswith("/") or raw.startswith("~/")):
         raise ValueError("workspace path must be absolute or home-relative")
@@ -357,6 +547,8 @@ def execute(request):
                     "workspace_id": state["id"], "path": str(path)}
         atomic(marker, state)
         changing_checkout = False
+        stashes = []
+        approval = None
         try:
             if not path.is_dir():
                 result = {"exists": False, "checked": now(), "clean": False,
@@ -382,75 +574,121 @@ def execute(request):
                         raise ValueError("cannot independently align a mirror")
                     if mirror and mirror.get("state") != "active" and action == "sync":
                         raise ValueError("mirror is not verified active; re-mirror or free it first")
-                    if not result["safe"]:
-                        raise ValueError("; ".join(result["reasons"]))
-                    if action == "sync" and not mirror and not result["clean"]:
-                        raise ValueError("; ".join(result["reasons"]))
-                    if action == "align" and not result["clean"]:
-                        raise ValueError("; ".join(result["reasons"]))
-                    matched = set()
-                    changing_checkout = True
-                    all_roots = roots(path)
-                    for root in all_roots:
-                        where = f" ({root.name})" if len(all_roots) > 1 else ""
-                        repos = manifest_repos(root, revision)
-                        before = {r["path"]: r for r in result["repos"]}
-                        if action == "sync" and mirror:
-                            for repo, spec in repos.items():
-                                branch = before[repo]["branch"]
-                                if branch and branch not in (spec["revision"], "main"):
-                                    spec["target"] = branch
-                        if action == "align":
-                            for repo, spec in repos.items():
-                                url = before[repo].get("remote") or ""
-                                keymatch = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
-                                key = "/".join(keymatch.groups()).lower() if keymatch else ""
-                                for pr in request.get("prs", []):
-                                    prkey = f"{pr['owner']}/{pr['repo']}".lower()
-                                    if prkey == key:
-                                        branch = pr.get("branch") or ""
-                                        if not branch or branch.startswith("-"):
-                                            raise ValueError(f"invalid review branch: {branch!r}")
+                    if action == "sync" and mirror and portal_approval is not None:
+                        if portal_approval["approved"] is not None:
+                            raise ValueError("Force sync is only available for free independent workspaces")
+                        portal_approval = None
+                    forced = False
+                    if portal_approval is not None:
+                        failures = [r for r in result["repos"] if r.get("error")]
+                        if failures:
+                            raise ValueError("; ".join(f"{r['path']}: {r['error']}" for r in failures))
+                        token = return_token(wid, path, revision, result, mirror)
+                        if approved and approved != token and result["clean"]:
+                            raise ValueError("workspace changed after approval; retry the return")
+                        if not result["clean"] and approved != token:
+                            approval = {
+                                "token": token,
+                                "revision": revision,
+                                "repos": [{key: r.get(key) for key in
+                                           ("path", "revision", "branch", "head", "dirty", "reasons")}
+                                          for r in result["repos"] if not r["clean"]],
+                                "blockers": return_blockers(result),
+                            }
+                        elif not result["clean"]:
+                            forced = True
+                    if approval is None:
+                        approved_manifests = None
+                        if forced:
+                            blockers = return_blockers(result)
+                            if blockers:
+                                raise ValueError("; ".join(blockers))
+                            changing_checkout = True
+                            approved_manifests = prepare_forced_return(path, revision, result, stashes)
+                        elif not result["safe"]:
+                            raise ValueError("; ".join(result["reasons"]))
+                        if action == "sync" and not mirror and not result["clean"] and not forced:
+                            raise ValueError("; ".join(result["reasons"]))
+                        if action == "align" and not result["clean"]:
+                            raise ValueError("; ".join(result["reasons"]))
+                        matched = set()
+                        changing_checkout = True
+                        all_roots = roots(path)
+                        for root in all_roots:
+                            where = f" ({root.name})" if len(all_roots) > 1 else ""
+                            repos = manifest_repos(root, revision)
+                            if forced and repos != approved_manifests[root]:
+                                raise ValueError("manifest changed after approval; review the workspace again")
+                            before = {r["path"]: r for r in result["repos"]}
+                            if action == "sync" and mirror:
+                                for repo, spec in repos.items():
+                                    branch = before[repo]["branch"]
+                                    if branch and branch not in (spec["revision"], "main"):
                                         spec["target"] = branch
-                                        matched.add(prkey)
-                        # Return first; octl must never rebase a development branch.
-                        baseline_rows = repo_batch(root, manifest_repos(root, revision), "update",
-                                                   "return", "Returning repositories to manifest revision" + where)
-                        failures = [r["error"] for r in baseline_rows if r.get("error")]
-                        if failures:
-                            raise RuntimeError("; ".join(failures))
-                        if action != "align":
-                            octl = shutil.which("octl") or str(Path.home() / ".local/bin/octl")
-                            label = "Running octl ws sync" + where
-                            progress("sync", label)
-                            run([octl, "ws", "sync", "--no-plugins"], root, 1200, octl_progress(label))
-                        after_rows = repo_batch(root, repos, "update", "update",
-                                                "Checking out target branches" + where)
-                        failures = [r["error"] for r in after_rows if r.get("error")]
-                        if failures:
-                            raise RuntimeError("; ".join(failures))
-                    if action == "align":
-                        expected = {f"{p['owner']}/{p['repo']}".lower()
-                                    for p in request.get("prs", [])}
-                        if not expected or matched != expected:
-                            raise ValueError("review repositories missing: " + ", ".join(expected - matched))
-                    result = inspect(path, revision, "verify", "Verifying clean baseline")
-                    if action == "free":
-                        if not result["clean"]:
-                            raise RuntimeError("return/sync did not reach a clean manifest baseline")
-                        state["mirror"] = None
-                        atomic(marker, state)
+                            if action == "align":
+                                for repo, spec in repos.items():
+                                    url = before[repo].get("remote") or ""
+                                    keymatch = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+                                    key = "/".join(keymatch.groups()).lower() if keymatch else ""
+                                    for pr in request.get("prs", []):
+                                        prkey = f"{pr['owner']}/{pr['repo']}".lower()
+                                        if prkey == key:
+                                            branch = pr.get("branch") or ""
+                                            if not branch or branch.startswith("-"):
+                                                raise ValueError(f"invalid review branch: {branch!r}")
+                                            spec["target"] = branch
+                                            matched.add(prkey)
+                            # Return first; octl must never rebase a development branch.
+                            baseline_rows = repo_batch(root, repos if forced else manifest_repos(root, revision),
+                                                       "force-update" if forced else "update",
+                                                       "return", "Returning repositories to manifest revision" + where)
+                            failures = [f"{r['path']}: {r['error']}" for r in baseline_rows if r.get("error")]
+                            if failures:
+                                raise RuntimeError("; ".join(failures))
+                            if action != "align":
+                                octl = shutil.which("octl") or str(Path.home() / ".local/bin/octl")
+                                label = "Running octl ws sync" + where
+                                progress("sync", label)
+                                run([octl, "ws", "sync", "--no-plugins"], root, 1200, octl_progress(label))
+                                if forced and manifest_repos(root, revision) != approved_manifests[root]:
+                                    raise ValueError("manifest changed during sync; review the workspace before retrying")
+                            after_rows = repo_batch(root, repos, "update", "update",
+                                                    "Checking out target branches" + where)
+                            failures = [f"{r['path']}: {r['error']}" for r in after_rows if r.get("error")]
+                            if failures:
+                                raise RuntimeError("; ".join(failures))
+                        if action == "align":
+                            expected = {f"{p['owner']}/{p['repo']}".lower()
+                                        for p in request.get("prs", [])}
+                            if not expected or matched != expected:
+                                raise ValueError("review repositories missing: " + ", ".join(expected - matched))
+                        result = inspect(path, revision, "verify", "Verifying clean baseline")
+                        if action == "sync" and portal_approval is not None and not result["clean"]:
+                            raise RuntimeError("sync did not reach a clean manifest baseline")
+                        if action == "free":
+                            if not result["clean"]:
+                                raise RuntimeError("return/sync did not reach a clean manifest baseline")
+                            state["mirror"] = None
+                            atomic(marker, state)
+            if stashes:
+                result["stashes"] = stashes
             result.update(id=wid, path=str(path), mirror=state.get("mirror"))
             response = {"ok": True, "status": result}
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, ET.ParseError) as e:
+            if approval is not None:
+                response["approval_required"] = approval
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, ET.ParseError) as e:
             if changing_checkout and action in {"sync", "free"} and state.get("mirror"):
                 state["mirror"].update(state="failed", updated=now(), error=str(e))
                 atomic(marker, state)
-            response = {"ok": False, "error": str(e), "mirror": state.get("mirror")}
+            error = str(e)
+            if stashes:
+                error += "; Saved work: " + stash_summary(stashes)
+            response = {"ok": False, "error": error, "mirror": state.get("mirror")}
         with history.open("a") as f:
             f.write(json.dumps({"at": now(), "workspace_id": wid, "action": action,
-                                "outcome": "ok" if response["ok"] else "error",
-                                "detail": response.get("error", ""),
+                                "outcome": ("approval-required" if approval is not None else
+                                            "ok" if response["ok"] else "error"),
+                                "detail": response.get("error", "") or stash_summary(stashes),
                                 "mirror": state.get("mirror")}) + "\n")
         with history.open() as f:
             response["log"] = [json.loads(line) for line in deque(f, maxlen=200)]

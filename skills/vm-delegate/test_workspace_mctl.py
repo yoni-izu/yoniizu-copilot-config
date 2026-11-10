@@ -92,6 +92,14 @@ cmd_workspace free /remote/slot WS-R-stable 2
             "free /slot WS-R-stable main null",
             "align /slot WS-R-stable main '{\"prs\":{}}'",
             "align /slot WS-R-stable main '{\"id\":\"WS-R-other\"}'",
+            "sync /slot WS-R-stable main '{\"portal_free\":{\"approved\":null}}'",
+            "free /slot WS-R-stable main '{\"portal_free\":{\"approved\":true}}'",
+            "free /slot WS-R-stable main '{\"portal_free\":{\"approved\":\"bad\"}}'",
+            "free /slot WS-R-stable main '{\"portal_free\":{\"approved\":null,\"extra\":1}}'",
+            "free /slot WS-R-stable main '{\"portal_sync\":{\"approved\":null}}'",
+            "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":true}}'",
+            "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":\"bad\"}}'",
+            "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":null,\"extra\":1}}'",
         ]:
             with self.subTest(args=args):
                 result = self.shell("""
@@ -103,6 +111,7 @@ cmd_workspace """ + args)
     def test_existing_remote_identity_is_adopted_before_any_mutation(self):
         result = self.shell("""
 T_NAME=lab
+rlogin() { echo /slot; }
 workspace_identity() {
   printf '%s\\n' "$*" >> "$EVENTS"
   printf '{"id":"WS-R-cached","rev":"main"}\\n'
@@ -144,6 +153,29 @@ cmd_workspace """ + shlex.join(["align", "/independent/slot", "WS-R-stable",
             "rev": "main", "prs": prs,
         })
 
+    def test_portal_free_approval_is_transported_without_shell_interpretation(self):
+        self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
+        for approved in (None, "a" * 64):
+            options = {"portal_free": {"approved": approved}}
+            result = self.shell("""
+rlogin() { bash -s <<< "$*"; }
+cmd_workspace """ + shlex.join(["free", "/remote/slot ' ; $(touch BAD)",
+                                "WS-R-stable", "release", json.dumps(options)]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["portal_free"], options["portal_free"])
+        self.assertFalse((Path.cwd() / "BAD").exists())
+
+    def test_portal_sync_approval_is_transported(self):
+        self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
+        for approved in (None, "a" * 64):
+            options = {"portal_sync": {"approved": approved}}
+            result = self.shell("""
+rlogin() { bash -s <<< "$*"; }
+cmd_workspace """ + shlex.join(["sync", "/remote/slot", "WS-R-stable",
+                                "release", json.dumps(options)]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["portal_sync"], options["portal_sync"])
+
     def test_first_remote_registration_inherits_pinned_revision_and_preserves_existing(self):
         module = self.home / ".copilot/skills/workspace-manager/wm.py"
         module.parent.mkdir(parents=True)
@@ -168,6 +200,7 @@ def identity(path, target):
 """)
         result = self.shell("""
 T_NAME=lab
+rlogin() { echo /remote/slot; }
 cmd_workspace() {
   printf '{"ok":true,"status":{"id":"%s","path":"%s","exists":true}}\\n' "$3" "$2"
 }
@@ -178,6 +211,165 @@ workspace_remote_identity /remote/slot main
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([row["rev"] for row in rows], ["a1_power_on", "a1_power_on"])
         self.assertEqual(json.loads(self.events.read_text())["slot"]["rev"], "a1_power_on")
+
+    def owner_fixture(self):
+        owner = Path(__file__).resolve().parents[1] / "workspace-manager"
+        fixture = self.home / ".copilot/skills/workspace-manager"
+        fixture.mkdir(parents=True)
+        for name in ("wm.py", "workspace_store.py", "workspace_runtime.py"):
+            (fixture / name).symlink_to(owner / name)
+        targets = self.home / ".mctl/targets"
+        targets.parent.mkdir()
+        targets.write_text("lab remote user@lab\nother remote user@other\n")
+        self.env["WORKSPACES_DB"] = str(self.home / "tasks/workspaces.db")
+        self.env["WORKSPACES_LEGACY_JSON"] = str(self.home / "tasks/workspaces.json")
+        transport = self.home / "bin/mctl"
+        transport.parent.mkdir()
+        transport.write_text("""#!/usr/bin/env python3
+import json, os, sys
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/workspace-manager"))
+import wm
+rec = wm.identity("/conflicting/slot", os.environ["CONFLICT_TARGET"])
+print(json.dumps(dict(ok=False, error="workspace identity mismatch",
+                     workspace_id=rec["id"], path="/canonical/slot")))
+""")
+        transport.chmod(0o755)
+        return """
+T_NAME=lab
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+if not wm.STORE.exists():
+    wm.save({"slots": {}, "tracked": {}, "groups": []})
+wm.track("/canonical/slot", target="lab", rev="a1_power_on")
+PY
+rlogin() { printf '/canonical/slot\\n'; }
+cmd_workspace() {
+  printf '{"ok":true,"status":{"id":"%s","path":"%s","exists":true,"safe":true,"clean":true}}\\n' "$3" "$2"
+}
+"""
+
+    def test_repeated_alias_reuses_canonical_identity_without_displacing_holder(self):
+        setup = self.owner_fixture()
+        result = self.shell(setup + """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.occupy_task(rec["slot"], "T-owner", _validated=True)[0]
+PY
+workspace_remote_identity /alias/slot main
+workspace_remote_identity /alias/slot main
+workspace_slot_unoccupied /canonical/slot
+""")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("occupied", result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], rows[1]["id"])
+        self.assertEqual([r["rev"] for r in rows], ["a1_power_on"] * 2)
+        check = self.shell("""
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys,json
+sys.path.insert(0, sys.argv[1])
+import wm
+rows = list(wm.tracked().values())
+assert len(rows) == 1, rows
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.get_holder(rec["slot"])["task_id"] == "T-owner"
+print(rec["id"])
+PY
+""")
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertEqual(check.stdout.strip(), rows[0]["id"])
+
+    def test_conflicting_machine_identity_fails_closed_across_paths_and_targets(self):
+        setup = self.owner_fixture()
+        for target in ("lab", "other"):
+            with self.subTest(target=target):
+                result = self.shell(setup + "\nexport CONFLICT_TARGET=" + target + """
+python3 - "$HOME/.copilot/skills/workspace-manager" """ + target + """ <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.track("/conflicting/slot", target=sys.argv[2])
+PY
+cmd_workspace() {
+  python3 - "$HOME/.copilot/skills/workspace-manager" """ + target + """ <<'PY'
+import sys,json
+sys.path.insert(0, sys.argv[1])
+import wm
+rec = wm.identity("/conflicting/slot", sys.argv[2])
+print(json.dumps(dict(ok=False, error="workspace identity mismatch",
+                     workspace_id=rec["id"], path="/canonical/slot")))
+PY
+}
+workspace_remote_identity /alias/slot main
+""")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("already tracked", result.stderr)
+        check = self.shell("""
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+rows = list(wm.tracked().values())
+assert len(rows) == 3, rows
+assert not any(r["path"] == "/alias/slot" for r in rows)
+assert wm.identity("/canonical/slot", "lab")["rev"] == "a1_power_on"
+PY
+""")
+        self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_unresolvable_alias_never_registers_a_workspace(self):
+        result = self.shell("""
+rlogin() { return 23; }
+workspace_register_remote() { echo unexpected >> "$EVENTS"; }
+workspace_remote_identity /missing/alias main
+""")
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_remote_path_resolves_real_symlinks_with_shell_safe_names(self):
+        canonical = self.scratch / "canonical ' ; $(false)"
+        canonical.mkdir()
+        alias = self.scratch / "alias slot"
+        alias.symlink_to(canonical, target_is_directory=True)
+        result = self.shell("""
+rlogin() { bash -s <<< "$*"; }
+workspace_remote_path """ + shlex.quote(str(alias)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(canonical))
+        for invalid in (self.events, self.scratch / "missing"):
+            result = self.shell("""
+rlogin() { bash -s <<< "$*"; }
+workspace_remote_path """ + shlex.quote(str(invalid)))
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_action_logging_through_alias_reuses_canonical_slot(self):
+        setup = self.owner_fixture()
+        local = self.home / "source"
+        local.mkdir()
+        result = self.shell(setup + """
+find_ws() { echo """ + shlex.quote(str(local)) + """; }
+map_remote() { echo /alias/slot/fw; }
+rlogin_cred() { return 0; }
+( cmd_sh 'true' )
+( cmd_sh 'true' )
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+remote = [r for r in wm.tracked().values() if r.get("target")]
+assert len(remote) == 1, remote
+assert remote[0]["path"] == "/canonical/slot", remote
+events = wm.action_log(remote[0]["id"])
+assert len([e for e in events if e["action"] == "mctl-sh"]) == 2, events
+PY
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_runtime_nonzero_exit_still_forwards_domain_json(self):
         self.runtime_fixture('print(\'{"ok":false,"error":"guard refused"}\')\nraise SystemExit(7)\n')
@@ -286,6 +478,7 @@ def log_action(slot, action, outcome, detail):
                 self.events.write_text("")
                 result = self.shell("""
 T_NAME=lab
+rlogin() { echo /remote/slot/fw; }
 find_ws() { echo /local/slot/fw; }
 map_remote() { echo /remote/slot/fw; }
 rlogin_cred() { return """ + str(rc) + """; }

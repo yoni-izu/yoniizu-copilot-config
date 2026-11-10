@@ -40,6 +40,9 @@ import workspace_store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "task-manager"))
 import task_store
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vm-delegate"))
+import vd
+
 STORE = workspace_store.DB_PATH
 PROJECTS_ROOT = Path(os.path.expanduser("~/projects"))
 DEFAULT_PROJECT = "iridium"
@@ -326,9 +329,11 @@ def mirror_state(target: str, path: str, source_id: str, source_path: str,
     return rec
 
 
-def _run_with_progress(args: list, timeout: int, progress) -> subprocess.CompletedProcess:
+def _run_with_progress(args: list, timeout: int, progress, *,
+                       env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run the runtime, forwarding its WS_PROGRESS stderr events to ``progress`` live."""
-    proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env)
     stdout: list[str] = []
     reader = threading.Thread(target=lambda: stdout.append(proc.stdout.read()), daemon=True)
     reader.start()
@@ -365,7 +370,10 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
     rec = record(slot)
     request = {"id": rec["id"], "path": rec["path"], "rev": rec["rev"], "action": action}
     request.update(options)
-    if action == "sync" and get_holder(slot) and not status_read(rec["id"]).get("mirror"):
+    portal_sync = options.get("portal_sync")
+    approved_sync = isinstance(portal_sync, dict) and portal_sync.get("approved") is not None
+    if action == "sync" and get_holder(slot) and (
+            approved_sync or not status_read(rec["id"]).get("mirror")):
         log_action(slot, action, "rejected", "workspace is occupied")
         raise ValueError("workspace is occupied; free it before syncing")
     if rec.get("target"):
@@ -379,10 +387,14 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
     result = {}
     try:
         timeout = 2400 if action != "status" else 180
-        r = (_run_with_progress(args, timeout, progress) if progress else
-             subprocess.run(args, text=True, capture_output=True, timeout=timeout))
+        env, agent_error = vd.agent_env(recheck=True) if rec.get("target") else (None, "")
+        r = (_run_with_progress(args, timeout, progress, env=env) if progress else
+             subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env))
         if r.returncode and not r.stdout.lstrip().startswith("{"):
-            raise RuntimeError((r.stderr or r.stdout).strip()[-3000:] or f"exit {r.returncode}")
+            error = (r.stderr or r.stdout).strip()[-3000:] or f"exit {r.returncode}"
+            if r.returncode == vd.SSH_FAIL_RC and agent_error:
+                error = f"{error}; {agent_error}"
+            raise RuntimeError(error)
         result = json.loads(r.stdout)
         if not isinstance(result, dict):
             raise ValueError("invalid workspace response: expected a JSON object")
@@ -431,7 +443,16 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
         reading["attempted"] = stamp()
         reading["log"] = result.get("log", [])
         status_write(slot, reading)
-        log_action(slot, action, "ok")
+        approval = result.get("approval_required")
+        if approval is not None:
+            if action not in {"free", "sync"} or not isinstance(approval, dict) or not approval.get("token"):
+                raise ValueError("invalid workspace approval response")
+            log_action(slot, action, "approval-required", f"workspace {action} awaits confirmation")
+            return dict(reading, approval_required=approval)
+        stashes = reading.get("stashes") or []
+        detail = "; ".join(f"{s['path']}: stash {s['oid']} from {s['branch'] or 'detached HEAD'}"
+                           for s in stashes)
+        log_action(slot, action, "ok", detail)
         return reading
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
         reading = status_read(rec["id"])
@@ -514,8 +535,10 @@ def track(path: str, label: str | None = None, rev: str | None = None,
 
 @workspace_serialized
 @serialized
-def untrack(slot: str):
-    """Drop a workspace from the roster. Refuses while it is held."""
+def untrack(slot: str, *, force: bool = False):
+    """Drop only the roster entry; force bypasses hold/mirror checks, not locks."""
+    if not isinstance(force, bool):
+        return False, "force must be a boolean"
     root = normalize_slot(slot)
     if not root:
         return False, f"invalid slot: {slot!r}"
@@ -523,15 +546,18 @@ def untrack(slot: str):
     recs = tracked(d, persist=False)
     if root not in recs:
         return False, f"'{root}' is not tracked"
-    if get_holder(root, d):
+    if not force and get_holder(root, d):
         return False, (f"'{root}' is held by {_holder_label(get_holder(root, d))}"
                        " \u2014 free it first")
-    if status_read(recs[root]["id"]).get("mirror"):
+    if not force and status_read(recs[root]["id"]).get("mirror"):
         return False, "release the mirror before stopping tracking"
-    log_action(root, "untrack", "ok", "directory left untouched")
+    log_action(root, "untrack", "ok",
+               "override requested; directory, holds and mirror state left untouched"
+               if force else "directory left untouched")
     recs.pop(root)
     save(d)
-    return True, f"stopped tracking '{root}'"
+    return True, (f"stopped tracking '{root}'"
+                  + (" (checks overridden; holds and mirror state preserved)" if force else ""))
 
 
 @workspace_serialized
@@ -781,9 +807,33 @@ def occupy_adhoc(slot: str, label: str, tag: str = "other",
     return True, f"{root} ← {label.strip()} ({tag})", displaced
 
 
-@workspace_serialized
 def release(slot: str, d: dict | None = None, autosave: bool = True,
             reset: bool = True):
+    """Free a slot's holder. Returns ``(ok, holder)``.
+
+    A tracked slot goes through the serialized, baseline-verified path below.
+    A holder on a slot that is no longer tracked is stale occupancy — there is
+    no workspace record to lock, reset, or event-log — so the holder record is
+    simply dropped; otherwise the holding task could never be released or
+    edited again (e.g. after a roster change removed its slot).
+    """
+    root = normalize_slot(slot)
+    if not root:
+        return False, None
+    with store_lock():
+        own = d if d is not None else load()
+        if tracked(own, persist=False).get(root) is None:
+            holder = get_holder(root, own)
+            _set_holder(own, root, None)
+            if autosave and d is None:
+                save(own)
+            return True, holder
+    return _release_tracked(root, d=d, autosave=autosave, reset=reset)
+
+
+@workspace_serialized
+def _release_tracked(slot: str, d: dict | None = None, autosave: bool = True,
+                     reset: bool = True):
     """Free only after a verified baseline return/sync; retain holder on failure.
 
     ``reset=False`` is for a caller that has just completed the same guarded

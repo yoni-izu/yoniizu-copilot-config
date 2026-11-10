@@ -68,11 +68,31 @@ to the same physical checkout on several hosts.
   development branches from their matching origin branches. Dirty/local-only
   work is never reset, rebased or silently discarded; updates are fast-forward
   only. Failed/in-progress mirrors must be re-mirrored or freed, not synced.
+  Portal Sync on a free independent workspace can request snapshot-bound
+  **Force sync** approval for dirty/non-baseline checkouts via `portal_sync`.
+  Approved Sync stashes changes and returns to manifest revisions with the
+  same safeguards as Portal Free, but never releases or creates a hold.
+  Occupancy is rechecked at execution; mirrors and network/authentication
+  failures cannot use this override. Normal CLI Sync remains guarded.
 - **Free** returns all repositories to their manifest revisions, then runs
   `octl ws sync --no-plugins` and verifies the result. Holder and mirror state
   clear only after success. Failures keep the reservation and are visible.
   `release(..., reset=False)` is internal to the portal worker after it has
   completed that physical operation, not a shortcut for callers.
+- **Portal return approval** adds an explicit, snapshot-bound confirmation when
+  the fresh check finds a dirty or non-baseline checkout. On approval, staged,
+  unstaged and untracked changes are stashed; named branches and their commits
+  remain intact. Ignored files are not stashed and Git refuses to overwrite
+  them. Target-branch local-only/unverifiable commits, unsafe detached commits,
+  invalid or changed manifests, missing repositories and failed stashes remain
+  blockers. Stash IDs and original branches are logged, even on partial
+  failure; the holder/mirror clears only after verification. Normal CLI Free
+  retains its existing guarded behavior and does not silently force a return.
+- **Untrack** (`wm.untrack(slot, force=False)`) removes only the roster entry.
+  Normally held workspaces and mirrors are refused. An explicit boolean
+  `force=True` bypasses only those two checks, preserving holds, saved readings,
+  mirror state and history without touching the checkout or contacting a machine.
+  Active-operation locks and workspace identity validation still apply.
 
 The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws` for
 multi-repository operations, verifies complete manifest coverage, and checks

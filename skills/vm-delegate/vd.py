@@ -260,15 +260,16 @@ def _agent_candidates() -> list[str]:
     return [s for _, s in found]
 
 
-def agent_env() -> tuple[dict, str]:
+def agent_env(*, recheck: bool = False) -> tuple[dict, str]:
     """(env for ssh subprocesses, error-or-empty).
 
     Prefers the inherited SSH_AUTH_SOCK when it actually holds identities;
     otherwise adopts the newest agent socket that does. The error is returned
     rather than raised so a probe can still run and report WHY it failed.
+    ``recheck`` bypasses the probe cache for independent workspace operations.
     """
     now = time.time()
-    if _AGENT["sock"] and now - _AGENT["at"] < AGENT_RECHECK:
+    if not recheck and _AGENT["sock"] and now - _AGENT["at"] < AGENT_RECHECK:
         return dict(os.environ, SSH_AUTH_SOCK=_AGENT["sock"]), _AGENT["error"]
 
     cur = os.environ.get("SSH_AUTH_SOCK", "")

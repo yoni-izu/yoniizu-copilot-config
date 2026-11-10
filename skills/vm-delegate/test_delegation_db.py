@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -14,6 +15,37 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import delegation_db
 import vd
+
+
+class AgentEnvironmentTests(unittest.TestCase):
+    def test_recheck_ignores_cached_agent_and_finds_working_socket(self):
+        with patch.dict(vd._AGENT, {"sock": "/old/agent", "error": "", "at": 100}), \
+                patch.dict(os.environ, {"SSH_AUTH_SOCK": "/empty/agent"}), \
+                patch.object(vd.time, "time", return_value=100), \
+                patch.object(vd, "_sock_has_keys", side_effect=lambda sock: sock == "/new/agent"), \
+                patch.object(vd, "_agent_candidates", return_value=["/old/agent", "/new/agent"]):
+            env, error = vd.agent_env(recheck=True)
+        self.assertEqual(env["SSH_AUTH_SOCK"], "/new/agent")
+        self.assertEqual(error, "")
+
+    def test_recheck_picks_up_agent_replacement_between_operations(self):
+        with patch.dict(vd._AGENT, {"sock": None, "error": "", "at": 0}), \
+                patch.dict(os.environ, {"SSH_AUTH_SOCK": "/empty/agent"}), \
+                patch.object(vd, "_sock_has_keys") as keys, \
+                patch.object(vd, "_agent_candidates") as candidates:
+            keys.side_effect = lambda sock: sock == "/first/agent"
+            candidates.return_value = ["/first/agent"]
+            self.assertEqual(vd.agent_env(recheck=True)[0]["SSH_AUTH_SOCK"], "/first/agent")
+            keys.side_effect = lambda sock: sock == "/second/agent"
+            candidates.return_value = ["/first/agent", "/second/agent"]
+            self.assertEqual(vd.agent_env(recheck=True)[0]["SSH_AUTH_SOCK"], "/second/agent")
+
+    def test_default_preserves_existing_probe_cache(self):
+        with patch.dict(vd._AGENT, {"sock": "/cached/agent", "error": "", "at": 100}), \
+                patch.object(vd.time, "time", return_value=101), \
+                patch.object(vd, "_sock_has_keys") as keys:
+            self.assertEqual(vd.agent_env()[0]["SSH_AUTH_SOCK"], "/cached/agent")
+        keys.assert_not_called()
 
 
 class DelegationTests(unittest.TestCase):
