@@ -16,6 +16,7 @@ spec, address map, routing, sideband fabrics, AxUSER, and FIU — plus the A2 RT
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| FIU termination exit vs. driver boot ordering | [fiu-termination-boot-ordering.md](fiu-termination-boot-ordering.md) | fiu, termination, reset isolation, iso_sw_man, boot order, init priority, psoc | Verified from spec + FW code | 2026-11-01 |
 | A2 NoC overview + address map (INC/GPU) | [a2-noc-overview.md](a2-noc-overview.md) | noc, fabric, address map, npa, fiu, inc, gpu, mem fabric, mng, ctrl, dbg, trc, ect, ts, routing, tp8, tp16 | Verified from spec | 2026-08-30 |
 
 ## Topic File Template
