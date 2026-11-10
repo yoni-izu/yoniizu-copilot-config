@@ -28,6 +28,29 @@
   contract. Quiesce enforcement, transition serialization and held/status
   reporting need explicit layer ownership when implementing.
 
+## EP training gate semantics (verified 2026-10-27)
+
+- SNPS DM databook v6.42a-lca01 §2.4, PDF p.106: deasserting
+  `app_ltssm_enable` outside Detect immediately returns LTSSM to Detect.
+  This transition is outside PCIe specification behavior and might cause a
+  PIPE protocol violation. Reference PDF p.1702 additionally says this causes
+  controller reset; recommended assertion/deassertion timing follows the
+  databook reset requirements. Do not describe this as graceful Link Disable.
+- Frozen Iridium `ip.se.rtl` commit
+  `9cb3d7d548760ce84215da2561dbd61620a9e00f`,
+  `dm_macro/rtl/dm_hot_rst_handler.v:56,110-111`: the CSR enable is AND-gated
+  with inverse link-down-reset/training-delay clear conditions.
+  `dm_pcie_iip_device_wrap.v:1414-1416` also wires those conditions to clear
+  the CSR. Setting the CSR permits training but cannot override these gates.
+- FW generated `prototype/dm_ctrl_regs.h:112-117` exposes APP_LTSSM_EN
+  at core +0x18, `VAL_MSK=1`. RMW must use this mask, not a whole-word
+  nonzero check. EP Link Control Link Disable remains reserved.
+- A conservative EP held observation is CSR bit clear, LTSSM Detect.Quiet,
+  both SMLH/RDLH link-up indications clear. RP Disabled cannot establish EP
+  completion. Neither CSR readback nor a multi-register snapshot proves
+  traffic drain or atomicity; caller serialization/quiescence remains required.
+  This is source-backed behavior, not a silicon-cycle validation.
+
 ## Sources
 
 - `Device Manageability Specification.docx`, section 9.5.3.1.3.9,

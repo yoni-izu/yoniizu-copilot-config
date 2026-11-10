@@ -32,6 +32,27 @@ if I fold the switch, all die0 in a rack, can the switch drop/delay and be the b
    - Rail topology scales beyond 64 devices: 2-rail=128, 4-rail=256, single 80×4 switch rail=512.
      Address bits select entry index + rail.
 
+### Port C2C[7] → switch wiring per rail count (added 2026-11-03)
+- Each die has 8 C2C ports: **C2C[0..6]** = intra-tray P2P to the same die index of the 7 other
+  chips; **C2C[7]** = the single switch-facing port (NoC §4.1, paras 227–235).
+- A **switch is keyed by (rail, die index)**. A rail is a chip-group; it owns **4 switches, one per
+  die plane** (the 3+1 redundancy set). Explicit 2-rail PoR wiring (paras 242–249):
+  `SwitchTray[d].Switch[r] ↔ Tray[15..0].Chip[rail r chips].Die[d]` → 4 switch trays × 2 = 8 switches.
+- **8-rail** (para 531: "each switch interconnects a single rail", rail = addr[40:38] = chip index)
+  is the same rule with one chip per rail (derived; the spec doesn't enumerate the wiring):
+  `Switch(rail c, plane d) ↔ Tray[*].Chip[c].Die[d].C2C[7]`.
+  - Per tray, the 32 port-7s go to **32 different switches** (8 rails × 4 die planes), so each
+    switch sees **exactly one port per tray**. Fan-in per switch = number of trays
+    (16 for a 16-tray rack, consistent with A1 `main` `num-switch-peers=16`). Up to 64 trays on a
+    64-port x4 switch gives 512 devices.
+  - Switch count = 32 (vs 8 for 2-rail, 16 for 4-rail). The 4 plane switches of rail c back each
+    other up (3+1 hash redistribution, paras 405–419).
+  - The NoC spec 8-rail nLUT index uses [43:41]. A1 FW `same_index` instead folds [40:38] and indexes
+    with [46:41] (see `c2c-same-index-topology.md`).
+- **A2 terminology:** A2 Scale-up doc calls **each switch a rail**. The full-scale baseline gives
+  one rail per (Chip, Die), with up to 64 rails (16 chips × 4). The same physical arrangement is
+  "32 rails" in A2 language. Don't confuse this with A1 "8 rails".
+
 ### Switch bottleneck / drop behavior (answers the TX≫RX question)
 - **Bottleneck / delay — YES on the inter-tray switch path.** The switch is a many-to-one
   aggregation point; a destination's ingress is a single x4 (32 GB/s). When egress saturates,
