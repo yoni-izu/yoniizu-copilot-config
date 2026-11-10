@@ -26,8 +26,26 @@ fast and does not require re-reading the (very large) source documents.
 
 <!-- Newest at top. Keep Tags lowercase and comma-separated for easy text search. -->
 
+Release 0.5.231 diagnostic caveats (2026-11-04): the
+[LinkStatus implementation entry](su-pcie-linkstatus-attribute-impl.md) also covers
+the OEM EP unsupported stub, raw PLDM booleans, the EP1 successful-zero fallback,
+ownership-gated EP0 reads, a startup-sweep retry gap, a speed/generation unit
+mismatch, and shipped in-band read-error masking.
+The same entry assesses the open release ports EP #471 / MNG #522 and the
+updated main MNG #515 at pinned heads. The release port now maps unwired
+state/status to `2/2`, and updated main fixes the earlier simulator selector
+failure. Startup retry and other gaps remain; author-reported A1 evidence is
+not customer PLDM verification.
+
+The [middleware enablement chronology](su-pcie-linkstatus-attribute-impl.md#middleware-enablement-and-release-chronology)
+distinguishes the 2026-10-14 A1 power-on wiring from earlier published images
+that had PCIe sensor descriptors but no PCIe providers, and from the separately
+pinned external 0.5.17 artifact.
+
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| SU/PCIe LinkStatus providers are wired in A1 FW. Release 0.5.231 has PCIe EP state/status defects; open release ports address normal EP0 and unwired-port state/status, while retry and other gaps remain. | [su-pcie-linkstatus-attribute-impl.md](su-pcie-linkstatus-attribute-impl.md) | linkstatus, sulinkstatus, pcielinkstatus, telemetry attribute, middleware provider, pldm state sensor, su subsystem, el_se, dll_active, rdlh_link_up, unwired port, simulator | Release verified from FW and ELF; PR heads assessed from source and author report; customer EP0 cause unconfirmed | 2026-11-05 |
+| SuSurpriseLinkDown spec semantics: one aggregated chip-health state and event, with the wording "encountered"; no clear rule and no counter defined; no per-port attribute in A1 | [su-surprise-link-down-attribute.md](su-surprise-link-down-attribute.md) | susurpriselinkdown, surprise down, scale-up, chip health, joint state and event, attribute 111 | Verified from specs | 2026-11-04 |
 | OemPcieLinkControl (formerly OemLinkControl): ownership-gated non-blocking transitions, mandatory traffic-idle check, status and recovery contract | [oem-pcie-link-control.md](oem-pcie-link-control.md) | oempcielinkcontrol, scale-up, ownership, quiesce | Verified from current internal working spec | 2026-10-25 |
 | Device Manageability Specification current copy — September 2026 OEM-command additions; still an internal working document with tracked changes, comments, and open items | [device-manageability-current-copy-status.md](device-manageability-current-copy-status.md) | device manageability, working spec, revision history, oem commands, tracked changes, open items, source precedence | Partial — current copy inspected; no prior copy available for a content diff | 2026-10-25 |
 | LTSSM Logger: revised spec permits software consumption and suppression/positive thresholds; EP and SE count-query/read restrictions rechecked | [ltssm-logger-contract.md](ltssm-logger-contract.md) | ltssm logger, invalidation, read pointer, statefilter, threshold, efuse, middleware | EP #442 at d1e9d3ce and SE #247 at ef0d32b4; reset guarantees remain unverified | 2026-10-20 |
