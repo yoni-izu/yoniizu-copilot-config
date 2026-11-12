@@ -23,6 +23,7 @@ architect initiatives) and verifies an answer, it records the findings here — 
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| **A2 D2D sub-system (5nm + new 3nm PHY; ROM ownership and CDUP CSR/FW delta)** | [a2-d2d.md](a2-d2d.md) | d2d, ucie, phy, 5nm, 3nm, n5, n3, rom sequence, cdup, multicast, csr, firmware, chiplet | Verified from spec, CSR headers + FW source; ROM sequence ownership and CDUP API ownership confirmed by user | 2026-11-11 |
 | **A2 HSI FW Jira work-breakdown structure (planning template)** | [a2-fw-plan-structure.md](a2-fw-plan-structure.md) | jira, planning, structure, hierarchy, initiative, epic, story, attribute, prjatlsw, prjirdmsw, feature matrix, categories, components, sw-only, product separation, driver convergence, template | Verified from Jira + local FW tree | 2026-08-30 |
 | **A2 HSI FW planning — anchors, gaps, redundant tickets** | [a2-fw-planning-gaps.md](a2-fw-planning-gaps.md) | jira, planning, firmware, hsi, initiatives, epics, attributes, gaps, duplicates, redundant, ipsesw, ippciesw, ipd2dsw, pldm | Verified from Jira + RTL | 2026-08-30 |
 | **A2 vs A1 executive delta summary (START HERE)** | [a2-vs-a1-summary.md](a2-vs-a1-summary.md) | a2, a1, iridium, delta, summary, changes, gen7, ucie, d2d, pcie, scale-up, gpu, inc, afd, prefill, dual-mode, planning | Verified | 2026-08-30 |
@@ -31,7 +32,6 @@ architect initiatives) and verifies an answer, it records the findings here — 
 | A2 NoC / fabric + address map (INC + GPU) | [a2-noc.md](a2-noc.md) | noc, fabric, address map, npa, fiu, inc, gpu, afd, prefill, remote device, mem fabric, tp8, tp16 | Verified from spec | 2026-08-30 |
 | A2 Scale-Up / C2C (PCIe-compliant + dual-mode) | [a2-scaleup-c2c.md](a2-scaleup-c2c.md) | su, scale-up, c2c, pcie compliant, dual-mode, rp, ep, gen7, flit, dragonfly, gpu, inc, ordering, aggregation, tp8, tp16, failover | Verified from spec | 2026-08-30 |
 | A2 PCIe EP sub-system (Gen7) | [a2-pcie-ep.md](a2-pcie-ep.md) | pcie, pcie ep, gen7, pam4, flit, fec, piw, elbi, bmu, ide, tee, ptm, msi-x, reset isolation, single ep | Verified from spec | 2026-08-30 |
-| A2 D2D sub-system (5nm + new 3nm PHY) | [a2-d2d.md](a2-d2d.md) | d2d, ucie, phy, 5nm, 3nm, n5, n3, arescore, gammacore, chiplet, die-to-die | Verified from spec | 2026-08-30 |
 | A2 architect HW initiatives (Confluence) | [a2-architect-initiatives.md](a2-architect-initiatives.md) | initiatives, architect, c2c, scale-up, se, pcie, noc, fiu, inc, gpu, pcie compliant, ordering, aggregation, multicast, fec, ptm, address map, tp8, tp16 | Verified from Confluence | 2026-08-30 |
 | A2 HSI Jira landscape | [a2-jira-landscape.md](a2-jira-landscape.md) | jira, hsi, atlantic2, tickets, initiatives, attributes, pldm, palladium, backlog | Verified from Jira | 2026-08-30 |
 | A2 Overview — what it is + feature set | [a2-overview.md](a2-overview.md) | a2, atlantic2, overview, feature set, dies, ring, sled, vme, vcore, cce, ucie, pcie gen7, scale-up, firmware agents, cortex-m7 | Verified from spec | 2026-08-30 |

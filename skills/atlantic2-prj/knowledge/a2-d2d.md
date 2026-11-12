@@ -1,12 +1,13 @@
 # A2 (Atlantic2) — D2D Sub-System
 
 - **Recorded:** 2026-08-30
-- **Status:** Verified from spec (Overview + D2D Rev2 vs Rev1 diff) + **architect confirmation**
-- **A2-vs-A1 delta:** **D2D is kept AS-IS for A2** (architect Maxim Leshin, 2026-08-30). Spec Rev2
-  == Rev1 (exact copy), **no D2D initiatives**. Only possible FW work = config deltas **if the new
-  AlphaWave (AW) IP drop requires a different configuration**.
+- **Updated:** 2026-11-11
+- **Status:** Spec, CSR headers and FW source; later project decisions confirmed by the user
+- **A2-vs-A1 delta:** The architect's earlier guidance was to retain the core D2D design. The
+  checked A2 wrapper CSR adds CDUP, which the user confirms is used and exposed through D2D
+  driver APIs; the project also uses both 5nm and N3 PHY variants.
 - **RTL branch/tag:** RTL diff done (mostly "align to a2"). n/a for spec.
-- **Tags:** d2d, ucie, phy, aw, alphawave, arescore, gammacore, chiplet, die-to-die, as-is, no initiatives, fw config
+- **Tags:** d2d, ucie, phy, 5nm, n3, aw, alphawave, cdup, firmware api, chiplet, die-to-die
 
 ## Architect input (AUTHORITATIVE — Maxim Leshin, 2026-08-30)
 The FW planner emailed the architect: "I don't see any initiatives open for D2D at
@@ -16,14 +17,11 @@ for A2?" Architect reply:
 > different configuration."**
 
 Interpretation:
-- **D2D design is unchanged for A2** — no architectural/spec delta, no D2D initiatives.
-- **D2D FW = essentially no A2 work**, UNLESS the new **AW (AlphaWave) IP** version ships with a
-  different configuration requirement (register defaults, init/config sequence). Action for FW
-  planning: **track the AW IP drop; diff its config/register requirements vs the A1 AW IP** — if
-  identical, D2D FW is carried over as-is.
-- This **supersedes** the earlier "brand-new 3nm PHY for D2D" framing: whatever new AW IP arrives,
-  the D2D block itself is kept as-is and FW only reacts to config differences. (The N3 PCIe7 PHY
-  seen in RTL is on the **SU/DMP** path, not D2D — see a2-rtl-analysis.md / a2-scaleup-c2c.md.)
+- This is guidance to reuse the core design, not proof that there are no A2 wrapper, register
+  map, topology or firmware changes. The CDUP CSR/FW evidence and subsequent user confirmation
+  below establish a D2D driver API requirement.
+- The user confirmed that A2 D2D uses **both 5nm and N3 PHYs** in two physical projects. An N3
+  PHY also being present on another path does not disprove the D2D variant.
 
 ## Scope / Question
 What changes for D2D in A2 vs A1, from the D2D Rev2 spec, the A2 Overview, and the user's PHY note.
@@ -38,14 +36,56 @@ What changes for D2D in A2 vs A1, from the D2D Rev2 spec, the A2 Overview, and t
      **GammaCORE32** N5 subsystem). Possibly minor logic changes vs A1.
   2. **Brand-new 3nm (N3) PHY** — NEW for A2. No N3 datasheet in `~/docs/D2D/` yet (only N5 docs:
      `arco_arescore_ucie_datasheet_n5...`, `Eland_gammaN64B1Tn5_...`). Add when available.
+- The user confirmed a determined 12-instance topology, two tape-outs and different ROMs for
+  the two physical variants. The instance mapping and any D2D-specific ROM differences are
+  not documented by that confirmation.
+- **ROM sequence ownership:** the user confirmed D2D owns the D2D sequence in ROM. The proposed
+  `[A2] D2D: ROM sequence` Epic is planned for `iridium-system-sw-9.0`; each implementation step
+  will be a Story, with details to be refined later. This remains a plan item only; no Jira issue
+  has been created. HSM integration, implementation stage and variant-specific differences remain
+  open.
 
 ## A2 vs A1 (Iridium) delta
 - **D2D spec content is near-identical A1→A2** — `D2D Specification Rev 2.0.0.docx` (A2) vs
   `D2D Specification Rev1.docx` (A1) differ only in figure/table caption numbering (verified by
   full paragraph diff: 1016 paras each, no substantive text change).
-- **The A2 change is HW/PHY**: add the 3nm PHY; keep the 5nm PHY (maybe minor logic tweaks). FW
-  impact = supporting a second PHY variant in the D2D PHY-FW load/auth/init path (the "UCIe PHY FW
-  image" is the AresCORE PHY firmware). Confirm against RTL diff + any N3 datasheet.
+- **PHY delta:** support both 3nm and 5nm variants. The exact per-variant firmware,
+  configuration and initialization differences remain to be confirmed.
+
+## CDUP placement — CSR and FW evidence (2026-11-11)
+
+- **A1 D2D-wrapper CSR does not contain a CDUP block.** In A1, the D2D-facing CDUP registers
+  are in the NoC `d2d_ch_mng` block (`CDUP_0` and `CDUP_1`), not in the D2D wrapper.
+- **A2 adds a D2D-wrapper CDUP register block** in the checked D2D CSR tag
+  `1_3_0_1p3_870`, beginning at `D2D_CDUP_GENERAL` (`0x800`). It includes duplication masks,
+  destination-coordinate and inter-sled tables, credit/scale-up controls, statistics,
+  response-error registers and rate limiting. The `GENERAL` reset value sets `DUP_DISABLE`.
+- **A1 FW ownership is split by block, not one universal CDUP owner.** The NoC driver programs
+  PRTR C2C CDUP coordinate maps and restores them after die reset; SE supplies the topology map.
+  The CCE driver initializes aligner and PRTR-router CDUP, and explicitly sets the disable bit
+  in the NoC D2D-channel CDUP blocks.
+- **A2 usage and API ownership:** the user confirmed that D2D-wrapper CDUP is used and the D2D
+  driver will provide its APIs. The caller, configuration policy, reset/replay ownership and
+  freeze timing were not specified. No A1 D2D-FW implementation was identified in the checked
+  workspace. CSR/FW evidence alone does not establish A2 RTL intent.
+
+## CDUP findings — sources
+
+- CSR headers, A1: `~/projects/iridium/two/fw/build_artifacts/include/ips/d2d/v1/3_0_11_3p0_1389/prototype/d2d_regs.h`
+  (no CDUP symbols); NoC D2D-channel CDUP at
+  `~/projects/iridium/two/fw/build_artifacts/include/ips/noc/v1/3_0_11_3p0_1389/prototype/d2d_ch_mng_regs.h`
+  (`D2D_CH_MNG_CDUP_0_GENERAL`, line 473; corresponding `CDUP_1` block).
+- CSR headers, A2: `~/projects/iridium/two/fw/build_artifacts/include/ips/d2d/v2/1_3_0_1p3_870/prototype/d2d_regs.h`
+  (`D2D_CDUP_GENERAL`, line 993); `d2d_regs_attr.h` in the same directory
+  (`D2D_CDUP_GENERAL__RST`, line 600).
+- FW: `~/projects/iridium/one/fw/ip/noc/drivers/el_noc/el_noc_cdup.c` (PRTR programming at
+  line 246; map restore at line 359); `~/projects/iridium/one/fw/ip/se/drivers/scale_engine/el_se_cdup.c`
+  (SE supplies the topology map, line 67); `~/projects/iridium/one/fw/ip/cce/drivers/el_cce/el_cce.c`
+  (D2D-channel duplication disabled, lines 743–752; PRTR and aligner setup, lines 757 and 780).
+- Evidence is from the checked CSR headers and firmware source only; **RTL behavior/intent has
+  not been independently confirmed**.
+- User input, 2026-11-11: "it is used. since its in D2D Wrapper, D2D driver will give the APIs
+  for it."
 
 ## Sources
 - Doc: `~/docs/A2/Atlantic2 Overview.docx` (D2D 231-235; feature set 127-129).
@@ -53,6 +93,8 @@ What changes for D2D in A2 vs A1, from the D2D Rev2 spec, the A2 Overview, and t
   paragraph diff showed no substantive content change.
 - PHY node facts: user statement (5nm same-as-A1 + new 3nm). See `d2d-ip` skill for PHY/controller
   datasheets and register maps.
-- **RTL (confirmed)**: `ip.d2d.rtl` `iridium...main` — mostly "align to a2" + UCIe link updates;
-  **D2D PHY macros are hard-macro stubs** (swap in progress) → D2D logic delta modest, PHY is the
-  real change. See a2-rtl-analysis.md.
+- User input, 2026-11-11: "we own the d2d sequence in ROM"; "epic should just generally mention D2D ROM sequence, every step there will be a story."
+- **Historical RTL note:** earlier research recorded hard-macro PHY stubs and alignment changes.
+  Its revision and current model availability have not been independently reverified here; ask
+  Neo for current RTL questions. The CSR and user-confirmed CDUP delta above must not be reduced
+  to a PHY-only firmware change.

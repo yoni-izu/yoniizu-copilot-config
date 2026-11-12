@@ -51,14 +51,20 @@ D2D responsibilities by stage (per the proposed driver-functionality split):
 ## Document Catalog
 
 > **Project note (A2 / Atlantic2 vs A1 / Iridium):** `D2D Specification **Rev 2.0.0**.docx` is the
-> **A2 (Atlantic2)** revision; `D2D Specification Rev1.docx` is the A1/Iridium baseline. The two
-> revisions are **textually identical** (only figure/table caption numbering differs). **Per the
-> architect (Maxim Leshin, 2026-08-30): "We are keeping the D2D as is. The FW should be updated
-> only if the new AW IP requires a different configuration."** → **no A2 D2D design change, no D2D
-> initiatives**; D2D FW is carried over unless the new **AlphaWave (AW)** IP drop needs different
-> config. A2 D2D config per the A2 Overview: **12× UCIe 2.0 Standard Package, 768 GB/s per
-> direction**. (Any new-process PHY seen in RTL — e.g. the **N3 PCIe7 PHY** — is on the **SU/DMP**
-> scale-up path, not D2D.) For project context see the `atlantic2-prj` skill.
+> **A2 (Atlantic2)** revision; `D2D Specification Rev1.docx` is the A1/Iridium baseline. Their
+> content was previously found to be textually identical apart from figure/table caption numbering.
+> The architect (Maxim Leshin, 2026-08-30) advised keeping the core D2D design as-is and updating
+> FW where the new AW IP needs different configuration. That guidance does not rule out changes in
+> the wrapper CSR, topology or PHY variants: Neo (2026-11-11) confirmed the A2 D2D PHY is
+> N3P only (Alphawave), in EW (side) and NS (mid) orientation variants — no 5nm/2nm D2D PHY; Tn5
+> files are unused leftovers (supersedes the earlier "5nm + N3" framing). The user also confirmed D2D owns the D2D sequence in ROM, the D2D
+> wrapper CDUP is used, and the D2D driver provides its APIs. The checked A2 CSR contains this
+> wrapper block; A1 D2D wrapper CSR does not. The exact PHY/ROM deltas, HSM integration, CDUP
+> consumer and RTL behavior remain to be confirmed from their respective owners/sources. For
+> tracked evidence see
+> [A2 D2D physical variants and wrapper CDUP API](knowledge/a2-physical-variants-and-cdup.md)
+> and the `atlantic2-prj` skill. A2 Overview figures are **12× UCIe 2.0 Standard Package,
+> 768 GB/s per direction**.
 
 ### D2D & UCIe Documents (`~/docs/D2D/`)
 
@@ -79,9 +85,9 @@ during PRIMEBOOT is the **AresCORE PHY** firmware.
 
 | File | Size | Content |
 |------|------|---------|
-| `arco_arescore_ucie_datasheet_n5_base_0_8_7_element.pdf` | ~6.1MB | **AresCORE™ UCIe D2D PHY IP** — 5nm Base Datasheet, v0.1.0_0.8.7 (Sep 2024, NDA for Element). PHY layer: TX/RX/common-lane configurability, SerDes, supported standards, electricals |
+| `arco_arescore_ucie_datasheet_n5_base_0_8_7_element.pdf` | ~6.1MB | **(A1 / N5 — not A2; A2 is N3P)** **AresCORE™ UCIe D2D PHY IP** — 5nm Base Datasheet, v0.1.0_0.8.7 (Sep 2024, NDA for Element). PHY layer: TX/RX/common-lane configurability, SerDes, supported standards, electricals |
 | `Eland_gammaN64B1Tn5_ss_a_controller_100_051.pdf` | ~2.9MB | **GammaCORE™ UCIe D2D Controller IP** — Base Datasheet (Eland_S variant), v1.0.0_0.5.1 (Oct 2025). Controller layer: streaming protocol, packing/mux, TX/RX buffers, flit gen/termination, end-to-end credit-based flow control, AXI4/FDI |
-| `Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` | ~1.2MB | **GammaCORE32™ 1×S32 Subsystem for UCIe** — 5nm Datasheet (Eland_S variant), v1.0.0_0.5.3 (Oct 2025). Subsystem-level: interfaces (APB, FDI, UCIe standard package, iJTAG), integration, miscellaneous signals |
+| `Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` | ~1.2MB | **(A1 / N5 — not A2)** **GammaCORE32™ 1×S32 Subsystem for UCIe** — 5nm Datasheet (Eland_S variant), v1.0.0_0.5.3 (Oct 2025). Subsystem-level: interfaces (APB, FDI, UCIe standard package, iJTAG), integration, miscellaneous signals |
 | `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.pdf` | ~3.1MB | **GammaCORE32 Register Descriptions (MMR)** — Eland variant, v1.0.0_0.5.3 (Oct 2025). Memory-mapped registers: DVSEC1/DVSEC2 (PCIe extended cap, UCIe Link DVSEC, sideband mailbox), GLOBAL_REG, CMN MCU control/IRQ registers, etc. |
 | `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` | ~3.5MB | Searchable plain-text extraction of the MMR PDF — **use this for register/bitfield keyword searches** (grep-friendly, page-delimited) |
 
