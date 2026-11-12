@@ -156,3 +156,7 @@ platform verification item, not a newly established code defect.
 - Locking precedent: `fw/ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ras_des.c`
 - Spec: Device Manageability, replacement received 2026-10-19 18:10 — LTSSM logger command `0x50`, tables 9-58..9-71; current contract linked above
 - Review: `Elmnt-Internal/ip.pcie.sw.fw.ep` PR #346 @ `cfe33b18`, review `5408638551`
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+The A2 LTSSM logger is polled only; `POP` and `TRGT_LOOKUP` were removed. See [a2-debug-security.md](a2-debug-security.md).

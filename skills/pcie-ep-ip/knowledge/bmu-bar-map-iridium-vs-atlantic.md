@@ -67,3 +67,7 @@ bit-identical.
 - **Risks:** Gen7 IP delta unknown until Gen7 headers land (Phase 0); confirm VRFID-in-MEM
   representative semantics with RTL owner (S. Zamir); `main` is pre-RTL-freeze — re-diff before
   locking FW field offsets.
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 BMU has 12 regions: all disabled means pass-through, and once any is enabled a miss is terminated. `BAR_ADDR_MAPPING_EN` is dead and the INC mapping registers were removed. See [a2-bmu-lmem.md](a2-bmu-lmem.md).

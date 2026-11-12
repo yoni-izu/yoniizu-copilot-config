@@ -128,3 +128,7 @@ all the device-side quiesce/reset that the PSOC reset previously did for free.
 - FW: `fw/ip/pcie/ep/include/el_piw_spi_bits.h:129-132`
 - Related: `iridium-prj` knowledge `reset-domains.md` (FLR resets PSOC/MuC, not PEP/PIW)
 - Context: PR `Elmnt-Internal/ip.pcie.sw.fw.ep#430`, branch `dev/vgomonovych/PIVSY-1592`
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 FLR needs `WD_CNT_CLR`. The termination masks reset to 1, so FW must clear them. See [a2-reset-isolation-perst.md](a2-reset-isolation-perst.md).

@@ -119,3 +119,7 @@ meta-data through the datapath.
 - Related KB: `sw-sram-copy-from-rom.md` (CSR offsets/fields for both paths,
   BOOT_FROM_ROM, dest base addresses), `phy-reset.md` (PERST re-copy trigger),
   `prstn-psoc-fuse-masked.md` (PERST edge reaching PSOC/EP).
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+The A2 copy FSM is the same design as A1. The copy base address is PARAMETER-reset, `PIW_DCCM` moved to 0x10000, the ROM hex is stale (Gen6), and the FSM never clears fast-access. See [a2-phy-cpu-start-and-copy-fsm.md](a2-phy-cpu-start-and-copy-fsm.md).

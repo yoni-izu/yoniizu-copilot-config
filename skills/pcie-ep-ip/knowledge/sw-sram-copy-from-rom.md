@@ -81,3 +81,7 @@ register is only for explicitness; `_1` (phy1) is left at reset (single-PHY,
   `el_piw_sram_to_phy_cp_impl`, `sram_cp_ccm_base_addr[ccm_type]`).
 - Bases: `fw/build_artifacts/include/projects/a1/3_0_11_3p0_1389/bases/fw/native/project_bases_fw_native.h`
   (`MNG_PCIE_EP_CLS_EP_PPW_0_PHY_ICCM_0 = 0x100000000450000`, `..._DCCM_0 = 0x100000000460000`).
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 keeps the `PPW_SW_SRAM_COPY_*` SW path, and `BOOT_FROM_ROM` resets to 0. See [a2-phy-cpu-start-and-copy-fsm.md](a2-phy-cpu-start-and-copy-fsm.md).

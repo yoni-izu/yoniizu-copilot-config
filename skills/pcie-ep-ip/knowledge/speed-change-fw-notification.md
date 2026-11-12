@@ -60,3 +60,7 @@ LBMIE/LABIE are Downstream-Port features.
   (`directed_speed_change` vs `speed_change` at Recovery.Speed), p.720 (RASDES EC Group #5:
   0x0C Speed Change Gen2, 0x0D Link Width Change).
 - KB cross-ref: `pcie-ep-ip/knowledge/link-down-fw-notification.md`.
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 has no speed-change interrupt; FW must poll Link Status. See [a2-controller-gen7-config.md](a2-controller-gen7-config.md).

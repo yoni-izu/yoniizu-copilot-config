@@ -52,3 +52,7 @@ Multi-die platforms replicate this whole inventory per die (address-map prefix `
 - Bindings:
   - `fw/ip/pcie/dts/bindings/snps,pcie6-phy.yaml` (includes `elmnt,pcie-phy.yaml`)
   - `fw/ip/se/dts/bindings/elmnt,c2c.yaml` (SE references the PHY via `phy-dev`)
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 has one x4 EP and one PHY macro per die, with no bifurcation. See [a2-ep-topology-addressing-isolation.md](a2-ep-topology-addressing-isolation.md).

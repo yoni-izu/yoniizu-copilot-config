@@ -123,3 +123,7 @@ abstraction (`el_pcie_phy`) must preserve the split.
   §3.9 ("on `cpu_run_ack` assertion: auto-clears the corresponding bit").
   NOTE: A2 (`..._A2.md` §3.9) drops the whole handshake — `CPU_RUN_REQ`/`CPU_IND`
   no longer exist in A2 `csr_ppw_ctrl`; this note is A1/Iridium-specific.
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+On A2, start the PHY CPU through the PHY PCS register `PHY0_CPU_CTRL` (0xCC; bit 2 = run, ack in 0xF8 bit 18). PIW `cpu_run_req` is dead. Do not port the A1 `CPU_RUN_REQ` poll. See [a2-phy-cpu-start-and-copy-fsm.md](a2-phy-cpu-start-and-copy-fsm.md).

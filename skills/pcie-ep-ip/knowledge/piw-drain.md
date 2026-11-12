@@ -136,3 +136,7 @@ sub-window). To identify the target, decode against the a1 project bases
 - Doc: `fw/ip/pcie/docs/pcie-cluster-architecture.md` (Key Interfaces table: PIW↔PEP AXI
   master/slave, Host→PIW LBW/HBW)
 - JIRA: IPPCIESW-241, IPPCIESW-341, IPPCIESW-311/-370
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 drain uses `BP_MODE` (2 bits: 0 off / 1 timer IRQ / 2 terminate / 3 IRQ only). See [a2-reset-isolation-perst.md](a2-reset-isolation-perst.md).

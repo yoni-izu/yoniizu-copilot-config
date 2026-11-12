@@ -73,3 +73,7 @@ Each SE PHY is a **standalone x4 macro** (`dwc_pcie6_x4_ns`, single `phy0`, no x
   `phy_ctrl_regs`; `se_phy_p0..p7`)
 - FW: `fw/ip/pcie/ep/docs/pcie-init-sequence.md` (`REQ_BROADCAST`), eye-margin tool (8 lanes / 2 inst)
 - Related: `phy-instance-count.md`
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 has a single x4 PHY per die, so dual-macro broadcast does not apply. See [a2-ep-topology-addressing-isolation.md](a2-ep-topology-addressing-isolation.md).

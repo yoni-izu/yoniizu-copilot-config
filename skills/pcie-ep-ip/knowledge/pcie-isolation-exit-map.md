@@ -75,3 +75,7 @@ Host-side access additionally needs: link up, DS_TERM MSTR gate clear, and the `
   mng app DT (`piw_fiu`/`pep_fiu` in `fiu-groups`), `ip/pcie/ep/drivers/snps_ep_ctl/dwc_ep_ctl_sv.c`,
   `proj_infra/include/arm/device_info_sram_mem_addr.h` (A1 power-on workspace)
 - Related: `ds-term.md` (host-side), noc-ip skill `knowledge/fiu-termination-boot-ordering.md`
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+On A2, `PSOC_MISC_POR.PCIE_EP_ISO` resets to 1 on every die, and FW must clear it. Also handle `RST_ISO_EN`, the isolation watchdog and `CFG_ISO_SW_MAN_SL`. See [a2-reset-isolation-perst.md](a2-reset-isolation-perst.md).

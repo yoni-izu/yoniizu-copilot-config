@@ -224,3 +224,7 @@ legacy ELBI path as **not usable on A1**.
 - [axi-term-status-sticky.md](axi-term-status-sticky.md) — `ELBI_TERM_CAP_STATUS` @ PEP_AUX 0x15c
 - [rasdp-error-mode-vs-aer-internal.md](rasdp-error-mode-vs-aer-internal.md) — RASDP error mode
   suspends wire access to CDM/ELBI registers
+
+
+## A2 UPDATE (2026-11-09, Neo against A2 RTL/CSR)
+A2 ELBI is CII-based, split into a management path and a debug path, with an `ELBI_SL` security level. See [a2-debug-security.md](a2-debug-security.md).
