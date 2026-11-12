@@ -115,3 +115,7 @@ SE init; `DOWN_PORTS` = only link-down ports, armed from the FLR ISR callback; s
 - FW (A1 `a1_power_on_002`): `fw/proj_infra/include/el_reset_components.h` (`EL_RESET_COMP_SE_0 = 81`),
   `fw/ip/se/drivers/scale_engine/el_se_reinit.c` (`el_se_die_arm_flr_reset`, file header),
   `fw/ip/se/drivers/scale_engine/el_se_orch.c` (`el_se_orch_phyfw_load_region`).
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: per-link resets (c3489b7); the PHY-global reset only fires when both DMs hold PHY reset; the even C2C/DM0 reset also resets the DMP glue. See [se-a2-reset-perst-hot-reset.md](se-a2-reset-perst-hot-reset.md).

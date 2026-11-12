@@ -33,3 +33,7 @@
 - Correct received data does NOT validate peer_idx: data is routed by the address in the TLP, credits by CAM(req_id). Both come from the same parser header slot, so correct data clears slot selection only, not the CAM mapping.
 - Interrupts: `c2c_sei_{p,np,cpl}_parse_peer_idx_{no,mult}_hit` (+ req_id info reg), `c2c_sei_credit_{aw,w,b,ar,r}_ovf` (available > max; per-peer bitmap in peer_h/peer_l info). There is **no underflow interrupt** (the starved peer is invisible). Also `c2c_sei_{p,np,cpl}_parse_unknown_fmt/stuck` and `c2c_sei_c2c_{p,np,cpl}_tlp_discard`. The every-1 µs PEER_CREDIT reload resets the counters before an OVF can build up, so the workaround hides the evidence.
 - Code nit: `p_tlp_parser.v:665` uses C2C_REC_CPL_PARSER_WIN_NATIVE_BEATS in the P parser.
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: the ReqID→peer CAM and default peer were removed; routing is via the 2K NPA table indexed by DEV_INDEX_OFFSET. See [c2c-a2-npa-table-address-translation.md](c2c-a2-npa-table-address-translation.md).

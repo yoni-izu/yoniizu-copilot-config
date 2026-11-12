@@ -70,3 +70,7 @@ meaningful; reserve negative for genuine failures worth surfacing.
 - FIU contract: `fw/ip/noc/include/el_fiu_intr.h` (SEI-owned, SPI-masked), `fw/ip/noc/drivers/el_fiu/el_fiu_group.c` (`el_fiu_mgr_handle_error_context`: reads+W1C both leaves; `num_err_rsp_events` independent of sinks).
 - Walker: `fw/infra/drivers/el_irq_tree/el_irq_tree.c` (`walk_tree` post-order `w1c_and_retry`, `accum_rc` sticky-negative).
 - FW under review: `ip.se.sw.fw` PR #148 / IPSESW-139 (`drivers/c2c/el_c2c_irq_handlers.c`, `el_c2c_cause_descs.c`, `el_c2c.c`).
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: 6 flat lines per C2C, a new SEI_2 cause register, DMP SEI replaces SERR/DERR, and the capture/peer_idx causes are dead. See [c2c-a2-interrupts.md](c2c-a2-interrupts.md).

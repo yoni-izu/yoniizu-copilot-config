@@ -72,3 +72,7 @@ handler in SE).
 - FW: `ip/se/drivers/scale_engine/el_se_reinit.c`, `el_se_orch.c` (`el_se_orch_init`),
   `Kconfig`, `docs/port_ownership_model.md` ("FLR policy").
 - Spec: `~/docs/PSoC/PSOC Specification Rev1.2.0.docx` §Reset flow (P1440–P1460), §FLR (P1505–P1509).
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: no FLR in the integration RTL; PERST_N is per C2C (SW-owned); resets are per link; hot reset is detected via SPI. See [se-a2-reset-perst-hot-reset.md](se-a2-reset-perst-hot-reset.md).

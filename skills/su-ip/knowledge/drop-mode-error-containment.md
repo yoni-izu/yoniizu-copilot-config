@@ -191,3 +191,7 @@ Implications for reviewers / integrators:
   Drop), P1242 (Lane/Link failure).
 - RTL/FW: `ip.se.sw.fw` not present in local workspace as of 2026-06-22 (no local drop/
   isolation/viral handling found).
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: "drop" = AG_SPLIT_MODE=3 / exp_ack_ebr_drop / silent_drop; isolation trigger writes are one-shot strobes with no drain-done status. See [c2c-a2-isolation-viral-ecc.md](c2c-a2-isolation-viral-ecc.md).

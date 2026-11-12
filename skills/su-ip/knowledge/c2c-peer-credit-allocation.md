@@ -34,3 +34,7 @@
 - RTL: same branch, `c2c_macro/rtl/c2c_remote_credit_manager_top.v:58-72,92-106,128-142` (programmed per-peer thresholds/counters)
 - RTL: same branch, `c2c_macro/rtl/c2c_tlp_transmit_pipe_buffers.v:342-347` (AW transmission waits for control and data credits)
 - RTL: same branch, `c2c_macro/rtl/c2c_tlp_transmit_pipe_buffers.v:161-165,342-347` (AR/AW scheduler credit gates); `c2c_macro/rtl/c2c_remote_credit_manager_top.v:57-72,87-102,261-274` (credit limit loads, counter seed, peer status)
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: in optimized mode FW programs the initial peer credits; release is HW; compliant mode bypasses C2C credits; max peers is 2048. See [c2c-a2-mode-straps-datapath.md](c2c-a2-mode-straps-datapath.md).

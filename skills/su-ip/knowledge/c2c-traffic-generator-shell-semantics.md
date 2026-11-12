@@ -20,3 +20,7 @@ How the Iridium C2C shell selects traffic-generator address windows and handles 
 - FW: `ip/se/drivers/scale_engine/el_se_orch.c` (`el_se_get_port_peer_target`)
 - FW API: `ip/se/include/el_se.h` (`el_se_peer_target`, `el_se_get_port_peer_target`)
 - FW docs: `ip/se/docs/shell_commands.md` (auto and raw mode `time` descriptions)
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2 still has traffic_gen in the master pipe (4 KB TRAFFIC_GEN.yml block); POR status unknown. See [c2c-a2-mng-counters-observability.md](c2c-a2-mng-counters-observability.md).

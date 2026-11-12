@@ -51,3 +51,7 @@ no orchestrator call); the only writer is the shell command.
 - Regs: `build_artifacts/include/ips/se/{v1,v2}/<ver>/prototype/c2c_regs.h` (fields/offset), `c2c_regs_attr.h` (`C2C_COMPRESSION__RST=0x6`)
 - Spec: `PCIe C2C Rev 2.0.0.docx` p.30 §7.2.5, P524-533
 - FW: `ip.se.sw.fw` → `drivers/c2c/el_c2c.c` (`el_c2c_set_compression_impl`), `drivers/c2c/el_c2c_shell.c` (`cmd_c2c_compression_enable`), `include/el_c2c_api.h` (`el_c2c_set_compression`), `drivers/c2c/tests/{host,arm}_tests_sv.c` (`c2c_ro_reset_checks` / `test_c2c_reset_defaults`)
+
+## A2 delta (2026-11-11, via Neo)
+
+- A2: the compression block matches A1, but the c2c_top glue changed (~841 lines) and needs re-verification. See [c2c-a2-mode-straps-datapath.md](c2c-a2-mode-straps-datapath.md).
