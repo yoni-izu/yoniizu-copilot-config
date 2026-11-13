@@ -60,30 +60,19 @@ argument-hint: 'Ask a question about the Atlantic project — architecture, PRM/
 
 ## Document Catalog
 
-### Atlantic Project Documents (`~/docs/Atlantic/`)
+### Git specification sources
 
-Project documents live under `~/docs/Atlantic/` (populated as the project ramps). Expect the same
-document families as Iridium — a **PRM** (master project spec), a **NoC / fabric spec**, and a
-**SoC spec** (reset domains, MMU/PMMU, virtualization). Discover what is currently present:
+Follow the [two-repository source map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#project-context):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 and
+verified legacy A1 documents in `Elmnt-Internal/project.atlantic2.hwarch.specs`,
+both on `main`. The project repo is deprecated, but this split is explicitly
+approved. No separate interim-Atlantic baseline was verified: label inherited
+A1/A2 context instead of calling it Atlantic-confirmed.
 
-```python
-import os, glob
-d = os.path.expanduser("~/docs/Atlantic")
-for f in sorted(glob.glob(os.path.join(d, "**", "*"), recursive=True)):
-    if os.path.isfile(f):
-        print(os.path.relpath(f, d), f"{os.path.getsize(f)//1024} KB")
-```
-
-### Per-IP Specs (defer to the IP skills, but useful as Atlantic project sources)
-
-- `~/docs/PCIe EP/` → `pcie-ep-ip` skill
-- `~/docs/D2D/` → `d2d-ip` skill
-- `~/docs/C2C/` and scale-up → `su-ip` skill
-- `~/docs/RAS/`, `~/docs/PSoC/` → `ras-manageability` skill
-- `~/docs/NOC/` → fabric/NoC supporting material
-
-> The IP specs are shared across projects. What differs per project is the **RTL branch** (`main`
-> for Atlantic, freezed-RTL for Iridium) and the project-specific **FW infra / manifests**.
+The map gives exact per-IP Markdown paths for PCIe EP, D2D, scale-up, PSOC,
+NoC and manageability. It also records missing vendor manuals, exact legacy
+baselines and NoC revision discrepancies. Historical knowledge is secondary,
+not current spec evidence. Do not discover or fall back to local document folders.
 
 ### External References (Confluence)
 
@@ -174,37 +163,10 @@ Determine which source(s) are most relevant:
 
 ### Step 2: Search the Source
 
-Use `python-docx` for `.docx` specs and the workspace search tools (grep/file/semantic) for the
-source tree.
-
-#### DOCX keyword search across paragraphs:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Atlantic/<spec>.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i} [{para.style.name}]: {para.text[:300]}")
-```
-
-#### DOCX heading map (locate a section, then read its range):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Atlantic/<spec>.docx")
-for i, p in enumerate(doc.paragraphs):
-    if p.style.name.lower().startswith("heading") and p.text.strip():
-        print(i, p.style.name, "|", p.text.strip())
-```
-
-#### DOCX search tables (register/field definitions live in tables):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Atlantic/<spec>.docx")
-for t_idx, table in enumerate(doc.tables):
-    for r_idx, row in enumerate(table.rows):
-        row_text = " | ".join(cell.text.strip() for cell in row.cells)
-        if "<keyword>" in row_text.lower():
-            print(f"Table {t_idx}, Row {r_idx}: {row_text}")
-```
+Select the mapped Git document and verify its project and cover revision.
+Resolve `main` to a commit and use the exact-path `gh api` raw Markdown
+lookup in the source map. Search headings, text and tables; cite repository,
+commit, path and section/table. Do not infer a baseline from a revision number.
 
 For **FW and non-RTL software**, prefer workspace tools under
 `~/projects/atlantic/<variant>/`, with a GitHub fallback limited to software.

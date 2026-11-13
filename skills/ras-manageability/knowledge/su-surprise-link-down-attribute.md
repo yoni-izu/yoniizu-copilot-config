@@ -17,5 +17,5 @@
 - HW side: there is no surprise-down counter in the DM controller. See su-ip `dm-surprise-down-reporting.md`.
 
 ## Sources
-- `~/docs/RAS/A1 Manageability Specification.docx`, tbl 53 rows 0–16 and tbl 61; paragraph 4283–4284.
-- `~/docs/RAS/Device Manageability Specification.docx`, tbl 207 row 13 and tbl 215.
+- Historical secondary A1 source: `A1 Manageability Specification.docx`, tbl 53 rows 0–16 and tbl 61; paragraph 4283–4284. Exact approved Git original unverified.
+- Historical secondary DMS source: `Device Manageability Specification.docx`, tbl 207 row 13 and tbl 215. Exact approved Git original unverified; mapped Chip Management / Platform Manageability are not proven equivalents.

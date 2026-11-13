@@ -44,7 +44,7 @@ stop the bleeding. If FW is slow to service it, the link is already flushed/drop
 | SU/C2C | viral→drop + SEI/SPMU event | isolation-WD (CTO)→SEI + link_req_rst_not |
 
 ## Sources
-- Doc: `~/docs/PCIe EP/controller/DWC_pcie_ctl_ep_databook.pdf` p.105 (reset-event source),
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_ep_databook.pdf` p.105 (reset-event source),
   p.107-108 (Fig 2-30, "create an interrupt … link has gone down"), p.611 (DRS on DL_Down→DL_Up),
   p.694 (RASDES EC group#1 link-down cause codes).
 - KB cross-ref: `pcie-ep-ip/knowledge/app-ctrl-crs-drs.md` (PERSTn ISR, DL_Down→DL_Up),

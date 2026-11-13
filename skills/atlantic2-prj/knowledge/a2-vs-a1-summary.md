@@ -52,13 +52,14 @@ single largest new capability vs Iridium.
   `gh api .../compare/iridium...main`). Confirmed Gen7 (EP `element_labs_ep16sx4_gen7` + SU DM
   `element_labs_dm16sx2_gen7`), EFEC, C2C aggregators, **3nm PHY on the SU DMP**, D2D PHY stubs,
   NoC `AXI_UC_GPU`/`AXI_UC_INC` channels. Still TODO: `ip.psoc.rtl` (544) + `ip.infra.rtl` (529).
-- **N3 (3nm) D2D PHY datasheet** — not yet in `~/docs/D2D/`; add + analyze when available.
+- **N3 (3nm) D2D PHY datasheet** — not verified in the approved Git catalog; report the missing vendor authority.
 - **PSoC Rev2.0.1** — analyzed → see `psoc-ip` skill (3× Cortex-M7 MuC/PTuC/RuC + TuC, no PCIe uC;
   new crypto SHA-384/256/512 + ECC P-384; HSM = Caliptra). RTL `ip.psoc.rtl` (544) still TODO.
 - **Compression Specification** (referenced by D2D Rev2) — not yet located.
 
 ## Sources
 - a2-overview.md, a2-jira-landscape.md, a2-architect-initiatives.md, a2-d2d.md, a2-pcie-ep.md,
-  a2-scaleup-c2c.md, a2-noc.md (this knowledge base). Docs under `~/docs/A2/`, `~/docs/D2D/`,
-  `~/docs/PCIe EP/`, `~/docs/C2C/`. Jira cloudId c155e965-159d-4564-a0a0-16eb85204b7f.
+  a2-scaleup-c2c.md, a2-noc.md (historical secondary knowledge). Revalidate via the
+  Git source map in `../SKILL.md`; missing exact originals are gaps, not current
+  evidence. Jira cloudId c155e965-159d-4564-a0a0-16eb85204b7f.
   Confluence page 1362952569.

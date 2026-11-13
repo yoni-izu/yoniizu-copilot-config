@@ -55,28 +55,24 @@ argument-hint: 'Ask a question about the Iridium project — architecture, PRM/N
 
 ## Document Catalog
 
-### Iridium Project Documents (`~/docs/Iridium/`)
+### Verified legacy A1 Git documents
 
 | File | Size | Content |
 |------|------|---------|
-| `Iridium PRM.docx` | ~2.7MB | Product Reference Manual — the master project spec. 3287 paras, 40 tables. Covers FIU, binning, memory scrubbing, reset flow, trace (ETR/BMON/STM/SPMU), security (SL/SG, CfgR, RR, PB, RAC/WAC, Boot ROM), GPIO/straps, eFuse, D2D, C2C, ECC, interrupts/PLIC, I-cache, MMU, VCore, PCIe, scheduler, VME, manageability, RAS, power/thermal loop, PSOC, logical BIST, CCE, margin tools, run-time FW security, boot-time estimation |
-| `Iridium NoC Specification.docx` | ~7.1MB | NoC / fabric spec. 1662 paras, 18 tables. Covers address map (memory regions, device/host/management/control/debug address spaces, NPA), redundancy (inner-die & platform), device coordinates, scale-up connectivity & routing, device routing, MEM fabric (planes, mRTR/pRTR, virtual channels, data merging, E2E credits), VME & datapaths |
-| `Iridium SoC spec.docx` | — | SoC architecture spec. 487 paras, 11 tables. Covers Architectural Design (**Reset Domains** — authoritative **Table 4-2** reset-domain matrix, *not* in the PRM; **Software Reset Flow**), MMU/PMMU (TLB, PTW, layers), Virtualization (PF/VF: PCIe BMU/iATU/CfgR/MSI-X/TEE, PSOC mailbox/FLR, MMU ASID/gateways, NoC), and PCIe EP capability/RAS support tables. Authority for the reset-domain matrix and SoC-level architecture. |
+| [Iridium PRM](https://github.com/Elmnt-Internal/project.atlantic2.hwarch.specs/blob/main/specs/iridium-prm/iridium-prm.md) | — | Legacy project reference: FIU, binning, reset, security, GPIO/eFuse, connectivity, ECC, interrupts, MMU, compute, manageability and power/thermal. |
+| [Iridium NoC](https://github.com/Elmnt-Internal/project.atlantic2.hwarch.specs/blob/main/specs/iridium-noc-specification/iridium-noc-specification.md) | — | Legacy address spaces, NPA, routing, redundancy, MEM fabric, credits and datapaths. |
+| [Iridium SoC](https://github.com/Elmnt-Internal/project.atlantic2.hwarch.specs/blob/main/specs/iridium-soc/iridium-soc.md) | — | SoC architecture: reset domains (historical Table 4-2), software reset flow, MMU/PMMU and virtualization; verify section/table locators in the Git revision. |
 
-### Related Project Data (`~/docs/`)
+### Source policy and per-IP documents
 
-| File | Content |
-|------|---------|
-| `HSI_Features.csv` / `HSI_Features_Enriched.csv` | HSI feature inventory (and enriched mapping) used for Iridium planning/traceability |
-| `enrich_csv.py` | Script that produced the enriched feature CSV |
-
-### Per-IP Specs (defer to the IP skills, but useful as Iridium project sources)
-
-- `~/docs/PCIe EP/` → `pcie-ep-ip` skill
-- `~/docs/D2D/` → `d2d-ip` skill
-- `~/docs/C2C/` and scale-up → `su-ip` skill
-- `~/docs/RAS/`, `~/docs/PSoC/` → `ras-manageability` skill
-- `~/docs/NOC/` → fabric/NoC supporting material
+Follow the [two-repository source map](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 and legacy
+A1 in `Elmnt-Internal/project.atlantic2.hwarch.specs`, both on `main`.
+The latter is deprecated but this split is explicitly approved. Legacy documents
+are `specs/iridium-*`, not an invented `archive/` directory. Missing exact
+legacy IP baselines and vendor manuals must be reported, not substituted with
+general/A2 snapshots. Historical notes and old extracts are secondary evidence.
+Planning inventories are not specifications; use the planning skill's authority.
 
 ### External References (Confluence)
 
@@ -168,46 +164,10 @@ Determine which source(s) are most relevant:
 
 ### Step 2: Search the Source
 
-Use `python-docx` for the `.docx` specs and workspace search tools for non-RTL
-software. RTL questions go to Neo (`neo-ask`) only.
-
-#### DOCX keyword search across paragraphs:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Iridium/Iridium PRM.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i} [{para.style.name}]: {para.text[:300]}")
-```
-
-#### DOCX heading map (locate a section, then read its range):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Iridium/Iridium PRM.docx")
-for i, p in enumerate(doc.paragraphs):
-    if p.style.name.lower().startswith("heading") and p.text.strip():
-        print(i, p.style.name, "|", p.text.strip())
-```
-
-#### DOCX extract a paragraph range for context:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Iridium/Iridium PRM.docx")
-for i in range(START, END):
-    if i < len(doc.paragraphs):
-        print(f"[{i}] {doc.paragraphs[i].text}")
-```
-
-#### DOCX search tables (register/field definitions live in tables):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/Iridium/Iridium PRM.docx")
-for t_idx, table in enumerate(doc.tables):
-    for r_idx, row in enumerate(table.rows):
-        row_text = " | ".join(cell.text.strip() for cell in row.cells)
-        if "<keyword>" in row_text.lower():
-            print(f"Table {t_idx}, Row {r_idx}: {row_text}")
-```
+Resolve `main` to a commit, then fetch the mapped `specs/iridium-*` Markdown
+with the exact-path `gh api` lookup in the source map. Verify the cover revision,
+search headings/text/tables and cite repo + commit + path + section/table.
+Use workspace tools for non-RTL software. RTL questions go to Neo only.
 
 For **FW and non-RTL software**, prefer workspace tools under
 `~/projects/iridium/<variant>/`, with a GitHub fallback limited to software.

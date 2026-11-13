@@ -52,10 +52,10 @@ What changes for scale-up/C2C in A2 vs A1 — especially the "PCIe Compliant mod
   (terminate AG/UC when MPS<256B), IPSESW-269/267 (multicast / GPU), IPSESW-146 (external FEC).
 
 ## Sources
-- Doc: `~/docs/A2/Atlantic2 Overview.docx` (Scale-Up 213-226; feature set 132-139).
-- Doc: `~/docs/C2C/PCIe C2C Rev 2.1.1.docx` (A2) — §4 topology/generation (177-210), §5 layers
+- Historical secondary extract: `Atlantic2 Overview.docx` (Scale-Up 213-226; feature set 132-139); exact Git original unverified.
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/pcie-c2c-Rev2.1.1/pcie-c2c.md` (A2). Historical secondary locators: §4 topology/generation (177-210), §5 layers
   (185-205), §8 PCIe-Compliant Mode (235-245), RAS (247-258), power (261-267). A1 baseline:
-  `~/docs/C2C/PCIe C2C.docx` (747 paras).
+  `PCIe C2C.docx` (747 paras; exact A1 Git original unverified).
 - Controller: Synopsys DWC PCIe **DM** (dual-mode) controller — see `su-ip` skill.
 - **RTL (confirmed)**: `ip.se.rtl` `iridium...main` — DM Gen7 macro `element_labs_dm16sx2_gen7_axi4_subsys`
   (DWC 6.60a), **EFEC integ**, **C2C read/write aggregators**, LTSSM logger, DMP **n3/3nm PCIe7

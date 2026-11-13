@@ -82,11 +82,11 @@ Correct naming:
 ```
 
 ## Sources
-- `~/docs/PCIe EP/controller/DWC_pcie_ctl_reference.pdf` §3.2.28.3 `EVENT_COUNTER_CONTROL_REG`,
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_reference.pdf` §3.2.28.3 `EVENT_COUNTER_CONTROL_REG`,
   Table 3-219 (field descriptions for `EVENT_COUNTER_EVENT_SELECT`, `EVENT_COUNTER_LANE_SELECT`,
   `EVENT_COUNTER_STATUS`, `EVENT_COUNTER_ENABLE`, `EVENT_COUNTER_CLEAR`). Cross-checked against a
   second instance of the same register block in the same manual — identical encoding.
-- `~/docs/PCIe EP/controller/DWC_pcie_ctl_ep_databook.pdf` §29.3.3.2 "Event Counters"
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_ep_databook.pdf` §29.3.3.2 "Event Counters"
   (Figure 29-7 register access diagram, Table 29-20 VSEC registers).
 - FW: `ip.pcie.sw.fw.ep` → `include/dwc_ep_ras_des.h`,
   `drivers/snps_ep_ctl/dwc_ep_ras_des.c`, `drivers/snps_ep_ctl/dwc_ep_ctl_shell_sv.c`.

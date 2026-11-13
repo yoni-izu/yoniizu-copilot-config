@@ -12,7 +12,7 @@
 A2 NoC / fabric structure and the A2-specific address-map additions.
 
 ## Findings (A2)
-- **A2 NoC spec** = `~/docs/A2/NOC/Atlantic2 NoC Specification Rev 1.2.0.docx` (2691 paras,
+- **Historical secondary A2 NoC extract** = `Atlantic2 NoC Specification Rev 1.2.0.docx` (2691 paras,
   38 tables). Same fabric family as Iridium: Address Map, Redundancy (inner-die + platform),
   Device Coordinates, Scale-Up Connectivity (Rail), Device Routing (inner/outer die), **MEM
   Fabric** (Plane Selection, Middle Router mRTR, PCIe Router pRTR, Virtual Channels, Data
@@ -44,7 +44,7 @@ A2 NoC / fabric structure and the A2-specific address-map additions.
   otherwise the fabric taxonomy (MEM/MNG/CTRL/DBG/TRC/ECT/TS + FIU) is carried from Iridium.
 
 ## Sources
-- Doc: `~/docs/A2/NOC/Atlantic2 NoC Specification Rev 1.2.0.docx` — Address Map (INC 628, remote
+- Revalidate using `project.atlantic2.hwarch.specs:specs/atlantic2-noc-specification/atlantic2-noc-specification-v1.5.0.md`; verify intended revision and conversion provenance (folder/header discrepancies; not a claim of latest). Historical secondary Rev1.2.0 locators: Address Map (INC 628, remote
   GPU 629/856-859, 660-664), GPU/AFD (417, 856), A2/GPU translation (947), collectives from
   remote/INC/GPU (2342-2347). H1/H2 fabric taxonomy as listed above.
 - Cross-ref: a2-architect-initiatives.md (IPNOCSW-115..138), a2-scaleup-c2c.md.

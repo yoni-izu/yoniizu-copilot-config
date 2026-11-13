@@ -48,17 +48,17 @@ argument-hint: 'Ask about the NoC/fabric IP — address map, routing, a specific
 
 ## Document Catalog
 
-> **Rule of thumb:** the highest-revision NoC spec is the current A2 doc. As of 2026-08-30 the
-> newest is **Rev 1.4.0** in `~/docs/NOC/` (supersedes Rev 1.2.0 in `~/docs/A2/NOC/`). The spec
-> structure is stable across 1.2.0→1.4.0; recent changes are content refinements (see rev
-> history: CCE descriptor, FIU outstanding-txn limit, NoC routing algorithm, device coordinates).
+Use the [NoC Git source map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#noc):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 and
+legacy A1 NoC in `Elmnt-Internal/project.atlantic2.hwarch.specs`, both on `main`.
+The deprecated project repo is retained by explicit approval.
 
-| File | Path | Content |
-|------|------|---------|
-| **Atlantic2 NoC Specification Rev 1.4.0** | `~/docs/NOC/Atlantic2 NoC Specification Rev 1.4.0.docx` | **Current A2 NoC spec** — address map, redundancy, device coordinates, scale-up connectivity, routing, MEM fabric, sideband fabrics, AxUSER, FIU, performance, RAS, security |
-| Atlantic2 NoC Specification Rev 1.2.0 | `~/docs/A2/NOC/Atlantic2 NoC Specification Rev 1.2.0.docx` | Earlier A2 revision (diff for recent changes) |
-| FIU uArch | `~/docs/NOC/FIU_uArc.docx` | FIU micro-architecture |
-| FIU AXI Integration | `~/docs/NOC/FIU AXI Intergration.pptx` | FIU ↔ AXI integration deck |
+**Verify the intended revision, never assume latest:** the unversioned A2
+Markdown cover says 1.0.1; the Rev1.5.0 folder's Markdown says 1.4.0.
+Version-specific v1.5.0 extracts and a Rev1.7.0 Word original exist; verify
+conversion provenance and project intent before choosing. Exact FIU uArch and
+AXI integration deck counterparts were not verified. Historical notes retain
+old locators as secondary evidence, not current spec authority; no local fallback.
 
 ### Spec section map (H1/H2)
 
@@ -97,16 +97,12 @@ directory. If none is verified source-free, use the specification or ask Neo
 - Isolation / rate-limit / reset-iso / security → FIU section.
 - RTL behavior → ask Neo (`~/bin/neo-ask --chip a1|a2`).
 
-### Step 2: Search the Spec (`python-docx`)
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/NOC/Atlantic2 NoC Specification Rev 1.4.0.docx")
-# heading map:
-for i,p in enumerate(doc.paragraphs):
-    if p.style.name.lower().startswith("heading") and p.text.strip():
-        print(i, p.style.name, "|", p.text.strip())
-# keyword search across paragraphs AND tables (address-map / field defs live in tables).
-```
+### Step 2: Search the Git specification
+
+Resolve a commit, fetch the exact mapped NoC Markdown using `gh api` from the
+source map and inspect its revision history. Search headings, text and tables
+(including address maps and fields). Cite repository, commit, path and
+section/table. Folder names alone do not establish revision or currency.
 
 ### Step 3: Search the RTL
 Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
@@ -124,5 +120,6 @@ a finding is contradicted later, correct it.
 ### Search Strategy Tips
 - **Acronyms**: spec has a Terminology/Acronyms section near the top.
 - **Tables**: address-map ranges and field/bit definitions live in tables — search both.
-- **A2-vs-A1 / recent changes**: read the spec **Revision History** table and diff Rev 1.2.0 vs
-  1.4.0; for implementation reality ask Neo (`neo-ask --chip a2`) for the RTL delta.
+- **A2-vs-A1 / recent changes**: compare the verified intended A2 revision with
+  mapped Iridium NoC, stating provenance discrepancies. For implementation
+  reality ask Neo (`neo-ask --chip a2`) for the RTL delta.

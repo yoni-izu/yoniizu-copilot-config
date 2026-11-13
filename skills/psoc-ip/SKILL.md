@@ -49,13 +49,14 @@ argument-hint: 'Ask about PSOC — the uC cluster, boot/reset, slow IOs, eFuse/G
 
 ## Document Catalog
 
-> **Rule of thumb:** Rev2.x = A2, Rev1.x = A1/Iridium. Diff Rev2 vs Rev1 for the A2 delta.
-
-| File | Path | Content |
-|------|------|---------|
-| **PSOC Specification Rev 2.0.1** | `~/docs/PSoC/PSOC Specification Rev2.0.1.docx` | **A2** PSOC spec — overview, slow IOs, peripheral engines, boot, reset, GPIO, uC cluster, clock/reset domains, binning, trace/debug, fabric mapping, interrupts, RAS, security, multi-die, platform guidelines, HSM (Caliptra) integration, FIU |
-| PSOC Specification Rev 1.2.0 | `~/docs/PSoC/PSOC Specification Rev1.2.0.docx` | **A1/Iridium** baseline (diff for the A1→A2 delta) |
-| Cortex-M7 | `Cortex-M7.docx` (referenced) | Arm Cortex-M7 processor details |
+Use the [PSOC Git source map](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#psoc)
+and [ARMCPU map](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#armcpu):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 PSOC,
+Cortex-M7 and verified legacy A1 SoC/PRM context in
+`Elmnt-Internal/project.atlantic2.hwarch.specs`, both on `main`. The deprecated
+project repo is retained by explicit approval. Exact A1 PSOC Rev1.2.0 is
+unverified; do not invent its path or infer project from Rev1/Rev2.
+Historical knowledge is secondary; no local-document fallback.
 
 ### Spec section map (H1)
 `Overview` · `Slow IOs` · `Peripheral Engines` · `Boot` · `Reset` · `GPIO` · `Micro Controllers` ·
@@ -83,15 +84,11 @@ directory. If none is verified source-free, use the specification or ask Neo
 ### Step 1: Classify → pick the spec section (see map). uC/CPU → "Micro Controllers"; boot →
 "Boot"; reset → "Reset"; crypto/eFuse/mailbox → "Peripheral Engines"; HSM → "HSM Integration".
 
-### Step 2: Search the Spec (`python-docx`)
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/PSoC/PSOC Specification Rev2.0.1.docx")
-for i,p in enumerate(doc.paragraphs):
-    if p.style.name.lower().startswith("heading") and p.text.strip():
-        print(i, p.style.name, "|", p.text.strip())
-# keyword-search paragraphs AND tables (memory sizes / config params live in tables).
-```
+### Step 2: Search the Git specification
+
+Resolve a commit and fetch the exact mapped PSOC Markdown with `gh api` as shown
+in the source map. Verify its cover revision; search headings/text/tables.
+Cite repository, commit, path and section/table, not old Word paragraph indexes.
 
 ### Step 3: Search the RTL
 Follow [rtl-vm-policy](../rtl-vm-policy/SKILL.md): ask **Neo** —
@@ -107,6 +104,6 @@ at top); correct stale entries when contradicted.
 
 ### Search Strategy Tips
 - **Acronyms**: spec Terminology/Acronyms section near the top (MuC/PTuC/RuC/TuC/FLA/HSM).
-- **A2-vs-A1**: diff Rev 2.0.1 vs Rev 1.2.0; for implementation reality ask
-  Neo (`neo-ask --chip a2`) for the RTL delta.
+- **A2-vs-A1**: compare only verified exact baselines; report missing Rev1.2.0.
+  For implementation reality ask Neo (`neo-ask --chip a2`) for the RTL delta.
 - **uC memories / config params**: in tables (Table 10-1 uC Memories, 10-2 Cortex-M7 params).

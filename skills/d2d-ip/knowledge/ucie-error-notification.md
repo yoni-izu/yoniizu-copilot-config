@@ -58,7 +58,7 @@ Physical Layer -> Adapter status/error signals (Ch 8 RDI):
   the quickest path to error containment.
 
 ## Sources
-- Spec: `~/docs/D2D/ucie_1p1_with_legal_disclaimer_july_10th_2023.pdf` (UCIe 1.1, 2023-07-10)
+- Historical secondary source: `ucie_1p1_with_legal_disclaimer_july_10th_2023.pdf` (UCIe 1.1, 2023-07-10); exact approved Git publication unverified. Internal D2D integration Markdown is not a substitute standard.
   - {ErrMsg} encoding: Table 6-8 (~p9524, p9681-9686)
   - RDI error signals pl_cerror/pl_error/pl_nferror/pl_trainerror/lp_linkerror: Chapter 8 RDI
     signal list (~txt lines 13998-14060)
@@ -67,4 +67,4 @@ Physical Layer -> Adapter status/error signals (Ch 8 RDI):
     §7.5.1.6-7.5.1.8 (~txt 11440-11640)
   - Uncorrectable Error Status/Mask/Severity Tables 7-27/28/29: §7.5.3.2-7.5.3.4
   - Adapter sideband ErrMsg-received status/mask/severity: ~txt 12001-12114
-- Cached plaintext: `~/docs/D2D/ucie_1p1.txt`
+- Historical plaintext title: `ucie_1p1.txt`; unavailable as verified Git evidence, not a lookup fallback.

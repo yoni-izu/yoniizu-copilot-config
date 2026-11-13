@@ -1,6 +1,6 @@
 ---
 name: su-ip
-description: 'Answer Scale Up (SU) IP design, usage, C2C, and PCIe DM controller questions using Synopsys DWC PCIe DM controller docs, PCIe6 PHY docs, and internal C2C specification. Use when: scale-up, SU link, C2C, chip-to-chip, PCIe dual-mode controller, DM controller, SU PHY, SU PCIe, SU registers, SU LTSSM, SU equalization, SU loopback, SU PRBS, multi-socket, scale-up interconnect.'
+description: 'Answer Scale Up (SU) IP design, usage, C2C, PCIe DM controller and project-specific PHY questions using mapped Git specifications, available vendor collateral and Neo for RTL. Use when: scale-up, SU link, C2C, chip-to-chip, PCIe dual-mode controller, DM controller, SU PHY, SU PCIe, SU registers, SU LTSSM, SU equalization, SU loopback, SU PRBS, multi-socket, scale-up interconnect.'
 argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM controller, or PHY behavior'
 ---
 
@@ -16,7 +16,7 @@ argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM contro
 - Questions about Scale Up (SU) link design and operation
 - DWC PCIe Dual-Mode (DM) controller behavior, registers, or configuration
 - C2C (chip-to-chip) protocol and specification
-- SU PHY questions (same PCIe6 PHY as EP — see PHY docs below)
+- SU PHY questions (project/revision-specific PCIe PHY — see vendor-source caveats below)
 - SU link training, equalization, LTSSM behavior
 - SU PRBS, loopback, BER testing
 - Multi-socket / scale-up interconnect architecture
@@ -25,7 +25,7 @@ argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM contro
 ## Architecture Context
 
 - **Controller**: Synopsys DWC PCIe Dual-Mode (DM) controller — supports both Root Complex (RC) and Endpoint (EP) modes
-- **PHY**: **Same Synopsys DWC PCIe6 PHY v2.63a as PCIe EP** — identical SerDes, PIPE interface, APB registers
+- **PHY**: project- and revision-specific. Neo's A2 mirror review identifies a Synopsys PCIe7 PHY integration (1.10a_pre1, TSMC 3nm); the exact PHY variant and its relationship to the EP PHY require the applicable vendor documentation. Do not generalize A1/EP PCIe6 details to A2 SU.
 - **C2C Protocol**: Element's internal chip-to-chip protocol running over the PCIe DM controller
 - **Use Case**: High-bandwidth scale-up links between SoCs (e.g., SU ↔ SU peer-to-peer)
 
@@ -43,13 +43,27 @@ Scale Up (SU / C2C) responsibilities by stage (per the proposed driver-functiona
 | EL SE           | —      | —         | FULL       | —               |
 
 - SU is brought up **entirely in MANAGEMENT** (FULL) — both the C2C protocol driver (`EL C2C`) and the Scale Up engine (`EL SE`, repo `ip.se.sw.fw`). It is **not** active in FLA.RT, PRIMEBOOT, or POWER & THERMAL.
-- The boot-flow page enumerates **PCIe PHY FW** (for the EP, loaded by FLA.RT) and **UCIe PHY FW** (for D2D, loaded by PRIMEBOOT) image loads, but does **not** separately call out an SU PHY FW load — the SU reuses the **same PCIe6 PHY** as the EP.
+- The boot-flow page enumerates PCIe PHY FW for the EP and UCIe PHY FW for D2D, but does not separately call out an SU PHY FW load. That omission does not establish whether A2 SU requires a distinct PHY image or shares one with another block; confirm the project-specific sequence with the owning FW/PHY teams and vendor materials.
 
 > The Init-vs-Runtime split is still evolving: after tape-out (TO) some functionality may shift between stages. Treat this as the current plan, not a frozen contract.
 
 ## Document Catalog
 
-### DM Controller Documents (`~/docs/C2C/`)
+### Git specification sources
+
+Use the [scale-up / SE Git source map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#scale-up-and-se):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 C2C
+and verified legacy A1 context in `Elmnt-Internal/project.atlantic2.hwarch.specs`,
+both on `main`. The deprecated project repo is retained by explicit approval.
+A2 C2C's cover is verified Rev2.1.1; the exact A1 C2C and earlier A2 originals
+are unverified. Historical notes and revision-comparison claims are secondary.
+
+Synopsys DM controller/DBI references, guides, errata and PCIe PHY/PCS
+manuals listed below are **unavailable in the verified two-repo catalog**.
+Preserve their vendor authority; internal C2C integration specs are not
+replacements. Report missing originals instead of using local-folder fallbacks.
+
+### Historical DM controller / C2C document titles
 
 | File | Pages | Content |
 |------|-------|---------|
@@ -59,7 +73,7 @@ Scale Up (SU / C2C) responsibilities by stage (per the proposed driver-functiona
 | `DWC_pcie_ctl_relnotes.pdf` | 38 | Release notes, known issues, errata |
 | `PCIe C2C Rev 2.1.1.docx` | — | **A2 (Atlantic2)** internal Element C2C spec — 2nd-gen scale-up; **PCIe-Compliant Mode** + **Dual-Mode Port** (RP/EP), Gen7, FLIT/Non-FLIT |
 | `PCIe C2C Rev 2.0.0.docx` | — | Earlier A2 C2C revision |
-| `PCIe C2C.docx` | — | **A1/Iridium** baseline C2C spec (diff for the A1→A2 delta) |
+| `PCIe C2C.docx` | — | Historical **A1/Iridium** title; exact Git original unverified, not available for a verified revision diff |
 
 > **Project note (A2 / Atlantic2 vs A1 / Iridium):** the A2 C2C spec (`PCIe C2C Rev 2.1.1.docx`)
 > is the **2nd generation** scale-up interconnect and is **~2.5× larger** than the A1 baseline
@@ -72,9 +86,12 @@ Scale Up (SU / C2C) responsibilities by stage (per the proposed driver-functiona
 > (ECRC/LCRC/AER, SECDED ECC, poison/viral, automatic lane failover, multiple concurrent links).
 > For project context see `atlantic2-prj`.
 
-### PHY Documents (`~/docs/PCIe EP/phy/`)
+### PCIe PHY vendor manuals (unavailable in the verified Git catalog)
 
-The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are shared:
+The following titles describe PCIe6 PHY collateral historically associated with PCIe/EP.
+Their applicability to A2 SU is **not verified**; A2 RTL review instead identified a PCIe7
+PHY integration. Do not use these manuals as evidence for A2 SU until the exact vendor
+revision and integration are confirmed:
 
 | File | Pages | Content |
 |------|-------|---------|
@@ -125,7 +142,7 @@ The SU uses the **identical PCIe6 PHY** as the PCIe EP. All PHY documents are sh
 | Extra docs | `DWC_pcie_ctl_user.pdf`, relnotes | — |
 | Register ref | Same format, DM variant registers | Same format, EP variant registers |
 | Use case | SU ↔ SU links, can act as RC or EP | Host-facing endpoint |
-| PHY | Identical PCIe6 PHY | Identical PCIe6 PHY |
+| PHY | A2 Neo mirror identifies Synopsys PCIe7 1.10a_pre1, TSMC 3nm; relationship to EP-specific PHY is unverified | PCIe6 collateral is listed historically; A2 applicability is unverified |
 
 ## Knowledge Base (Expert Memory)
 
@@ -138,8 +155,9 @@ controller docs, PHY docs, C2C spec, or RTL.
 - Detail files: `knowledge/<topic-slug>.md` — verified findings with full citations
 
 Consult source-free knowledge first when available (Step 0) and update it with
-paraphrased findings after non-trivial research (final step). PHY facts equally
-true for the EP can also be recorded in the `pcie-ep-ip` knowledge base.
+paraphrased findings after non-trivial research (final step). Cross-link a PHY
+fact to `pcie-ep-ip` only after independently confirming its project, vendor
+revision and applicability to both IPs.
 
 > **Recording trigger — read this twice.** Record a finding whenever you **verify** a
 > non-trivial IP fact during this turn, regardless of *why* you were invoked. The
@@ -183,7 +201,7 @@ Determine which document(s) are most relevant:
 | DM integration/bring-up | `DWC_pcie_ctl_user.pdf` | `DWC_pcie_ctl_dm_databook.pdf` |
 | RC mode specifics | `DWC_pcie_ctl_dm_databook.pdf` | Controller reference |
 | Known issues/errata | `DWC_pcie_ctl_relnotes.pdf` | |
-| C2C protocol/spec | `PCIe C2C Rev 2.0.0.docx` | |
+| C2C protocol/spec | Mapped A2 C2C Markdown, cover Rev2.1.1 | General C2C, not an A1 original |
 | PHY registers (APB) | `dwc_pcie6phy_g2_tsmc5ff_x4ns_reference.pdf` | |
 | PHY architecture, PRBS, loopback | `dwc_pcie6phy_g2_tsmc5ff_x4ns_databook.pdf` | |
 | PCS wrapper | `dwc_pcie6_phy_pcs_wrapper_databook.pdf` | |
@@ -192,56 +210,19 @@ Determine which document(s) are most relevant:
 
 ### Step 2: Search the Document
 
-Use `pymupdf` (fitz) for PDF files, `python-docx` for .docx files.
-
-#### PDF keyword search:
-```python
-import fitz
-doc = fitz.open("<path>")
-for page_num in range(len(doc)):
-    page = doc[page_num]
-    text = page.get_text()
-    if "<keyword>" in text.lower():
-        print(f"Page {page_num}: {text[:200]}")
-```
-
-#### PDF targeted read:
-```python
-import fitz
-doc = fitz.open("<path>")
-for page_num in range(START, END):
-    page = doc[page_num]
-    print(f"--- Page {page_num} ---")
-    print(page.get_text())
-```
-
-#### DOCX search (for C2C spec):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/C2C/PCIe C2C Rev 2.0.0.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i}: {para.text[:300]}")
-```
-
-#### DOCX table search (C2C register definitions):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/C2C/PCIe C2C Rev 2.0.0.docx")
-for t_idx, table in enumerate(doc.tables):
-    for r_idx, row in enumerate(table.rows):
-        row_text = " | ".join(cell.text.strip() for cell in row.cells)
-        if "<keyword>" in row_text.lower():
-            print(f"Table {t_idx}, Row {r_idx}: {row_text}")
-```
+Resolve a commit and fetch the exact mapped C2C Markdown with `gh api` as shown
+in the source map. Verify project/revision; search headings, text and tables.
+Cite repository, commit, path and section/table. For vendor-specific DM/PHY
+questions, report the missing manual/revision; the historical filename catalog
+does not imply availability and internal integration Markdown is not a substitute.
 
 ### Step 3: Extract and Answer
 
 1. Search with broad keywords first, then narrow down
-2. For register lookups: search the reference PDF by register name or offset
-3. For DM-specific features (RC mode, dual-mode switching): check the DM databook first
-4. For PHY questions: use the same PHY docs as PCIe EP (located under `~/docs/PCIe EP/phy/`)
-5. Always cite the source document and page number in your answer
+2. Generated CSR lookups use `csr-bot`; vendor registers need the exact manual.
+3. DM implementation details require the DM databook, unavailable in this catalog.
+4. The PCIe6 PHY manuals listed here are unavailable and do not establish A2 SU or EP behavior.
+5. Cite Git provenance and section/table; old PDF pages are historical locators.
 6. If the docs don't cover it, ask Neo (`~/bin/neo-ask`) for a paraphrased RTL
    finding; never use GitHub, local or VM-worktree RTL reads.
 
@@ -264,14 +245,15 @@ Skip recording only for trivial lookups already fully covered by an existing ent
 - **DM vs EP registers**: The DM reference may have additional RC-mode registers not present in the EP reference. Search the C2C-dir reference for DM-specific registers.
 - **RC mode**: Search DM databook for "root complex", "RC mode", "type 1"
 - **Dual-mode switching**: Search for "mode switch", "dual mode", "DM"
-- **C2C protocol**: Search the docx spec. Registers may be in tables.
-- **PHY questions**: Always use `~/docs/PCIe EP/phy/` — the PHY is identical across EP and SU
+- **C2C protocol**: search the mapped Git Markdown, including register tables.
+- **PHY questions**: identify the project and exact vendor PHY revision first. The PCIe6
+  manuals listed here are unavailable in the verified catalog and do not establish A2 SU behavior.
 - **The 18845-page reference**: Always search by keyword first, never scan sequentially
 
 ## Important Notes
 
 - The DM controller reference is 18845 pages — ALWAYS use keyword search, never sequential scan
-- PHY docs are shared with PCIe EP — located under `~/docs/PCIe EP/phy/`, NOT under `~/docs/C2C/`
+- Do not assume SU and EP share a PHY across projects; internal C2C specs do not replace vendor authorities.
 - PHY registers are per-lane: offset = base + lane*0x400 + register_offset
 - For questions that span both controller and PHY, cross-reference both databooks
 - The DM controller has superset functionality vs EP controller (includes RC mode)

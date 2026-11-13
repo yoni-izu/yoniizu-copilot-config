@@ -103,7 +103,7 @@ sticky-by-design hardware and must be documented as such.
   note 6 ("Sticky vs. non-sticky resets"); reset-input table (`button_rst_n` = warm/button,
   `power_up_rst_n` = power-up/cold).
 - RTL: `Elmnt-Internal/ip.pcie.rtl` → `pep_macro/rtl/pep_wrap.v` (`app_mask_sticky_rst ('0) //TODO`).
-- Spec: `~/docs/Iridium/Iridium SoC spec.docx` Table 4-2 "Reset Domains" — PEP reset by PoR + Warm only.
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/iridium-soc/iridium-soc.md`. Historical secondary Table 4-2 "Reset Domains" finding: PEP reset by PoR + Warm only; verify the selected Git revision.
 - FW: `ip.pcie.sw.fw.ep` → `drivers/el_pcie_ep/el_pcie_ep.c`
   (`el_pcie_ep_post_bring_up_cfg`, `el_pcie_ep_init` unconditional call site),
   `drivers/snps_ep_ctl/dwc_ep_ras_des.c` (`dwc_ep_ctl_ec_clear/ec_enable/ec_restart`),

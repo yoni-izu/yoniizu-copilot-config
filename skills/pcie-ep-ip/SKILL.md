@@ -28,8 +28,8 @@ argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or contr
 
 ## Architecture Context
 
-- **Controller**: Synopsys DWC PCIe EP controller v6.42a-lca01. PCIe 6.0 compliant. Flit mode capable.
-- **PHY**: Synopsys DWC PCIe6 PHY v2.63a. SerDes PIPE architecture.
+- **Controller**: A1 (Iridium) — Synopsys DWC PCIe EP controller v6.42a-lca01, PCIe 6.0. **A2 (Atlantic2)** — DWC 6.60a-lu05 (`ep/solution_ws`, Gen7 x4); `ep/i_DWC_pcie_ctl_adv` (6.52a) in the RTL repo is a stale reference. Flit mode capable.
+- **PHY**: A1 — Synopsys DWC PCIe6 PHY v2.63a. **A2** — `dwc_pcie7phy_tsmc3pff_x4ns` **1.06b** on N3P (PIPE 7.0); the Arch v1.3 doc's "1.10" is wrong, and SDK 4.003.0 is not the PHY release. SerDes PIPE architecture.
 - **PCS Wrapper**: Thin layer — CDC + reorder only. MAC does encode/decode/scramble.
 - **PIPE Interface**: PHY ↔ Controller communication. In SerDes arch, raw data crosses PIPE (no 8b/10b or 128b/130b at PIPE boundary).
 
@@ -46,7 +46,7 @@ PCIe EP responsibilities by stage (per the proposed driver-functionality split):
 | EL PCIE EP      | INIT   | RUNTIME   | RUNTIME    | —               |
 | EL PIW          | INIT   | —         | RUNTIME    | —               |
 
-- **FLA.RT** (runs on the MuC, executes from SPSRAM) is **primarily responsible for PCIe bring-up**. It loads/authenticates the **PCIe PHY FW ICCM and DCCM** images and copies them into the PHY memories (cold reset only), and runs the PCIe EP / PIW **INIT** path so the host PCIe link can be established — required before the host can stream any further images (the 100 ms PCIe-link target favors early bring-up).
+- **FLA.RT** (runs on the MuC, executes from SPSRAM) is proposed to perform early PCIe bring-up: authenticate and stage the **PCIe PHY FW ICCM and DCCM** images on cold boot, copy them into the PHY, and run the PCIe EP / PIW **INIT** path. The EP specification relies on retained staging SRAM to avoid a fresh SPI download and authentication on warm reset; whether the PHY memories must be re-copied depends on the reset implementation. The spec's 100 ms power-stable-to-PERST delay is not itself a 100 ms link-up deadline; it separately specifies entry to LTSSM Detect within 20 ms of the end of fundamental reset. See [A2 Git specification contracts](./knowledge/a2-github-spec-por-conflicts.md).
 - **PRIMEBOOT** and **MANAGEMENT** run the PCIe EP **RUNTIME** path; PIW **RUNTIME** lives in MANAGEMENT.
 - Caveat from the page: PCIe init is **currently part of PRIMEBOOT**; depending on timing requirements it may be moved to FLA.RT. Treat the table as the current plan, not a frozen contract.
 
@@ -54,28 +54,42 @@ PCIe EP responsibilities by stage (per the proposed driver-functionality split):
 
 ## Document Catalog
 
+### Git specification sources
+
+Use the [PCIe EP Git source map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#pcie-ep):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; A2 and
+verified legacy A1 context in `Elmnt-Internal/project.atlantic2.hwarch.specs`,
+both on `main`. The deprecated project repo is retained by explicit approval.
+Exact A1 EP and MSI-X Gateway uArch baselines are unverified. Historical
+knowledge is secondary and must be revalidated against Git evidence.
+
+The vendor titles below preserve the correct Synopsys authority for controller,
+PHY, PCS and firmware questions, but **none of these vendor manuals was verified
+in either repository**. Internal EP integration specs are not substitutes.
+Report missing manual/revision requirements; no local-folder fallback.
+
 > **Project note (A2 / Atlantic2 vs A1 / Iridium):** `PCIe EP Specification **Rev 2.0.0**.docx` is
 > the **A2 (Atlantic2)** EP spec (a feature *superset* — some features are per-product). The
 > headline A2 delta is **PCIe Gen7**: **Gen7 ×4, 64 GB/s per direction**, PAM4 signaling (Gen6/7),
 > 256-byte **FLIT** mode, **Enhanced (custom) FEC + increased voltage swing**, credits fine-tuned
-> for 1 µs round-trip. A2 uses a **single PCIe EP shared among the 4 dies** for the host link.
+> for 1 µs round-trip. **EP topology is contested between sources:** NoC Rev 1.6 describes one, two or four logical host EPs mapped to physical ports on the dies, while Chip Management Rev 1.0 says up to two EP ports per chip. Historical Neo research found an x4 EP per die, but has not resolved the enabled A2 product topology. Chip Management is not a verified exact DMS equivalent. See [A2 Git specification contracts](./knowledge/a2-github-spec-por-conflicts.md); do not assume either four enabled EPs or an approved two-EP cap without the product POR.
 > The EP macro has its own **micro-controller** (ICCM/DCCM, PSOC mailbox) that answers FLR/hot
 > reset and can extend the PCIe capability list in SW. For project context see `atlantic2-prj`.
 
-### Top-Level Documents (`~/docs/PCIe EP/`)
+### Internal specification title (Git path in source map)
 
 | File | Content |
 |------|---------|
 | `PCIe EP Specification Rev 2.0.0.docx` | **A2** internal Element EP spec (overall EP design, feature superset; **Gen7**) |
 
-### Controller Documents (`~/docs/PCIe EP/controller/`)
+### Synopsys controller manuals (unavailable in the verified Git catalog)
 
 | File | Pages | Content |
 |------|-------|---------|
 | `DWC_pcie_ctl_ep_databook.pdf` | 952 | EP controller architecture, features, programming model, integration |
 | `DWC_pcie_ctl_reference.pdf` | 18845 | Complete register reference — all config space and DBI registers |
 
-### PHY Documents (`~/docs/PCIe EP/phy/`)
+### Synopsys PHY manuals (unavailable in the verified Git catalog)
 
 | File | Pages | Content |
 |------|-------|---------|
@@ -93,7 +107,7 @@ PCIe EP responsibilities by stage (per the proposed driver-functionality split):
 | `dwc_pcie6phy_g2_tsmc5ff_x4ns_config_reference_manual.xlsx` | — | PHY configuration spreadsheet |
 | `readme_2.63a_cust4_pre1.txt` | — | Release notes for PHY v2.63a |
 
-### PIW Documents (`~/docs/PCIe EP/PIW/`)
+### Historical PIW document title (exact Git counterpart unverified)
 
 | File | Content |
 |------|---------|
@@ -191,44 +205,20 @@ Determine which document(s) are most relevant:
 
 ### Step 2: Search the Document
 
-Use `pymupdf` (fitz) for PDF files, `python-docx` for .docx files.
-
-#### PDF keyword search — scan for relevant pages:
-```python
-import fitz
-doc = fitz.open("<path>")
-for page_num in range(len(doc)):
-    page = doc[page_num]
-    text = page.get_text()
-    if "<keyword>" in text.lower():
-        print(f"Page {page_num}: {text[:200]}")
-```
-
-#### PDF targeted read — extract full page content:
-```python
-import fitz
-doc = fitz.open("<path>")
-for page_num in range(START, END):
-    page = doc[page_num]
-    print(f"--- Page {page_num} ---")
-    print(page.get_text())
-```
-
-#### DOCX search:
-```python
-import docx
-doc = docx.Document("<path>")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i}: {para.text[:200]}")
-```
+For internal integration, resolve a commit and fetch the exact mapped Markdown
+with `gh api` as shown in the source map. Verify cover revision; search headings,
+text and tables, then cite repository, commit, path and section/table.
+The vendor-document classification above is an authority map, not an available
+file catalog: when a required manual is absent, report the gap rather than
+searching local copies or extrapolating vendor registers from the internal spec.
 
 ### Step 3: Extract and Answer
 
 1. Search with broad keywords first, then narrow down
-2. For register lookups: search the reference PDF by register name or offset
-3. For architectural questions: start with the databook, then cross-reference the register manual
-4. Always cite the source document and page number in your answer
+2. For generated CSR lookups use `csr-bot`; vendor register claims require the
+   exact approved vendor reference (currently unavailable in this Git catalog).
+3. Use internal EP Markdown for integration, not as a replacement databook.
+4. Cite Git provenance and section/table; old PDF pages are historical locators.
 5. If the docs don't cover it, ask Neo (`~/bin/neo-ask`) for a paraphrased RTL
    finding; never use GitHub, local or VM-worktree RTL reads.
 
@@ -248,7 +238,9 @@ Skip recording only for trivial lookups already fully covered by an existing ent
 
 ### Search Strategy Tips
 
-- **Register by name**: Search reference PDF for the exact register name (e.g., `PORT_LINK_CTRL_OFF`, `TST_CFG_0`)
+- **Vendor register by name**: requires the exact approved reference (currently
+  unavailable); use names such as `PORT_LINK_CTRL_OFF` / `TST_CFG_0` to scope
+  the missing-manual request, not to infer values from integration specs.
 - **Register by offset**: Search for hex offset (e.g., `0x710`, `0x2038`)
 - **Feature by keyword**: Search databook for feature name (e.g., `lane margining`, `EINJ`, `RAS DES`)
 - **PHY PRBS/loopback**: Databook pages ~100-130 cover test modes. Key registers: `TST_CFG_0` (offset per-lane: `0x2000+j*0x400+0x038`)
@@ -278,7 +270,8 @@ excerpt-bearing note; ask Neo (`neo-ask`) for a paraphrased re-check:
 
 ## Important Notes
 
-- The controller reference PDF is 18845 pages — ALWAYS use keyword search, never sequential scan
+- If a controller reference is published in an approved Git source, verify
+  revision and keyword-search rather than sequentially scanning its 18845 pages.
 - PHY registers are per-lane: offset = base + lane*0x400 + register_offset
 - The `.xlsx` config reference manual can be read with `openpyxl` if needed
 - For questions combining controller + PHY behavior, cross-reference both databooks

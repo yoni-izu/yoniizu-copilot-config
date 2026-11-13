@@ -49,8 +49,8 @@ spaces). Owner: Maxim Leshin.
   changes. Fabric taxonomy (MEM/MNG/CTRL/DBG/TRC/ECT/TS + FIU) carried from Iridium.
 
 ## Sources
-- Doc: `~/docs/NOC/Atlantic2 NoC Specification Rev 1.4.0.docx` (2724 paras, 39 tables; owner
-  Maxim Leshin) and `~/docs/A2/NOC/...Rev 1.2.0.docx`. Address Map: INC (~para 628), remote GPU
+- Historical secondary extracts: `Atlantic2 NoC Specification Rev 1.4.0.docx` (2724 paras, 39 tables; owner
+  Maxim Leshin) and Rev1.2.0. Revalidate at `project.atlantic2.hwarch.specs:specs/atlantic2-noc-specification/atlantic2-noc-specification-v1.5.0.md`; verify intended revision and conversion provenance, not latest by filename. Old locators: Address Map: INC (~para 628), remote GPU
   (~629, 856-859, 660-664), GPU/AFD (417, 856), A2/GPU translation (947), collectives (2342-2347).
   Revision History table (evolution through Dec 2025).
 - Cross-ref (project scope): `atlantic2-prj` → a2-noc.md, a2-scaleup-arch.md.

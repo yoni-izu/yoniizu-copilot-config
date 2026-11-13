@@ -49,7 +49,7 @@ Reset domains per **`Iridium SoC spec.docx`** Table 4-2 "Reset Domains" (section
   inference depends on it.
 
 ## Sources
-- Spec: `~/docs/Iridium/Iridium SoC spec.docx` — Table 4-2 "Reset Domains"
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/iridium-soc/iridium-soc.md` — historical secondary locator: Table 4-2 "Reset Domains"; verify the Git revision before using this extract as a contract.
   (section "Architectural Design → Reset Domains", table object index 3). **Authority for the
   reset-domain matrix** (the PRM does not contain this table). Verified 2026-06-11.
 - Source: `~/projects/iridium/three/fw/ip/psoc/drivers/el_reset/el_reset.c`

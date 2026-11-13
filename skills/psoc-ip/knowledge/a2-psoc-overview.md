@@ -38,7 +38,7 @@ What PSOC is in A2 and what changed vs the A1 (Iridium) Rev1 spec.
   mined.)
 
 ## Sources
-- Doc: `~/docs/PSoC/PSOC Specification Rev2.0.1.docx` (H1/H2 map; crypto §SHA/ECC P-384; HSM
-  Integration §; Boot §; Reset §) vs `~/docs/PSoC/PSOC Specification Rev1.2.0.docx` (A1 baseline).
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/psoc-specification-Rev2.0.1/psoc-specification.md` (H1/H2 map; crypto §SHA/ECC P-384; HSM
+  Integration §; Boot §; Reset §). Historical secondary comparison used PSOC Rev1.2.0 (exact A1 Git baseline unverified); do not claim a current verified revision diff.
 - Cross-ref: `ras-manageability` (manageability/RAS/power-thermal protocol content),
   `atlantic2-prj` (project context).

@@ -49,7 +49,7 @@ The separate uncorrectable status register at 0x10 (MMR section 17.5,
 pages 1524-1525) contains uncorrectable bits 0-5 only.
 No hardware validation performed.
 
-- Spec: `~/docs/D2D/D2D Specification Rev 2.0.0.docx`
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/d2d-specification-Rev2.0.0/d2d-specification.md`; this historical extract and its original locators are secondary, not current Git evidence.
   - Running Parity / runtime link testing: P286-291, P782-786 (Fig 6-10 / P285)
   - PHY health (SLM/per-lane/eye/PLL): P723-727; UCIe 1.1 framing P477, P480
   - Interrupts: P754-761

@@ -44,7 +44,21 @@ argument-hint: 'Ask a question about RAS design, manageability protocol, error h
 
 ## Document Catalog
 
-### RAS & Manageability Documents (`~/docs/RAS/`)
+### Git specification sources and missing originals
+
+Use the [management / RAS source map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#management-and-ras):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`; project
+Chip Management, Platform Manageability and legacy A1 PRM/SoC context in
+`Elmnt-Internal/project.atlantic2.hwarch.specs`, both on `main`. The deprecated
+project repo is retained by explicit approval.
+
+**No exact RAS Specification, DMS, or A1 Manageability v0.6 was verified in
+either tree.** Chip Management (cover Rev1.0.0) and Platform Manageability
+(cover Rev0.1) are relevant but not proven equivalents. The historical titles
+and domain knowledge below are secondary, not current project contracts.
+Report missing exact documents; there is no local-document fallback.
+
+### Historical authority distinctions (original Git paths unavailable)
 
 | File | Content |
 |------|---------|
@@ -248,47 +262,17 @@ cross-linked in that IP's knowledge base.
 
 ### Step 1: Search the Specifications
 
-Both specs are `.docx` files. Use `python-docx` to search and extract content.
-
-#### Keyword search across all paragraphs (RAS spec):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/RAS/RAS Specification.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i}: {para.text[:300]}")
-```
-
-#### Keyword search (Manageability spec):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/RAS/Device Manageability Specification.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i}: {para.text[:300]}")
-```
-
-#### Extract a range of paragraphs for context:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/RAS/<spec_file>")
-for i in range(START, END):
-    if i < len(doc.paragraphs):
-        print(f"[{i}] {doc.paragraphs[i].text}")
-```
-
-#### Search tables (telemetry attributes, registers, PLDM commands are in tables):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/RAS/<spec_file>")
-for t_idx, table in enumerate(doc.tables):
-    for r_idx, row in enumerate(table.rows):
-        row_text = " | ".join(cell.text.strip() for cell in row.cells)
-        if "<keyword>" in row_text.lower():
-            print(f"Table {t_idx}, Row {r_idx}: {row_text}")
-```
+Fetch the exact mapped Git Markdown with `gh api` at a resolved commit.
+Inspect its cover/scope, headings, text and tables. Cite repository, commit,
+path and section/table. Check whether it actually governs the requested
+contract; related Chip Management / Platform Manageability content alone
+cannot establish a missing DMS/RAS/A1 v0.6 requirement.
 
 ### Step 2: Choose the Right Document
+
+The table below preserves **historical authority distinctions**, not verified
+Git availability. If an exact governing original is missing, report that gap;
+do not assert A1 support from broader internal material or a bundled snapshot.
 
 | Question About | Search In |
 |---------------|-----------|
@@ -354,7 +338,7 @@ Skip recording only for trivial lookups already fully covered by an existing ent
 - **Power/thermal**: Search for "TDP", "EDP", "throttl", "thermal", "power", "rate limit"
 - **Flashless**: Search for "flashless", "non-volatile", "MC responsibility", "history"
 - **Margin tools**: Search for "margin", "eye", "BER", "PRBS"
-- The docx format preserves heading hierarchy — check `para.style.name` for section structure
+- Search verified Git Markdown headings/tables; missing exact contracts remain gaps.
 
 ## Important Notes
 

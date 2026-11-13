@@ -45,7 +45,7 @@ mailboxes**; MuC↔HSM uses a dedicated mailbox inside the HSM (§10.5, para 192
 - Platform guidelines PCIe (§20.12): common-clock 100 MHz ref + 100 Ω, Wake/Power-break GPIOs.
 
 ## Sources
-- Doc: `~/docs/PSoC/PSOC Specification Rev2.0.1.docx` — "Micro Controllers" (para 1853-1965),
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/psoc-specification-Rev2.0.1/psoc-specification.md`. Historical secondary locators: "Micro Controllers" (para 1853-1965),
   uC Cluster (1919-1923), uC Communication (1929-1934), Cortex-M7 (1876-1918); PCIe reset (1658,
   1664, 1696), boot ROM PCIe Gen1 (1570), Platform Guidelines PCIe (2316-2318).
 - Cross-ref: `atlantic2-prj` → a2-pcie-ep.md (the PCIe uC = PHY FW CPU inside `ip.pcie.rtl`).

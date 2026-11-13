@@ -41,7 +41,7 @@ mask + c2c-reset-enable step above when the BMC requests the scale-up reset.
 - FW impl (reset-mask + c2c-reset-enable on scale-up reset path):
   - `Elmnt-Internal/ip.psoc.sw.fw`#390 — https://github.com/Elmnt-Internal/ip.psoc.sw.fw/pull/390
   - `Elmnt-Internal/module.infra.sw.fw`#118 — https://github.com/Elmnt-Internal/module.infra.sw.fw/pull/118
-- Spec context (now partially superseded): `~/docs/C2C/PCIe C2C Rev 2.0.0.docx` §13.3 Error
+- Historical secondary context (partially superseded): `PCIe C2C Rev 2.0.0.docx` (exact Git original unverified). Revalidate with `project.atlantic2.hwarch.specs:specs/pcie-c2c-Rev2.1.1/pcie-c2c.md`; old locator §13.3 Error
   Containment, P1107–P1114 (interrupts), P1144–P1167 (trace/SPMU events), P1176–P1239
   (RAS / Isolation / Drop), P1242 (Lane/Link failure)
 - Related: `su-ip` knowledge base — `drop-mode-error-containment.md` (full C2C-side detail,

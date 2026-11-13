@@ -36,7 +36,7 @@ Yes — the D2D IP exposes several distinct error-injection / fault-insertion ca
    - **Periodic parity flit injection**: spec states "UCIe 1.0 included periodic parity flit injection" (P479), part of run-time testability (P477-480); this is the Running Parity mechanism (item 2).
 
 ## Sources
-- Spec: `~/docs/D2D/D2D Specification Rev 2.0.0.docx`
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/d2d-specification-Rev2.0.0/d2d-specification.md`; this historical extract and its original locators are secondary, not current Git evidence.
   - CRC injection: P1262, status bit P1259
   - Running Parity / Runtime Link Testing: P286–291, P476–481, P782–786 (`D2D_ERR_LINK_TEST_CTL.RX_EN/TX_EN`, `ointerrup_1`)
   - ECC injection: P1294 (`imp_mb_config6/7`)

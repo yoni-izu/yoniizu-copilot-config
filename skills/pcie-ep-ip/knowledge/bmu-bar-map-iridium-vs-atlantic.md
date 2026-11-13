@@ -29,7 +29,7 @@ RTL branch `iridium`) and Atlantic (`main`), and what it means for FW.
   - removed `piw_macro/rtl/piw_tlp_bar_map.v`; added `piw_tlp_dns_lmem_addr_virtualization.v`, `piw_tlp_dns_suspension_buffer.v`, `piw_iip_device_top_stub.v`
   - `pep_macro/rtl/element_labs_ep16sx4_gen7_axi4_subsys_wrap.v` (was `ep8sx8_gen6`)
 - FW (Iridium baseline): `ip.pcie.sw.fw.ep` — `drivers/el_pcie_ep/el_pcie_ep_bar_map.c`, `include/el_piw.h`
-- Full write-up: `~/docs/PCIe_EP_Iridium_to_Atlantic_Changes.md`
+- Historical secondary title: `PCIe_EP_Iridium_to_Atlantic_Changes.md` (exact Git counterpart unverified). Revalidate integration claims using the PCIe/legacy SoC Git paths in `../SKILL.md`, not this missing write-up.
 
 ## FW Change Plan (BMU BAR-to-SoC mapping, Atlantic)
 Target: `ip.pcie.sw.fw.ep` — `drivers/el_pcie_ep/el_pcie_ep_bar_map.c`, `drivers/el_piw/*`,

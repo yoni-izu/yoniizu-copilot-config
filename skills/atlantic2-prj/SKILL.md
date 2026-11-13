@@ -25,7 +25,7 @@ argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium
   - **PCIe EP**: **GEN7** support.
   - **SU / C2C (scale-up)**: a PCIe **"Compliant" mode**.
 - A2 **HSI Jira** initiatives/epics (`ASIC Project == Atlantic2`) — plan, scope, ownership.
-- A2 **Rev2.x specs** (the Rev2 docs are A2; Rev1 docs are A1/Iridium).
+- A2 project specs: select by verified document scope, not a Rev1/Rev2 heuristic.
 - A2 **RTL**: A1 froze on a specific tag; everything on the RTL `main` branch **since that tag**
   is A2 work. Ask Neo (`~/bin/neo-ask --chip a2`) for the delta.
 
@@ -38,7 +38,7 @@ argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium
 
 > This is a **project-scope** skill. For deep single-IP questions, defer to the dedicated IP
 > skills (`pcie-ep-ip`, `d2d-ip`, `su-ip`, `noc-ip`, `psoc-ip`, `ras-manageability`) — which have been updated
-> with the A2 Rev2.x doc references — and use this skill for the project context, the cross-IP
+> with explicit A2 Git source mappings — and use this skill for the project context, the cross-IP
 > picture, the A2-vs-A1 delta, and where things live in the A2 tree.
 >
 > For the **A1/Iridium** baseline, use the `iridium-prj` skill. For the interim **Atlantic**
@@ -67,35 +67,23 @@ argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium
 
 ## Document Catalog
 
-> **Rule of thumb: Rev2.x docs are A2; Rev1.x docs are A1 (Iridium).** The IP spec folders are
-> shared across projects and now hold BOTH revisions — always pick the Rev2 doc for A2 and diff
-> it against the Rev1 doc for the A2-vs-A1 delta.
+Use the [verified Git source map](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md):
+general architecture is in `Elmnt-Internal/module.arch.hwarch.specs`; A2
+project specs **and legacy A1** are in `Elmnt-Internal/project.atlantic2.hwarch.specs`,
+both on `main`. The project repo has a deprecation notice; the user explicitly
+approved retaining this split.
 
-### A2 project documents
+The map records exact Markdown paths for every IP, legacy `specs/iridium-*`
+PRM/SoC/NoC/security, and the Git original of A2 Arch Enhancements v1.3.
+An exact Atlantic2 Overview / A2 Scale-up Markdown counterpart was not verified.
+Do not treat the general overview as the missing A2 original.
 
-| Doc | Path | Notes |
-|-----|------|-------|
-| **Atlantic2 Overview** | `~/docs/A2/Atlantic2 Overview.docx` | Top-level "what A2 is" + high-level deltas |
-| **A2 Arch Enhancements v1.3** | `~/docs/A2/A2_Arch_Enhancments_v1.3.docx` | **Key A2-delta doc** — scale-up domain (16K Ranks), GPU/A2 disaggregation (workers/experts, MoE), M2M dataflow, INC collective acceleration, dynamic multicast |
-| **A2 Scale-up** | `~/docs/A2/A2 Scale-up.docx` | Scale-up domain overview, platform variants, routing & address-space model (subset of Arch Enhancements) |
-| **A2 NoC Specification Rev 1.4.0** | `~/docs/NOC/Atlantic2 NoC Specification Rev 1.4.0.docx` | **Newest** A2 NoC/fabric + address map (supersedes Rev 1.2.0 in `~/docs/A2/NOC/`). See the `noc-ip` skill. |
-
-### Per-IP A2 (Rev2.x) specs — used to update the IP skills
-
-| IP | A2 doc (Rev2) | A1 baseline (Rev1) | IP skill |
-|----|---------------|--------------------|----------|
-| PCIe EP | `~/docs/PCIe EP/PCIe EP Specification Rev 2.0.0.docx` | (prior Rev) | `pcie-ep-ip` |
-| D2D | `~/docs/D2D/D2D Specification Rev 2.0.0.docx` | `~/docs/D2D/D2D Specification Rev1.docx` | `d2d-ip` |
-| C2C / SU | `~/docs/C2C/PCIe C2C Rev 2.1.1.docx` (newest), `Rev 2.0.0.docx` | `~/docs/C2C/PCIe C2C.docx` | `su-ip` |
-| PSoC | `~/docs/PSoC/PSOC Specification Rev2.0.1.docx` | `~/docs/PSoC/PSOC Specification Rev1.2.0.docx` | `psoc-ip` |
-| RAS / Device Mgmt | `~/docs/RAS/RAS Specification.docx`, `Device Manageability Specification.docx` | (same) | `ras-manageability` |
-
-> Discover what is currently present (docs are added as A2 ramps):
-> ```python
-> import glob, os
-> for f in sorted(glob.glob(os.path.expanduser("~/docs/**/*.docx"), recursive=True)):
->     print(os.path.relpath(f, os.path.expanduser("~/docs")), f"{os.path.getsize(f)//1024} KB")
-> ```
+**NoC revisions require verification:** unversioned A2 Markdown says 1.0.1;
+the Rev1.5.0 folder's Markdown says 1.4.0; version-specific v1.5.0 extracts
+and a Rev1.7.0 Word original exist. No folder is automatically "latest".
+Exact legacy D2D/PSOC/C2C originals, DMS/RAS and vendor manuals are gaps, not
+permission to invent archive paths. Existing knowledge is historical secondary
+evidence; revalidate before calling a claim A2-confirmed.
 
 ### External References (Confluence)
 
@@ -155,8 +143,8 @@ paraphrased findings after non-trivial research (final step).
 
 | Topic | Primary Source | Secondary |
 |-------|---------------|-----------|
-| What A2 is / high-level deltas | `Atlantic2 Overview.docx` | A2 initiatives (Confluence) |
-| Address map, fabric, routing, credits | A2 NoC spec Rev 1.4.0 (`noc-ip`) | Overview |
+| What A2 is / high-level deltas | Verified project IP docs; exact A2 Overview unavailable | A2 initiatives (Confluence); general overview is context only |
+| Address map, fabric, routing, credits | Mapped A2 NoC, intended revision verified (`noc-ip`) | General overview (not the missing A2 original) |
 | D2D (new 5nm/3nm PHY, UCIe) | D2D Spec Rev 2.0.0 + `d2d-ip` | D2D RTL diff |
 | PCIe EP (GEN7) | PCIe EP Spec Rev 2.0.0 + `pcie-ep-ip` | PCIe RTL diff |
 | SU/C2C (PCIe compliant mode) | PCIe C2C Rev 2.1.1 + `su-ip` | C2C RTL diff |
@@ -167,8 +155,9 @@ paraphrased findings after non-trivial research (final step).
 
 ### Step 2: Search the Source
 
-- **DOCX** (Rev2 for A2, Rev1 for A1): use `python-docx` — heading map, paragraph search, table
-  search (register/field defs live in tables). Diff Rev2 vs Rev1 for the A2 delta.
+- **Specifications**: resolve a Git commit, fetch the exact mapped Markdown
+  with `gh api` as shown in the source map, then search headings/text/tables.
+  Verify cover revision and project scope; compare only verified A1/A2 baselines.
 - **RTL**: ask Neo (`neo-ask --chip a2`) to compare the A1 freeze with A2 `main`.
 - **FW/software source**: workspace tools under `~/projects/atlantic2/<variant>/`
   (fall back to GitHub for non-RTL content only).
@@ -179,7 +168,8 @@ paraphrased findings after non-trivial research (final step).
 2. Where A2 material is not yet populated but the IP is inherited from A1, answer from the IP
    skill / `iridium-prj` and **flag it as inherited (A1 baseline)**.
 3. Cross-IP questions: give the project picture here, point to the IP skill for the deep dive.
-4. **Always cite** the source (Rev2 doc + para/table, RTL repo/commit/path, manifest/`.star`).
+4. **Always cite** Git repo/commit/path + section/table, Neo's cited RTL findings,
+   or the manifest/`.star`; historical paragraph indexes are secondary locators.
 
 ### Step 4: Record Verified Findings (last)
 
@@ -190,7 +180,8 @@ paraphrased findings after non-trivial research (final step).
 
 ### Search Strategy Tips
 
-- **A2-vs-A1**: always keep the Rev1 (A1) doc handy to diff against the Rev2 (A2) doc.
+- **A2-vs-A1**: compare verified project documents; if either exact baseline is
+  unavailable, report the gap rather than deriving a delta from general snapshots.
 - **Acronyms**: each spec has a Terminology/Acronyms section near the top.
 - **Address map / regions**: A2 NoC spec "Address Map".
 - **RTL delta**: ask Neo (`neo-ask --chip a2`) for the A1-freeze → A2-`main` delta per IP.

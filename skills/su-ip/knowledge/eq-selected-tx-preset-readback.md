@@ -90,12 +90,12 @@ which preset won?" Also: a review of a colleague's doc (`c2c_gen5_preset_config.
 
 ## Sources
 
-- `~/docs/C2C/DWC_pcie_ctl_reference.pdf` (6.42a-lca01) p.2727-2743: SD_EQ_CONTROL1/2, SD_EQ_STATUS1/2/3;
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_reference.pdf` (6.42a-lca01) p.2727-2743: SD_EQ_CONTROL1/2, SD_EQ_STATUS1/2/3;
   p.3251-3281: GEN3_RELATED_OFF, GEN3_EQ_LOCAL_FS_LF, GEN3_EQ_PSET_INDEX, GEN3_EQ_CONTROL_OFF (FB_MODE, PSET_REQ_AS_COEF).
-- `~/docs/C2C/DWC_pcie_ctl_dm_databook.pdf` p.837-840 (FOM vs DIR, lead flow), p.840-842
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_dm_databook.pdf` p.837-840 (FOM vs DIR, lead flow), p.840-842
   (optional FOM coefficient requests), p.851 (final-request acceptance), p.843-844 (Table A-3
   default map), p.855-856 (worked example).
-- `~/docs/PCIe EP/phy/dwc_pcie6_phy_pcs_wrapper_databook.pdf` p.179-181 (Table 5-8, Gen3/4/5 mapping note);
+- Historical secondary vendor source (unavailable in verified Git catalog): `dwc_pcie6_phy_pcs_wrapper_databook.pdf` p.179-181 (Table 5-8, Gen3/4/5 mapping note);
   `dwc_pcie6phy_g2_tsmc5ff_x4ns_databook.pdf` p.53 (coefficient mapping figure).
 - PCI-SIG, `NCB-PCI_Express_Base_6.3.pdf`, p.118 (`MUST@FLIT` definition); §7.7.6.9,
   Table 7-83, p.1160 (32.0 GT/s USP Tx Preset debug-capture field); p.467

@@ -111,7 +111,7 @@ SE init; `DOWN_PORTS` = only link-down ports, armed from the FLR ISR callback; s
   (`async_unit_rst_out_n`), `psoc_boot/rtl/rst_mng_pkg.v` (`RST_OUT_NUM = 129`),
   `psoc_boot/misc/rst_rename.pl` (vector → `async_noc_rst_n[63:0]` etc.),
   `psoc_boot/rtl/psoc_rst_default_type_unit_pkg.v` (per-type default enables), `psoc_boot/misc/rst_types.txt`.
-- Doc: `~/docs/C2C/DWC_pcie_ctl_dm_databook.pdf` v6.42a — Table 2-10 pp.104-105, Figure 2-30 p.110.
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_dm_databook.pdf` v6.42a — Table 2-10 pp.104-105, Figure 2-30 p.110.
 - FW (A1 `a1_power_on_002`): `fw/proj_infra/include/el_reset_components.h` (`EL_RESET_COMP_SE_0 = 81`),
   `fw/ip/se/drivers/scale_engine/el_se_reinit.c` (`el_se_die_arm_flr_reset`, file header),
   `fw/ip/se/drivers/scale_engine/el_se_orch.c` (`el_se_orch_phyfw_load_region`).

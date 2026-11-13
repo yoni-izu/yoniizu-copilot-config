@@ -34,7 +34,7 @@ What changes for D2D in A2 vs A1, from the D2D Rev2 spec, the A2 Overview, and t
 - **Two PHY IP versions in A2** (per user, authoritative):
   1. **5nm PHY** — same family as A1 (AlphaWave **AresCORE** PHY / **GammaCORE** controller /
      **GammaCORE32** N5 subsystem). Possibly minor logic changes vs A1.
-  2. **Brand-new 3nm (N3) PHY** — NEW for A2. No N3 datasheet in `~/docs/D2D/` yet (only N5 docs:
+  2. **Brand-new 3nm (N3) PHY** — NEW for A2. No N3 vendor manual verified in the approved Git catalog (historical N5 titles:
      `arco_arescore_ucie_datasheet_n5...`, `Eland_gammaN64B1Tn5_...`). Add when available.
 - The user confirmed a determined 12-instance topology, two tape-outs and different ROMs for
   the two physical variants. The instance mapping and any D2D-specific ROM differences are
@@ -88,8 +88,8 @@ What changes for D2D in A2 vs A1, from the D2D Rev2 spec, the A2 Overview, and t
   for it."
 
 ## Sources
-- Doc: `~/docs/A2/Atlantic2 Overview.docx` (D2D 231-235; feature set 127-129).
-- Doc: `~/docs/D2D/D2D Specification Rev 2.0.0.docx` (A2) vs `D2D Specification Rev1.docx` (A1) —
+- Historical secondary extract: `Atlantic2 Overview.docx` (D2D 231-235; feature set 127-129); exact Git original unverified.
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/d2d-specification-Rev2.0.0/d2d-specification.md` (A2); historical secondary comparison with `D2D Specification Rev1.docx` (A1, exact Git original unverified) —
   paragraph diff showed no substantive content change.
 - PHY node facts: user statement (5nm same-as-A1 + new 3nm). See `d2d-ip` skill for PHY/controller
   datasheets and register maps.

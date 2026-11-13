@@ -50,32 +50,51 @@ D2D responsibilities by stage (per the proposed driver-functionality split):
 
 ## Document Catalog
 
-> **Project note (A2 / Atlantic2 vs A1 / Iridium):** `D2D Specification **Rev 2.0.0**.docx` is the
-> **A2 (Atlantic2)** revision; `D2D Specification Rev1.docx` is the A1/Iridium baseline. Their
-> content was previously found to be textually identical apart from figure/table caption numbering.
+### Git specification sources
+
+Use the [D2D two-repository map and pinned lookup](../../installed-plugins/ai-toolkit/fw-soc/references/specification-sources.md#d2d):
+general architecture in `Elmnt-Internal/module.arch.hwarch.specs`, A2 and
+verified legacy A1 context in `Elmnt-Internal/project.atlantic2.hwarch.specs`
+(`main` for both). The deprecated project repo is retained by explicit approval.
+The exact A1 Rev1 original is unverified; historical identity/delta claims below
+are secondary, not evidence that the general snapshot is that baseline.
+UCIe/Alphawave manuals listed below are historical titles, **unavailable in the
+verified Git catalog**. Internal integration specs do not replace vendor data.
+Report missing manuals; do not discover or fall back to local document folders.
+
+> **Project note (A2 / Atlantic2 vs A1 / Iridium):** The A2 project repository contains a
+> `Rev2.0.0`-named D2D document, but its Word and Markdown covers say `1.0.0` and its
+> revision history ends at `1.1.0`. The newer general D2D document's history adds `2.1.0`;
+> whether its added idle-traffic requirements apply to A2 is unconfirmed. Do not infer the
+> document's revision from its path. `D2D Specification Rev1.docx` was the historical
+> A1/Iridium title; a prior comparison reported textual identity apart from captions, but
+> its exact A1 original is not verified in the current Git catalog.
 > The architect (Maxim Leshin, 2026-08-30) advised keeping the core D2D design as-is and updating
 > FW where the new AW IP needs different configuration. That guidance does not rule out changes in
 > the wrapper CSR, topology or PHY variants: Neo (2026-11-11) confirmed the A2 D2D PHY is
 > N3P only (Alphawave), in EW (side) and NS (mid) orientation variants — no 5nm/2nm D2D PHY; Tn5
 > files are unused leftovers (supersedes the earlier "5nm + N3" framing). The user also confirmed D2D owns the D2D sequence in ROM, the D2D
 > wrapper CDUP is used, and the D2D driver provides its APIs. The checked A2 CSR contains this
-> wrapper block; A1 D2D wrapper CSR does not. The exact PHY/ROM deltas, HSM integration, CDUP
-> consumer and RTL behavior remain to be confirmed from their respective owners/sources. For
-> tracked evidence see
+> wrapper block; A1 D2D wrapper CSR does not. The exact PHY/ROM deltas, HSM integration and CDUP
+> API consumer remain to be confirmed. For current source reconciliation, including the
+> fatal-error, mailbox, gateway and idle-traffic qualifications, see
+> [A2 Git specification reconciliation](knowledge/a2-current-spec-contracts.md); it supersedes
+> conflicting broad claims in older knowledge notes. For physical-variant evidence see
 > [A2 D2D physical variants and wrapper CDUP API](knowledge/a2-physical-variants-and-cdup.md)
-> and the `atlantic2-prj` skill. A2 Overview figures are **12× UCIe 2.0 Standard Package,
-> 768 GB/s per direction**.
+> and the `atlantic2-prj` skill. A2 NoC Rev 1.7 describes one horizontal and two vertical
+> x32 connections per die, consistent with **12 connected D2D endpoints** across four dies;
+> the precise wrapper-to-package mapping still needs confirmation.
 
-### D2D & UCIe Documents (`~/docs/D2D/`)
+### Historical D2D & UCIe document titles
 
 | File | Size | Content |
 |------|------|---------|
-| `D2D Specification Rev 2.0.0.docx` | ~5.5MB | **A2** internal Element D2D specification — protocol, PHY, registers, integration |
-| `D2D Specification Rev1.docx` | ~5.5MB | **A1/Iridium** baseline revision (near-identical content; diff for the A1→A2 delta) |
+| `D2D Specification Rev 2.0.0.docx` | ~5.5MB | A2 project-repository document; the filename is not its verified internal revision — protocol, PHY, registers, integration |
+| `D2D Specification Rev1.docx` | ~5.5MB | Historical **A1/Iridium** title; exact Git original unverified, not available for a verified revision diff |
 | `ucie_1p1_with_legal_disclaimer_july_10th_2023.pdf` | ~7MB | UCIe 1.1 specification — industry standard for Universal Chiplet Interconnect Express (UCIe), relevant for D2D/Chiplet/Inter-die standards, protocol, and PHY |
 | `ucie_1p1.txt` | ~0.8MB | Searchable plain-text extraction of the UCIe 1.1 PDF (grep-friendly) |
 
-### AlphaWave IP Vendor Docs (`~/docs/D2D/`)
+### AlphaWave IP vendor authorities (not available in the verified Git catalog)
 
 AlphaWave (Alphawave Semi) supplies Element's licensed D2D/UCIe silicon IP. The stack has three
 layers: **AresCORE** (the UCIe D2D **PHY** IP) → **GammaCORE** (the UCIe D2D **controller** IP) →
@@ -89,17 +108,18 @@ during PRIMEBOOT is the **AresCORE PHY** firmware.
 | `Eland_gammaN64B1Tn5_ss_a_controller_100_051.pdf` | ~2.9MB | **GammaCORE™ UCIe D2D Controller IP** — Base Datasheet (Eland_S variant), v1.0.0_0.5.1 (Oct 2025). Controller layer: streaming protocol, packing/mux, TX/RX buffers, flit gen/termination, end-to-end credit-based flow control, AXI4/FDI |
 | `Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` | ~1.2MB | **(A1 / N5 — not A2)** **GammaCORE32™ 1×S32 Subsystem for UCIe** — 5nm Datasheet (Eland_S variant), v1.0.0_0.5.3 (Oct 2025). Subsystem-level: interfaces (APB, FDI, UCIe standard package, iJTAG), integration, miscellaneous signals |
 | `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.pdf` | ~3.1MB | **GammaCORE32 Register Descriptions (MMR)** — Eland variant, v1.0.0_0.5.3 (Oct 2025). Memory-mapped registers: DVSEC1/DVSEC2 (PCIe extended cap, UCIe Link DVSEC, sideband mailbox), GLOBAL_REG, CMN MCU control/IRQ registers, etc. |
-| `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` | ~3.5MB | Searchable plain-text extraction of the MMR PDF — **use this for register/bitfield keyword searches** (grep-friendly, page-delimited) |
+| `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` | ~3.5MB | Historical MMR extraction title, unavailable as verified Git evidence; not an active register lookup source |
 
-> **Vendor docs vs. internal spec:** For **register offsets/bitfields, PHY electricals, controller
-> streaming/flit/credit behaviour, and interface signals**, the AlphaWave docs above are the
-> authoritative source. For **Element-specific integration** (wrapper, manageability bridge,
-> multi-die topology, boot-flow responsibilities) the internal `D2D Specification Rev 2.0.0.docx`
-> is authoritative. When they disagree on IP-internal behaviour, prefer the AlphaWave doc and
-> record the reconciliation in the knowledge base.
+> **Vendor docs vs. internal spec:** The exact applicable AlphaWave documentation is the
+> authority for **IP-internal register fields, PHY electricals, controller streaming/flit/credit
+> behaviour and interface signals**. For **Element-specific integration** (wrapper,
+> manageability bridge, multi-die topology, boot-flow responsibilities), consult the pinned A2
+> project document and reconcile relevant newer general specifications with their owners. Do not
+> infer document precedence or revision from a filename. Record verified reconciliations.
 >
-> The MMR register doc ships as both `.pdf` and `.txt`; **search the `.txt`** (page-delimited,
-> grep/`python-docx`-free) for fast register lookups, then cite the PDF page.
+> A historical MMR plain-text extraction is not current spec evidence. Until an
+> approved Git publication is verified, report vendor register-source gaps
+> rather than searching an old local extraction.
 
 ## Source Code Repositories
 
@@ -171,36 +191,11 @@ paraphrased findings after non-trivial research (final step).
 
 ### Step 1: Search the Specification
 
-The D2D spec is a `.docx` file. Use `python-docx` to search and extract content.
-
-#### Keyword search across all paragraphs:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/D2D/D2D Specification Rev 2.0.0.docx")
-for i, para in enumerate(doc.paragraphs):
-    if "<keyword>" in para.text.lower():
-        print(f"Para {i}: {para.text[:300]}")
-```
-
-#### Extract a range of paragraphs for context:
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/D2D/D2D Specification Rev 2.0.0.docx")
-for i in range(START, END):
-    if i < len(doc.paragraphs):
-        print(f"[{i}] {doc.paragraphs[i].text}")
-```
-
-#### Search tables (register definitions are often in tables):
-```python
-import docx
-doc = docx.Document("/home/yoniizu/docs/D2D/D2D Specification Rev 2.0.0.docx")
-for t_idx, table in enumerate(doc.tables):
-    for r_idx, row in enumerate(table.rows):
-        row_text = " | ".join(cell.text.strip() for cell in row.cells)
-        if "<keyword>" in row_text.lower():
-            print(f"Table {t_idx}, Row {r_idx}: {row_text}")
-```
+Select the mapped general or A2 D2D Markdown, verify its scope/revision, resolve
+a commit and fetch its exact path with `gh api` as shown in the source map.
+Search headings, text and tables. Cite repository, commit, path and section/table.
+If the exact legacy or licensed manual is missing, report that gap; historical
+knowledge can guide research but cannot establish a current specification claim.
 
 ### Step 2: Extract and Answer
 
@@ -232,10 +227,11 @@ Skip recording only for trivial lookups already fully covered by an existing ent
 - **State machines**: Search for "state", "FSM", or specific state names
 - **Timing**: Search for "latency", "cycle", "clock", "frequency"
 - **Integration**: Search for "port", "signal", "interface", "pin"
-- The docx format preserves heading hierarchy — check `para.style.name` for section structure
+- Search Git Markdown headings and tables; verify extraction provenance and revision.
 
 ## Important Notes
 
-- This is a single-document IP — the docx is the primary and only spec
+- Use mapped internal Git specs for integration; vendor internals need the
+  missing exact licensed manual, not an internal-spec substitute.
 - For cross-die questions that also involve PCIe or C2C, use the `pcie-ep-ip` or `su-ip` skills as well
-- Register tables in docx can have merged cells — handle gracefully when parsing
+- Check Markdown table conversion carefully; original merged cells can lose context.

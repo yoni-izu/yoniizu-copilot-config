@@ -118,7 +118,7 @@ Correctable RASDP errors have no such gating: "Errors Reported When Detected (Im
 
 ## Sources
 
-- Doc: `~/docs/PCIe EP/controller/DWC_pcie_ctl_ep_databook.pdf`
+- Historical secondary vendor source: `DWC_pcie_ctl_ep_databook.pdf`; unavailable in the verified Git catalog, not replaceable by internal EP integration Markdown.
   - p.668 §29.1 — ECRC wire protection
   - p.669 §29.2.1 — RAS DP overview, RAM + datapath protection scope and mechanisms
   - pp.673–677 — RAS protection types, limitations, and error injection

@@ -149,7 +149,7 @@ cause. In `INTR_SPI_MASK`, **1 = masked**, so unmasking means clearing bits (the
   (lines ~925–1005, `csr_field_flr_ctrl_*`, `csr_field_flr_wd_wd_val`)
 - Doc: `ip.pcie.rtl` @ `origin/iridium` —
   `pep_macro/misc/PCIE_IIP_DEVICE_WRAP_Micro_Architecture.md` §5 "pep_flr_handler (PF and VF)"
-- Spec: `~/docs/Iridium/Iridium SoC spec.docx` Table 4-2 "Reset Domains"
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/iridium-soc/iridium-soc.md`; historical secondary locator: Table 4-2 "Reset Domains".
   (see `iridium-prj/knowledge/reset-domains.md`)
 - FW: `fw/ip/psoc/drivers/el_reset/el_reset_isr.c`, `el_reset_cause.c`
 - FW: `fw/ip/pcie/ep/drivers/el_pcie_ep/el_pcie_ep_reset.c`

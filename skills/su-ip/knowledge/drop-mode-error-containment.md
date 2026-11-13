@@ -186,7 +186,7 @@ Implications for reviewers / integrators:
   FW reports link-error event only; BMC resets the entire tray on any link error; on the
   scale-up-reset request FW configures reset mask + enables c2c reset before issuing reset;
   nothing more for drop mode. Impl PRs: `ip.psoc.sw.fw`#390, `module.infra.sw.fw`#118.
-- Doc: `~/docs/C2C/PCIe C2C Rev 2.0.0.docx` — §13.3 Error Containment, paragraphs
+- Historical secondary source: `PCIe C2C Rev 2.0.0.docx` (exact original unverified). Revalidate against `project.atlantic2.hwarch.specs:specs/pcie-c2c-Rev2.1.1/pcie-c2c.md`, without assuming revision identity. Old locators: §13.3 Error Containment, paragraphs
   P1107–P1114 (interrupts), P1144–P1167 (trace/SPMU events), P1176–P1239 (RAS / Isolation /
   Drop), P1242 (Lane/Link failure).
 - RTL/FW: `ip.se.sw.fw` not present in local workspace as of 2026-06-22 (no local drop/

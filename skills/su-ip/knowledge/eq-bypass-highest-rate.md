@@ -68,9 +68,9 @@
 
 ## Sources
 
-- Doc: `~/docs/C2C/DWC_pcie_ctl_dm_databook.pdf` (6.42a-lca01) p.834 (PDF index 833) — "Gen 5
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_dm_databook.pdf` (6.42a-lca01) p.834 (PDF index 833) — "Gen 5
   and above": EQ Bypass to Highest Data Rate + No Equalization Needed, redo-EQ procedure.
-- Doc: `~/docs/C2C/DWC_pcie_ctl_reference.pdf` pp.2436–2441 (PDF idx 2435–2440) —
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_reference.pdf` pp.2436–2441 (PDF idx 2435–2440) —
   `PL32G_CAPABILITY_REG` (Table 3-138) / `PL32G_CONTROL_REG` (Table 3-139) field semantics and
   reset values.
 - CSR model (A1 v1, `3_0_11_3p0_1389`): `build_artifacts/include/ips/se/v1/.../prototype/`

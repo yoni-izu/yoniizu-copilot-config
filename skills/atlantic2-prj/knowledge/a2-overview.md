@@ -79,7 +79,7 @@ sub-systems. Foundation for the whole `atlantic2-prj` skill.
   confirmed against Rev2 IP specs / RTL diffs.
 
 ## Sources
-- Doc: `~/docs/A2/Atlantic2 Overview.docx` — "A2 Overview" (para 90-94), "A2 Feature Set"
+- Historical secondary extract: `Atlantic2 Overview.docx` (exact Git original unverified) — "A2 Overview" (para 90-94), "A2 Feature Set"
   (para 108-169), "PCIe Sub-System" (198-212), "Scale-Up Sub-System" (213-226), "D2D Sub-System"
   (231-235), "Peripheral" (238-241), "Firmware Agents" (642-680).
 - Referenced specs: PCIe EP Rev 2.0.0, PCIe C2C Rev 2.0.0, D2D Rev 2.0.0, PSOC Rev 2.0.0.

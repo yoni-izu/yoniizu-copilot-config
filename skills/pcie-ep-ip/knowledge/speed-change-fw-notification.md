@@ -52,10 +52,10 @@ LBMIE/LABIE are Downstream-Port features.
 | SU/C2C USP role | reserved → LTSSM/poll | reserved → LTSSM/poll |
 
 ## Sources
-- Doc: `~/docs/PCIe EP/controller/DWC_pcie_ctl_reference.pdf` p.1724-1725 (Table 2-137 SII
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_reference.pdf` p.1724-1725 (Table 2-137 SII
   Interrupt Signals: `cfg_bw_mgt_int/_msi`, `cfg_link_auto_bw_int/_msi`, EP/USP-reserved,
   `Exists: !(CC_DEVICE_TYPE==CC_EP)`).
-- Doc: `~/docs/PCIe EP/controller/DWC_pcie_ctl_ep_databook.pdf` p.690 (Table 29-11 LTSSM state
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_ep_databook.pdf` p.690 (Table 29-11 LTSSM state
   transition reason: `smlh_ltssm_state/_previous_state/_state_reason`), p.697
   (`directed_speed_change` vs `speed_change` at Recovery.Speed), p.720 (RASDES EC Group #5:
   0x0C Speed Change Gen2, 0x0D Link Width Change).

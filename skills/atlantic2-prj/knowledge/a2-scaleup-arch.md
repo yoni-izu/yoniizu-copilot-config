@@ -84,10 +84,10 @@ worker/expert dataflow, INC collective acceleration, and dynamic multicast.
   dynamic multicast via 128 KB BAR. A1/Iridium scale-up was A2↔A2 only, no GPU, no INC offload.
 
 ## Sources
-- Doc: `~/docs/A2/A2_Arch_Enhancments_v1.3.docx` — Purpose/Scope (119-136), Domain Overview
+- Git original: `project.atlantic2.hwarch.specs:raw-specs/A2_Arch_Enhancments_v1.3.docx`. Historical secondary locators: Purpose/Scope (119-136), Domain Overview
   (148-234), Logical→Physical (236-241), Collective Op Acceleration / INC (417-473), M2M
   Enhancements (478-522).
-- Doc: `~/docs/A2/A2 Scale-up.docx` — overlapping subset (domain overview, platform variants,
+- Historical secondary extract: `A2 Scale-up.docx` (exact Git original unverified) — overlapping subset (domain overview, platform variants,
   routing model, address space, HW assumptions).
 - Cross-ref: a2-noc.md (INC/GPU address spaces), a2-scaleup-c2c.md (dual-mode PCIe controller),
   a2-architect-initiatives.md (SE/C2C initiatives).

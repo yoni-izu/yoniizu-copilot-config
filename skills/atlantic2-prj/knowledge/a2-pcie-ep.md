@@ -75,10 +75,10 @@ the PSOC MuC; only the PHY has a FW-running CPU (a new Gen7 PHY IP version, not 
 (SU/DMP mirrors this with the same DWC PCIe7 PHY in **N3/3nm**.)
 
 ## Sources
-- Doc: `~/docs/A2/Atlantic2 Overview.docx` (PCIe 198-212, feature set 130-131, sharing 94).
-- Doc: `~/docs/PCIe EP/PCIe EP Specification Rev 2.0.0.docx` — Overview (209-227), FEC (378-393),
+- Historical secondary extract: `Atlantic2 Overview.docx` (PCIe 198-212, feature set 130-131, sharing 94); exact Git original unverified.
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/pcie-ep-specification-Rev2.0.0/pcie-ep-specification.md`. Historical secondary locators: Overview (209-227), FEC (378-393),
   FLIT (385-397), PAM4 (567-571), capability + integration-feature H2 lists.
-- Also: `~/docs/PCIe_EP_Iridium_to_Atlantic_Changes.md` (prior Iridium→Atlantic change notes).
+- Secondary historical title: `PCIe_EP_Iridium_to_Atlantic_Changes.md` (prior Iridium→Atlantic notes; exact Git counterpart unverified).
 - **RTL (confirmed)**: `ip.pcie.rtl` `iridium...main` — Gen7 macro `element_labs_ep16sx4_gen7_axi4_subsys`,
   PIW rework (RR integ, suspension buffer, vrfid, 11-bit id), PMMU integration, ETR/SE-ATB. See
   a2-rtl-analysis.md.

@@ -129,7 +129,7 @@
 - **Registers:** generated A2 (`v2/0_0_0_0p0_0000`) `aw_phy_d2d_reg_regs.h` is `#define`-identical to
   the A1 `v1` header (incl. `RUNTIME_LINK_TEST_CNTRL_REG1`, `MB_DATA_REPAIR`, `WIDTH_DEG`). The later
   A2 drop `v2/0_8_4_0p8_238` in the a1_power_on artifacts does not carry AW headers at all (92
-  files, no `aw_*`/d2d). No N3 AW datasheet/MMR is in `~/docs/D2D/` yet.
+  files, no `aw_*`/d2d). No N3 AW datasheet/MMR was verified in the approved Git catalog; vendor-source gap.
 - **FW policy for A2 is not yet defined:** `proj_infra/soc/dts/a2/` has **no D2D LTSM cfg/vfields
   files** (A1's `a1_d2d_ltsm_cfg.dtsi` / `a1_d2d_ltsm_vfields.dtsi` have no a2 counterpart). When
   they are created, they will inherit `no-degrade = <1>` and the reference state mask unless the
@@ -144,7 +144,7 @@
 - A2 FW headers: `~/projects/iridium/a1_power_on/fw/build_artifacts/include/v2/0_0_0_0p0_0000/prototype/aw_phy_d2d_reg_regs.h`
   (diff vs `v1/prototype/…` empty); `v2/0_8_4_0p8_238/prototype/` (no AW headers).
 - A2 project context: `~/.copilot/skills/atlantic2-prj/knowledge/a2-d2d.md`, `a2-overview.md:38`.
-- UCIe 1.1 (`~/docs/D2D/ucie_1p1.txt`): L1444-1458 (package repair pins), §4.3 L4212-4264, §4.3.7
+- Historical secondary UCIe 1.1 extraction (exact approved Git original unavailable): L1444-1458 (package repair pins), §4.3 L4212-4264, §4.3.7
   L4893-4899, MBINIT.REPAIRMB L5943-6025 + Table 4-9 L6020-6024, LINKSPEED L6365-6382,
   MBTRAIN.REPAIR L6460-6500, PHY register TOC L355-367, 7.5.3.36 L12851+.
 - AW MMR (`Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt`/`.pdf`): p187 (TRAIN_SETUP4),

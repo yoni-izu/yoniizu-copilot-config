@@ -98,8 +98,8 @@ Sources: `ip.se.sw.fw` `drivers/scale_engine/el_se_shell.c:1879,2052,2213`,
 `drivers/scale_engine/el_se_shell_sv.c:998,4576`,
 `drivers/scale_engine/el_se_diag.c:28`, `drivers/snps_dm_ctl/dwc_dm_ctl.c:1587`,
 `include/dwc_dm_ctl.h:168`, `drivers/scale_engine/Kconfig:157,183`, and
-`docs/shell_commands.md:50`; Synopsys DM databook `~/docs/C2C/DWC_pcie_ctl_dm_databook.pdf`
-pp. 809-810 and DM register reference `~/docs/C2C/DWC_pcie_ctl_reference.pdf`
+`docs/shell_commands.md:50`; historical secondary Synopsys DM databook `DWC_pcie_ctl_dm_databook.pdf`
+pp. 809-810 and DM register reference `DWC_pcie_ctl_reference.pdf` (both unavailable in the verified Git catalog)
 pp. 2655-2658 (enable encoding also verified on pp. 4688 and 6435). See also
 `link-width-configuration.md` for the A1 controller's x4 width.
 

@@ -42,7 +42,7 @@ PPW/DMP CPU run/halt registers.
 Multi-die platforms replicate this whole inventory per die (address-map prefix `D<n>_MNG_...`).
 
 ## Sources
-- Databook: `~/docs/PCIe EP/phy/dwc_pcie6phy_g2_tsmc5ff_x4ns_databook.pdf`
+- Historical secondary vendor source: `dwc_pcie6phy_g2_tsmc5ff_x4ns_databook.pdf`; unavailable in the verified Git catalog. Internal EP integration specs do not replace this manual.
   - p.18 Quick Reference — "Lane Configurations: x4", bumps `TXP/N[3..0]` / `RXP/N[3..0]`
   - p.20 Features — "One, two, or four full-duplex PAM-4 transceivers" (family supports
     x1/x2/x4; Iridium uses x4)

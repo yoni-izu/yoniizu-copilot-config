@@ -5,7 +5,7 @@
 - **Tags:** alphawave, alphawave semi, arescore, gammacore, gammacore32, eland, eland_s, ucie phy, d2d phy, d2d controller, subsystem, mmr, dvsec, cmn mcu, 1xs32, vendor ip, el aw d2d, uisrb, sideband mailbox
 
 ## Scope / Question
-What are the AlphaWave IP docs added to `~/docs/D2D/`, what does each cover, and how do they
+What are the historically cataloged AlphaWave IP docs, what does each cover, and how do they
 map to the Element D2D/UCIe stack and FW (EL AW D2D driver family, boot flow).
 
 ## Findings
@@ -54,7 +54,11 @@ is three layers; docs are named after the product + `Eland`/`Eland_S` config and
 - These vendor docs map to the FW **EL AW D2D** driver family (AW = AlphaWave).
 
 ## Sources
-- `~/docs/D2D/arco_arescore_ucie_datasheet_n5_base_0_8_7_element.pdf` — p1 (title), p3 (TOC)
-- `~/docs/D2D/Eland_gammaN64B1Tn5_ss_a_controller_100_051.pdf` — p1 (title), p3 (TOC)
-- `~/docs/D2D/Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` — p1 (title), p3 (TOC)
-- `~/docs/D2D/Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` (+ `.pdf`) — p1–2 (title + TOC)
+- Historical secondary vendor title: `arco_arescore_ucie_datasheet_n5_base_0_8_7_element.pdf` — p1 (title), p3 (TOC)
+- Historical secondary vendor title: `Eland_gammaN64B1Tn5_ss_a_controller_100_051.pdf` — p1 (title), p3 (TOC)
+- Historical secondary vendor title: `Eland_gammaN64B1Tn5_ss_a_datasheet_100_053.pdf` — p1 (title), p3 (TOC)
+- Historical secondary vendor title: `Eland_gammaN64B1Tn5_ss_a_mmr_100_053_Registers_Descriptons.txt` (+ `.pdf`) — p1–2 (title + TOC)
+
+None of these licensed manuals was verified in the approved two-repo Git
+catalog. Preserve vendor authority but report the source gap; internal
+integration specs do not replace these manuals or validate this old extract.

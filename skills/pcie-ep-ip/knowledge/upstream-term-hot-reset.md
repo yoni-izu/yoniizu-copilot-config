@@ -98,7 +98,7 @@ verified for this build.
   and `piw_main_cfg_regs_attr.h:591`;
   `build_artifacts/include/ips/pcie/v2/1_0_7_1p0_503/prototype/piw_main_cfg_regs.h:1197`
   and `piw_main_cfg_regs_attr.h:660`.
-- Docs: `~/docs/PCIe EP/PCIe EP Specification Rev 2.0.0.docx`,
+- Revalidation source: `project.atlantic2.hwarch.specs:specs/pcie-ep-specification-Rev2.0.0/pcie-ep-specification.md`; historical secondary document locators follow,
   "Upstream Access Termination"; Synopsys EP controller databook pp. 107-109.
 
 ## Is HW-vs-FW release configurable? (checked 2026-11, Neo A2 @ ip.pcie.rtl 77b45f10 / ip.pcie.csr 6904415b)

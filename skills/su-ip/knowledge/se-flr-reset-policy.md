@@ -71,7 +71,7 @@ handler in SE).
   `proj_infra/soc/dts/a1/a1_psoc.dtsi` (reset node), `ip/psoc/dts/bindings/reset/el,reset.yaml`.
 - FW: `ip/se/drivers/scale_engine/el_se_reinit.c`, `el_se_orch.c` (`el_se_orch_init`),
   `Kconfig`, `docs/port_ownership_model.md` ("FLR policy").
-- Spec: `~/docs/PSoC/PSOC Specification Rev1.2.0.docx` §Reset flow (P1440–P1460), §FLR (P1505–P1509).
+- Historical secondary source: `PSOC Specification Rev1.2.0.docx` §Reset flow (P1440–P1460), §FLR (P1505–P1509); exact A1 Git original unverified. Legacy SoC/PRM paths in the source map provide context, not that missing original.
 
 ## A2 delta (2026-11-11, via Neo)
 

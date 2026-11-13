@@ -52,7 +52,7 @@ port (RC/RP)**; they are Reserved for an upstream port / EP.
 2. Request RTL to add INT_SIG bits 16/17 to the SPI cause tree (A2 change).
 
 ## Citations
-- `~/docs/C2C/DWC_pcie_ctl_reference.pdf` p1725–1726 (signals), p7812–7813 Table 3-2433
+- Historical secondary vendor source (unavailable in verified Git catalog): `DWC_pcie_ctl_reference.pdf` p1725–1726 (signals), p7812–7813 Table 3-2433
   (LBMS/LABS field semantics); `DWC_pcie_ctl_user.pdf` p301;
   `DWC_pcie_ctl_dm_databook.pdf` p477–478.
 - `Elmnt-Internal/ip.se.rtl` @iridium & @main: `dm_macro/rtl/dm_wrap.v`, `dm_macro/rtl/dm_pcie_iip_device_wrap.v`.
