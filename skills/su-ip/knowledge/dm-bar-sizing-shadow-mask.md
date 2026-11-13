@@ -123,6 +123,20 @@ check for finding #2: if `se bar` reports `64bit=yes prefetchable=yes` without a
 `BAR0_TYPE_0` / `PREFETCHABLE_0_0` / `BARn_MASK_0` coreConsultant values for the SE DM
 instance are **not** in `ip.se.rtl` (Synopsys IP delivered separately) — unverified.
 
+### A2 aperture correction (Neo mirror review, 2026-11-12)
+
+The 38-bit BAR0/BAR2 masks observed in the A2 DWC configuration are programmable reset
+defaults, not a proven fixed aperture limit. The A2 C2C candidate describes a 48-bit
+inter-sled BAR window, and the reviewed data path carries the required high address bits.
+Neither establishes that the integrated DWC DBI accepts a 48-bit mask: verify the exact
+vendor semantics, FW-programmed mask and wrapper read-back, then exercise a high address.
+Do not state either "fixed at 38 bits" or "48-bit supported" without that evidence.
+
+The C2C candidate used for comparison is
+`project.atlantic2.hwarch.specs@15bd28840a84cc265db7b8c3de745775be800b2d`,
+`raw-specs/PCIe_C2C_Rev_2.2.0.docx`; its filename says 2.2.0, but its cover says 2.1.1
+and it contains tracked changes.
+
 ## Sources
 
 - Doc: `DWC_pcie_ctl_dm_databook.pdf` (v6.42a-lca01) pp. 182–184 (Table 3-9/3-10, §3.6.1.3),
