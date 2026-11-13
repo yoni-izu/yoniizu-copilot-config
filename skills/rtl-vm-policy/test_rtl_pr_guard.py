@@ -27,7 +27,8 @@ class ClassificationTests(unittest.TestCase):
         query.assert_not_called()
 
     def test_mixed_hdl_and_rtl_directory_are_blocked(self):
-        for path in ("src/design.sv", "rtl/README.md", "ip/top.VHD"):
+        for path in ("src/design.sv", "rtl/README.md", "ip/top.VHD",
+                     "encrypted/block.vp", "encrypted/block.SVP"):
             with self.subTest(path=path), patch.object(
                 guard, "_query", return_value=connection(
                     "files", [{"path": path, "changeType": "MODIFIED"}],
@@ -60,6 +61,11 @@ class ClassificationTests(unittest.TestCase):
                         headRefOid=HEAD, baseRefOid=BASE)],
             [connection("files", [{"path": "src/a.c", "changeType": "SURPRISE"}],
                         headRefOid=HEAD, baseRefOid=BASE)],
+            [connection("files", [{"path": "../rtl/block.c", "changeType": "MODIFIED"}],
+                        headRefOid=HEAD, baseRefOid=BASE)],
+            [connection("files", [{"path": "src/a.c", "changeType": "MODIFIED"},
+                                  {"path": "src/a.c", "changeType": "MODIFIED"}],
+                        headRefOid=HEAD, baseRefOid=BASE)],
             [
                 connection("files", [], count=1, more=True, cursor="next",
                            headRefOid=HEAD, baseRefOid=BASE),
@@ -72,6 +78,13 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual(guard.classify_pr("org", "ip.example.sw.fw", 2)[0], "unknown")
         with patch.object(guard, "_query", side_effect=guard.MetadataError("unavailable")):
             self.assertEqual(guard.classify_pr("org", "ip.example.sw.fw", 2)[0], "unknown")
+
+    def test_details_preserve_ambiguous_paths_and_both_revision_ids(self):
+        files = [{"path": "drivers/v1/a.c", "changeType": "RENAMED"}]
+        with patch.object(guard, "_query", return_value=connection(
+                "files", files, headRefOid=HEAD, baseRefOid=BASE)):
+            kind, _, head, base, result = guard.classify_pr_details("org", "ip.example.sw.fw", 2)
+        self.assertEqual((kind, head, base, result), ("unknown", HEAD, BASE, files))
 
     def test_requested_graphql_fields_do_not_include_patches(self):
         self.assertNotIn("diffHunk", guard._FILES_QUERY)

@@ -10,7 +10,7 @@ from typing import Any
 
 
 _RTL_NAME = re.compile(r"(^|[._/-])(rtl|hdl)(?=$|[._/-])", re.IGNORECASE)
-_HDL_SUFFIXES = {".v", ".vh", ".sv", ".svh", ".sva", ".vhd", ".vhdl", ".vams"}
+_HDL_SUFFIXES = {".v", ".vh", ".vp", ".sv", ".svh", ".svp", ".sva", ".vhd", ".vhdl", ".vams"}
 _FILES_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
@@ -101,6 +101,15 @@ def is_rtl_path(path: str) -> bool:
     )
 
 
+def valid_metadata_path(path: Any) -> bool:
+    return (
+        isinstance(path, str) and bool(path)
+        and not path.startswith("/") and "\\" not in path
+        and all(part not in {"", ".", ".."} for part in path.split("/"))
+        and all(character not in path for character in ("\0", "\n", "\r"))
+    )
+
+
 def _query(owner: str, repo: str, number: int, query: str, cursor: str | None) -> dict:
     args = [
         "gh", "api", "graphql",
@@ -112,8 +121,9 @@ def _query(owner: str, repo: str, number: int, query: str, cursor: str | None) -
     if cursor is not None:
         args.extend(["-f", f"cursor={cursor}"])
     try:
-        result = subprocess.run(args, cwd=Path.home(), capture_output=True, text=True, check=False)
-    except OSError as exc:
+        result = subprocess.run(args, cwd=Path.home(), capture_output=True, text=True,
+                                check=False, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
         raise MetadataError("GitHub metadata client unavailable") from exc
     if result.returncode:
         raise MetadataError("GitHub metadata request failed")
@@ -182,12 +192,14 @@ def _connection_pages(
     raise MetadataError("metadata exceeded pagination limit")
 
 
-def classify_pr(owner: str, repo: str, number: int) -> tuple[str, str, str | None]:
-    """Return classification, reason, and verified head without source or patches."""
+def classify_pr_details(
+    owner: str, repo: str, number: int
+) -> tuple[str, str, str | None, str | None, list[dict]]:
+    """Return the classification and verified, source-free revision/file metadata."""
     if not owner or not repo or number <= 0:
-        return "unknown", "invalid PR identity", None
+        return "unknown", "invalid PR identity", None, None, []
     if is_rtl_repo(repo):
-        return "rtl", "RTL repository", None
+        return "rtl", "RTL repository", None, None, []
     try:
         pr, files = _connection_pages(owner, repo, number, _FILES_QUERY, "files")
         head, base = pr.get("headRefOid"), pr.get("baseRefOid")
@@ -196,22 +208,32 @@ def classify_pr(owner: str, repo: str, number: int) -> tuple[str, str, str | Non
             for oid in (head, base)
         ):
             raise MetadataError("PR revision metadata is incomplete")
+        paths = set()
         for file in files:
             path, change = file.get("path"), file.get("changeType")
             if (
-                not isinstance(path, str) or not path
+                not valid_metadata_path(path)
                 or not isinstance(change, str)
                 or change not in {"ADDED", "DELETED", "MODIFIED", "CHANGED", "RENAMED", "COPIED"}
+                or path in paths
             ):
                 raise MetadataError("changed-file metadata is incomplete")
+            paths.add(path)
             if is_rtl_path(path):
-                return "rtl", "HDL or RTL path in changed-file metadata", head
+                return "rtl", "HDL or RTL path in changed-file metadata", head, base, files
         # The GraphQL path is the new name; the previous name is not exposed.
         if any(file["changeType"] in {"CHANGED", "RENAMED", "COPIED"} for file in files):
-            return "unknown", "source path or type of changed/renamed/copied file is unavailable", head
+            return ("unknown", "source path or type of changed/renamed/copied file is unavailable",
+                    head, base, files)
     except MetadataError as exc:
-        return "unknown", str(exc), None
-    return "software", "complete changed-file metadata", head
+        return "unknown", str(exc), None, None, []
+    return "software", "complete changed-file metadata", head, base, files
+
+
+def classify_pr(owner: str, repo: str, number: int) -> tuple[str, str, str | None]:
+    """Return classification, reason, and verified head without source or patches."""
+    kind, reason, head, _, _ = classify_pr_details(owner, repo, number)
+    return kind, reason, head
 
 
 def review_state(owner: str, repo: str, number: int) -> tuple[dict, list[dict]]:
