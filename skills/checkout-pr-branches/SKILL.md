@@ -30,6 +30,9 @@ checkout where available: it classifies complete changed-file metadata and
 fetches the verified head SHA, rather than a floating branch. An unknown
 classification or unavailable guard stops checkout. Its filename heuristic
 is not proof that unmarked files or review text contain no HDL.
+For a rename/copy with an unavailable old path, `--neo-assisted` may resolve
+the classification only if Neo verifies all affected paths and the exact head
+and base; an inconclusive answer still stops the whole set.
 
 ### 1. Parse PR URLs
 
@@ -42,9 +45,9 @@ URL format: `https://github.com/{owner}/{repo}/pull/{number}`
 
 ### 2. Find the workspace manifest
 
-Look for the repo manifest XML that maps repo names to local paths. Common locations:
-- `.repo/manifests/` directory — search for XML files
-- Look for `<project name="..." path="...">` entries
+Resolve the active manifest from `.repo/metadata.json`; do not select an
+arbitrary XML file from another revision or project. Read its
+`<project name="..." path="...">` entries.
 
 In the manifest, each `<project>` element has:
 - `name`: the repo name (matches the GitHub repo name)
@@ -70,7 +73,9 @@ Run these in parallel or chained with `&&` and `echo "---"` separators for effic
 
 Use the guarded helper; it fetches the verified PR-head SHA, not a branch that
 could change after classification. If the helper or its guard is unavailable,
-stop rather than falling back to an unguarded local fetch.
+stop rather than falling back to an unguarded local fetch. Existing branches
+and dirty work are preserved. The resulting branch tracks the verified PR head
+remote, changing the target of future plain pull/push commands.
 
 ```bash
 python3 ~/.copilot/installed-plugins/ai-toolkit/fw-soc/general/skills/fw-workspace-git/scripts/pr_set.py checkout {PR_URLS} --ws {WORKSPACE_ROOT}
