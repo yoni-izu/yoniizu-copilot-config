@@ -1,7 +1,7 @@
 # A2 D2D Physical Variants and Wrapper CDUP
 
-- **Recorded:** 2026-11-11 (corrected 2026-11-11)
-- **Status:** Project facts confirmed by user; register placement verified from CSR headers and A1 FW; A2 RTL intent not independently verified
+- **Recorded:** 2026-11-11 (corrected 2026-11-12)
+- **Status:** Project facts confirmed by user and Neo; register placement verified from CSR headers; ROM image and physical ROM count unverified
 - **Tags:** a2, atlantic2, d2d, n3p, ew, ns, orientation, phy, physical variant, tapeout, rom, cdup, multicast, driver api
 
 ## Scope / Question
@@ -14,8 +14,9 @@ assumptions in the D2D IP skill.
   in **EW** (side) and **NS** (mid) orientations. The 3 nm vs 2 nm question is back-end only;
   the back-end flow (`project.atlantic2.be.die0/atlantic2_tech.yml`) shows N3P with
   `aresSE36n3_b_top_wrap` / `aresSN36n3_e_top_wrap` (v0p5p0). `Tn5` files are A1 leftovers.
-- **One ROM** (inferred from the single die; not separately confirmed). D2D owns the D2D
-  sequence in ROM; HSM integration and implementation stage remain unspecified.
+- A common ROM design or image was inferred from the single die design, but neither a shared
+  image nor the physical ROM count across a multi-die package was independently confirmed.
+  D2D owns the D2D sequence in ROM; HSM integration and implementation stage remain unspecified.
 - Variant/build behaviour differences are a **FW source-segregation** concern; which blocks go
   into emulation is not a FW decision.
 - The A2 D2D wrapper has a CDUP register block in the checked CSR tag
@@ -27,8 +28,6 @@ assumptions in the D2D IP skill.
   are not established by this finding.
 - The A2 D2D topology is **12 instances and determined**, per the user. The exact mapping is
   not recorded here.
-- **Planning decision:** a D2D ROM-sequence Epic exists in the A2 plan, with each sequence step
-  as a Story. Milestone is deliberately unassigned for now.
 - **Correction 2026-11-11 (Neo):** CDUP is in **mid wrappers only** (≤2 copies); tag 1047 removes
   17 CDUP registers — see `a2-cdup-mid-only-and-1047-removals.md`.
 - **Resolved 2026-11-11 (Neo, user asked to confirm):** the A2 D2D PHY is a **single node, TSMC N3P**
@@ -52,10 +51,10 @@ or the exact N3/A1-family implementation delta from the CSR and FW evidence alon
 
 ## Sources
 
-- User confirmation, 2026-11-11: A2 uses both D2D PHYs in two tape-outs/physical projects
-  under one logical project; the physical variants have different ROMs; the 12-instance
-  topology is determined; D2D wrapper CDUP is used and the D2D driver provides its APIs; D2D
-  owns the D2D sequence in ROM; a ROM-sequence Epic with one Story per step is planned (milestone TBD).
+- User confirmation, 2026-11-11: the 12-instance topology is determined; D2D wrapper CDUP is
+  used and the D2D driver provides its APIs; D2D owns the D2D sequence in ROM. Earlier
+  assumptions about different-process tape-outs and different ROMs were superseded by the
+  subsequent N3P finding; neither a shared image nor the physical ROM count was verified.
 - A2 CSR: `~/projects/iridium/two/fw/build_artifacts/include/ips/d2d/v2/1_3_0_1p3_870/prototype/d2d_regs.h`
   (`D2D_CDUP_GENERAL`, line 993) and `d2d_regs_attr.h` (`D2D_CDUP_GENERAL__RST`, line 600).
 - A1 CSR: `~/projects/iridium/two/fw/build_artifacts/include/ips/d2d/v1/3_0_11_3p0_1389/prototype/d2d_regs.h`
@@ -64,5 +63,5 @@ or the exact N3/A1-family implementation delta from the CSR and FW evidence alon
 - A1 FW reference: `~/projects/iridium/one/fw/ip/cce/drivers/el_cce/el_cce.c`
   (`el_cce_disable_d2d_dups`, line 743); `~/projects/iridium/one/fw/ip/noc/drivers/el_noc/el_noc_cdup.c`
   (`el_noc_cdup_write_die`, line 246).
-- **No A2 RTL behavior or intent is asserted here.** RTL questions must follow the VM-only
-  Neo policy.
+- Current A2 spec and Neo reconciliation: [a2-current-spec-contracts.md](a2-current-spec-contracts.md).
+  RTL questions must follow the VM-only Neo policy.
