@@ -94,14 +94,17 @@ to the same physical checkout on several hosts.
   mirror state and history without touching the checkout or contacting a machine.
   Active-operation locks and workspace identity validation still apply.
 
-The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws` for
-multi-repository operations, verifies complete manifest coverage, and checks
+The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws --argv` for
+multi-repository operations, passes its named repository-worker arguments
+directly without shell evaluation, verifies complete manifest coverage, and checks
 each repository's result (the wip wrapper's exit status alone is insufficient).
 Temporary scans preserve the user's existing WIP branch plan; concurrent
 changes are reported rather than overwritten. Undeclared source repositories
 and missing manifest repositories block checkout-changing actions.
 Only supported, fully resolved manifests are acted on; unsupported manifest
 elements fail explicitly. It must not be used for arbitrary shell commands.
+The local or remote WIP must advertise `forall-argv-v1`; older versions fail
+closed and need updating before workspace operations.
 
 ### Mirror state and history
 

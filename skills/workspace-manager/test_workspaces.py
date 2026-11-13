@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -389,6 +390,53 @@ class RuntimeTests(unittest.TestCase):
     def execute(self, action, **extra):
         return runtime.execute(dict(self.request, action=action, **extra))
 
+    def test_status_uses_named_repository_worker(self):
+        calls = []
+        original = runtime.run
+
+        def record(args, *rest, **kwargs):
+            calls.append(args)
+            return original(args, *rest, **kwargs)
+
+        with patch.object(runtime, "run", side_effect=record):
+            result = self.execute("status")
+        self.assertTrue(result["ok"], result)
+        commands = [args[3:] for args in calls if args[1:3] == ["forall", "ws"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertEqual(command[:4], ["--argv", sys.executable,
+                                           str(Path(runtime.__file__).resolve()), "--repo-worker"])
+            self.assertNotIn("-c", command[:4])
+
+    def test_old_wip_is_rejected_before_forall(self):
+        calls = []
+        original = runtime.run
+
+        def no_capabilities(args, *rest, **kwargs):
+            calls.append(args)
+            if args[1:] == ["capabilities"]:
+                raise RuntimeError("unknown command: capabilities")
+            return original(args, *rest, **kwargs)
+
+        with patch.object(runtime, "run", side_effect=no_capabilities):
+            result = self.execute("status")
+        self.assertFalse(result["ok"])
+        self.assertIn("WIP lacks direct-argument support", result["error"])
+        self.assertFalse(any(args[1:2] == ["forall"] for args in calls))
+
+    def test_transported_runtime_invokes_its_named_worker(self):
+        transported = self.home / "transport/workspace_runtime.py"
+        transported.parent.mkdir()
+        shutil.copyfile(runtime.__file__, transported)
+        result = subprocess.run(
+            [sys.executable, str(transported), json.dumps(dict(self.request, action="status"))],
+            env=os.environ.copy(), text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout.splitlines()[-1])
+        self.assertTrue(response["ok"], response)
+        self.assertTrue(response["status"]["clean"], response)
+
     def portal_free(self, approved=None):
         return self.execute("free", portal_free={"approved": approved})
 
@@ -711,7 +759,7 @@ class RuntimeTests(unittest.TestCase):
 
         def fail_after_stash(args, cwd, timeout=180, on_line=None):
             output = original_run(args, cwd, timeout, on_line)
-            if args[1:3] == ["forall", "ws"] and '"action": "stash"' in args[3]:
+            if args[1:3] == ["forall", "ws"] and json.loads(args[-1])["action"] == "stash":
                 raise RuntimeError("simulated failure after stashing")
             return output
 
@@ -866,7 +914,7 @@ class RuntimeTests(unittest.TestCase):
         self.git(self.manifests, "push", "origin", "main")
         result = self.execute("sync")
         self.assertFalse(result["ok"])
-        self.assertIn("coverage mismatch", result["error"])
+        self.assertIn("missing repository: fw:missing", result["error"])
         self.assertFalse((self.home / "octl-calls").exists())
 
     def test_status_preserves_existing_wip_branch_plan(self):

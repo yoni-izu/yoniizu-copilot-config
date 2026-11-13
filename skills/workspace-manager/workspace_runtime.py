@@ -2,7 +2,6 @@
 """Portable, guarded workspace operations. Also sent to mctl targets verbatim."""
 from __future__ import annotations
 
-import base64
 import fcntl
 import functools
 import hashlib
@@ -12,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -133,138 +133,152 @@ def octl_progress(label):
     return on_line
 
 
-# Run once per repository through wip forall, never through a second repo loop.
-REPO_WORKER = r'''
-import hashlib, json, os, pathlib, stat, subprocess, sys
-data=json.loads(sys.argv[1])
-p=str(pathlib.Path.cwd().resolve())
-def git(*args, optional=False):
-    r=subprocess.run(["git",*args],text=True,capture_output=True,timeout=180)
-    if r.returncode and not optional:
-        raise RuntimeError((r.stderr or r.stdout).strip())
-    return r.stdout.strip() if not r.returncode else None
-def git_bytes(*args):
-    r=subprocess.run(["git",*args],capture_output=True,timeout=180)
-    if r.returncode:
-        raise RuntimeError(os.fsdecode(r.stderr or r.stdout).strip())
-    return r.stdout
-def working_digest(status):
-    h=hashlib.sha256(status.encode())
-    if not status:
-        return h.hexdigest()
-    h.update(git_bytes("diff","--cached","--raw","-z","--no-ext-diff","--no-abbrev"))
-    changed=set(git_bytes("diff","--name-only","-z","--no-ext-diff").split(b"\0"))-{b""}
-    untracked=set(git_bytes("ls-files","--others","--exclude-standard","-z").split(b"\0"))-{b""}
-    for name in sorted(changed|untracked):
-        h.update(name+b"\0")
-        filename=os.fsdecode(name)
-        try:
-            before=os.lstat(filename)
-        except FileNotFoundError:
-            if name in untracked:
-                raise RuntimeError("untracked file changed during inspection: "+filename)
-            h.update(b"missing")
-            continue
-        h.update(str(before.st_mode).encode()+b"\0")
-        file_hash=hashlib.sha256()
-        if stat.S_ISLNK(before.st_mode):
-            file_hash.update(os.fsencode(os.readlink(filename)))
-            after=os.lstat(filename)
-        elif stat.S_ISREG(before.st_mode):
-            fd=os.open(filename,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
-            with os.fdopen(fd,"rb") as f:
-                opened=os.fstat(f.fileno())
-                if (before.st_dev,before.st_ino)!=(opened.st_dev,opened.st_ino):
-                    raise RuntimeError("file changed during inspection: "+filename)
-                for chunk in iter(lambda:f.read(1024*1024),b""):
-                    file_hash.update(chunk)
-                after=os.fstat(f.fileno())
-        else:
-            raise RuntimeError("cannot safely stash a nested repository or special file: "+filename)
-        final=os.lstat(filename)
-        identity=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
-        if identity(before)!=identity(after) or identity(before)!=identity(final):
-            raise RuntimeError("file changed during inspection: "+filename)
-        h.update(file_hash.digest())
-    return h.hexdigest()
-stash=None
-try:
-    spec=data["repos"].get(p)
-    if spec is None:
-        raise RuntimeError("repository not in the resolved manifest: "+p)
-    if git("rev-parse","--show-toplevel") != p:
-        raise RuntimeError("missing repository checkout: "+p)
-    rev=spec["revision"]
-    branch=git("symbolic-ref","--quiet","--short","HEAD",optional=True)
-    head=git("rev-parse","HEAD")
-    status=git("status","--porcelain","--untracked-files=all")
-    dirty=bool(status)
-    status_digest=working_digest(status)
-    ref=git("rev-parse","--verify","refs/remotes/origin/"+rev+"^{commit}",optional=True)
-    ref=ref or git("rev-parse","--verify",rev+"^{commit}",optional=True)
-    baseline=(branch==rev) if branch else bool(ref and head==ref)
-    current=git("rev-parse","--verify","refs/remotes/origin/"+branch+"^{commit}",optional=True) if branch else ref
-    ahead=git("rev-list",current+"..HEAD","--count") if current else None
-    target=spec.get("target") or rev
-    target_ref=git("rev-parse","--verify","refs/heads/"+target+"^{commit}",optional=True)
-    target_remote=git("rev-parse","--verify","refs/remotes/origin/"+target+"^{commit}",optional=True)
-    target_ahead=git("rev-list",target_remote+".."+target_ref,"--count") if target_ref and target_remote else None
-    safe=not dirty and ahead=="0"
-    reasons=[]
-    if dirty: reasons.append("uncommitted or untracked changes")
-    if ahead is None: reasons.append("cannot verify local commits against origin")
-    elif ahead!="0": reasons.append(ahead+" local-only commit(s)")
-    if not baseline: reasons.append("on "+(branch or head[:12])+", expected "+rev)
-    action=data["action"]
-    state={"revision":rev,"branch":branch,"head":head,"status_digest":status_digest,
-           "current_ref":current,"target_ref":target_ref,"target_remote":target_remote}
-    if action=="stash":
-        if spec.get("expected") != state:
-            raise RuntimeError("repository changed after approval; review it again")
+def repo_worker(payload):
+    """Run once per repository through wip forall or for the manifest checkout."""
+    data = json.loads(payload)
+    path = str(Path.cwd().resolve())
+
+    def git(*args, optional=False):
+        result = subprocess.run(["git", *args], text=True, capture_output=True, timeout=180)
+        if result.returncode and not optional:
+            raise RuntimeError((result.stderr or result.stdout).strip())
+        return result.stdout.strip() if not result.returncode else None
+
+    def git_bytes(*args):
+        result = subprocess.run(["git", *args], capture_output=True, timeout=180)
+        if result.returncode:
+            raise RuntimeError(os.fsdecode(result.stderr or result.stdout).strip())
+        return result.stdout
+
+    def working_digest(status):
+        digest = hashlib.sha256(status.encode())
+        if not status:
+            return digest.hexdigest()
+        digest.update(git_bytes("diff", "--cached", "--raw", "-z", "--no-ext-diff", "--no-abbrev"))
+        changed = set(git_bytes("diff", "--name-only", "-z", "--no-ext-diff").split(b"\0")) - {b""}
+        untracked = set(git_bytes("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")) - {b""}
+        for name in sorted(changed | untracked):
+            digest.update(name + b"\0")
+            filename = os.fsdecode(name)
+            try:
+                before = os.lstat(filename)
+            except FileNotFoundError:
+                if name in untracked:
+                    raise RuntimeError("untracked file changed during inspection: " + filename)
+                digest.update(b"missing")
+                continue
+            digest.update(str(before.st_mode).encode() + b"\0")
+            file_hash = hashlib.sha256()
+            if stat.S_ISLNK(before.st_mode):
+                file_hash.update(os.fsencode(os.readlink(filename)))
+                after = os.lstat(filename)
+            elif stat.S_ISREG(before.st_mode):
+                fd = os.open(filename, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as file:
+                    opened = os.fstat(file.fileno())
+                    if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise RuntimeError("file changed during inspection: " + filename)
+                    for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                        file_hash.update(chunk)
+                    after = os.fstat(file.fileno())
+            else:
+                raise RuntimeError("cannot safely stash a nested repository or special file: " + filename)
+            final = os.lstat(filename)
+            def identity(item):
+                return (item.st_dev, item.st_ino, item.st_mode, item.st_size,
+                        item.st_mtime_ns, item.st_ctime_ns)
+            if identity(before) != identity(after) or identity(before) != identity(final):
+                raise RuntimeError("file changed during inspection: " + filename)
+            digest.update(file_hash.digest())
+        return digest.hexdigest()
+
+    stash = None
+    try:
+        spec = data["repos"].get(path)
+        if spec is None:
+            raise RuntimeError("repository not in the resolved manifest: " + path)
+        if git("rev-parse", "--show-toplevel") != path:
+            raise RuntimeError("missing repository checkout: " + path)
+        rev = spec["revision"]
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD", optional=True)
+        head = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain", "--untracked-files=all")
+        dirty = bool(status)
+        status_digest = working_digest(status)
+        ref = git("rev-parse", "--verify", "refs/remotes/origin/" + rev + "^{commit}", optional=True)
+        ref = ref or git("rev-parse", "--verify", rev + "^{commit}", optional=True)
+        baseline = (branch == rev) if branch else bool(ref and head == ref)
+        current = (git("rev-parse", "--verify", "refs/remotes/origin/" + branch + "^{commit}",
+                       optional=True) if branch else ref)
+        ahead = git("rev-list", current + "..HEAD", "--count") if current else None
+        target = spec.get("target") or rev
+        target_ref = git("rev-parse", "--verify", "refs/heads/" + target + "^{commit}", optional=True)
+        target_remote = git("rev-parse", "--verify", "refs/remotes/origin/" + target + "^{commit}",
+                            optional=True)
+        target_ahead = (git("rev-list", target_remote + ".." + target_ref, "--count")
+                        if target_ref and target_remote else None)
+        safe = not dirty and ahead == "0"
+        reasons = []
         if dirty:
-            previous=git("rev-parse","--verify","refs/stash",optional=True)
-            git("stash","push","--include-untracked","--message",
-                "team-portal return "+(branch or "detached")+" "+head[:12])
-            saved=git("rev-parse","--verify","refs/stash",optional=True)
-            if not saved or saved==previous:
-                raise RuntimeError("git did not create a stash for the uncommitted changes")
-            stash={"path":p,"branch":branch,"head":head,"oid":saved}
-            if git("status","--porcelain","--untracked-files=all"):
-                raise RuntimeError("working tree remains dirty after stashing; check submodules")
-    elif action!="status":
-        if action=="force-update":
-            if dirty: raise RuntimeError("working tree changed after stashing")
-            if ahead!="0" and (not branch or branch==target):
-                raise RuntimeError("local commits on the target or detached HEAD cannot be safely returned")
-        elif not safe:
-            raise RuntimeError("; ".join(reasons))
-        git("fetch","origin")
-        remote="refs/remotes/origin/"+target
-        if git("rev-parse","--verify",remote+"^{commit}",optional=True):
-            local_target=git("rev-parse","--verify","refs/heads/"+target+"^{commit}",optional=True)
-            if local_target and git("rev-list",remote+".."+local_target,"--count")!="0":
-                raise RuntimeError("target branch "+target+" has local-only commits")
-            if not local_target:
-                git("checkout","--no-overwrite-ignore","-b",target,"--track","origin/"+target)
-            else: git("checkout","--no-overwrite-ignore",target)
-            git("merge","--ff-only","--no-overwrite-ignore",remote)
-        else:
-            git("fetch","origin",target)
-            git("checkout","--no-overwrite-ignore","--detach","FETCH_HEAD")
-        if git("status","--porcelain","--untracked-files=all"):
-            raise RuntimeError("working tree changed during checkout; refusing to sync")
-        branch=git("symbolic-ref","--quiet","--short","HEAD",optional=True)
-        head=git("rev-parse","HEAD")
-    result={"path":p,**state,"revision":rev,"branch":branch,"head":head,"dirty":dirty,
-            "remote":git("remote","get-url","origin",optional=True),
-            "baseline":baseline,"safe":safe,"clean":safe and baseline,"reasons":reasons,
-            "ahead":ahead,"target_ahead":target_ahead}
-except Exception as e:
-    result={"path":p,"error":str(e),"clean":False,"safe":False,"reasons":[str(e)]}
-if stash:
-    result["stash"]=stash
-print("WS_RESULT:"+json.dumps(result))
-'''
+            reasons.append("uncommitted or untracked changes")
+        if ahead is None:
+            reasons.append("cannot verify local commits against origin")
+        elif ahead != "0":
+            reasons.append(ahead + " local-only commit(s)")
+        if not baseline:
+            reasons.append("on " + (branch or head[:12]) + ", expected " + rev)
+        action = data["action"]
+        state = {"revision": rev, "branch": branch, "head": head, "status_digest": status_digest,
+                 "current_ref": current, "target_ref": target_ref, "target_remote": target_remote}
+        if action == "stash":
+            if spec.get("expected") != state:
+                raise RuntimeError("repository changed after approval; review it again")
+            if dirty:
+                previous = git("rev-parse", "--verify", "refs/stash", optional=True)
+                git("stash", "push", "--include-untracked", "--message",
+                    "team-portal return " + (branch or "detached") + " " + head[:12])
+                saved = git("rev-parse", "--verify", "refs/stash", optional=True)
+                if not saved or saved == previous:
+                    raise RuntimeError("git did not create a stash for the uncommitted changes")
+                stash = {"path": path, "branch": branch, "head": head, "oid": saved}
+                if git("status", "--porcelain", "--untracked-files=all"):
+                    raise RuntimeError("working tree remains dirty after stashing; check submodules")
+        elif action != "status":
+            if action == "force-update":
+                if dirty:
+                    raise RuntimeError("working tree changed after stashing")
+                if ahead != "0" and (not branch or branch == target):
+                    raise RuntimeError("local commits on the target or detached HEAD cannot be safely returned")
+            elif not safe:
+                raise RuntimeError("; ".join(reasons))
+            git("fetch", "origin")
+            remote = "refs/remotes/origin/" + target
+            if git("rev-parse", "--verify", remote + "^{commit}", optional=True):
+                local_target = git("rev-parse", "--verify", "refs/heads/" + target + "^{commit}",
+                                   optional=True)
+                if local_target and git("rev-list", remote + ".." + local_target, "--count") != "0":
+                    raise RuntimeError("target branch " + target + " has local-only commits")
+                if not local_target:
+                    git("checkout", "--no-overwrite-ignore", "-b", target, "--track", "origin/" + target)
+                else:
+                    git("checkout", "--no-overwrite-ignore", target)
+                git("merge", "--ff-only", "--no-overwrite-ignore", remote)
+            else:
+                git("fetch", "origin", target)
+                git("checkout", "--no-overwrite-ignore", "--detach", "FETCH_HEAD")
+            if git("status", "--porcelain", "--untracked-files=all"):
+                raise RuntimeError("working tree changed during checkout; refusing to sync")
+            branch = git("symbolic-ref", "--quiet", "--short", "HEAD", optional=True)
+            head = git("rev-parse", "HEAD")
+        result = {"path": path, **state, "revision": rev, "branch": branch, "head": head, "dirty": dirty,
+                  "remote": git("remote", "get-url", "origin", optional=True),
+                  "baseline": baseline, "safe": safe, "clean": safe and baseline, "reasons": reasons,
+                  "ahead": ahead, "target_ahead": target_ahead}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+        result = {"path": path, "error": str(exc), "clean": False, "safe": False, "reasons": [str(exc)]}
+    if stash:
+        result["stash"] = stash
+    print("WS_RESULT:" + json.dumps(result))
 
 
 def roots(path):
@@ -323,6 +337,12 @@ def manifest_repos(root, revision):
 
 def repo_batch(root, repos, action="status", step=None, label=None, on_result=None):
     wip = shutil.which("wip") or str(Path.home() / "bin/wip")
+    try:
+        capabilities = run([wip, "capabilities"], root.parent, 30).splitlines()
+    except RuntimeError as exc:
+        raise ValueError(f"WIP lacks direct-argument support; update WIP on this machine: {exc}") from exc
+    if "forall-argv-v1" not in capabilities:
+        raise ValueError("WIP lacks direct-argument support; update WIP on this machine")
     # wip scan writes a shared state file in the slot; serialize sibling roots.
     lockdir = root.parent / ".wip"
     lockdir.mkdir(exist_ok=True)
@@ -338,10 +358,8 @@ def repo_batch(root, repos, action="status", step=None, label=None, on_result=No
             run([wip, "scan"], root.parent, 180)
             scanned = statefile.read_bytes()
             payload = json.dumps({"repos": repos, "action": action})
-            code = "import base64;exec(base64.b64decode(" + repr(
-                base64.b64encode(REPO_WORKER.encode()).decode()) + "))"
-            command = shlex.join(["python3", "-c", code, payload])
-            output = run([wip, "forall", "ws", command], root, 900,
+            output = run([wip, "forall", "ws", "--argv", sys.executable,
+                          str(Path(__file__).resolve()), "--repo-worker", payload], root, 900,
                          repo_progress(root, len(repos), step, label, on_result)
                          if step or on_result else None)
         finally:
@@ -390,7 +408,7 @@ def repo_progress(root, total, step, label, on_result=None):
 
 def repo_single(path, spec, action="status"):
     payload = json.dumps({"repos": {str(path.resolve()): spec}, "action": action})
-    output = run(["python3", "-c", REPO_WORKER, payload], path)
+    output = run([sys.executable, str(Path(__file__).resolve()), "--repo-worker", payload], path)
     lines = [line for line in output.splitlines() if line.startswith("WS_RESULT:")]
     if len(lines) != 1:
         raise ValueError(f"invalid repository response: {path}")
@@ -704,4 +722,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--repo-worker":
+        repo_worker(sys.argv[2])
+    else:
+        main()

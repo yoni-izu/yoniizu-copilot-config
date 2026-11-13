@@ -481,21 +481,39 @@ cmd_info() {
 cmd_forall() {
 	local scope=all
 	if [[ "${1:-}" == ws || "${1:-}" == all ]]; then scope=$1; shift; fi
-	local cmd="$*"
-	[[ -n "$cmd" ]] || die "usage: wip forall [ws|all] <command>"
+	local direct=no cmd=""
+	if [[ "${1:-}" == --argv ]]; then direct=yes; shift; else cmd="$*"; fi
+	[[ $# -gt 0 && -n "$1" ]] || die "usage: wip forall [ws|all] [--argv] <command>"
 	find_root
 	local target_ws=""
 	[[ "$scope" == ws ]] && { target_ws=$(current_ws) || die "not inside a workspace under $wip_root"; }
-	local key ws_name path rp
+	local key ws_name path rp failed=0 matched=0
 	for key in "${!wip_info[@]}"; do
 		ws_name=${key%%:*}
 		[[ "$scope" == ws && "$ws_name" != "$target_ws" ]] && continue
+		matched=$((matched + 1))
 		path=${wip_info[$key]%%:*}
 		rp="$wip_root/$ws_name/$path"
-		[[ -d "$rp" ]] || continue
+		if [[ ! -d "$rp" ]]; then
+			if [[ "$direct" == yes ]]; then echo "missing repository: $key" >&2; failed=1; fi
+			continue
+		fi
 		echo "== $key =="
-		( cd "$rp" && eval "$cmd" )
+		if [[ "$direct" == yes ]]; then
+			if ! ( cd "$rp" && "$@" ); then
+				echo "command failed in $key" >&2
+				failed=1
+			fi
+		else
+			( cd "$rp" && eval "$cmd" )
+		fi
 	done
+	local loop_status=$?
+	if [[ "$direct" == yes ]]; then
+		if [[ "$matched" -eq 0 ]]; then echo "no repositories matched $scope" >&2; return 1; fi
+		return "$failed"
+	fi
+	return "$loop_status"
 }
 
 # ===========================================================================
@@ -655,7 +673,7 @@ ${C_SEC}Discovery / state${C_OFF}
   ${C_CMD}wip save${C_OFF} ${C_ARG}<name>${C_OFF}     Save current state to ~/.wip/saved/<name>.wip.
   ${C_CMD}wip load${C_OFF} ${C_ARG}<name>${C_OFF}     Restore a snapshot into the WIP root's state.
   ${C_CMD}wip list${C_OFF}            List saved snapshots.
-  ${C_CMD}wip forall${C_OFF} [${C_ARG}ws|all${C_OFF}] ${C_ARG}<cmd>${C_OFF}  Run <cmd> in every repo (default all).
+  ${C_CMD}wip forall${C_OFF} [${C_ARG}ws|all${C_OFF}] [--argv] ${C_ARG}<cmd>${C_OFF}  Run in every repo; --argv passes arguments directly.
 
 ${C_SEC}Working modes${C_OFF} (per WIP root; drives align / set-upstream / push)
   ${C_CMD}author${C_OFF}   Local is the source of truth. align rebases dev branches onto
@@ -699,9 +717,11 @@ EOF
 main() {
 	local assume_yes=no want_help=no args=()
 	# pull out --yes/-y, --help/-h and --force-mirror anywhere
-	local a
+	local a literal_args=no
 	for a in "$@"; do
+		if [[ "$literal_args" == yes ]]; then args+=("$a"); continue; fi
 		case "$a" in
+			--argv) args+=("$a"); literal_args=yes ;;
 			--yes|-y) assume_yes=yes ;;
 			--help|-h) want_help=yes ;;
 			--force-mirror) FORCE_MIRROR=yes ;;
@@ -730,6 +750,7 @@ main() {
 		list)        cmd_list ;;
 		status)      cmd_status ;;
 		info)        cmd_info ;;
+		capabilities) printf '%s\n' 'forall-argv-v1' ;;
 		forall)      cmd_forall "$@" ;;
 		help|-h|--help) cmd_help "${1:-}" ;;
 		ws|all)
