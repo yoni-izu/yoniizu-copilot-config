@@ -7,9 +7,10 @@ re-reading the (very large) source documents.
 
 ## How to use this file
 
-1. **Before researching** any question, scan the table below (and full-text search the
-   `knowledge/` directory) for relevant entries. If a matching topic exists, read its detail
-   file first — it may answer the question directly or narrow the search.
+1. **Before researching** any question, scan the table below for relevant entries. Historical
+   detail files may contain RTL excerpts: do not bulk-search them or read an excerpt-bearing
+   file. Read a detail file only when it is known to be excerpt-free; otherwise ask Neo for a
+   paraphrased re-check.
 2. **After verifying** a non-trivial finding from a doc or RTL, record it:
    - Create or update a topic file `knowledge/<short-topic-slug>.md` using the template below.
    - Add/refresh a row in the table (newest at top).
@@ -46,16 +47,24 @@ published images that contained PCIe PLDM sensors without PCIe providers.
 
 | Topic | File | Tags | Status | Recorded |
 |-------|------|------|--------|----------|
+| **A2 EP Git specification currency and open contracts** — topology, boot timing, BMU/iATU, PTM, messages and RAS | [a2-github-spec-por-conflicts.md](./a2-github-spec-por-conflicts.md) | a2, github, spec, topology, bmu, iatu, multicast, boot, plic, ptm, ras | verified spec text; a2 por and rtl unresolved | 2026-11-13 |
+| **A1 LTSSM equalization phase timeouts** — Gen3/4/5 USP/DSP phase timers, configurable lead timeout behavior, PHY evaluation timeout; Gen6 Recovery not verified | [ltssm-equalization-phase-timeouts.md](ltssm-equalization-phase-timeouts.md) | ltssm, equalization, recovery, timeout, gen3, gen4, gen5, gen6 | verified from docs; gen6 partial | 2026-11-12 |
+| **A2 LTSSM logger entry format + candidate fields** — 46-bit entry (32b core_clk ts, 6b state, 8b reason), no wrap/drop flag, DATA CSR bits [31:14] free; cheap adds: pm_current_data_rate, link_up flags, neg width, in_l0p, rcvry_eq, flit | [a2-ltssm-logger-entry-format.md](a2-ltssm-logger-entry-format.md) | a2, ltssm logger, timestamp, core_clk, data rate, link width, ippciesw-519 | verified (Neo, A2) | 2026-11-12 |
 | **A2 EP topology, addressing and isolation** | [a2-ep-topology-addressing-isolation.md](a2-ep-topology-addressing-isolation.md) | a2, topology, base address, pcie_ep_iso, remote die | verified (Neo, A2) | 2026-11-09 |
 | **A2 controller config (Gen7 x4, iATU 8/8, eFEC, margining)** | [a2-controller-gen7-config.md](a2-controller-gen7-config.md) | a2, gen7, iatu, efec, straps, margining | verified (Neo, A2) | 2026-11-09 |
 | **A2 PHY CPU start and copy FSM** | [a2-phy-cpu-start-and-copy-fsm.md](a2-phy-cpu-start-and-copy-fsm.md) | a2, phy0_cpu_ctrl, copy fsm, boot_from_rom, phy 1.06b | verified (Neo, A2) | 2026-11-09 |
 | **A2 PIW TuC (exists, same as A1)** | [a2-piw-tuc.md](a2-piw-tuc.md) | a2, tuc, piw, piw_mng_cfg, warm reset assist | verified (Neo, A2) | 2026-11-10 |
 | **A2 BMU and LMEM virtualization** | [a2-bmu-lmem.md](a2-bmu-lmem.md) | a2, bmu, lmem, bar, suspension buffer | verified (Neo, A2) | 2026-11-09 |
-| **A2 reset, isolation, PERST, hot reset, FLR, drain** | [a2-reset-isolation-perst.md](a2-reset-isolation-perst.md) | a2, reset, rst_iso, hot reset mask, bp_mode, termination | verified (Neo, A2) | 2026-11-09 |
+| **A2 reset, isolation, PERST, hot reset, FLR, drain** | [a2-reset-isolation-perst.md](a2-reset-isolation-perst.md) | a2, reset, rst_iso, hot reset mask, bp_mode, termination, perst irq, flr_wd, slverr, early notify | verified (Neo, A2) | 2026-11-12 |
 | **A2 interrupts (PLIC), PM, PME_TO_ACK** | [a2-interrupts-plic-pm.md](a2-interrupts-plic-pm.md) | a2, plic, pm, pme_to_ack | verified (Neo, A2) | 2026-11-09 |
 | **A2 PTM, AER, ECC, RAS-DES, FEI/FPM** | [a2-ptm-ras-diagnostics.md](a2-ptm-ras-diagnostics.md) | a2, ptm, aer, viral, ras-des, fei, einj | verified (Neo, A2) | 2026-11-09 |
 | **A2 debug and security** | [a2-debug-security.md](a2-debug-security.md) | a2, ltssm logger, dump bus, ftlb, sl, cfgr | verified (Neo, A2) | 2026-11-09 |
 | **A2 CSR changes since 1p4** | [a2-csr-drop-since-1p4.md](a2-csr-drop-since-1p4.md) | a2, csr drop, 1p4, renames, removed | verified (Neo, A2) | 2026-11-09 |
+| **A2 PPW_CTRL map, PHY_CTRL refclk traps, PHY done bit** | [a2-ppw-ctrl-map.md](a2-ppw-ctrl-map.md) | a2, ppw_ctrl, phy_ctrl, phy_status, pll lock, sris, upcs, pmd, iccm, dccm, fw_csr_8 | Verified from RTL (done bit partial) | 2026-11-12 |
+| **A2 eFEC blocks, APP_CTRL split, reset-value traps (SW_READY, LTSSM re-arm, CII_ENABLE)** | [a2-efec-appctrl-reset-traps.md](a2-efec-appctrl-reset-traps.md) | a2, efec, astera, app_ctrl, sw_ready, ltssm_en, cii_enable, cic, elbi, bar_addr_mapping, vid, did | Verified from RTL | 2026-11-12 |
+| **A2 interrupt counts (PEP 60/PIW 99/PPW 0), stubbed sources, version/tag pitfalls** | [a2-interrupt-counts-and-versions.md](a2-interrupt-counts-and-versions.md) | a2, interrupts, stub, sei, 6.60a, 1.06b, a2_rev2p0, fullchip tag, iridium_rev2p4_be | Verified from RTL/CSR | 2026-11-12 |
+| **A2 PTM/RAS/security programming, single-EP topology, PSOC reset hooks, missed blocks** | [a2-ptm-ras-security-topology.md](a2-ptm-ras-security-topology.md) | a2, ptm, ecc, viral, margining, ltssm logger, bar2sl, cfgr_rr_active_en, single ep, psoc mask, drain, efec intr, tlp gen, serializer, bmu, flr | Verified from RTL (2 offset conflicts) | 2026-11-12 |
+| **A2 MSI-X GW CSRs, multicast BAR, capability POR, recovery eFuse** | [a2-msix-gw-multicast-cap-por.md](a2-msix-gw-multicast-cap-por.md) | a2, msix gateway, coalescing, sec_lvl, multicast, rbar, aspm, ecrc, mps, recovery efuse, ide, pf vf, credits, sriov, ari, l1ss, doe, ltssm_en | Verified from doc + RTL (r06, r09 spec-conflict verdicts: L1-only ASPM, SR-IOV/ARI/L1SS/DOE caps present, credits programmable) | 2026-11-12 |
 | **VDM handling (A1)** — controller FILTER_MASK_2 VENMSG0/1 (0=drop, Type0 w/ UR; reset 0x3 pass); RX via PIW generic msg mailbox (AXI fwd, back-pressure, SPI/SEI) or MSG_RX capture CSRs; TX via VMI CSRs MSG_CTRL_* or PIW TLP_UPS_GEN; FW prod only sets drop cfg, rest SV-only; no MCTP-over-PCIe. Passed msgs are AUTONOMOUSLY written by msg mailbox HW to MNG fabric at unprogrammed base 0 (64K x 128B). After 64K msgs the mailbox overflows (CI never advanced) and wedges ALL host downstream writes; Cpl-must-not-pass-P then starves upstream reads → Cpl timeout → AXI error → MuC BusFault (infra-ai#461). | [vdm-handling.md](vdm-handling.md) | vdm, vendor message, vmi, filter_mask_2, msg mailbox, mctp, msg_rx, overflow, cpl ordering, busfault | verified (docs+neo+fw); controller cfg unverified | 2026-11-12 |
 | **Upstream termination on Hot Reset** — A1 tag-pinned RTL: `MASK=1` enables the trigger; reset `0x3` enables hot reset and BME-low. PIW terminates upstream requests and automatically clears the reset condition when `smlh_req_rst_not` rises; BME-low or another enabled condition can keep termination active. No explicit FW release is required for the reset condition. A1 tag offset `0x148`, local A2 header `0x14c`; newer RTL CSR map `0x174`. | [upstream-term-hot-reset.md](upstream-term-hot-reset.md) | upstream termination, ups_term, tlp_upstream_term, smlh_req_rst, hot reset, bus master enable, viral, fw release | Verified from Neo tag-pinned A1 RTL + FW; A2 tag mapping pending | 2026-11-10 |
 | **PCIe EQ preset readback** — Base Spec 6.3 provides a per-lane, RO 32G Lane EQ Control `USP_TX_PRESET` debug capture for USP/Crosslink Supported=0; capture is MUST@FLIT. In preset-only FOM the lead re-requests the winner, but later coefficient requests can leave the capture stale; it does not report the DSP TX | [eq-preset-readback.md](eq-preset-readback.md) | pcie, equalization, preset, transmitter preset, lane equalization control, debug readback | Verified from PCIe Base Spec 6.3 + Synopsys DM reference/databook; hardware capture unverified | 2026-11-08 |

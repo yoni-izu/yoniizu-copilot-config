@@ -62,3 +62,22 @@
 - 4 registers: `MISC_CTRL`, `PHY_CTRL`, `CFG_OB_CLK_DIV`, `PHY_STATUS` (`PHY_STATUS` is new in the CSR).
 - A single aggregate PHY interrupt goes to SEI.
 - The PHY register map (RAL) is in `project.atlantic2.csr`.
+
+## Round-2 conflicts and prerequisites (Neo r05/r07/r08, 2026-11-12)
+- **The run_req source is CONFLICTED.**
+  - This note and r02 say FW raises it via PCS 0xCC bit 2.
+  - r05 says HW raises it after the copy FSM.
+  - r08 says the CPU run/halt/ack registers were removed from PPW.
+  - Treat this as an open RTL question until it is confirmed on the A2 PHY drop.
+- **`PPW_PRST_SRAM_COPY_CFG`** has three fields, all resetting to 0:
+  - `BOOT_FROM_ROM[0]`
+  - `CONT_ON_PRST[1]`
+  - `BROADCAST_CHICKEN[2]`
+- **HW copy prerequisites:**
+  - The HW copy needs pre-loaded images and `INIT_DONE`.
+  - Its latency against the 20 ms warm-reset budget is unknown.
+- **PHY CPU ECC:**
+  - FW sets `ECC_EN` by an RMW through PIW_MAIN_CFG 0x50/0x54/0x58.
+  - The mask resets to 0, so **FW must set the mask**.
+  - PHY SRAM ECC errors are not reported to any interrupt.
+- **Scope:** no ARM boot, remote-die or recovery RTL exists in the PCIe repos. Remote-die PHY FW load is a FW/PSOC flow, still required per the B3.4 decision.
