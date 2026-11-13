@@ -44,7 +44,7 @@ class WorkspaceMctlTests(unittest.TestCase):
         mirror = {"source_id": "WS-L-source", "source_path": "/src/'$(false)", "state": "syncing"}
         args = ["mirror", path, "WS-R-stable", "fb/release-12", json.dumps(mirror)]
         result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 rlogin_cred() { echo forbidden-retry >&2; return 99; }
 find_ws() { return 98; }
 map_remote() { return 97; }
@@ -59,7 +59,7 @@ cmd_workspace """ + shlex.join(args))
     def test_clear_mirror_transports_explicit_null(self):
         self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
         result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 cmd_workspace mirror /remote/slot WS-R-stable 4 null
 """)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -74,7 +74,7 @@ cmd_workspace mirror /remote/slot WS-R-stable 4 null
         ]:
             with self.subTest(command=command):
                 result = self.shell("""
-rlogin() { echo called >> "$EVENTS"; """ + command + """; }
+rlogin_workspace() { echo called >> "$EVENTS"; """ + command + """; }
 rlogin_cred() { return 99; }
 cmd_workspace free /remote/slot WS-R-stable 2
 """)
@@ -103,10 +103,44 @@ cmd_workspace free /remote/slot WS-R-stable 2
         ]:
             with self.subTest(args=args):
                 result = self.shell("""
-rlogin() { echo unexpected >> "$EVENTS"; }
+rlogin_workspace() { echo unexpected >> "$EVENTS"; }
 cmd_workspace """ + args)
                 self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.events.read_text(), "")
+
+    def test_workspace_transport_streams_runtime_and_quotes_request(self):
+        body = "import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n"
+        self.runtime_fixture(body)
+        request = json.dumps({"path": "/slot/' ; $(touch BAD)\n", "rev": "main"})
+        runtime = self.home / ".copilot/skills/workspace-manager/workspace_runtime.py"
+        result = self.shell("""
+rsh() { printf '%s' "$1" > "$EVENTS"; cat > "$HOME/streamed-runtime"; }
+rlogin_workspace """ + shlex.join([request, str(runtime)]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / "streamed-runtime").read_text(), body)
+        command = shlex.split(self.events.read_text())
+        self.assertEqual(command[:3], ["bash", "-l", "-c"])
+        self.assertEqual(command[4:], ["_", request])
+        script = """umask 077
+runtime_dir=$(mktemp -d) || exit 1
+cleanup() { rm -f -- "$runtime_dir/workspace_runtime.py"; rmdir -- "$runtime_dir"; }
+trap cleanup EXIT
+cat > "$runtime_dir/workspace_runtime.py" || exit 1
+python3 "$runtime_dir/workspace_runtime.py" "$1"
+"""
+        self.assertEqual(command[3], script)
+        script_path = self.scratch / "remote-command.sh"
+        script_path.write_text(script)
+        tmpdir = self.scratch / "remote-tmp"
+        tmpdir.mkdir()
+        completed = subprocess.run(
+            ["bash", str(script_path), request], input=body, capture_output=True, text=True,
+            env=dict(self.env, TMPDIR=str(tmpdir)), timeout=15, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), json.loads(request))
+        self.assertEqual(list(tmpdir.iterdir()), [])
+        self.assertFalse((Path.cwd() / "BAD").exists())
 
     def test_existing_remote_identity_is_adopted_before_any_mutation(self):
         result = self.shell("""
@@ -144,7 +178,7 @@ workspace_remote_identity /slot
         self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
         prs = [{"owner": "org", "repo": "repo", "branch": "dev/review", "pr_number": 42}]
         result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 cmd_workspace """ + shlex.join(["align", "/independent/slot", "WS-R-stable",
                                 "main", json.dumps({"prs": prs})]))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -158,7 +192,7 @@ cmd_workspace """ + shlex.join(["align", "/independent/slot", "WS-R-stable",
         for approved in (None, "a" * 64):
             options = {"portal_free": {"approved": approved}}
             result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 cmd_workspace """ + shlex.join(["free", "/remote/slot ' ; $(touch BAD)",
                                 "WS-R-stable", "release", json.dumps(options)]))
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -170,7 +204,7 @@ cmd_workspace """ + shlex.join(["free", "/remote/slot ' ; $(touch BAD)",
         for approved in (None, "a" * 64):
             options = {"portal_sync": {"approved": approved}}
             result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 cmd_workspace """ + shlex.join(["sync", "/remote/slot", "WS-R-stable",
                                 "release", json.dumps(options)]))
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -374,7 +408,7 @@ PY
     def test_runtime_nonzero_exit_still_forwards_domain_json(self):
         self.runtime_fixture('print(\'{"ok":false,"error":"guard refused"}\')\nraise SystemExit(7)\n')
         result = self.shell("""
-rlogin() { bash -s <<< "$*"; }
+rlogin_workspace() { python3 "$2" "$1"; }
 cmd_workspace free /remote/slot WS-R-stable a1_power_on
 """)
         self.assertEqual(result.returncode, 7)

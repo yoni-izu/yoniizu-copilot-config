@@ -84,7 +84,9 @@ every action can be run by hand with no AI involvement.
 - **The target must have the `wip` CLI.** All remote git ops (`mirror`,
   `release`, `mctl wip …`) call `~/bin/wip` on the target. A fresh mirror may
   not have it yet — run `mctl setup [name]` once (it deploys `wip` + state dirs
-  if missing), or deploy by hand:
+  if missing). Remote workspace-manager checks also require WIP to advertise
+  `forall-argv-v1` via `wip capabilities`; update an older target WIP before
+  those checks. To deploy by hand:
   ```bash
   ~/bin/wip-deploy "$(mctl -t <name> ip)"     # vm target (by IP)
   ~/bin/wip-deploy user@host                   # remote target
@@ -438,12 +440,13 @@ snapshot token for **Force sync** on free independent workspaces only. It
 uses the same safe stashing and revision-return flow without releasing the
 workspace; occupancy and mirror guards are not bypassed.
 
-The local portable `workspace-manager/workspace_runtime.py` is base64-encoded
-and sent through existing `rlogin`/login-shell stdin, with shell-quoted JSON:
+The local portable `workspace-manager/workspace_runtime.py` is streamed as data
+to a private temporary file through a login-shell transport, with shell-quoted JSON:
 `{action,path,id,rev,mirror?}` (or `prs` for review alignment, `portal_free`
 for a portal-confirmed return, and `portal_sync` for confirmed Sync). No remote
 installation beyond Python's standard library and the existing `wip`/`octl` for repository
-operations is needed, and no remote `rtk` is used. Stdout is the runtime's
+operations is needed, and no remote `rtk` is used. The runtime file is removed
+when the command exits. Stdout is the runtime's
 single JSON response `{ok,error?,status?,log?}`. Domain failures preserve JSON
 and exit zero at this transport layer; callers must check `ok`. SSH/transport
 errors retain nonzero exit status and stderr, with no automatic retry.
