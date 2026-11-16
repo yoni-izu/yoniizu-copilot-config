@@ -627,30 +627,47 @@ class TeamStore(TeamPortalMixin):
             if patch.get(field) is not None and not 1 <= int(patch[field]) <= upper:
                 raise ValueError(f"{field} out of range")
 
-    def add_member(self, member_key: str, fields: dict[str, Any]) -> str:
-        if not re.fullmatch(r"[a-z0-9_-]+", member_key):
+    def _prepare_new_member(self, member_key: str, fields: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(member_key, str) or not re.fullmatch(r"[a-z0-9_-]+", member_key):
             raise ValueError("member_key must match [a-z0-9_-]+")
         fields = dict(fields)
         self._validate_member_fields(fields)
         if not fields.get("display_name"):
             raise ValueError("display_name is required")
-        stamp = now_iso()
+        return fields
+
+    def _member_conflicts(
+        self, conn: sqlite3.Connection, member_key: str, fields: dict[str, Any]
+    ) -> list[str]:
+        problems = []
+        if conn.execute("SELECT 1 FROM members WHERE member_key=?", (member_key,)).fetchone():
+            problems.append(f"member already exists: {member_key}")
+        for column in ("jira_account_id", "github_handle"):
+            if fields.get(column):
+                clash = conn.execute(
+                    f"SELECT member_key FROM members WHERE {column}=?", (fields[column],)
+                ).fetchone()
+                if clash:
+                    problems.append(f"{column} already used by {clash[0]}")
+        return problems
+
+    def _insert_member(
+        self, conn: sqlite3.Connection, member_key: str, fields: dict[str, Any], stamp: str
+    ) -> None:
+        problems = self._member_conflicts(conn, member_key, fields)
+        if problems:
+            raise ValueError(problems[0])
+        columns = ["member_key", *fields, "created_at", "updated_at"]
+        conn.execute(
+            f"INSERT INTO members({', '.join(columns)}) VALUES({', '.join('?' for _ in columns)})",
+            (member_key, *fields.values(), stamp, stamp),
+        )
+        domain_db.audit(conn, "member", member_key, "create", fields)
+
+    def add_member(self, member_key: str, fields: dict[str, Any]) -> str:
+        fields = self._prepare_new_member(member_key, fields)
         with self.connect() as conn:
-            if conn.execute("SELECT 1 FROM members WHERE member_key=?", (member_key,)).fetchone():
-                raise ValueError(f"member already exists: {member_key}")
-            for column in ("jira_account_id", "github_handle"):
-                if fields.get(column):
-                    clash = conn.execute(
-                        f"SELECT member_key FROM members WHERE {column}=?", (fields[column],)
-                    ).fetchone()
-                    if clash:
-                        raise ValueError(f"{column} already used by {clash[0]}")
-            columns = ["member_key", *fields, "created_at", "updated_at"]
-            conn.execute(
-                f"INSERT INTO members({', '.join(columns)}) VALUES({', '.join('?' for _ in columns)})",
-                (member_key, *fields.values(), stamp, stamp),
-            )
-            domain_db.audit(conn, "member", member_key, "create", fields)
+            self._insert_member(conn, member_key, fields, now_iso())
         return member_key
 
     def update_member(self, member_key: str, revision: str, patch: dict[str, Any]) -> None:

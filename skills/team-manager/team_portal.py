@@ -757,6 +757,14 @@ class TeamPortalMixin:
                     result["assignments"].append(projected)
             if audience == "private":
                 result["feedback"] = self.list_entities("feedback", None)
+        import team_onboarding
+        result["onboarding"] = {}
+        for member in result["members"]:
+            progress = team_onboarding.status(self, member["member_key"], audience, when)
+            if progress is not None and (audience == "private" or progress["total"]):
+                result["onboarding"][member["member_key"]] = progress
+        if audience == "private":
+            result["onboarding_spec"] = team_onboarding.spec()
         return result
 
     def _save_meeting(self, data: dict, *, create: bool, shared_only: bool = False) -> dict:
@@ -1345,9 +1353,17 @@ class TeamPortalMixin:
             return self._bulk_set(data)
         if action == "meeting-prepare":
             return {"ok": True, "action": action, "entity": self._prepare_meeting(data)}
+        if action == "onboarding-preview":
+            import team_onboarding
+            return {"ok": True, "action": action, "entity": team_onboarding.preview(self, data)}
         if action in {"item-set", "item-note"}:
             entity = self._mutate_item(action, data)
             ident = entity["item_id"]
+        elif action == "onboarding-apply":
+            import team_onboarding
+            applied = team_onboarding.apply(self, data)
+            ident = applied["member_key"]
+            entity = {**self.get_member(ident), "onboarding": applied}
         elif action == "member-add":
             _keys(data, set(self.MEMBER_EDITABLE) | {"member_key"}, {"member_key", "display_name"})
             ident = data.pop("member_key")

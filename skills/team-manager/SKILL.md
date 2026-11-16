@@ -35,6 +35,31 @@ This skill is the unified owner replacing legacy `one-on-one` and `team-planner`
    - separate counts for features, bugs, attributes, stories with evidence and scope coverage.
 7. **Typed cross-database references**
    - links to tasks/bugs/RAID/PR and other owned domains with provenance.
+8. **Onboarding**
+   - registering a new member with a reviewed intake, a dated first-month
+     checklist, buddy assignment, readiness gaps and progress tracking.
+
+## Onboarding a new member
+
+Use `team_onboarding.py` through `team.py onboard` or the portal's private
+**Add member** dialog — never a bare `member-add` for a new hire.
+
+1. **Preview** (no writes): validates the intake, detects key/GitHub/Jira
+   identity conflicts, and returns the exact member record, checklist tasks,
+   readiness gaps and a `plan_revision`.
+2. **Register** with that `plan_revision`: member, 11 checklist assignments
+   (`kind='onboarding'`, ids `asg-onb-<member>-<step>`), their tracked items on
+   the new member's page and `onboarding-of`/`onboarding-buddy` refs are written
+   in one transaction; a changed plan is rejected.
+3. **Track**: `team.py onboarding-status <member>` / portal header progress;
+   close readiness gaps later via Edit profile (`member-set`).
+
+Missing readiness fields (role, employment type, country, Jira ID, GitHub
+handle, IP, buddy) never block registration; their impact stays visible and the
+dependent views report unknown. Registration grants no accounts, access or
+machines and calls no external system — those are checklist requests. Leave
+stays unknown until an HR import. See
+[workflows.md](references/workflows.md#4c-onboarding-workflow).
 
 ## Skill boundaries
 

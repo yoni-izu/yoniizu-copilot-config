@@ -27,6 +27,33 @@ def cmd_member_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_onboard(args: argparse.Namespace) -> int:
+    import team_onboarding
+
+    data = json.loads(args.data)
+    if not args.apply:
+        plan = team_onboarding.preview(TeamStore(), data)
+        _print(plan)
+        return 3 if plan["errors"] else 0
+    if not args.plan_revision:
+        print("--apply requires --plan-revision from the reviewed preview", file=sys.stderr)
+        return 2
+    _print(team_onboarding.apply(TeamStore(), {**data, "plan_revision": args.plan_revision}))
+    return 0
+
+
+def cmd_onboarding_status(args: argparse.Namespace) -> int:
+    import team_onboarding
+
+    as_of = date.fromisoformat(args.as_of) if args.as_of else None
+    result = team_onboarding.status(TeamStore(), args.member, "private", as_of)
+    if result is None:
+        print(f"no onboarding checklist recorded for {args.member}", file=sys.stderr)
+        return 2
+    _print(result)
+    return 0
+
+
 def cmd_leave_import(args: argparse.Namespace) -> int:
     result = team_ingest.import_leave_csv(
         TeamStore(),
@@ -253,6 +280,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--revision", required=True, help="from `show <member>`")
     p.add_argument("--data", required=True, help="JSON object of editable fields")
     p.set_defaults(func=cmd_member_set)
+
+    p = sub.add_parser("onboard", help="onboard a new member (preview unless --apply)")
+    p.add_argument("--data", required=True,
+                   help="JSON intake: member_key, display_name, onboarding_date, ... (see onboarding spec)")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--plan-revision", help="plan_revision printed by the reviewed preview")
+    p.set_defaults(func=cmd_onboard)
+
+    p = sub.add_parser("onboarding-status", help="checklist progress and readiness gaps")
+    p.add_argument("member")
+    p.add_argument("--as-of")
+    p.set_defaults(func=cmd_onboarding_status)
 
     p = sub.add_parser("leave-import", help="ingest an HR leave CSV (preview unless --apply)")
     p.add_argument("csv")

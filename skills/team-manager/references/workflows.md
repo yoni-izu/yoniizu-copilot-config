@@ -125,8 +125,39 @@ team.py backfill --apply [--confirm-merged]
 
 - Re-runs are idempotent; bugs reopened/reassigned and stale *candidate* features are retracted.
 - Confirmed/accepted features are never downgraded.
-- Add a member: `team.py member-add <key> --data '{"display_name": "...", "onboarding_date": "YYYY-MM-DD", "employment_type": "full-time", "main_ip_ownership": "..."}'`.
+- Add a **new hire** with the onboarding workflow (§4c). `member-add` remains for
+  roster corrections/imports only: `team.py member-add <key> --data '{"display_name": "...", "onboarding_date": "YYYY-MM-DD", "employment_type": "full-time", "main_ip_ownership": "..."}'`.
 - Map missing identities first: `team.py show <key>` → `team.py member-set <key> --revision <rev> --data '{"github_handle": "..."}'`.
+
+## 4c) Onboarding workflow
+
+```bash
+team.py onboard --data '{"member_key":"dana","display_name":"Dana ...","onboarding_date":"2026-12-01",
+  "base_country":"Israel","github_handle":"...","jira_account_id":"...","buddy_key":"igal"}'
+# review: errors (blocking), gaps (readiness impact), tasks, not_done; exit 3 on errors
+team.py onboard --data '<same JSON>' --apply --plan-revision <plan_revision from the preview>
+team.py onboarding-status dana [--as-of YYYY-MM-DD]
+```
+
+- Required: `member_key`, `display_name`, `onboarding_date`. Readiness fields
+  are optional but each gap names what stays unknown. Optional `task_visibility`
+  (`private` default, `shared` to show the checklist in Presentation).
+- Checklist (dates relative to start): accounts/access and machine/VM/workspace
+  slot (−5d), confirm buddy (−3d), day-one welcome and reading list (day 0),
+  workspace build+test, identity check + first activity scan and first 1:1
+  (+7d), first reviewed contribution (+14d), goals/IP/capacity and onboarding
+  retrospective (+30d). Lead-owned steps sit on the lead's task list and appear
+  in the new member's Items, like lead-owned 1:1 actions; member-owned steps are
+  on the member's list. Without a recorded lead every step goes to the member
+  and the preview warns.
+- Edit/close steps through the normal assignment/item APIs. Re-running onboarding
+  for an existing member is rejected (`member already exists`).
+- Portal: private-mode **Add member** → Preview → Register. Any change after a
+  preview invalidates it. Progress (`done/total`, overdue, next step) shows on
+  the overview and member header; readiness gaps only in Private mode.
+- Not automated: access grants, VM allocation (`vm-delegate`), workspace slot
+  (`workspace-manager`), Jira/Confluence changes. The historical roster in
+  `jira-hsi-planning/private-context.md` is not updated; team.db is the roster.
 
 ## 5) Cross-domain link workflow
 

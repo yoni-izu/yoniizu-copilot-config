@@ -26,6 +26,14 @@ Canonical store: `~/tasks/team.db` (`TEAM_DB` override), owned by `team-manager`
 - `feature_sets` + `feature_prs`: delivered-feature evidence and PR set grouping provenance.
 - `issue_completions`: normalized issue completion events for Bugs/Attributes/Stories metrics.
 - `typed_refs`: typed cross-domain links (`tasks`, `bugs`, `raid`, etc.) with provenance.
+- Onboarding (no new table): `assignments.kind='onboarding'`, id
+  `asg-onb-<member>-<step>`, owner = lead or new member; each has a non-historical
+  tracked item with `member_key=<new member>`; `typed_refs` domain `team`,
+  provenance `onboarding`, relations `onboarding-of` (→ member) and
+  `onboarding-buddy` (→ buddy, on the buddy step); audit action `onboard` with
+  the reviewed `plan_revision`. Payload: `onboarding[<member>]` progress for
+  members with checklist steps visible to the audience (`gaps` private only) and
+  private-only `onboarding_spec` (intake fields + checklist).
 - `documents`: planning and summary documents captured as database records.
 - `exports`: on-demand Confluence/export history.
 - `imports`: migration/import provenance and conflict tracking.
