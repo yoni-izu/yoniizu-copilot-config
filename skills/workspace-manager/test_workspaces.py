@@ -69,6 +69,94 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(wm.set_slot_fields("one", {"group": ""})[0])
         self.assertEqual(wm.record("one")["group"], "")
 
+    def test_purpose_persists_and_legacy_workspaces_remain_general(self):
+        self.assertEqual(wm.roster(cached_only=True)[0]["purpose"], "general")
+        for purpose in wm.PURPOSES:
+            with self.subTest(purpose=purpose), patch.object(wm.vd, "jobs", return_value=[]):
+                self.assertTrue(wm.set_slot_fields("one", {"purpose": purpose})[0])
+                row = wm.roster(cached_only=True)[0]
+                self.assertEqual(row["purpose"], purpose)
+                self.assertEqual(row["allowed_uses"], wm.purpose_uses(purpose))
+        for value in ("arbitrary", None, [], False):
+            self.assertFalse(wm.set_slot_fields("one", {"purpose": value})[0])
+        self.assertEqual(wm.record("one")["purpose"], "mirror")
+
+    def test_tracking_validates_dedication_and_cli_can_edit_without_machine_access(self):
+        extra = self.base / "review"
+        extra.mkdir()
+        self.assertFalse(wm.track(str(extra), purpose="invalid")[0])
+        self.assertTrue(wm.track(str(extra), purpose="review")[0])
+        self.assertEqual(wm.record("review")["purpose"], "review")
+        with patch.object(wm.vd, "jobs", return_value=[]), \
+                patch.object(wm, "workspace_request") as request, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(wm.main(["purpose", "review", "build-root"]), 0)
+            self.assertEqual(wm.main(["purpose", "review"]), 0)
+        request.assert_not_called()
+        self.assertEqual(wm.record("review")["purpose"], "build-root")
+
+    def test_remote_job_matching_uses_machine_and_whole_slot_including_unverified_runs(self):
+        rec = {"target": "lab", "path": "/home/remote/projects/chip/build"}
+        rows = [
+            {"target": "lab", "tag": "projects_chip_build_fw", "status": "unknown"},
+            {"target": "lab", "tag": "projects_chip_build2_fw", "status": "running"},
+            {"target": "other", "tag": "projects_chip_build_fw", "status": "running"},
+            {"target": "lab", "tag": "projects_chip_build_fw", "status": "passed"},
+            {"target": "lab", "tag": "projects_chip_build_fw", "status": "unknown",
+             "owns_slot": False},
+        ]
+        with patch.object(wm.vd, "jobs", return_value=rows):
+            self.assertEqual(wm.active_jobs(rec), rows[:1])
+
+    def test_dedicated_assignment_matrix_cannot_be_forced_or_skip_validated(self):
+        tasks = {"tasks": [{"id": "T-review", "category": "code-review"},
+                           {"id": "T-dev", "category": "feature"}]}
+        for purpose in wm.PURPOSES:
+            with self.subTest(purpose=purpose), \
+                    patch.object(wm.vd, "jobs", return_value=[]), \
+                    patch.object(wm.task_store, "load", return_value=tasks), \
+                    patch.object(wm, "require_clean"):
+                self.assertTrue(wm.set_slot_fields("one", {"purpose": purpose})[0])
+                for tid, activity in (("T-review", "review"), ("T-dev", "development")):
+                    ok, msg, _ = wm.occupy_task("one", tid, force=True, _validated=True)
+                    self.assertEqual(ok, wm.allows(wm.record("one"), activity), msg)
+                    if ok:
+                        wm.release("one", reset=False)
+                for tag in wm.ADHOC_TAGS:
+                    ok, msg, _ = wm.occupy_adhoc("one", tag, tag, force=True, _validated=True)
+                    self.assertEqual(ok, wm.allows(wm.record("one"), "adhoc:" + tag), msg)
+                    if ok:
+                        wm.release("one", reset=False)
+        self.assertEqual(wm.record("one")["purpose"], "mirror")
+
+    def test_purpose_change_refuses_holds_mirrors_and_unverified_jobs_without_partial_edits(self):
+        with patch.object(wm, "require_clean"):
+            self.assertTrue(wm.occupy_adhoc("one", "hold")[0])
+        ok, _ = wm.set_slot_fields("one", {"purpose": "review", "label": "lost"})
+        self.assertFalse(ok)
+        self.assertEqual(wm.record("one")["label"], "one")
+        wm.release("one", reset=False)
+        wm.status_write("one", {"mirror": {"state": "active"}})
+        self.assertFalse(wm.set_slot_fields("one", {"purpose": "review"})[0])
+        wm.status_write("one", {})
+        for status in ("running", "unknown"):
+            with patch.object(wm.vd, "jobs", return_value=[{
+                    "ws": str(self.local / "fw"), "status": status, "owns_slot": True}]):
+                self.assertFalse(wm.set_slot_fields("one", {"purpose": "review"})[0])
+        with patch.object(wm.vd, "jobs", return_value=[]):
+            self.assertTrue(wm.set_slot_fields("one", {"purpose": "review"})[0])
+
+    def test_dedication_rejects_align_and_incoming_mirror_before_transport(self):
+        for purpose, action, options in [
+                ("development", "align", {}), ("build-root", "align", {}),
+                ("review", "mirror", {"mirror": {"state": "syncing"}})]:
+            with self.subTest(purpose=purpose), patch.object(wm.vd, "jobs", return_value=[]):
+                self.assertTrue(wm.set_slot_fields("one", {"purpose": purpose})[0])
+            with patch.object(wm.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "dedicated"):
+                    wm.workspace_request("one", action, **options)
+                run.assert_not_called()
+
     def test_metadata_revision_guard_preserves_hold_and_rejects_unknown_group(self):
         with patch.object(wm, "workspace_request", return_value={"clean": True}):
             self.assertTrue(wm.occupy_task("one", "T-1")[0])
@@ -129,7 +217,8 @@ class RegistryTests(unittest.TestCase):
                                          progress=(lambda event: None) if streaming else None)
                 agent.assert_called_once_with(recheck=True)
                 invoked, unused = (stream, run) if streaming else (run, stream)
-                self.assertEqual(invoked.call_args.kwargs["env"], env)
+                self.assertEqual(invoked.call_args.kwargs["env"],
+                                 dict(env, WM_LOCKED_WORKSPACE=wm.record(slot)["id"]))
                 unused.assert_not_called()
 
     def test_local_workspace_does_not_resolve_ssh_agent(self):
@@ -978,6 +1067,41 @@ class GithubAuthTests(unittest.TestCase):
                 patch.object(runtime.subprocess, "run",
                              return_value=subprocess.CompletedProcess([], 1)):
             self.assertEqual(runtime.github_https_config(), {})
+
+
+class DeployedManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        p = patch.object(wm, "slot_path", lambda slot, d=None: self.tmp / slot)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def checkout(self, path, **meta):
+        (path / ".repo").mkdir(parents=True)
+        (path / ".repo/metadata.json").write_text(json.dumps(meta))
+
+    def test_reads_project_and_revision_from_child_checkouts(self):
+        self.checkout(self.tmp / "rv/fw", project="iridium", manifest_revision="main")
+        self.checkout(self.tmp / "rv/sw", project="iridium", manifest_revision="",
+                      init_args={"revision": "main"})
+        out = wm.deployed_manifest("rv")
+        self.assertEqual((out["project"], out["revision"], len(out["roots"])),
+                         ("iridium", "main", 2))
+
+    def test_slot_that_is_itself_a_checkout(self):
+        self.checkout(self.tmp / "ws", project="atlantic2", manifest_revision="a2_main")
+        self.assertEqual(wm.deployed_manifest("ws")["revision"], "a2_main")
+
+    def test_errors(self):
+        self.assertIn("does not exist", wm.deployed_manifest("missing")["error"])
+        (self.tmp / "empty").mkdir()
+        self.assertIn("no octl checkout", wm.deployed_manifest("empty")["error"])
+        self.checkout(self.tmp / "mix/a", project="iridium", manifest_revision="main")
+        self.checkout(self.tmp / "mix/b", project="iridium", manifest_revision="a1_power_on_branch")
+        self.assertIn("different manifests", wm.deployed_manifest("mix")["error"])
+        with patch.object(wm, "slot_path", side_effect=ValueError("remote workspace paths")):
+            self.assertIn("remote", wm.deployed_manifest("r")["error"])
 
 
 if __name__ == "__main__":

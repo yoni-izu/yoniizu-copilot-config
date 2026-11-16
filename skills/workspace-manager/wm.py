@@ -47,8 +47,19 @@ STORE = workspace_store.DB_PATH
 PROJECTS_ROOT = Path(os.path.expanduser("~/projects"))
 DEFAULT_PROJECT = "iridium"
 
-ADHOC_TAGS = ["monitor", "debug", "development", "experiment", "other"]
+ADHOC_TAGS = ["monitor", "debug", "development", "experiment", "other", "review", "build", "test"]
 HOLDER_TYPES = ["task", "adhoc"]
+PURPOSES = {
+    "general": "General", "review": "Review", "development": "Development",
+    "build-root": "Build root", "mirror": "Mirror",
+}
+PURPOSE_USES = {
+    "review": {"review", "adhoc:review", "mirror-source"},
+    "development": {"development", "adhoc:development", "adhoc:debug",
+                    "adhoc:experiment", "mirror-source"},
+    "build-root": {"mirror", "build", "test", "adhoc:build", "adhoc:test"},
+    "mirror": {"mirror", "build", "test", "adhoc:build", "adhoc:test"},
+}
 
 TODAY = date.today().isoformat()
 _STORE_LOCK = threading.RLock()
@@ -86,6 +97,52 @@ def new_id(remote: bool = False) -> str:
 
 def stamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def purpose_uses(purpose: str) -> list[str]:
+    if not isinstance(purpose, str) or purpose not in PURPOSES:
+        raise ValueError(f"invalid workspace purpose: {purpose!r}")
+    return ["*"] if purpose == "general" else sorted(PURPOSE_USES[purpose])
+
+
+def allows(rec: dict, activity: str) -> bool:
+    uses = purpose_uses(rec.get("purpose", "general"))
+    return "*" in uses or activity in uses
+
+
+def require_use(slot: str, activity: str) -> None:
+    rec = record(slot)
+    if not allows(rec, activity):
+        raise ValueError(f"workspace '{rec['slot']}' is dedicated to "
+                         f"{PURPOSES[rec.get('purpose', 'general')]} and cannot be used for {activity}")
+
+
+def require_task(slot: str, task_id: str) -> None:
+    if record(slot).get("purpose", "general") == "general":
+        return
+    task = next((t for t in task_store.load()["tasks"] if t["id"] == task_id), None)
+    if task is None:
+        raise ValueError(f"cannot determine purpose of task {task_id}")
+    require_use(slot, "review" if task.get("category") == "code-review" else "development")
+
+
+def active_jobs(rec: dict) -> list[dict]:
+    """Saved delegation readings only; unknown newest runs also reserve capacity."""
+    path = rec["path"].rstrip("/")
+    tag_path = path.removeprefix("~/")
+    if tag_path.startswith("/home/"):
+        tag_path = tag_path.split("/", 3)[-1]
+    elif tag_path.startswith(str(Path.home()) + "/"):
+        tag_path = tag_path[len(str(Path.home())) + 1:]
+    tag = tag_path.replace("/", "_")
+    def matches(job):
+        if rec.get("target"):
+            return (job.get("target") == rec["target"]
+                    and (job.get("tag") == tag or job.get("tag", "").startswith(tag + "_")))
+        ws = job.get("ws") or ""
+        return ws == path or ws.startswith(path + "/")
+    return [j for j in vd.jobs() if j.get("owns_slot", True)
+            and j.get("status") in {"running", "unknown"} and matches(j)]
 
 
 # ----------------------------------------------------------------------------
@@ -207,6 +264,8 @@ def roster(d: dict | None = None, *, cached_only: bool = False) -> list[dict]:
             "label": rec.get("label") or slot,
             "badge": rec.get("badge") or slot[:2].upper(),
             "rev": rec.get("rev") or "main",
+            "purpose": rec.get("purpose", "general"),
+            "allowed_uses": purpose_uses(rec.get("purpose", "general")),
             "group": rec.get("group") or "",
             "order": rec.get("order", 0),
             "exists": reading.get("exists") if cached_only or rec.get("target") else Path(os.path.expanduser(
@@ -319,6 +378,8 @@ def identity(path: str, target: str = "") -> dict:
 def mirror_state(target: str, path: str, source_id: str, source_path: str,
                  state: str, detail: str = "") -> dict:
     rec = identity(path, target)
+    if state != "released":
+        require_use(rec["slot"], "mirror")
     reading = status_read(rec["id"])
     reading["mirror"] = None if state == "released" else {
         "source_id": source_id, "source_path": source_path,
@@ -368,6 +429,10 @@ def _run_with_progress(args: list, timeout: int, progress, *,
 def workspace_request(slot: str, action: str = "status", *, _adopted: bool = False,
                       progress=None, **options) -> dict:
     rec = record(slot)
+    if action == "align":
+        require_use(slot, "review")
+    elif action == "mirror" and options.get("mirror") is not None:
+        require_use(slot, "mirror")
     request = {"id": rec["id"], "path": rec["path"], "rev": rec["rev"], "action": action}
     request.update(options)
     portal_sync = options.get("portal_sync")
@@ -388,6 +453,9 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
     try:
         timeout = 2400 if action != "status" else 180
         env, agent_error = vd.agent_env(recheck=True) if rec.get("target") else (None, "")
+        if rec.get("target"):
+            env = dict(env if env is not None else os.environ,
+                       WM_LOCKED_WORKSPACE=rec["id"])
         r = (_run_with_progress(args, timeout, progress, env=env) if progress else
              subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env))
         if r.returncode and not r.stdout.lstrip().startswith("{"):
@@ -495,8 +563,12 @@ def guarded_occupancy(fn):
 @serialized
 def track(path: str, label: str | None = None, rev: str | None = None,
           group: str | None = None, badge: str | None = None,
-          target: str | None = None):
+          target: str | None = None, purpose: str = "general"):
     """Add a workspace directory to the tracked roster. ``(ok, msg, slot)``."""
+    try:
+        purpose_uses(purpose)
+    except ValueError as error:
+        return False, str(error), None
     raw = (path or "").strip()
     if not raw:
         return False, "a workspace path is required", None
@@ -525,6 +597,7 @@ def track(path: str, label: str | None = None, rev: str | None = None,
         "label": (label or "").strip() or p.name,
         "badge": (badge or "").strip() or p.name[:2].upper(),
         "rev": (rev or "").strip() or "main",
+        "purpose": purpose,
         "group": group or "",
         "order": max((r.get("order", 0) for r in recs.values()), default=-1) + 1,
     }
@@ -563,7 +636,7 @@ def untrack(slot: str, *, force: bool = False):
 @workspace_serialized
 @serialized
 def set_slot_fields(slot: str, fields: dict):
-    """Update roster metadata (``group``/``label``/``rev``/``badge``) for a slot."""
+    """Update roster metadata without changing a checkout."""
     root = normalize_slot(slot)
     if not root:
         return False, f"invalid slot: {slot!r}"
@@ -572,6 +645,16 @@ def set_slot_fields(slot: str, fields: dict):
     rec = recs.get(root)
     if rec is None:
         return False, f"'{root}' is not tracked"
+    if "purpose" in fields:
+        try:
+            purpose_uses(fields["purpose"])
+        except ValueError as error:
+            return False, str(error)
+        if fields["purpose"] != rec.get("purpose", "general"):
+            if get_holder(root, d) or status_read(rec["id"]).get("mirror"):
+                return False, "free the workspace before changing its dedicated purpose"
+            if active_jobs(rec):
+                return False, "workspace has running or unverified jobs; verify completion before changing purpose"
     if fields.get("rev") and fields["rev"] != rec.get("rev"):
         if get_holder(root, d) or status_read(rec["id"]).get("mirror"):
             log_action(root, "metadata", "rejected", "cannot change revision while occupied or mirroring")
@@ -585,6 +668,8 @@ def set_slot_fields(slot: str, fields: dict):
         if key in fields:
             val = (fields.get(key) or "").strip()
             rec[key] = val or (root if key == "label" else rec.get(key, ""))
+    if "purpose" in fields:
+        rec["purpose"] = fields["purpose"]
     save(d)
     log_action(root, "metadata", "ok", json.dumps(fields))
     return True, f"updated '{root}'"
@@ -702,6 +787,45 @@ def is_free(slot: str, d: dict | None = None) -> bool:
     return not reading.get("mirror")
 
 
+def deployed_manifest(slot: str, d: dict | None = None) -> dict:
+    """What a local slot actually has deployed, read from its octl checkouts.
+
+    Returns ``{"project", "revision", "roots"}`` from every
+    ``.repo/metadata.json`` under the slot (the slot itself or its direct
+    children, the same roots ``workspace_runtime`` aligns), or ``{"error"}``
+    when there is none, the checkouts disagree, or the slot is remote. The
+    tracked ``rev`` is a declaration; this is the deployed reading.
+    """
+    try:
+        root = slot_path(slot, d)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if not root.is_dir():
+        return {"error": f"{root} does not exist"}
+    if (root / ".repo/metadata.json").is_file():
+        roots = [root]
+    else:
+        roots = sorted(p for p in root.iterdir()
+                       if p.is_dir() and (p / ".repo/metadata.json").is_file())
+    if not roots:
+        return {"error": f"no octl checkout (.repo/metadata.json) in {root}"}
+    seen = set()
+    for r in roots:
+        try:
+            meta = json.loads((r / ".repo/metadata.json").read_text())
+        except (OSError, ValueError) as exc:
+            return {"error": f"unreadable {r}/.repo/metadata.json: {exc}"}
+        project = meta.get("project") or (meta.get("init_args") or {}).get("project") or ""
+        revision = (meta.get("manifest_revision")
+                    or (meta.get("init_args") or {}).get("revision") or "")
+        seen.add((project, revision))
+    if len(seen) != 1:
+        return {"error": "checkouts in this slot deploy different manifests: " + ", ".join(
+            f"{p or '?'}@{r or '?'}" for p, r in sorted(seen))}
+    project, revision = seen.pop()
+    return {"project": project, "revision": revision, "roots": [str(r) for r in roots]}
+
+
 def all_holders(d: dict | None = None) -> dict[str, dict]:
     """Map of slot -> holder for every currently-occupied slot."""
     d = d if d is not None else load()
@@ -745,6 +869,7 @@ def occupy_task(slot: str, task_id: str, detail: str | None = None,
         return False, f"invalid slot: {slot!r}", None
     own = d if d is not None else load()
 
+    require_task(root, task_id)
     current = get_holder(root, own)
     if current and not (current.get("type") == "task" and current.get("task_id") == task_id):
         return False, f"slot '{root}' occupied by {_holder_label(current)}; free it first", None
@@ -789,6 +914,7 @@ def occupy_adhoc(slot: str, label: str, tag: str = "other",
         return False, f"invalid tag: {tag} (use one of {', '.join(ADHOC_TAGS)})", None
     own = d if d is not None else load()
 
+    require_use(root, "adhoc:" + tag)
     current = get_holder(root, own)
     displaced = None
     if current:
@@ -980,12 +1106,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     for s in d["slots"]:
         if s not in slots and get_holder(s, d):
             slots.append(s)
-    rows = [("Slot", "Holder", "Kind", "Since", "Detail")]
+    rows = [("Slot", "Purpose", "Holder", "Kind", "Since", "Detail")]
     occupied = 0
     for s in slots:
+        purpose = PURPOSES[tracked(d).get(s, {}).get("purpose", "general")]
         h = get_holder(s, d)
         if not h:
-            rows.append((s, "—", "free", "—", "—"))
+            rows.append((s, purpose, "—", "free", "—", "—"))
             continue
         occupied += 1
         if h.get("type") == "task":
@@ -998,7 +1125,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             holder = h.get("label", "")
             detail = ""
             kind = f"adhoc/{h.get('tag', 'other')}"
-        rows.append((s, holder, kind, h.get("since") or "—", detail))
+        rows.append((s, purpose, holder, kind, h.get("since") or "—", detail))
     _print_table(rows)
     print(f"\n{occupied} / {len(slots)} slots occupied")
     return 0
@@ -1007,10 +1134,11 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     h = get_holder(args.slot)
     root = normalize_slot(args.slot)
+    purpose = PURPOSES[tracked().get(root, {}).get("purpose", "general")]
     if not h:
-        print(f"{root}: free")
+        print(f"{root}: free · purpose: {purpose}")
         return 0
-    print(f"{root}: {holder_summary(h)} (since {h.get('since') or '—'})")
+    print(f"{root}: {holder_summary(h)} (since {h.get('since') or '—'}) · purpose: {purpose}")
     return 0
 
 
@@ -1069,6 +1197,11 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wm", description="workspace-manager CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("purpose", help="show or change persistent workspace dedication")
+    a.add_argument("slot")
+    a.add_argument("value", nargs="?", choices=PURPOSES)
+    a.set_defaults(func=cmd_purpose)
 
     for command in ("refresh", "sync", "log"):
         a = sub.add_parser(command)
@@ -1132,6 +1265,19 @@ def main(argv: list[str] | None = None) -> int:
 def _print_identity(args) -> int:
     print(json.dumps(identity(args.path, args.target)))
     return 0
+
+
+def cmd_purpose(args) -> int:
+    try:
+        if args.value is None:
+            print(PURPOSES[record(args.slot).get("purpose", "general")])
+            return 0
+        ok, message = set_slot_fields(args.slot, {"purpose": args.value})
+        print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+    except ValueError as error:
+        print(f"[wm] {error}", file=sys.stderr)
+        return 1
 
 
 def _workspace_cli(args, command) -> int:

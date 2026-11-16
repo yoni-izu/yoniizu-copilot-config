@@ -93,6 +93,11 @@ to the same physical checkout on several hosts.
   `force=True` bypasses only those two checks, preserving holds, saved readings,
   mirror state and history without touching the checkout or contacting a machine.
   Active-operation locks and workspace identity validation still apply.
+- **Deployed manifest** (`wm.deployed_manifest(slot)`, read-only, local slots)
+  returns the `project` and `manifest_revision` actually deployed, read from the
+  slot's `.repo/metadata.json` checkouts (the slot or its direct children), or an
+  error when there is none or they disagree. The tracked `rev` is only a
+  declaration; the portal's auto-review matches workspaces on this reading.
 
 The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws --argv` for
 multi-repository operations, passes its named repository-worker arguments
@@ -141,6 +146,42 @@ The owner database uses transactions alongside the process/thread lifecycle lock
 Tests:
 `python3 -m unittest discover -s ~/.copilot/skills/workspace-manager -p 'test_*.py'`.
 
+## Dedicated workspaces
+
+Tracked workspaces have a persistent `purpose`, independent of their current
+holder or mirror. Missing purpose means `general`; existing workspaces are not
+reclassified. Free/release does not clear dedication.
+
+| Purpose | Allowed use |
+|---|---|
+| `general` | Existing unrestricted behavior |
+| `review` | Code-review tasks, ad-hoc `review` holds, outgoing source mirroring |
+| `development` | Non-review tasks, ad-hoc `development`/`debug`/`experiment` holds, outgoing source mirroring |
+| `build-root` | Incoming mirrors, build/test dispatch, ad-hoc `build`/`test` reservations |
+| `mirror` | Same policy as `build-root`, with a distinct display label |
+
+Use `wm.py purpose SLOT` to inspect, or `wm.py purpose SLOT review` (etc.) to
+change. The portal exposes the same owner API in Track/Edit. Purpose changes
+require no holder, no mirror, no active workspace operation and no running or
+unverified matching delegated job. The portal additionally refuses changes
+that conflict with queued actions. Verify job outcomes through the delegation
+owner before repurposing; do not clear saved job state to bypass this guard.
+
+`wm.require_use(slot, activity)` and `wm.allows(record, activity)` are the policy
+authority. `wm.require_task(slot, task_id)` resolves the task category through
+the task owner. Assignment/hold and review-alignment APIs enforce policy even
+with `force` or prevalidated cleanliness. The roster includes `purpose` and
+`allowed_uses` for presentation; never trust client-supplied permissions.
+Unknown purposes fail closed. Use `review`, `build` or `test` ad-hoc tags rather
+than disguising dedicated activity as an `other`/`experiment` hold.
+
+Supported `mctl` dispatch checks destination policy before side effects.
+Review/Development workspaces can be build sources, not build execution
+destinations. Generic `mctl run`/`sh`/`wip` operations require General targets;
+use structured workspace Sync/Free for dedicated-target maintenance. The
+policy is not an OS sandbox and does not prevent arbitrary terminal commands.
+Agents must honor it for manual selection and execution as well.
+
 ## CLI cheatsheet
 
 Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
@@ -150,7 +191,7 @@ Run as: `python3 ~/.copilot/skills/workspace-manager/wm.py <subcommand> ...`
 | `list [--project NAME]` | Show every slot and its holder | Default project: `iridium`. Slots come from the project dir plus any occupied slot. |
 | `status <slot>` | Show one slot's holder | Normalizes sub-paths (`one/fw` → `one`). |
 | `occupy <slot> --task T-NNN [--detail PATH] [--force]` | Give a slot to a task | Requires a fresh clean baseline and a free slot; `--force` cannot displace a hold. |
-| `occupy <slot> --label "purpose" [--tag TAG] [--force]` | Grab a slot for an **ad-hoc** purpose | `--tag` ∈ `monitor`, `debug`, `development`, `experiment`, `other` (default `other`). |
+| `occupy <slot> --label "purpose" [--tag TAG] [--force]` | Grab a slot for an **ad-hoc** purpose | `--tag` ∈ `monitor`, `debug`, `development`, `experiment`, `other`, `review`, `build`, `test` (default `other`); dedication applies. |
 | `release <slot>` / `free <slot>` | Free a slot | No-op if already free. |
 | `whereami [--cwd PATH]` | Report the slot for the current (or given) directory | Resolves `~/projects/<project>/<slot>/...`. |
 | `migrate [--keep-fields]` | One-time import of legacy per-task `workspace` holds | Moves active holds through owner APIs and removes legacy fields from task records (unless `--keep-fields`). This is distinct from database import. |
@@ -181,6 +222,8 @@ The following JSON describes the owner API representation, not an editable datab
 
 - `wm.get_holder(slot)` → holder dict or `None`
 - `wm.is_free(slot)` → bool
+- `wm.require_use(slot, activity)` → raises `ValueError` on incompatible dedication
+- `wm.allows(record, activity)` → compatibility predicate (free does not imply compatible)
 - `wm.all_holders()` → `{slot: holder}` for every occupied slot
 - `wm.slot_of_task(task_id)` → slot name or `None`
 - `wm.occupy_task(slot, task_id, detail=None, force=False)` → `(ok, msg, displaced)`
