@@ -234,7 +234,7 @@ def _sock_has_keys(sock: str) -> bool:
         return False
     env = dict(os.environ, SSH_AUTH_SOCK=sock)
     try:
-        p = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True,
+        p = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=10, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -287,30 +287,10 @@ def agent_env(*, recheck: bool = False) -> tuple[dict, str]:
     return dict(os.environ), err
 
 
-def _probe_once(target: str) -> tuple[dict, str, bool]:
-    """One ssh round trip. Returns (rows, error-or-empty, retryable)."""
-    env, agent_err = agent_env()
-    try:
-        p = subprocess.run([str(MCTL), "-t", target, "jobs-probe"],
-                           capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env)
-    except subprocess.TimeoutExpired:
-        # Not retryable: it already cost PROBE_TIMEOUT seconds.
-        return {}, f"'{target}' did not answer within {PROBE_TIMEOUT}s", False
-    except OSError as e:
-        return {}, str(e), True
-    if p.returncode != 0 and not p.stdout.strip():
-        err = (p.stderr or "").strip().splitlines()
-        msg = err[-1] if err else f"jobs-probe failed (rc={p.returncode})"
-        if p.returncode == SSH_FAIL_RC and agent_err:
-            # ssh -o BatchMode=yes with no usable key fails at rc=255 with NO
-            # diagnostic at all. Naming the real cause is the difference between
-            # a fixable report and a target that silently never answers.
-            msg = f"{msg} \u2014 {agent_err}"
-            return {}, msg, False          # retrying without a key is pointless
-        return {}, msg, p.returncode == SSH_FAIL_RC
-
+def parse_probe(text: str) -> dict:
+    """jobs-probe / jobs-watch TSV rows -> {(tag, kind): row}."""
     rows: dict[tuple[str, str], dict] = {}
-    for line in p.stdout.splitlines():
+    for line in text.splitlines():
         parts = line.rstrip("\n").split("\t")
         if len(parts) < 8:
             continue
@@ -327,7 +307,32 @@ def _probe_once(target: str) -> tuple[dict, str, bool]:
             "cmd": cmd,
             "last_line": last,
         }
-    return rows, "", False
+    return rows
+
+
+def _probe_once(target: str) -> tuple[dict, str, bool]:
+    """One ssh round trip. Returns (rows, error-or-empty, retryable)."""
+    env, agent_err = agent_env()
+    try:
+        p = subprocess.run([str(MCTL), "-t", target, "jobs-probe"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=PROBE_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        # Not retryable: it already cost PROBE_TIMEOUT seconds.
+        return {}, f"'{target}' did not answer within {PROBE_TIMEOUT}s", False
+    except OSError as e:
+        return {}, str(e), True
+    if p.returncode != 0 and not p.stdout.strip():
+        err = (p.stderr or "").strip().splitlines()
+        msg = err[-1] if err else f"jobs-probe failed (rc={p.returncode})"
+        if p.returncode == SSH_FAIL_RC and agent_err:
+            # ssh -o BatchMode=yes with no usable key fails at rc=255 with NO
+            # diagnostic at all. Naming the real cause is the difference between
+            # a fixable report and a target that silently never answers.
+            msg = f"{msg} \u2014 {agent_err}"
+            return {}, msg, False          # retrying without a key is pointless
+        return {}, msg, p.returncode == SSH_FAIL_RC
+
+    return parse_probe(p.stdout), "", False
 
 
 def probe(target: str) -> tuple[dict, str]:
@@ -509,7 +514,7 @@ def sync_logs(target: str) -> dict:
         return {"target": target, "error": "mctl not installed", "logs": 0}
     try:
         p = subprocess.run([str(MCTL), "-t", target, "jobs-sync"],
-                           capture_output=True, text=True, timeout=SYNC_TIMEOUT,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=SYNC_TIMEOUT,
                            env=agent_env()[0])
     except subprocess.TimeoutExpired:
         return {"target": target, "error": f"log sync timed out ({SYNC_TIMEOUT}s)", "logs": 0}
@@ -530,7 +535,7 @@ def tail_remote(target: str, tag: str, kind: str, lines: int = 200) -> str:
         return ""
     try:
         p = subprocess.run([str(MCTL), "-t", target, "jobs-tail", tag, kind, str(lines)],
-                           capture_output=True, text=True, timeout=TAIL_TIMEOUT,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TAIL_TIMEOUT,
                            env=agent_env()[0])
     except (subprocess.TimeoutExpired, OSError):
         return ""
@@ -583,7 +588,11 @@ def tail(target: str, tag: str, kind: str, lines: int = 200, job_id: str = "") -
             "at": time.strftime("%H:%M:%S")}
 
 
-def refresh(only: str | None = None, sync: bool = True) -> dict:
+def refresh(only: str | None = None, sync: bool = True,
+            preprobed: dict | None = None) -> dict:
+    """Reconcile job state. ``preprobed`` maps target -> parse_probe() rows that
+    were already read over a live link (portal live status); those targets are
+    not probed again."""
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     jobs = _read_log()
     state = _read_state()
@@ -610,7 +619,12 @@ def refresh(only: str | None = None, sync: bool = True) -> dict:
 
     probed: dict[str, dict] = {}
     for t in sorted(pending):
-        rows, err = probe(t)
+        if preprobed is not None:
+            if t not in preprobed:
+                continue
+            rows, err = preprobed[t], ""
+        else:
+            rows, err = probe(t)
         probed[t] = rows
         if err:
             errors[t] = err
@@ -777,7 +791,7 @@ def machines(force: bool = False) -> dict:
 
     try:
         p = subprocess.run(["octl", "vm", "list", "--output", "json", "--silent"],
-                           capture_output=True, text=True, timeout=OCTL_TIMEOUT)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=OCTL_TIMEOUT)
     except subprocess.TimeoutExpired:
         return failed(f"octl vm list timed out ({OCTL_TIMEOUT}s)")
     except OSError as e:
@@ -846,7 +860,7 @@ def power(action: str, instance_id: str) -> dict:
         return {"error": f"not an instance id: {instance_id}"}
     cmd = ["octl", "vm", action, instance_id]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=OCTL_TIMEOUT)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=OCTL_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"error": f"octl vm {action} timed out ({OCTL_TIMEOUT}s)"}
     except OSError as e:
@@ -1187,6 +1201,67 @@ def portal_log(target: str, tag: str, kind: str, job_id: str = "") -> dict:
     out["target"], out["tag"], out["kind"] = target, tag, kind
     out["job_id"] = job_id or ""
     return out
+
+
+def job_statuses() -> dict:
+    """Cheap {job id: {status, rc, target, tag, kind, ws}} for change detection."""
+    state = (_read_state().get("jobs") or {})
+    out = {}
+    for j in _read_log():
+        st = state.get(j["id"]) or {}
+        out[j["id"]] = {"status": st.get("status") or "unknown", "rc": st.get("rc"),
+                        "target": j.get("target") or "vm", "tag": j.get("tag", ""),
+                        "kind": j.get("kind", ""),
+                        "ws": _ws_label(j.get("ws") or "", j.get("tag", ""))}
+    return out
+
+
+# Lines a finished log shows in the portal terminal (its scrollback size).
+LOG_VIEW_LINES = 20000
+
+
+def log_view(job_id: str) -> dict:
+    """How the portal's terminal log viewer should show one job's log.
+
+    Returns ``{"mode": "remote", "target", "command", "title", "running"}``
+    (run over ``mctl -t <target> term``) or ``{"error": ...}``. Every log is
+    read with ``tail`` on the machine itself; nothing is downloaded and the
+    local mirror is never shown. A live job is followed with ``tail -F``; a
+    settled one prints its last ``LOG_VIEW_LINES`` lines (the browser
+    terminal's scrollback) and exits. A run whose slot was taken over by a
+    later run is read from the target's timestamped ``runs/`` archive (mctl
+    keeps one ``<kind>-<stamp>-<pid>.log`` per run).
+    """
+    job = _job_by_id(job_id or "")
+    if not job:
+        return {"error": "unknown job"}
+    target = job.get("target") or "vm"
+    tag, kind = job.get("tag", ""), job.get("kind", "") or "build"
+    if not (_safe_id(target) and _safe_id(tag) and _safe_id(kind)):
+        return {"error": "job has an unsafe target/tag/kind"}
+    pid = job.get("pid")
+    st = (_read_state().get("jobs") or {}).get(job_id) or {}
+    pid = st.get("pid") if st.get("pid") is not None else pid
+    pid = int(pid) if str(pid or "").isdigit() else None
+    running = st.get("status") == "running"
+    title = f"{target}:{tag}/{kind}.log"
+    if owns_slot(job):
+        follow = (f"tail -n 300 -F {kind}.log" if running
+                  else f"tail -n {LOG_VIEW_LINES} {kind}.log")
+        script = (f'cd "$HOME/.mctl/jobs/{tag}" 2>/dev/null '
+                  f'|| {{ echo "no job dir {tag} on {target}"; exit 3; }}; '
+                  f'[ -f {kind}.log ] || {{ echo "{kind}.log is gone on {target}"; exit 3; }}; '
+                  f'{follow}')
+        return {"mode": "remote", "target": target, "running": running,
+                "command": script, "title": ("tail -F " if running else "tail ") + title}
+    if pid:
+        script = (f'f=$(ls -1 "$HOME/.mctl/jobs/{tag}/runs/"{kind}-*-{pid}.log 2>/dev/null | tail -1); '
+                  f'[ -n "$f" ] || {{ echo "run pid {pid} of {tag}/{kind} is not archived on {target}"; exit 3; }}; '
+                  f'echo "== $f"; tail -n {LOG_VIEW_LINES} "$f"')
+        return {"mode": "remote", "target": target, "running": False,
+                "command": script, "title": f"tail {title} (archived run, pid {pid})"}
+    return {"error": f"a later run in {tag} overwrote {kind}.log on {target} and "
+                     "this run has no pid to find its archived copy"}
 
 
 def portal_tail(target: str, tag: str, kind: str, lines: int = 200,

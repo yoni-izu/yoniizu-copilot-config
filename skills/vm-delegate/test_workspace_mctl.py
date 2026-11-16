@@ -26,12 +26,35 @@ class WorkspaceMctlTests(unittest.TestCase):
                         PLDM_DB=str(self.home / "tasks/pldm.db"))
         self.env.pop("BASH_ENV", None)
 
-    def shell(self, code):
-        script = f"source <(sed '$d' {shlex.quote(str(MCTL))})\n" + code
+    def shell(self, code, *, real_policy=False):
+        stub = ("rlogin() { bash -c \"$1\"; }\n" if real_policy
+                else "workspace_policy_guard() { :; }\n")
+        script = f"source <(sed '$d' {shlex.quote(str(MCTL))})\n" + stub + code
         return subprocess.run(
             ["bash", "-c", script], env=self.env, text=True, capture_output=True,
             timeout=15, check=False,
         )
+
+    def test_start_job_archives_previous_run_with_timestamp_and_pid(self):
+        jd = self.home / "jobs" / "tag"
+        ws = self.home / "ws"
+        ws.mkdir()
+        code = f"""T_NAME=lab; T_KIND=remote; MCTL_KEEP_RUNS=2
+for i in 1 2 3 4; do
+  start_job {shlex.quote(str(ws))} build "echo run$i" 0 {shlex.quote(str(jd))} >/dev/null || exit 9
+  for _ in $(seq 50); do grep -q __MCTL_DONE__ {shlex.quote(str(jd))}/build.log 2>/dev/null && break; sleep 0.1; done
+  echo $(( $(date +%s) - 3600 * i )) > {shlex.quote(str(jd))}/build.started
+done
+"""
+        r = self.shell("rlogin() { bash -c \"$1\"; }\n" + code)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("run4", (jd / "build.log").read_text())
+        runs = sorted((jd / "runs").glob("build-*.log"))
+        self.assertEqual(len(runs), 2, [x.name for x in runs])
+        for log in runs:
+            self.assertRegex(log.name, r"^build-\d{8}-\d{6}-\d+\.log$")
+            self.assertTrue(log.with_suffix(".cmd").exists())
+        self.assertEqual({x.read_text().splitlines()[0] for x in runs}, {"run2", "run3"})
 
     def runtime_fixture(self, body):
         runtime = self.home / ".copilot/skills/workspace-manager/workspace_runtime.py"
@@ -278,7 +301,12 @@ if not wm.STORE.exists():
     wm.save({"slots": {}, "tracked": {}, "groups": []})
 wm.track("/canonical/slot", target="lab", rev="a1_power_on")
 PY
-rlogin() { printf '/canonical/slot\\n'; }
+rlogin() {
+  case "$1" in
+    *'resolve=lambda p:'*) bash -c "$1" ;;
+    *) printf '/canonical/slot\\n' ;;
+  esac
+}
 cmd_workspace() {
   printf '{"ok":true,"status":{"id":"%s","path":"%s","exists":true,"safe":true,"clean":true}}\\n' "$3" "$2"
 }
@@ -318,6 +346,113 @@ PY
 """)
         self.assertEqual(check.returncode, 0, check.stderr)
         self.assertEqual(check.stdout.strip(), rows[0]["id"])
+
+    def test_dedicated_destinations_block_unrelated_dispatch_and_hold_policy_lock(self):
+        setup = self.owner_fixture()
+        result = self.shell(setup + """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.vd.jobs = lambda: []
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.set_slot_fields(rec["slot"], {"purpose": "review"})[0]
+PY
+workspace_policy_guard /canonical/slot lab build
+""", real_policy=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dedicated to Review", result.stderr)
+        result = self.shell("""
+T_NAME=lab
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.vd.jobs = lambda: []
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.set_slot_fields(rec["slot"], {"purpose": "mirror"})[0]
+PY
+workspace_policy_guard /canonical/slot lab build || exit $?
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+try:
+    wm.set_slot_fields(wm.identity("/canonical/slot", "lab")["slot"], {"purpose": "review"})
+except ValueError as error:
+    assert "operation already running" in str(error), error
+else:
+    raise SystemExit("policy was changed during dispatch")
+PY
+""", real_policy=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_policy_rejection_prevents_build_test_and_generic_execution(self):
+        for command in ("cmd_build", "cmd_test ip/mng", "cmd_run true",
+                        "cmd_sh true", "cmd_wip diff"):
+            with self.subTest(command=command):
+                result = self.shell("""
+find_ws() { echo /local/slot/fw; }
+map_remote() { echo /remote/slot/fw; }
+workspace_remote_path() { echo /remote/slot/fw; }
+workspace_policy_guard() { echo policy-denied >&2; return 73; }
+start_job() { echo unexpected-dispatch >> "$EVENTS"; }
+rlogin_cred() { echo unexpected-execution >> "$EVENTS"; }
+""" + command)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.assertIn("policy-denied", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_policy_guards_resolve_home_relative_and_symlinked_sibling_paths(self):
+        setup = self.owner_fixture()
+        physical = self.home / "physical"
+        (physical / "review").mkdir(parents=True)
+        (self.home / "batch").symlink_to(physical, target_is_directory=True)
+        setup += """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+assert wm.track("~/batch/review", target="lab", purpose="review")[0]
+PY
+"""
+        first = self.shell(setup + """
+workspace_policy_guard "$HOME/physical/review/fw" lab build
+""", real_policy=True)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("dedicated to Review", first.stderr)
+        tree = self.shell("""
+T_NAME=lab
+workspace_policy_guard_tree "$HOME/physical"
+""", real_policy=True)
+        self.assertNotEqual(tree.returncode, 0)
+        self.assertIn("dedicated to Review", tree.stderr)
+        allowed_alias = self.shell("""
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.vd.jobs = lambda: []
+rec = wm.identity("~/batch/review", "lab")
+assert wm.set_slot_fields(rec["slot"], {"purpose": "build-root"})[0]
+PY
+workspace_policy_guard "$HOME/physical/review" lab build
+""", real_policy=True)
+        self.assertNotEqual(allowed_alias.returncode, 0)
+        self.assertIn("refresh its status", allowed_alias.stderr)
+        independent = self.shell("""
+workspace_policy_guard /elsewhere lab build
+""", real_policy=True)
+        self.assertEqual(independent.returncode, 0, independent.stderr)
+
+    def test_mirror_policy_rejection_precedes_push_checkout_and_sync(self):
+        result = self.shell(self.mirror_stubs() + """
+workspace_policy_guard() { echo purpose-denied >&2; return 73; }
+cmd_mirror --sync
+""")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("purpose", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
 
     def test_conflicting_machine_identity_fails_closed_across_paths_and_targets(self):
         setup = self.owner_fixture()

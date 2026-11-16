@@ -55,6 +55,20 @@ every action can be run by hand with no AI involvement.
 
 ## Golden rules (why the script exists)
 
+- **Honor dedicated workspace purpose.** The workspace owner
+  ([policy](../workspace-manager/SKILL.md#dedicated-workspaces)) checks supported
+  `mctl` dispatches. Review/Development slots can be sources; build/test execution
+  destinations must be General, Build root or Mirror. Mirror destinations obey
+  the same rule. Generic `run`, `sh` and `wip` require General destinations;
+  whole-root `wip` also checks other tracked destinations under that root.
+  Guards resolve physical paths, including home-relative paths and symlinks.
+  If a tracked path is an alias, refresh its workspace status to reconcile the
+  canonical identity before dispatch; do not register a duplicate to bypass it.
+  Use the structured `workspace sync`/`free` APIs for dedicated-target maintenance,
+  not `sh` to bypass policy. Dispatch holds the workspace policy lock; running
+  or unverified delegated jobs block repurposing after dispatch. Status, logs,
+  artifact retrieval and safe release remain available. No force flag bypasses
+  dedication. This is managed-tool policy, not an OS sandbox.
 - **Prefer `mctl <sub>` over hand-rolled `ssh`.** Do not reconstruct the SSH /
   `nohup` / `rsync` incantations in the model — call the script. It already
   encodes every gotcha below.
