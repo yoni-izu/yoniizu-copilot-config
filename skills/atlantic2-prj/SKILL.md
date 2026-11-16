@@ -11,6 +11,9 @@ argument-hint: 'Ask about Atlantic2 (A2) — what it is, what changed vs Iridium
 
 # Atlantic2 (A2) Project Expert
 
+For a chip-wide or cross-IP hardware architecture synthesis, use `hw-arch`
+with this skill for A2-specific context; retain the IP skills for IP details.
+
 ## When to Use
 
 - Questions about the **Atlantic2 (A2)** project — the **next** project, successor to

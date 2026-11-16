@@ -19,6 +19,7 @@ at a repo level under `.github/`.
 - `build-fw` — Build FW Zephyr applications.
 - `checkout-pr-branches` — Multi-repo PR checkout.
 - `d2d-ip`, `pcie-ep-ip`, `su-ip` — IP design/usage Q&A.
+- `hw-arch` — Chip-wide hardware architecture and cross-IP questions.
 - `jira-hsi-planning` — HSI Jira planning assistant.
 - `manager-brief` — Weekly 1:1 brief for upward reporting.
 - `notebook` — Personal dev notebook (ideas, conventions).

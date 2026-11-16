@@ -11,6 +11,9 @@ argument-hint: 'Ask a question about the Iridium project — architecture, PRM/N
 
 # Iridium Project Expert
 
+For a chip-wide or cross-IP hardware architecture synthesis, use `hw-arch`
+with this skill for Iridium-specific context; retain the IP skills for IP details.
+
 ## When to Use
 
 - Questions about the **Iridium project** as a whole — how the parts fit together, not just one IP

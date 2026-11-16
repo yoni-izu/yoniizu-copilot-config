@@ -11,6 +11,9 @@ argument-hint: 'Ask a question about the Atlantic project — architecture, PRM/
 
 # Atlantic Project Expert
 
+For a chip-wide or cross-IP hardware architecture synthesis, use `hw-arch`
+with this skill for Atlantic-specific context; retain the IP skills for IP details.
+
 ## When to Use
 
 - Questions about the **Atlantic project** as a whole — how the parts fit together, not just one IP

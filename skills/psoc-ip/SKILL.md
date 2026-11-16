@@ -11,6 +11,9 @@ argument-hint: 'Ask about PSOC — the uC cluster, boot/reset, slow IOs, eFuse/G
 
 # PSOC (Platform / Management SoC) IP Expert
 
+For a chip-wide or cross-IP architecture question, use `hw-arch` for the
+system picture and this skill for the PSOC-specific details.
+
 ## When to Use
 
 - **PSOC** block design and behavior: the platform/management sub-system that owns boot, reset,

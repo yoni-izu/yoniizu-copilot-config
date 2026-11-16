@@ -11,6 +11,9 @@ argument-hint: 'Ask a question about Scale Up IP design, C2C protocol, DM contro
 
 # Scale Up (SU) IP Documentation Q&A
 
+For a chip-wide or cross-IP architecture question, use `hw-arch` for the
+system picture and this skill for the Scale Up-specific details.
+
 ## When to Use
 
 - Questions about Scale Up (SU) link design and operation

@@ -11,6 +11,9 @@ argument-hint: 'Ask about the NoC/fabric IP — address map, routing, a specific
 
 # NoC (Network-on-Chip) / Fabric IP Expert
 
+For a chip-wide or cross-IP architecture question, use `hw-arch` for the
+system picture and this skill for the NoC-specific details.
+
 ## When to Use
 
 - **NoC / fabric IP** design, integration, and behavior questions (die-internal interconnect).

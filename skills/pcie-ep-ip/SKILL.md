@@ -11,6 +11,9 @@ argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or contr
 
 # PCIe EP IP Documentation Q&A
 
+For a chip-wide or cross-IP architecture question, use `hw-arch` for the
+system picture and this skill for the PCIe EP-specific details.
+
 ## When to Use
 
 - Questions about DWC PCIe EP controller behavior, registers, or configuration

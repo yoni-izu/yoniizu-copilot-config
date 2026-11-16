@@ -11,6 +11,9 @@ argument-hint: 'Ask a question about D2D IP design, protocol, or integration'
 
 # D2D IP Documentation Q&A
 
+For a chip-wide or cross-IP architecture question, use `hw-arch` for the
+system picture and this skill for the D2D-specific details.
+
 ## When to Use
 
 - Questions about die-to-die (D2D) interface design and protocol
