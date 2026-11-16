@@ -22,9 +22,11 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import pr_store as db
+import jira_sync
 
 # Legacy discovery is used only by the explicit migrate command.
 STORE_CANDIDATES = [
@@ -247,7 +249,7 @@ def records() -> list[dict]:
             if old:
                 # The last GitHub observation, not a stale memoir status, wins.
                 f["prs"][i] = {**pr, **old}
-    return feats
+    return [jira_sync.project(f) for f in feats]
 
 
 def _dedupe(feats: list[dict]) -> list[dict]:
@@ -332,6 +334,9 @@ def probe(pr: dict) -> dict:
     except json.JSONDecodeError:
         out["error"] = "bad gh json"
         return out
+    if not isinstance(v, dict) or v.get("state") not in ("OPEN", "MERGED", "CLOSED"):
+        out["error"] = "missing or unknown GitHub PR state"
+        return out
     state = (v.get("state") or "").upper()
     out.update(review=v.get("reviewDecision") or None,
                merge_state=v.get("mergeStateStatus"), mergeable=v.get("mergeable"),
@@ -391,7 +396,7 @@ def probe(pr: dict) -> dict:
 
 
 def refresh(only=None, workers: int = 8,
-            do_purge: bool = True, progress=None) -> dict:
+            do_purge: bool = True, progress=None, jira: bool = True) -> dict:
     """Re-probe every tracked PR and persist the new Status cells.
 
     ``only`` limits the scan to one feature id or an iterable of ids; the probe
@@ -400,13 +405,17 @@ def refresh(only=None, workers: int = 8,
 
     ``progress`` is an optional ``fn(done, total, feature, pr)`` called once per
     completed probe so a caller can stream the scan to a UI.
+
+    ``jira=False`` refreshes GitHub state only: no Jira lifecycle sync and no
+    archived Jira retries, so unattended callers never transition tickets.
     """
     with db.edit():
         text, revision, _ = db.snapshot()
         feats = records()
     ids = None if only is None else ({only} if isinstance(only, int) else {int(i) for i in only})
     targets = [f for f in feats
-               if not f["complete"] and (ids is None or f["id"] in ids)]
+               if (not f["complete"] or (jira and jira_sync.needs_retry(f)))
+               and (ids is None or f["id"] in ids)]
     jobs = [(f, pr) for f in targets for pr in f["prs"]]
     if jobs:
         if progress:
@@ -444,7 +453,15 @@ def refresh(only=None, workers: int = 8,
                 expected_revision=revision, action="refresh")
     except db.Conflict as exc:
         return {"error": str(exc), "features": [], "retry": True}
-    return payload
+    if not jira:
+        return {**payload, **_payload(records()), "last_scan": payload["last_scan"],
+                "jira_sync": [], "jira_sync_skipped": True}
+    results = sync_jira({f["id"] for f in targets})
+    with db.edit():
+        latest_text, _, latest_cache = db.snapshot()
+        db.save(latest_text, {**latest_cache, "jira_sync": results}, action="jira-sync-results")
+    return {**payload, **_payload(records()), "last_scan": payload["last_scan"],
+            "jira_sync": results}
 
 
 def _carry_probe(feats: list[dict], skip: set[int]) -> None:
@@ -675,6 +692,7 @@ def add_pr(feat_id: int, ref: str, branch: str = "", title: str = "",
 
     db.save("\n".join(lines) + "\n")
     _sync_cache()
+    _invalidate_jira(feat_id)
     return True, f"[{feat_id}] + {repo}#{number}"
 
 
@@ -698,6 +716,7 @@ def remove_pr(feat_id: int, number: int, repo: str = "") -> tuple[bool, str]:
     del lines[hits[0]]
     db.save("\n".join(lines) + "\n")
     _sync_cache()
+    _invalidate_jira(feat_id)
     return True, f"[{feat_id}] \u2212 {gone}#{number}"
 
 
@@ -868,6 +887,75 @@ def add_note(feat_id: int, text: str, label: str = "") -> tuple[bool, str]:
     return True, f"[{feat_id}] note added"
 
 
+def _invalidate_jira(feat_id: int) -> None:
+    feature = next(f for f in records() if f["id"] == feat_id)
+    approvals, _ = jira_sync.evidence(feature)
+    for key, approval in approvals.items():
+        if approval.get("confirmed") is True:
+            ok, msg = add_note(feat_id, json.dumps(
+                {"key": key, "confirmed": False, "prs": jira_sync.pr_set(feature),
+                 "reason": "pr-set-changed"},
+                sort_keys=True), "jira-coverage")
+            if not ok:
+                raise ValueError(msg)
+
+
+@db.atomic
+def confirm_jira(feature_id: int, key: str, confirmed: bool = True,
+                 expected_revision: int | None = None) -> tuple[bool, str]:
+    """Record the user's whole-ticket coverage decision for this exact PR set."""
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Z][A-Z0-9]{1,15}-[1-9]\d*", key):
+        return False, "a valid uppercase Jira key is required"
+    if not isinstance(confirmed, bool):
+        return False, "confirmed must be a boolean"
+    if expected_revision is not None and db.snapshot()[1] != expected_revision:
+        return False, "feature revision conflict; reload before confirming"
+    feature = next((f for f in records() if f["id"] == feature_id), None)
+    if feature is None:
+        return False, f"feature [{feature_id}] not found"
+    if key not in feature["jira"] or not feature["prs"]:
+        return False, "ticket must be referenced by a feature with at least one PR"
+    data = {"key": key, "confirmed": confirmed, "prs": jira_sync.pr_set(feature),
+            "reason": "user-decision"}
+    return add_note(feature_id, json.dumps(data, sort_keys=True), "jira-coverage")
+
+
+def sync_jira(feature_ids: set[int], client=None) -> list[dict]:
+    """Run after fresh GitHub probes, including incomplete archived Jira retries."""
+    results = []
+    for feature_id in sorted(feature_ids):
+        feature = next((f for f in records() if f["id"] == feature_id), None)
+        if feature is None:
+            continue
+        for key in jira_sync.coverage(feature):
+            current = records()
+            feature = next(f for f in current if f["id"] == feature_id)
+            if key not in jira_sync.coverage(feature):
+                continue
+            revision = feature["revision"]
+
+            @contextmanager
+            def guard():
+                # Only the final ownership check, write and verification hold the
+                # owner lock, preventing local coverage edits during a transition.
+                with db.edit():
+                    yield db.snapshot()[1] == revision
+
+            try:
+                jira = client if client is not None else jira_sync.JiraClient()
+                result = jira_sync.synchronize(feature, key, current, jira, guard)
+            except jira_sync.JiraError as exc:
+                result = {"feature_id": feature_id, "key": key, "state": "error",
+                          "message": str(exc), "prs": jira_sync.pr_set(feature)}
+            _, old = jira_sync.evidence(feature)
+            if old.get(key) != result:
+                ok, msg = add_note(feature_id, json.dumps(result, sort_keys=True), "jira-sync")
+                if not ok:
+                    raise ValueError(msg)
+            results.append(result)
+    return results
+
+
 def post_ci(owner: str, repo: str, number: int) -> tuple[bool, str]:
     """Post a ``/ci`` comment on one PR to (re-)trigger its CI pipeline.
 
@@ -947,7 +1035,7 @@ def _payload(feats: list[dict]) -> dict:
         openish = [p for p in prs if p.get("status") in OPEN_STATES]
         worst = min((p.get("status", "pending") for p in openish),
                     key=_rank, default="merged" if prs and not openish else "pending")
-        f = dict(f)
+        f = jira_sync.project(f)
         f.update(merged=len(merged), total=len(prs), open=len(openish), worst=worst,
                  blocked=[p for p in prs
                           if p.get("status") in ("ci-fail", "changes-requested",
@@ -1013,6 +1101,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="only this feature id (repeatable)")
     r.add_argument("--no-purge", action="store_true",
                    help="keep fully-merged features in active tracking")
+    r.add_argument("--no-jira-sync", action="store_true",
+                   help="refresh GitHub state only; never transition Jira tickets")
     g = sub.add_parser("purge", help="retire features whose PRs are all merged")
     g.add_argument("-n", "--dry-run", action="store_true")
     ap_ = sub.add_parser("add-pr", help="track one more PR on a feature")
@@ -1045,6 +1135,11 @@ def main(argv: list[str] | None = None) -> int:
     nt.add_argument("feature", type=int)
     nt.add_argument("text")
     nt.add_argument("-l", "--label", default="", help="short tag, e.g. 'rebase + /ci'")
+    jc = sub.add_parser("confirm-jira", help="confirm whole-ticket coverage for the exact PR set")
+    jc.add_argument("feature", type=int)
+    jc.add_argument("key")
+    jc.add_argument("--revoke", action="store_true")
+    jc.add_argument("--expected-revision", type=int, required=True)
     df = sub.add_parser("drop-feature", help="retire a feature from tracking")
     df.add_argument("feature", type=int)
     sub.add_parser("payload", help="emit the portal JSON")
@@ -1075,7 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if matches else 1
     elif a.cmd == "list":
         _print(payload())
-    elif a.cmd in ("add-pr", "rm-pr", "add-feature", "drop-feature", "edit-feature", "note"):
+    elif a.cmd in ("add-pr", "rm-pr", "add-feature", "drop-feature", "edit-feature", "note",
+                   "confirm-jira"):
         if a.cmd == "add-pr":
             ok, msg = add_pr(a.feature, a.ref, lookup=not a.no_lookup)
         elif a.cmd == "rm-pr":
@@ -1088,6 +1184,8 @@ def main(argv: list[str] | None = None) -> int:
                                    priority=a.priority, expected_revision=a.expected_revision)
         elif a.cmd == "note":
             ok, msg = add_note(a.feature, a.text, a.label)
+        elif a.cmd == "confirm-jira":
+            ok, msg = confirm_jira(a.feature, a.key, not a.revoke, a.expected_revision)
         else:
             ok, msg, _ = add_feature(a.name, a.description, a.pr,
                                      summary=a.summary, jira=a.jira,
@@ -1095,13 +1193,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[pm] {msg}")
         return 0 if ok else 1
     elif a.cmd == "refresh":
-        pl = refresh(a.feature, do_purge=not a.no_purge)
+        pl = refresh(a.feature, do_purge=not a.no_purge, jira=not a.no_jira_sync)
+        if pl.get("jira_sync_skipped"):
+            print("[pm] Jira lifecycle sync skipped (--no-jira-sync)")
         _print(pl)
+        for result in pl.get("jira_sync", []):
+            print(f"[pm] Jira [{result['feature_id']}] {result['key']}: "
+                  f"{result['state']} - {result['message']}")
         if not pl.get("error"):
             print(f"\n[pm] probed {pl.get('scanned', 0)} PR(s) at {pl['last_scan']}")
             for f in pl.get("purged", []):
                 print(f"[pm] all {f['total']} PRs merged for [{f['id']}] "
                       f"{f['name']} \u2014 dropped from active tracking")
+        return int(bool(pl.get("error") or pl.get("failed") or any(
+            r["state"] in ("error", "blocked") for r in pl.get("jira_sync", []))))
     elif a.cmd == "purge":
         with db.edit():
             text = db.snapshot()[0]

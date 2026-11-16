@@ -1,7 +1,7 @@
 ---
 name: pr-monitor
-description: "Monitor pending feature PR submissions across repos. Use when: user wants to log PRs for a feature, check PR status, monitor CI failures, review comments, rebase needs, analyze failures, list pending features, remove merged features, checkout PR branches, rebase PRs, draft review request message, test a feature on the PLDM job queue, track PLDM/Palladium test results per feature, PR monitoring, feature submission tracking."
-argument-hint: "Action (log/status/check/remove/list/checkout/rebase/review-msg/pldm-test/pldm-status) and optionally: feature ID/name or PR URLs"
+description: "Monitor pending feature PR submissions across repos and synchronize fully covered Jira tickets assigned to the user to In Review and Done. Use when: log feature PRs, check PR status, monitor CI failures, review comments, rebase needs, analyze failures, list or remove features, checkout or rebase branches, draft review requests, test features on PLDM, confirm whole-ticket Jira coverage, track Jira lifecycle, PR monitoring."
+argument-hint: "Action (log/status/check/remove/list/confirm-jira/checkout/rebase/review-msg/pldm-test/pldm-status) and optionally: feature ID/name or PR URLs"
 ---
 
 > **Portal handoff:** For Team Portal/dashboard questions, feature requests,
@@ -24,6 +24,31 @@ Track and monitor sets of GitHub PRs grouped by feature. Canonical state lives i
 Use `pm.py` for every read/write; do not edit the database or legacy memory file.
 The original memoir and cache are backed up and imported once. Markdown is an
 explicit import/export format, not a second writable source.
+
+## Jira lifecycle synchronization
+
+Read [Jira lifecycle](./references/jira-lifecycle.md) for confirmation and safety rules.
+For each referenced ticket, **ask the user once whether this exact feature PR set
+fully implements the whole ticket**. Never infer consent from a Jira key, title,
+description, or an earlier partial feature. Record explicit approval with
+`pm.py confirm-jira ID KEY --expected-revision REV` (revision from `pm.py show ID`);
+it is kept as a `jira-coverage` feature note. PR additions/removals revoke approval.
+Read prior coverage notes first; remember an explicit "no" with `--revoke` and
+do not ask again for that set unless the user requests it. A `pr-set-changed`
+invalidation requires a new coverage decision, not inferred reapproval.
+The Portal offers equivalent per-ticket confirmation/revocation controls.
+
+On each CLI `refresh` or Portal **Scan PRs**, confirmed tickets currently assigned
+to the authenticated Jira user move to **In Review** while PRs await merge, then
+**Done** only when every PR is freshly verified merged. This runs without a model,
+using private Jira credentials, not an MCP session. There is no new polling timer.
+The Team Portal's daily maintenance run refreshes GitHub state with Jira sync
+disabled (`refresh --no-jira-sync` / `pm.refresh(jira=False)`), so it never
+transitions tickets or retries archived Jira failures unattended.
+Report `jira_sync` outcomes, including blocked/error results; never claim Jira was
+updated without verification. Failed Done updates remain retryable after retirement.
+Existing features are not opted in automatically. Read-only list/payload/show,
+logging, confirmation and manual removal do not themselves transition tickets.
 
 ## Markdown interchange format
 
@@ -81,15 +106,18 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
 5. Include the summary, Jira keys, priority and description using supported flags.
    The owner records branches/titles and initializes PLDM state.
 6. Verify the resulting feature using `pm.py payload`; never write a Markdown block directly.
+   For referenced Jira tickets, ask for whole-ticket coverage confirmation and
+   record approved tickets as described above; leave partial/unknown coverage off.
 7. Confirm with a summary table, showing the assigned ID.
 
 ### 2. Check All Features (`status` / `check`)
 
 **Procedure:**
-1. Read `pm.py payload`.
-2. For each PR in every feature, gather status **in parallel where possible**:
-   a. Use `github-pull-request_issue_fetch` to get current PR state (open/merged/closed), mergeable status, and whether it's behind base branch (needs rebase).
-   b. Use `github-pull-request_pullRequestStatusChecks` to get CI status and review state (approvals, requested changes, unresolved comments).
+1. Run `pm.py refresh` first, then read `pm.py payload`; include returned
+   `jira_sync` outcomes (including retired-feature retries) in the report.
+2. Use the fresh PR state, mergeability, checks and review decision returned by
+   the owner. Fetch additional GitHub detail only for unresolved review threads
+   or failure analysis; do not repeat every probe already performed by refresh.
 3. Determine each PR's status:
    - **merged** — PR state is merged
    - **closed** — PR state is closed (not merged)
@@ -99,7 +127,8 @@ User provides a feature name and one or more PR URLs or `owner/repo#number` refe
    - **approved** — All required reviews approved, CI green
    - **pending** — Open, CI running or no reviews yet
    > **Note:** CI does not run automatically — it starts only when someone comments `/ci` on the PR. A PR with **no check runs at all** has simply not had CI triggered yet; treat this as `pending` (not `ci-fail`), and note it may need a `/ci` comment. Do not use close/reopen to start CI.
-4. Persist status observations through `pm.py refresh`, never direct file/database edits.
+4. The initial `pm.py refresh` already persisted observations and synchronized
+   opted-in Jira tickets. Do not duplicate its Jira writes through MCP.
 5. **Refresh in-flight PLDM jobs.** For any feature whose `PLDM Test` is non-terminal (`queued` or `running`) and which has a `PLDM Details` line, re-check the job outcome using the `pldm-status` logic (step 10) and update `PLDM Test` + the `updated` date. Features that are `not-tested` or already terminal (`passed`/`failed`/`cancelled`) are left untouched.
 6. Present a per-feature summary table:
 
@@ -298,19 +327,23 @@ During any `status`/`check` operation:
 - `pm.py refresh` does this automatically (see below), which is the normal path. Do it by hand
   when retiring without a scan.
 - Notify the user: "All PRs for **<feature>** are merged — dropped from active tracking."
+- Retirement is independent of Jira success: refresh keeps retrying confirmed
+  completion updates that failed, using fresh GitHub probes, until verified Done.
 
 ## `pm.py` — the token-free status refresher
 
 `pm.py` (next to this file) does the mechanical half of `status`/`check` **without a model in
 the loop**: it reads the owner database, probes tracked PRs through `gh` in parallel, and
-writes the new value back into each row's `Status` cell. Everything else in the file — the
-memoir bullets, descriptions, PLDM lines — is left byte-for-byte alone.
+writes the new value back into each row's `Status` cell. Existing descriptions,
+notes and PLDM fields are preserved. Opted-in Jira synchronization additionally
+appends result notes through the owner; it never rewrites prior activity.
 
 ```bash
 python3 ~/.copilot/skills/pr-monitor/pm.py list            # what's tracked, from the store
 python3 ~/.copilot/skills/pr-monitor/pm.py refresh         # probe GitHub, update Status cells
 python3 ~/.copilot/skills/pr-monitor/pm.py refresh -f 4 -f 7  # just features 4 and 7 (others keep cached probe detail)
 python3 ~/.copilot/skills/pr-monitor/pm.py refresh --no-purge   # keep merged features active
+python3 ~/.copilot/skills/pr-monitor/pm.py refresh --no-jira-sync  # GitHub only; never transition Jira
 python3 ~/.copilot/skills/pr-monitor/pm.py purge -n        # what would be retired
 python3 ~/.copilot/skills/pr-monitor/pm.py payload         # JSON for the Team Portal
 
@@ -320,6 +353,9 @@ pm.py note 4 "rebased clean, /ci posted" -l "rebase + /ci"   # append activity n
 pm.py add-pr 4 <url|owner/repo#123>             # track one more PR on feature 4
 pm.py rm-pr 4 286 [--repo ip.pcie.sw.fw.ep]     # stop tracking one PR
 pm.py drop-feature 4                            # retire a feature from active tracking
+pm.py show 4                                    # includes revision and archived Jira history
+pm.py confirm-jira 4 TEST-123 --expected-revision REV  # explicit whole-ticket approval
+pm.py confirm-jira 4 TEST-123 --expected-revision REV --revoke
 ```
 
 Per PR it runs `gh pr view` (state, mergeable, mergeStateStatus, reviewDecision) plus
@@ -445,6 +481,8 @@ When multiple conditions apply, report the highest-priority status:
 - Each feature has a stable running ID in its header (`## [N] <Feature Name>`); assign `max(existing)+1` on `log` and never renumber on `remove`.
 - Never delete a feature entry. Retiring a fully-merged batch is an automatic heading annotation, not a deletion, and `remove` should do the same unless the user explicitly asks for the text to go.
 - When checking status, fetch all PRs even if some have cached status — always get fresh data.
+- Jira updates require explicit whole-ticket confirmation for the current PR set;
+  show synchronization errors and never substitute cached PR states for fresh probes.
 - Use `gh` CLI as fallback if the GitHub tools don't return sufficient detail (e.g., for failure logs).
 - Present results as markdown tables for readability.
 - When a PR has unresolved review comments, mention the count and latest commenter.

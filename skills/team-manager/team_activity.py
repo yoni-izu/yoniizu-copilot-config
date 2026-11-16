@@ -35,6 +35,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
 from private_paths import load_private_json  # noqa: E402
+from jira_client import credentials as shared_jira_credentials, JiraError  # noqa: E402
 
 JIRA_CONFIG = load_private_json("config/jira.json")
 JIRA_SITE = os.environ.get(
@@ -150,26 +151,11 @@ def jira_credentials() -> tuple[str, str]:
             "config",
             "Jira site is not configured; set TEAM_ACTIVITY_JIRA_SITE or add "
             "config/jira.json under COPILOT_PRIVATE_DIR")
-    email = os.environ.get("ATLASSIAN_EMAIL")
-    token = os.environ.get("ATLASSIAN_TOKEN")
-    if email and token:
-        return email, token
     host = urllib.parse.urlparse(JIRA_SITE).hostname
     try:
-        import netrc
-        auth = netrc.netrc().authenticators(host)
-        if auth and auth[0] and auth[2]:
-            return auth[0], auth[2]
-    except (OSError, netrc.NetrcParseError):
+        return shared_jira_credentials(JIRA_SITE)
+    except JiraError:
         pass
-    token_file = Path("~/.atlassian-token").expanduser()
-    email_file = Path("~/.atlassian-email").expanduser()
-    if token_file.exists():
-        lines = token_file.read_text(encoding="utf-8").strip().splitlines()
-        tok = lines[0].strip() if lines else ""
-        mail = email_file.read_text(encoding="utf-8").strip() if email_file.exists() else email
-        if tok and mail:
-            return mail, tok
     raise ActivitySourceError(
         "auth",
         f"no Atlassian credentials: add a ~/.netrc entry for {host} (login=email, "
