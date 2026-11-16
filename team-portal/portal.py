@@ -16,6 +16,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from datetime import date, datetime
 from html import escape
@@ -46,6 +48,12 @@ import tm  # noqa: E402
 import wm  # noqa: E402
 import team_api  # noqa: E402
 from action_queue import ActionQueue  # noqa: E402
+import maintenance  # noqa: E402
+import portal_settings  # noqa: E402
+import terminal  # noqa: E402
+import events  # noqa: E402
+import live_status  # noqa: E402
+import ai  # noqa: E402
 
 # bug-monitor owns the HSI bug store. The portal dashboard renders its Bugs
 # section from it; the portal never touches ~/tasks/bugs.json directly.
@@ -80,13 +88,6 @@ try:
 except ImportError:
     rd = None
 
-# pjq.py (pldm-job-queue skill) tracks PLDM hardware jobs; zero-token gh polling.
-sys.path.insert(0, os.path.expanduser("~/.copilot/skills/pldm-job-queue"))
-try:
-    import pjq  # noqa: E402
-except ImportError:
-    pjq = None
-
 # vd.py (vm-delegate skill) keeps the history of every job mctl delegated to a
 # VM / lab machine; refreshing it is one ssh round trip per target, no tokens.
 sys.path.insert(0, os.path.expanduser("~/.copilot/skills/vm-delegate"))
@@ -113,16 +114,6 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 __STYLES__
 </head>
 <body>
-<div id="align-banner">
-  <div class="ab-head">
-    <span id="align-spin" class="ab-spin"></span>
-    <b id="align-title">Aligning workspace…</b>
-    <button id="align-toggle" type="button" class="ab-toggle" aria-expanded="true" aria-controls="align-body action-queue">Collapse</button>
-    <button id="align-close" class="ab-close" aria-label="Dismiss">&times;</button>
-  </div>
-  <div id="action-queue"></div>
-  <div id="align-body"></div>
-</div>
 <div class="portal-shell" id="portal-shell">
 <aside class="portal-sidebar">
   <div class="portal-brand">
@@ -151,9 +142,26 @@ __STYLES__
     </div>
   </div>
   <div class="topbar-tools">
-    <button class="refresh" id="action-queue-open" type="button" hidden>Actions</button>
+    <div class="aq-anchor" id="aq-anchor">
+      <button class="aq-card" id="action-queue-open" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="align-banner" hidden>
+        <span class="aq-spin" id="aq-spin" aria-hidden="true"></span>
+        <span class="aq-text"><small>ACTIONS</small><b id="aq-summary">Idle</b></span>
+        <span class="aq-caret" aria-hidden="true">▾</span>
+      </button>
+      <div id="align-banner">
+        <div class="ab-head">
+          <span id="align-spin" class="ab-spin"></span>
+          <b id="align-title">Aligning workspace…</b>
+          <button id="align-toggle" type="button" class="ab-toggle" aria-expanded="true" aria-controls="align-body action-queue">Collapse</button>
+          <button id="align-close" class="ab-close" aria-label="Dismiss">&times;</button>
+        </div>
+        <div id="action-queue"></div>
+        <div id="align-body"></div>
+      </div>
+    </div>
     <div class="clock-chip"><span aria-hidden="true">◷</span><time id="local-clock"></time><small>LOCAL</small></div>
     <div class="refresh-wrap">
+      <button class="refresh ai-btn" id="ai-open" type="button" hidden aria-haspopup="dialog"><span class="ico" aria-hidden="true">✦</span> AI</button>
       <button class="refresh cmdk-btn" id="cmdk-open" title="Jump to anything (Ctrl/⌘+K)"><span class="ico">⌕</span> Jump <kbd>⌘K</kbd></button>
       <button class="refresh" id="refresh" title="Reload entry values without losing filters, tab, or sort"><span class="ico">↻</span> Refresh</button>
       <div class="refresh-note" id="refresh-note"></div>
@@ -168,84 +176,24 @@ __STYLES__
         <h2>HSI Firmware — team report</h2>
         <p class="sub" id="ov-asof"></p>
       </div>
-      <div class="slicer" id="ov-sprints"></div>
     </div>
 
-    <div class="kpis" id="ov-kpis"></div>
-
     <div class="ov-canvas">
+      <div class="tile t12 brief-tile" style="--tk:#118DFF;" data-overview-tile="brief">
+        <h3>Morning brief</h3>
+        <p class="cap" id="ov-brief-cap"></p>
+        <div id="ov-brief"></div>
+      </div>
+      <div class="fresh-strip t12" id="ov-fresh" aria-label="How old each data source is"></div>
+      <div class="tile t12 pulse-tile" style="--tk:#1AAB40;" data-overview-tile="pulse">
+        <h3>Live pulse</h3>
+        <p class="cap" id="ov-pulse-cap"></p>
+        <div class="pulse-grid" id="ov-pulse"></div>
+      </div>
       <div class="tile t12 chg-tile" style="--tk:#9E8FE9;" data-overview-tile="changes">
         <h3>What changed since your last visit</h3>
         <p class="cap" id="ov-chg-cap"></p>
         <div id="ov-changes"></div>
-      </div>
-      <div class="tile t8" style="--tk:#118DFF;">
-        <h3>Bug flow — open vs closed</h3>
-        <p class="cap">Cumulative over 90 days, from each bug's created/resolved date in the local mirror.</p>
-        <div id="ov-bugflow"></div>
-      </div>
-      <div class="tile t4" style="--tk:#1AAB40;">
-        <h3>Bug backlog health</h3>
-        <p class="cap">Share of open bugs that are triaged, and that carry a milestone and a sprint.</p>
-        <div id="ov-gauges"></div>
-      </div>
-
-      <div class="tile t8" style="--tk:#E66C37;">
-        <h3>Mean time to close — monthly</h3>
-        <p class="cap" id="ov-ttc-cap">Days from created to resolved, bucketed by the month the bug closed.</p>
-        <div id="ov-ttc"></div>
-      </div>
-      <div class="tile t4" style="--tk:#6B007B;">
-        <h3>Open bugs by IP</h3>
-        <p class="cap">Components mapped to an IP via the team-weekly scoreboard.</p>
-        <div class="chart-row"><div id="ov-bugip"></div><div class="legend" id="ov-bugip-lg"></div></div>
-      </div>
-
-      <div class="tile t8" style="--tk:#12239E;">
-        <h3>Per-IP scoreboard</h3>
-        <p class="cap">Open bugs, attention load, review pressure and the 12-week load trend per IP.</p>
-        <div id="ov-scoreboard"></div>
-      </div>
-      <div class="tile t4" style="--tk:#E044A7;">
-        <h3>Open bugs by owner</h3>
-        <p class="cap">Who is actually carrying the open bug load.</p>
-        <div class="chart-row"><div id="ov-bugowner"></div><div class="legend" id="ov-bugowner-lg"></div></div>
-      </div>
-
-      <div class="tile t8" style="--tk:#D64550;">
-        <h3>Needs you now</h3>
-        <p class="cap">One ranked queue across bugs, RAID, reviews and blocked tasks — worst first.</p>
-        <div id="ov-feed"></div>
-      </div>
-      <div class="tile t4" style="--tk:#D9B300;">
-        <h3>Bug hygiene — missing planning fields</h3>
-        <p class="cap">Open bugs carrying each flag. These are the gaps to close in Jira — each row opens that exact set as a Jira search.</p>
-        <div id="ov-flags"></div>
-      </div>
-
-      <div class="tile t12" style="--tk:#197278;">
-        <h3>Development hygiene</h3>
-        <p class="cap">How cleanly work is flowing through the pipe — outgoing PRs, my review turnaround, and work-in-progress discipline.</p>
-        <div class="hyg-wrap">
-          <div class="hyg-score" id="ov-hyg-score"></div>
-          <div class="hyg-rules" id="ov-hygiene"></div>
-        </div>
-      </div>
-
-      <div class="tile t5" style="--tk:#744EC2;">
-        <h3>RAID — open rows</h3>
-        <p class="cap">From the RAID database, worst RAG then worst score.</p>
-        <div id="ov-raid"></div>
-      </div>
-      <div class="tile t3" style="--tk:#197278;">
-        <h3>Review queue</h3>
-        <p class="cap">PRs in my incoming review queue, by consolidated state.</p>
-        <div id="ov-reviews"></div>
-      </div>
-      <div class="tile t4" style="--tk:#3599B8;">
-        <h3>Workspace occupancy</h3>
-        <p class="cap">Which physical checkouts are in use, and by what.</p>
-        <div class="slots" id="ov-slots"></div>
       </div>
     </div>
   </div><!-- /sec-overview -->
@@ -466,8 +414,8 @@ __STYLES__
         <button id="pr-collapse" class="btn" title="Collapse or expand the PR rows of every feature">⇱ Collapse all</button>
         <button id="pr-track" class="btn" title="Track a new feature by hand: a name, an optional description, and its PRs">＋ Track feature</button>
         <div class="dd pe-menu" title="Open the CI/CD pipeline explorer (Oded's dashboard) on a view"><button type="button" class="dd-btn"><span class="dd-label">⇢ Pipelines</span><span class="dd-caret">▾</span></button><div class="dd-panel" id="pe-menu"></div></div>
-        <button id="pr-scan" class="btn primary" title="Re-probe every tracked PR through the gh CLI, and retire features whose PRs are all merged. No model, no tokens.">↻ Scan PRs</button>
-        <button id="pr-scan-sel" class="btn" hidden title="Re-probe only the PRs of the ticked features">↻ Scan selected PRs</button>
+        <button id="pr-scan" class="btn primary" title="Re-probe tracked PRs, sync opted-in Jira tickets assigned to you, retry archived Jira syncs, and retire fully merged features. No model, no tokens.">↻ Scan PRs</button>
+        <button id="pr-scan-sel" class="btn" hidden title="Re-probe selected features and sync their opted-in Jira tickets; archived Jira retries may also run">↻ Scan selected PRs</button>
         <span id="pr-scan-note" class="ro-note"></span>
       </div>
     </div>
@@ -531,42 +479,18 @@ __STYLES__
     </table>
   </div><!-- /sec-prs -->
 
-  <div id="sec-pldmq" style="display:none;">
-    <div class="rpt-head">
-      <div>
-        <h2>PLDM job queue</h2>
-        <p class="sub" id="pq-asof"></p>
-      </div>
-      <div class="slicer">
-        <a class="chip" id="pq-portal" target="_blank" rel="noopener">Queue portal &#8599;</a>
-        <button id="pq-scan" class="btn primary" title="Follow every tracked job through the gh CLI: build run, queue row, execution run, and the failure evidence. No model, no tokens.">&#8635; Scan queue</button>
-        <span id="pq-scan-note" class="ro-note"></span>
-      </div>
-    </div>
-    <div class="kpis" id="pq-kpis"></div>
-    <table id="pq-tbl">
-      <thead><tr>
-        <th style="width:20%;">Job</th><th style="width:14%;">Feature</th>
-        <th style="width:12%;">Image</th><th style="width:16%;">Stage</th>
-        <th style="width:10%;">Status</th><th style="width:12%;">EDK</th>
-        <th style="width:8%;">Age</th><th style="width:8%;">Links</th>
-      </tr></thead>
-      <tbody id="pq-body"></tbody>
-    </table>
-  </div><!-- /sec-pldmq -->
-
   <div id="sec-vm" style="display:none;">
     <div class="rpt-head">
       <div>
-        <h2>VM delegator log</h2>
+        <h2>Machines</h2>
         <p class="sub" id="vm-asof"></p>
       </div>
       <div class="slicer">
         <select id="vm-target" data-filter><option value="">All targets</option></select>
         <label class="chip"><input type="checkbox" id="vm-livefirst" checked> Live on top</label>
         <button id="vm-vms" class="btn" title="Query `octl vm list` for the power state, lease and IP of every EC2 instance. Does not touch the targets over ssh.">&#9741; Check VM status</button>
-        <button id="vm-sync" class="btn" title="Mirror every target's job logs into ~/.mctl/jobs. The target keeps only the newest log per workspace and overwrites it on the next run, so this is what makes an old log openable later.">&#8595; Sync logs</button>
-        <button id="vm-refresh" class="btn primary" title="Ask every target for the state of its job dirs, mirror its logs, and re-read the EC2 power state. One ssh round trip per machine plus an octl call. No model, no tokens.">&#8635; Refresh status</button>
+        <button id="vm-sync" class="btn" title="Mirror VM and lab-machine job logs into ~/.mctl/jobs. Each target keeps only the newest log per workspace and overwrites it on the next run, so syncing makes an old log openable later.">&#8595; Sync logs</button>
+        <button id="vm-refresh" class="btn primary" title="Refresh job state and logs for every VM and lab-machine target, then re-read EC2 power state. One ssh round trip per machine plus an octl call. No model, no tokens.">&#8635; Refresh status</button>
         <span id="vm-refresh-note" class="ro-note"></span>
       </div>
     </div>
@@ -583,23 +507,6 @@ __STYLES__
       <tbody id="vm-body"></tbody>
     </table>
 
-    <!-- Log viewer. Doubles as a live tail: for a running job the panel
-         re-polls `mctl jobs-tail` on a timer, which is a plain ssh round trip,
-         so no websocket and no extra dependency. -->
-    <div id="vm-logpane" class="logpane" style="display:none;">
-      <div class="logpane-head">
-        <div class="logpane-t">
-          <b id="vm-log-title">log</b>
-          <span id="vm-log-sub" class="muted"></span>
-        </div>
-        <div class="logpane-act">
-          <label class="chip" id="vm-log-followwrap"><input type="checkbox" id="vm-log-follow"> Follow</label>
-          <button id="vm-log-reload" class="ci-btn" title="Re-read this log now">&#8635;</button>
-          <button id="vm-log-close" class="ci-btn" title="Close">&#10005;</button>
-        </div>
-      </div>
-      <pre id="vm-log-body" class="logpane-body"></pre>
-    </div>
   </div><!-- /sec-vm -->
 
   <div id="sec-raid" style="display:none;">
@@ -628,6 +535,29 @@ __STYLES__
 
   <div id="sec-team" style="display:none;">
     <div id="team-root"></div>
+  </div>
+
+  <div id="sec-settings" style="display:none;">
+    <div class="rpt-head">
+      <div>
+        <h2>Settings</h2>
+        <p class="sub">Portal settings are saved on the server and journaled; browser preferences stay in this browser only.</p>
+      </div>
+    </div>
+    <div class="ov-canvas">
+      <div class="tile t7" style="--tk:#118DFF;"><h3>Daily routine</h3>
+        <p class="cap">Portal setting · applies to the maintenance timer and <code>routine.py</code>.</p>
+        <div id="set-routine"></div></div>
+      <div class="tile t5" style="--tk:#6B007B;"><h3>Routine status</h3>
+        <p class="cap">Live from systemd and the latest morning brief.</p>
+        <div id="set-status"></div></div>
+      <div class="tile t12" style="--tk:#12239E;"><h3>AI, machines &amp; notifications</h3>
+        <p class="cap">Portal setting · AI runs (Copilot CLI), browser terminals, the live ssh status link and pop-up notifications.</p>
+        <div id="set-groups"></div></div>
+      <div class="tile t12" style="--tk:#E66C37;"><h3>Display &amp; live behaviour</h3>
+        <p class="cap">Browser preference · saved instantly in this browser.</p>
+        <div id="set-prefs"></div></div>
+    </div>
   </div>
 </div><!-- /wrap -->
 </div><!-- /portal-main -->
@@ -659,112 +589,29 @@ def _annotate_tasks(tasks: list[dict], wd: dict | None = None) -> list[dict]:
     return out
 
 
-TEAM_PLANNER = Path(os.path.expanduser("~/team-planner"))
-IP_SCOREBOARD = Path(os.path.expanduser(
-    "~/.copilot/skills/team-weekly/references/ip-scoreboard.md"))
-
-# Fallback if the team-weekly reference table is missing or unparseable.
-DEFAULT_IPS = [
-    {"name": "PCIe EP", "owners": "Mateusz + Vasyl", "hints": ["pcie"]},
-    {"name": "SE", "owners": "Akshay", "hints": ["ip-se-"]},
-    {"name": "D2D", "owners": "Igal", "hints": ["d2d"]},
-    {"name": "Infra/Mng", "owners": "FW Lead", "hints": ["infra", "mng", "noc"]},
-]
-
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_MONTHS = {m: i for i, m in enumerate(
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+MORNING_BRIEF = STATE_DIR / "morning-brief.json"
 
 
-def _plain(s: str) -> str:
-    """Strip markdown links and bold markers from a field value."""
-    return _MD_LINK.sub(r"\1", s or "").replace("**", "").strip()
-
-
-def _parse_program_dates() -> dict:
-    """Power-on / delivery gates and the sprint calendar from guidelines.md."""
-    out = {"power_on": None, "a1_delivery": None, "sprints": []}
-    f = TEAM_PLANNER / "guidelines.md"
-    if not f.exists():
-        return out
-    txt = f.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r"\*\*Power-on:\*\*\s*\*\*(\d{4}-\d{2}-\d{2})\*\*", txt)
-    if m:
-        out["power_on"] = m.group(1)
-    m = re.search(r"\*\*A1 big delivery:\*\*.*?\*\*(\d{4}-\d{2}-\d{2})\*\*", txt)
-    if m:
-        out["a1_delivery"] = m.group(1)
-
-    year = int((out["power_on"] or out["a1_delivery"] or "2026")[:4])
-    # "MS8.1=3749 (Aug 30–Sep 13)" — windows carry no year, so infer it and roll
-    # over when the end month wraps past the start month.
-    for name, sid, window in re.findall(r"(MS[\d.]+)=(\d+)\s*\(([^)]*)\)", txt):
-        span = re.match(r"([A-Z][a-z]{2})\s+(\d{1,2})\s*[–-]\s*"
-                        r"(?:([A-Z][a-z]{2})\s+)?(\d{1,2})", window.strip())
-        start = end = None
-        if span:
-            sm, sd, em, ed = span.groups()
-            em = em or sm
-            try:
-                start = date(year, _MONTHS[sm], int(sd))
-                ey = year + 1 if _MONTHS[em] < _MONTHS[sm] else year
-                end = date(ey, _MONTHS[em], int(ed))
-            except (KeyError, ValueError):
-                start = end = None
-        out["sprints"].append({
-            "name": name, "id": sid, "window": window.split(",")[0].strip(),
-            "start": start.isoformat() if start else None,
-            "end": end.isoformat() if end else None,
-        })
-    return out
-
-
-def _parse_raid() -> list[dict]:
-    """RAID rows for the Overview. team-planner's rd.py owns the parsing."""
-    if rd is None:
-        return []
-    return rd.payload()["rows"]
-
-
-def _parse_ips() -> list[dict]:
-    """IP → owner → component-hint mapping from the team-weekly reference."""
-    if not IP_SCOREBOARD.exists():
-        return DEFAULT_IPS
-    ips = []
-    txt = IP_SCOREBOARD.read_text(encoding="utf-8", errors="replace")
-    for line in txt.splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) != 3 or cells[0] in ("IP", "---") or set(cells[0]) == {"-"}:
-            continue
-        hints = re.findall(r'"([^"]+)"', cells[2])
-        if not hints:
-            continue
-        ips.append({"name": cells[0], "owners": cells[1], "hints": hints})
-    return ips or DEFAULT_IPS
+def _read_morning_brief() -> dict | None:
+    """Latest daily-maintenance brief (written by routine.py). Derived, never
+    authoritative; a missing file means no run has completed yet."""
+    try:
+        data = json.loads(MORNING_BRIEF.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        return {"error": f"Morning brief unreadable: {error}"}
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        return {"error": "Morning brief has an unsupported format"}
+    return data
 
 
 def overview_payload() -> dict:
-    """Team-level context for the portal's Overview storefront. All of it comes
-    from local files — the portal never calls Jira/GitHub."""
-    errors = {}
-    try:
-        raid = _parse_raid()
-    except (ValueError, OSError) as error:
-        raid = []
-        errors["raid"] = str(error)
-    try:
-        program = _parse_program_dates()
-    except (ValueError, OSError) as error:
-        program = {"power_on": None, "a1_delivery": None, "sprints": []}
-        errors["program"] = str(error)
-    try:
-        ips = _parse_ips()
-    except (ValueError, OSError) as error:
-        ips = DEFAULT_IPS
-        errors["ips"] = str(error)
-    return {"program": program, "raid": raid, "ips": ips,
-            "today": date.today().isoformat(), "errors": errors}
+    """Overview data that no other section serves: the routine's morning brief
+    (including its pulse snapshot). The live pulse itself is computed in the
+    browser by assets/pulse.js from the other sections' payloads."""
+    return {"brief": _read_morning_brief(),
+            "today": date.today().isoformat(), "errors": {}}
 
 
 def bug_payload() -> dict:
@@ -809,6 +656,18 @@ def pr_track_edit(path: str, payload: dict) -> tuple[bool, str]:
     mistyped line should not throw away the references that did resolve.
     """
     fid = payload.get("feature_id")
+    if path == "/api/feature-jira-coverage":
+        if type(fid) is not int:
+            return False, "feature_id must be an integer"
+        if not isinstance(payload.get("key"), str):
+            return False, "key must be a string"
+        if type(payload.get("confirmed")) is not bool:
+            return False, "confirmed must be a boolean"
+        if type(payload.get("expected_revision")) is not int:
+            return False, "expected_revision must be an integer"
+        return pm.confirm_jira(
+            fid, payload["key"], confirmed=payload["confirmed"],
+            expected_revision=payload["expected_revision"])
     if path == "/api/feature-track":
         ok, msg, _ = pm.add_feature(payload.get("name", ""),
                                     payload.get("description", ""),
@@ -866,16 +725,6 @@ def raid_payload() -> dict:
         return {"rows": [], "owners": [], "counts": {}, "path": "", "error": str(e)}
 
 
-def pldmq_payload() -> dict:
-    """Tracked PLDM jobs from pjq.py. Read-only; scanning is a separate POST."""
-    if pjq is None:
-        return {"jobs": [], "counts": {}, "portal": "", "error": "pjq unavailable"}
-    try:
-        return pjq.payload()
-    except Exception as e:
-        return {"jobs": [], "counts": {}, "portal": "", "error": str(e)}
-
-
 def vmlog_payload() -> dict:
     """Delegated VM/lab jobs from vd.py. Read-only; the probe is a separate POST."""
     if vd is None:
@@ -883,10 +732,13 @@ def vmlog_payload() -> dict:
                 "machines_checked": "", "last_refresh": "", "log": "",
                 "error": "vm-delegate unavailable"}
     try:
-        return vd.payload()
+        body = vd.payload()
     except Exception as e:
         return {"jobs": [], "running": [], "counts": {}, "targets": [], "machines": [],
                 "machines_checked": "", "last_refresh": "", "log": "", "error": str(e)}
+    body["terminal_targets"] = portal_settings.load()["machines"]["terminal_targets"]
+    body["live"] = live_payload()["links"]
+    return body
 
 
 def is_pinned_slot(slot: str) -> bool:
@@ -902,7 +754,7 @@ def viable_slots() -> list[str]:
     them at PR branches, clobbering the revision they exist to hold.
     """
     return [r["slot"] for r in wm.roster() if not r["target"]
-            and r["rev"] == "main" and r["exists"]]
+            and r["rev"] == "main" and r["exists"] and wm.allows(r, "build")]
 
 
 def ws_ui_payload(wd: dict, *, cached_only: bool = False) -> dict:
@@ -913,15 +765,19 @@ def ws_ui_payload(wd: dict, *, cached_only: bool = False) -> dict:
     """
     roster = wm.roster(wd, cached_only=cached_only)
     canonical = ([r["slot"] for r in roster if not r["target"]
-                  and r["rev"] == "main" and r["exists"]]
+                  and r["rev"] == "main" and r["exists"] and wm.allows(r, "build")]
                  if cached_only else viable_slots())
-    return dict(wd, canonical=canonical,
+    return dict(wd, canonical=canonical, purposes=wm.PURPOSES,
+                purpose_uses={p: wm.purpose_uses(p) for p in wm.PURPOSES},
                 roster=roster, groups=wm.groups(wd), targets=wm.machine_targets())
 
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 ASSET_TYPES = {".css": "text/css; charset=utf-8",
                ".js": "application/javascript; charset=utf-8"}
+# Every servable asset, by exact name, so a crafted path cannot escape.
+ASSET_NAMES = ("portal.css", "pulse.js", "portal.js", "team.js", "term.js", "aichat.js",
+               "vendor/xterm.js", "vendor/xterm.css", "vendor/addon-fit.js")
 
 
 def asset_text(name: str) -> str:
@@ -929,14 +785,76 @@ def asset_text(name: str) -> str:
     return (ASSETS / name).read_text(encoding="utf-8")
 
 
+def render_aichat_page() -> str:
+    """The detached AI panel window (assets/aichat.js); the query names the chat."""
+    v = asset_stamp()
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Portal AI</title>'
+            f'<link rel="stylesheet" href="/assets/portal.css?v={v}"></head>'
+            '<body class="aichat-page"><main id="aichat-root" class="aichat-window"></main>'
+            f'<script src="/assets/aichat.js?v={v}"></script>'
+            '<script>PortalAIChat.mountFromQuery(document.getElementById("aichat-root"));'
+            '</script></body></html>')
+
+
+def render_term_page() -> str:
+    """The pop-up terminal window (xterm.js + assets/term.js)."""
+    v = asset_stamp()
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Portal terminal</title>'
+            f'<link rel="stylesheet" href="/assets/vendor/xterm.css?v={v}">'
+            '<style>html,body{margin:0;height:100%;background:#0f1419;color:#d6dde6;'
+            'font:13px system-ui,sans-serif}body{display:flex;flex-direction:column}'
+            'header{display:flex;gap:10px;align-items:center;padding:6px 10px;'
+            'border-bottom:1px solid #26303b}#term-title{font-weight:600;flex:1;'
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+            '.term-status{opacity:.85}.term-status.ok{color:#7ee787}.term-status.bad{color:#ff7b72}'
+            'button{background:#21262d;color:inherit;border:1px solid #3a4450;border-radius:6px;'
+            'padding:3px 10px;cursor:pointer}#term{flex:1;min-height:0;padding:4px}</style>'
+            '</head><body><header><span id="term-title">Terminal</span>'
+            '<span id="term-status" class="term-status" role="status" aria-live="polite"></span>'
+            '<button id="term-again" type="button" hidden>Reconnect</button></header>'
+            '<div id="term" aria-label="Terminal"></div>'
+            f'<script src="/assets/vendor/xterm.js?v={v}"></script>'
+            f'<script src="/assets/vendor/addon-fit.js?v={v}"></script>'
+            f'<script src="/assets/term.js?v={v}"></script></body></html>')
+
+
+def term_spec(data: dict) -> dict:
+    """Validate a /api/term/open request into a terminal spec."""
+    if not isinstance(data, dict):
+        raise terminal.TermError("request must be an object")
+    kind = data.get("kind")
+    if kind == "shell":
+        allowed = portal_settings.load()["machines"]["terminal_targets"]
+        return terminal.shell_spec(str(data.get("target") or ""), allowed)
+    if kind == "log":
+        if vd is None:
+            raise terminal.TermError("vm-delegate is not installed")
+        return terminal.log_spec(vd.log_view(str(data.get("job") or "")))
+    raise terminal.TermError("kind must be shell or log")
+
+
 def asset_stamp() -> str:
     """Cache-buster derived from the assets' mtimes."""
-    return str(int(max((ASSETS / n).stat().st_mtime for n in ("portal.css", "portal.js", "team.js"))))
+    return str(int(max((ASSETS / n).stat().st_mtime for n in ("portal.css", "pulse.js", "portal.js", "team.js"))))
 
 
 # Oded's CI/CD pipeline explorer (~/odeds_sandbox, pipeline-explorer.service).
 # The portal only deep-links into it; it never calls it.
 PIPELINE_EXPLORER_URL = os.environ.get("PIPELINE_EXPLORER_URL", "http://127.0.0.1:8080")
+
+
+def _journal_settings(status: str, detail: str, applied: str) -> None:
+    """One self-contained journal event per settings save; never blocks the save."""
+    try:
+        maintenance.record(f"Settings {'updated' if status == 'completed' else 'save failed'}"
+                           f" via portal: {detail}"[:1000], status,
+                           component="portal-settings", deployment=applied)
+    except (ValueError, sqlite3.Error, OSError) as error:
+        print(f"[portal] settings journal write failed: {error}", file=sys.stderr)
 
 
 def boot_payload(tasks: list[dict], wd: dict) -> str:
@@ -954,10 +872,10 @@ def boot_payload(tasks: list[dict], wd: dict) -> str:
         "overview": overview_payload(),
         "prs": pr_payload(),
         "raid": raid_payload(),
-        "pldmq": pldmq_payload(),
         "vmlog": vmlog_payload(),
         "team": team_api.payload(),
         "explorer": {"url": PIPELINE_EXPLORER_URL.rstrip("/")},
+        "settings": portal_settings.payload(include_status=False),
     }, ensure_ascii=False).replace("</", "<\\/")
 
 
@@ -967,12 +885,16 @@ def render_dashboard_html(tasks: list[dict], inline: bool = False) -> str:
     wd = wm.load()
     if inline:
         styles = "<style>\n" + asset_text("portal.css") + "\n</style>"
-        scripts = ("<script>\n" + asset_text("portal.js") + "\n</script>"
-                   + "<script>\n" + asset_text("team.js") + "\n</script>")
+        scripts = ("<script>\n" + asset_text("pulse.js") + "\n</script>"
+                   + "<script>\n" + asset_text("portal.js") + "\n</script>"
+                   + "<script>\n" + asset_text("team.js") + "\n</script>"
+                   + "<script>\n" + asset_text("aichat.js") + "\n</script>")
     else:
         v = asset_stamp()
         styles = f'<link rel="stylesheet" href="/assets/portal.css?v={v}">'
-        scripts = (f'<script src="/assets/portal.js?v={v}"></script>'
+        scripts = (f'<script src="/assets/pulse.js?v={v}"></script>'
+                   f'<script src="/assets/portal.js?v={v}"></script>'
+                   f'<script src="/assets/aichat.js?v={v}"></script>'
                    f'<script src="/assets/team.js?v={v}"></script>')
     return (DASHBOARD_TEMPLATE
             .replace("__STYLES__", styles)
@@ -992,7 +914,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def render_review_draft(draft: dict) -> str:
-    title = escape(f'{draft["task_id"]} - {draft["repo"]}#{draft["pr_number"]}')
+    heads = draft.get("heads") or []
+    if draft.get("kind") == "legacy-pr" and heads:
+        title = escape(f'{draft["task_id"]} - {heads[0]["repo"]}#{heads[0]["pr_number"]}')
+    else:
+        title = escape(f'{draft["task_id"]} - {draft.get("title", "")}')
+    covered = "".join(
+        f'<li>{escape(str(h.get("repo", "")))}#{escape(str(h.get("pr_number", "")))}: '
+        f'<code>{escape(str(h.get("head_sha", "")))}</code></li>' for h in heads)
     content = (MarkdownIt("gfm-like", {"html": False, "linkify": True})
                .use(tasklists_plugin)
                .render(draft["content"]))
@@ -1040,8 +969,9 @@ def render_review_draft(draft: dict) -> str:
         'Back to review task</a>'
         f'<header class="review-header"><h1>Review draft: {title}</h1>'
         '<p class="review-meta">Local draft only - not submitted to GitHub.</p>'
-        f'<p class="review-meta">Saved: {escape(draft["updated_at"])}<br>'
-        f'Head reviewed: <code>{escape(draft["head_sha"])}</code></p></header>'
+        f'<p class="review-meta">Saved: {escape(draft["updated_at"])}</p>'
+        f'<p class="review-meta">Heads reviewed:</p><ul class="review-meta">{covered}</ul>'
+        '</header>'
         f'<main class="review-content">{content}</main></body></html>'
     )
 
@@ -1152,7 +1082,72 @@ def enqueue_action(job: dict) -> str:
     return ACTION_QUEUE.enqueue(job)
 
 
+def action_resources(job: dict) -> set[str]:
+    """Resolve current owner identities; never trust resource claims from clients."""
+    kind = job["kind"]
+    if kind == "pr-scan":
+        return {"domain:prs"}
+    if kind == "review-scan":
+        # Completion can release any review's workspace hold.
+        return {"domain:tasks", "workspace:*"}
+    if kind == "vm-refresh":
+        # The delegation owner and VM_REFRESH_LOCK still serialize fleet probes.
+        return {"domain:delegation", "vm:*"}
+    if kind == "ai":
+        return {"ai:" + job["run_id"]}
+    if kind == "auto-review":
+        # Only the run itself: its occupy/free steps are separate queued
+        # workspace actions with their own claims (claiming the workspace
+        # here would deadlock them).
+        return {"auto-review:" + job["ws_id"]}
+    if kind == "review-chat":
+        # One message at a time per chat; opening also serialises with any
+        # auto-review on the same workspace.
+        claims = {"review-chat:" + job["chat_id"]}
+        if job.get("op") == "open":
+            claims.add("auto-review:" + job["ws_id"])
+        return claims
+    if kind not in {"workspace-action", "align", "pldm"}:
+        return {"*"}
+    if kind == "pldm":
+        slot = job["request"].get("slot")
+        if not slot:
+            return {"*"}  # Auto-selection is deferred until execution.
+        slots = [slot]
+        claims = {"domain:prs", "domain:pldm"}
+    elif kind == "align":
+        slots = [job["slot"]]
+        claims = {"domain:tasks"}
+    else:
+        slots = job["request"]["slots"]
+        claims = set()
+        if job["action"] in {"occupy", "free"}:
+            claims.add("domain:tasks")
+        if job["action"] == "occupy":
+            # Reassignment may also release the task's previous workspace.
+            claims.add("workspace:*")
+    for slot in slots:
+        rec = wm.record(slot)
+        claims.add("workspace:" + rec["id"])
+        if rec.get("target"):
+            claims.add("vm:" + rec["target"])
+        mirror = wm.status_read(rec["id"]).get("mirror") or {}
+        if mirror.get("source_id"):
+            claims.add("workspace:" + mirror["source_id"])
+    return claims or {"*"}
+
+
 def execute_action(job: dict, store_lock=None) -> None:
+    if job["kind"] in {"workspace-action", "align", "pldm"}:
+        claims = action_resources(job)
+        if any(key.startswith("vm:") for key in claims):
+            # Also exclude inline VM power/sync and the automatic watchdog.
+            with VM_REFRESH_LOCK:
+                return _execute_action(job, store_lock)
+    return _execute_action(job, store_lock)
+
+
+def _execute_action(job: dict, store_lock=None) -> None:
     kind = job["kind"]
     if kind == "workspace-action":
         return run_workspace_job(job, store_lock)
@@ -1163,6 +1158,8 @@ def execute_action(job: dict, store_lock=None) -> None:
         return run_workspace_alignment(job, store_lock)
     if kind == "pr-scan":
         PR_SCAN_LOCK.acquire()
+        if job["request"].get("jira", True) is False:
+            return run_pr_scan(job, job["request"].get("only"), jira=False)
         return run_pr_scan(job, job["request"].get("only"))
     if kind == "review-scan":
         REVIEW_SCAN_LOCK.acquire()
@@ -1170,6 +1167,12 @@ def execute_action(job: dict, store_lock=None) -> None:
     if kind == "vm-refresh":
         VM_REFRESH_LOCK.acquire()
         return run_vm_refresh(job)
+    if kind == "ai":
+        return run_ai_job(job)
+    if kind == "auto-review":
+        return run_auto_review(job)
+    if kind == "review-chat":
+        return run_review_chat_job(job)
     if kind == "pldm":
         with PLDM_LOCK:
             feature = next((f for f in pm.records() if f["id"] == job["feature_id"]), None)
@@ -1196,9 +1199,6 @@ REVIEW_SCAN_LOCK = _threading.Lock()
 
 # the RAID owner (rd.py) does not lock across processes.
 RAID_LOCK = _threading.Lock()
-
-# Serialises the PLDM queue scan (gh probe of every active tracked job).
-PLDMQ_SCAN_LOCK = _threading.Lock()
 
 # Serialises the VM delegation probe (one ssh round trip per target).
 VM_REFRESH_LOCK = _threading.Lock()
@@ -1840,7 +1840,7 @@ def prepare_pldm_job(feature: dict, opts: dict) -> tuple[dict | None, str]:
                       f"({len(prs)} PR(s), image {opts.get('image_type') or PLDM_IMAGE_TYPES[0]})")
 
     if wm.is_free(slot):
-        ok, msg, _ = wm.occupy_adhoc(slot, f"PLDM test: {display}", tag="experiment")
+        ok, msg, _ = wm.occupy_adhoc(slot, f"PLDM test: {display}", tag="build")
         if not ok:
             return None, msg
         held = True
@@ -1882,15 +1882,18 @@ PR_SCAN_ICONS = {
 }
 
 
-def run_pr_scan(job: dict, only=None) -> None:
+def run_pr_scan(job: dict, only=None, jira: bool = True) -> None:
     """Probe tracked PRs and release the execution-time PR store lock."""
     try:
-        _run_pr_scan(job, only)
+        if jira:
+            _run_pr_scan(job, only)
+        else:
+            _run_pr_scan(job, only, jira_enabled=False)
     finally:
         PR_SCAN_LOCK.release()
 
 
-def _run_pr_scan(job: dict, only=None) -> None:
+def _run_pr_scan(job: dict, only=None, jira_enabled: bool = True) -> None:
     def progress(done, total, feat, pr):
         with ALIGN_LOCK:
             job["total"] = total
@@ -1906,7 +1909,10 @@ def _run_pr_scan(job: dict, only=None) -> None:
                 "detail": f"{pr.get('status') or 'unknown'} \u00b7 {feat['name']}",
             })
     try:
-        result = pm.refresh(only=only, progress=progress)
+        if jira_enabled:
+            result = pm.refresh(only=only, progress=progress)
+        else:
+            result = pm.refresh(only=only, progress=progress, jira=False)
     except Exception as e:
         with ALIGN_LOCK:
             job.update(status="error", finished=tm.NOW, current=None, message=str(e))
@@ -1914,26 +1920,41 @@ def _run_pr_scan(job: dict, only=None) -> None:
     with ALIGN_LOCK:
         job["current"] = None
         job["finished"] = tm.NOW
-        if result.get("error"):
-            job.update(status="error", message=result["error"])
-            return
-        job["status"] = "done"
         job["result"] = result
+        job["status"] = "error" if result.get("error") else "done"
         gone = result.get("purged") or []
         bad = result.get("failed") or []
-        parts = []
+        jira = result.get("jira_sync") or []
+        jira_counts = {state: sum(row.get("state") == state for row in jira)
+                       for state in ("updated", "unchanged", "blocked", "error")}
+        result["jira_sync_counts"] = jira_counts
+        parts = [str(result["error"])] if result.get("error") else []
         if gone:
             parts.append(f"retired {len(gone)}: " + ", ".join(f["name"] for f in gone))
         if bad:
             parts.append(f"\u26a0 {len(bad)} PR(s) gh could not reach: "
                          + ", ".join(f"{b['repo']}#{b['number']}" for b in bad[:4]))
+        if result.get("jira_sync_skipped"):
+            parts.append("Jira sync skipped")
+        if jira:
+            parts.append("Jira sync: " + ", ".join(
+                f"{count} {state}" for state, count in jira_counts.items()))
+        jira_failed = [row for row in jira if row.get("state") in ("blocked", "error")]
+        if jira_failed:
+            job["status"] = "error"
+            parts.append("\u26a0 Jira sync incomplete (including archived retries): "
+                         + "; ".join(
+                             f"feature {row.get('feature_id')} / {row.get('key')}: "
+                             f"{row.get('state')} \u2014 {row.get('message', '')}"
+                             for row in jira_failed))
         job["message"] = " \u00b7 ".join(parts)
 
 
-def start_pr_scan_job(only=None) -> str:
-    """Queue a PR scan (all features, or ``only`` ids)."""
+def start_pr_scan_job(only=None, jira: bool = True) -> str:
+    """Queue a PR scan (all features, or ``only`` ids); ``jira=False`` is GitHub-only."""
+    request = {"only": only} if jira else {"only": only, "jira": False}
     job = {
-        "kind": "pr-scan", "slot": "PRs", "request": {"only": only},
+        "kind": "pr-scan", "slot": "PRs", "request": request,
         "current": None, "total": 0, "message": "", "repos": [],
     }
     return enqueue_action(job)
@@ -2034,10 +2055,943 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
             VM_REFRESH_LOCK.release()
 
 
+# --------------------------------------------------------------- live + events
+# Notifications for every tab (and a Windows toast when none is open).
+EVENTS = events.Bus(settings=lambda: portal_settings.load()["notify"])
+LIVE: live_status.Manager | None = None
+LIVE_STATE = {"changed": 0.0}
+JOB_DONE_WORDS = {"passed": ("\u2713 passed", "ok"), "failed": ("\u2717 failed", "bad"),
+                  "died": ("\u2717 died", "bad")}
+
+
+def live_block(target: str, text: str) -> None:
+    """Reconcile one jobs-watch block; notify on running -> settled."""
+    if vd is None:
+        return
+    rows = vd.parse_probe(text)
+    # A user refresh / workspace action owns the delegation state right now;
+    # the next block (seconds away) will catch up.
+    if not VM_REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        before = vd.job_statuses()
+        vd.refresh(only=target, sync=False, preprobed={target: rows})
+        after = vd.job_statuses()
+    finally:
+        VM_REFRESH_LOCK.release()
+    changed = [jid for jid, row in after.items()
+               if (before.get(jid) or {}).get("status") != row["status"]]
+    if changed:
+        LIVE_STATE["changed"] = time.time()
+    settled = False
+    for jid in changed:
+        row, prev = after[jid], (before.get(jid) or {}).get("status")
+        if prev == "running" and row["status"] in JOB_DONE_WORDS:
+            word, tone = JOB_DONE_WORDS[row["status"]]
+            settled = True
+            EVENTS.publish("machine_jobs", f"{row['kind'].capitalize()} {word} on {row['target']}",
+                           f"{row['ws']}" + (f" \u00b7 rc={row['rc']}" if row["rc"] not in (None, 0) else ""),
+                           tone, "#vm")
+    if settled:
+        # Keep a local copy of the finished log before the slot is reused.
+        threading.Thread(target=lambda: vd.sync_logs(target), daemon=True).start()
+
+
+def live_reach(target: str, up: bool, why: str) -> None:
+    EVENTS.publish("reachability", f"{target} is reachable again" if up
+                   else f"{target} became unreachable", why or "", "ok" if up else "bad", "#vm")
+
+
+def start_live_status() -> None:
+    global LIVE
+    if vd is None:
+        return
+    LIVE = live_status.Manager(
+        live_block, live_reach, lambda: vd.agent_env()[0],
+        lambda: portal_settings.load()["machines"])
+    LIVE.sync()
+
+
+# ------------------------------------------------------------------ AI ----
+AI_STORE = ai.Store(STATE_DIR / "ai")
+AI_SECTIONS = {"overview": "Overview", "work": "Tasks", "ws": "Workspaces",
+               "bugs": "Bugs", "prs": "PRs", "vm": "Machines", "raid": "RAID",
+               "team": "Team"}
+# Live job dicts of running AI calls, so a follow-up can't race its parent.
+AI_ACTIVE: set[str] = set()
+
+
+def ai_usage_payload() -> dict:
+    cfg = portal_settings.load()["ai"]
+    use = AI_STORE.usage()
+    return {"enabled": bool(cfg["enabled"]), "used": use["runs"], "cap": cfg["daily_cap"],
+            "premium": use.get("premium", 0), "model": cfg["model"],
+            "interactive_used": use.get("interactive", 0),
+            "interactive_cap": cfg.get("interactive_daily_cap", 150)}
+
+
+def _recent_tasks(tasks: list[dict]) -> list[dict]:
+    """Open tasks plus anything finished in the last two weeks."""
+    cutoff = (date.today().toordinal() - 14)
+    out = []
+    for t in tasks:
+        done = t.get("status") in {"done", "cancelled"}
+        when = t.get("completed") or t.get("updated") or ""
+        try:
+            recent = date.fromisoformat(str(when)[:10]).toordinal() >= cutoff
+        except ValueError:
+            recent = False
+        if not done or recent:
+            out.append({k: v for k, v in t.items() if k not in {"notes", "history"}})
+    return out
+
+
+def ai_section_data(section: str, private: bool) -> Any:
+    """What the section shows, read now, from the same payloads it renders."""
+    if section == "overview":
+        tasks = tm.load()["tasks"]
+        open_tasks = [t for t in tasks if t.get("status") not in {"done", "cancelled"}]
+        return {"brief": overview_payload().get("brief"),
+                "open_tasks": len(open_tasks),
+                "tasks_in_progress": [{"id": t["id"], "title": t.get("title"),
+                                       "category": t.get("category")}
+                                      for t in open_tasks if t.get("status") == "in-progress"],
+                "prs": pr_payload().get("counts"),
+                "machines": {k: vmlog_payload().get(k) for k in ("counts", "running")}}
+    if section == "work":
+        return {"tasks": _recent_tasks(_annotate_tasks(tm.load()["tasks"], wm.load()))}
+    if section == "ws":
+        return ws_ui_payload(wm.load(), cached_only=True)
+    if section == "bugs":
+        return bug_payload()
+    if section == "prs":
+        return pr_payload()
+    if section == "vm":
+        data = vmlog_payload()
+        data.pop("log", None)
+        return data
+    if section == "raid":
+        return raid_payload()
+    if section == "team":
+        return team_api.payload("private" if private else "shared", None)
+    raise ValueError("unknown section")
+
+
+def ai_render(markdown: str) -> str:
+    return (MarkdownIt("gfm-like", {"html": False, "linkify": True})
+            .use(tasklists_plugin).render(markdown or ""))
+
+
+def ai_public(run: dict) -> dict:
+    out = {k: v for k, v in run.items() if k not in {"prompt", "context"}}
+    out["answer_html"] = ai_render(run.get("answer") or "") if run.get("answer") else ""
+    return out
+
+
+def start_ai_run(body: dict, private: bool) -> dict:
+    """Validate an Explain/Ask/brief request, reserve budget and queue it."""
+    cfg = portal_settings.load()["ai"]
+    if not cfg["enabled"]:
+        raise ValueError("AI is turned off in Settings")
+    kind = body.get("kind")
+    if kind not in {"explain", "ask", "brief"}:
+        raise ValueError("kind must be explain, ask or brief")
+    section = body.get("section") if kind != "brief" else "overview"
+    if section not in AI_SECTIONS:
+        raise ValueError("unknown section")
+    question = body.get("question") or ""
+    focus = body.get("focus") or ""
+    if not isinstance(question, str) or not isinstance(focus, str):
+        raise ValueError("question and focus must be text")
+    question, focus = question.strip()[:4000], focus.strip()[:600]
+    if kind == "ask" and not question:
+        raise ValueError("a question is required")
+    parent = None
+    if body.get("parent"):
+        parent = AI_STORE.get(str(body["parent"]))
+        if not parent or not parent.get("session_id"):
+            raise ValueError("the conversation to continue is not available")
+        if parent.get("private") and not private:
+            raise PermissionError("enable private mode to continue this conversation")
+        if parent["id"] in AI_ACTIVE:
+            raise ValueError("wait for the previous answer first")
+        if kind != "ask":
+            raise ValueError("follow-ups must be questions")
+    context = body.get("context")
+    if kind == "brief":
+        if not isinstance(context, (dict, list)):
+            raise ValueError("the brief run needs its sections as context")
+    else:
+        context = None
+    AI_STORE.reserve(cfg["daily_cap"])
+    run = ai.new_run(kind, section=section, question=question, focus=focus,
+                     private=bool(private and section == "team"),
+                     parent=parent["id"] if parent else None,
+                     resume=parent["session_id"] if parent else None)
+    if context is not None:
+        run["context"] = context
+    AI_STORE.save(run)
+    label = {"explain": f"Explain {AI_SECTIONS[section]}",
+             "ask": f"Ask \u00b7 {AI_SECTIONS[section]}",
+             "brief": "AI brief"}[kind]
+    job_id = enqueue_action({"kind": "ai", "run_id": run["id"], "title": label,
+                             "slot": label, "current": "queued", "message": "",
+                             "repos": [], "total": 0,
+                             "link": f"ai/{run['id']}"})
+    return {"run_id": run["id"], "job": job_id}
+
+
+def _ai_progress(job: dict):
+    def on_line(ev: dict) -> None:
+        text = ai.progress_text(ev)
+        if text:
+            with ALIGN_LOCK:
+                job["current"] = text
+    return on_line
+
+
+def run_ai_job(job: dict) -> None:
+    run = AI_STORE.get(job.get("run_id", ""))
+    if run is None:
+        raise ValueError("AI run record is missing")
+    cfg = portal_settings.load()["ai"]
+    AI_ACTIVE.add(run["id"])
+    if run.get("parent"):
+        AI_ACTIVE.add(run["parent"])
+    try:
+        read_at = ai.now_iso()
+        run.update(status="running", started=read_at)
+        with ALIGN_LOCK:
+            job["current"] = "reading portal data"
+        if run["kind"] == "brief":
+            text, cut = ai.compact(run.pop("context", {}), 20_000)
+            prompt = ai.brief_prompt(text, read_at, cut)
+        elif run.get("resume"):
+            text, cut = "", False
+            prompt = ai.followup_prompt(run["question"])
+        else:
+            data = ai_section_data(run["section"], run.get("private", False))
+            text, cut = ai.compact(data)
+            label = AI_SECTIONS[run["section"]]
+            prompt = (ai.explain_prompt(run["section"], label, text, read_at, cut, run["focus"])
+                      if run["kind"] == "explain" else
+                      ai.ask_prompt(run["section"], label, text, read_at, cut,
+                                    run["question"], run["focus"]))
+        run.update(context_bytes=len(text), truncated=cut)
+        AI_STORE.save(run)
+        argv = ai.build_argv(prompt, model=cfg["model"], profile="read",
+                             allow_reads=cfg["allow_jira_github_reads"],
+                             resume=run.get("resume"))
+        result = ai.run_copilot(argv, cwd=str(Path.home()), timeout=cfg["timeout_s"],
+                                on_line=_ai_progress(job))
+        _ai_finish(run, result)
+        with ALIGN_LOCK:
+            job.update(status="error" if run["error"] else "done", current=None,
+                       message=run["error"] or (run["answer"].strip().splitlines() or [""])[0][:200])
+    except Exception as error:                                   # noqa: BLE001
+        run.update(status="error", error=str(error), finished=ai.now_iso())
+        AI_STORE.save(run)
+        raise
+    finally:
+        AI_ACTIVE.discard(run["id"])
+        if run.get("parent"):
+            AI_ACTIVE.discard(run["parent"])
+
+
+def _ai_finish(run: dict, result: dict) -> None:
+    run.update(answer=result.get("answer") or "", error=result.get("error") or "",
+               session_id=result.get("session_id"), model=result.get("model"),
+               premium=result.get("premium") or 0, nano_aiu=result.get("nano_aiu") or 0,
+               tools=result.get("tools") or 0, finished=ai.now_iso(),
+               status="error" if result.get("error") else "done")
+    AI_STORE.save(run)
+    AI_STORE.add_premium(run["premium"])
+
+
+# ------------------------------------------------------------ auto-review ----
+AUTO_REVIEW_WAIT = 3600
+
+
+def _task(tid: str) -> dict | None:
+    return next((t for t in tm.load()["tasks"] if t["id"] == tid), None)
+
+
+def tm_note(tid: str, message: str) -> None:
+    """Append a task note through the task owner's transaction."""
+    with tm.task_store.transaction() as data:
+        task = tm.find_task(data, tid)
+        if task is not None:
+            tm.append_note(task, message)
+            task["updated"] = tm.TODAY
+
+
+def _draft_marks(task: dict) -> dict:
+    marks = {(r.get("pr_url"), d.get("id")): d.get("updated_at")
+             for r in task.get("reviews") or [] for d in r.get("drafts") or []}
+    marks.update({("task", d.get("id")): d.get("updated_at")
+                  for d in task.get("review_drafts") or []})
+    return marks
+
+
+def _open_reviews(task: dict) -> list[dict]:
+    return [r for r in task.get("reviews") or []
+            if r.get("pr_url") and not r.get("merged") and not r.get("closed")]
+
+
+def _pr_repo(review: dict) -> str:
+    if review.get("repo"):
+        return review["repo"]
+    parts = urlparse(review.get("pr_url") or "").path.strip("/").split("/")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def review_requirement(task: dict) -> dict:
+    """The manifest a workspace must have deployed to review this task's PRs.
+
+    ``revision`` is the PRs' common base branch (read from GitHub);
+    ``project`` comes from ``project.<name>.*`` repos and is empty when every
+    PR is in a project-neutral repo (``ip.*``), which any project can host.
+    Mixed projects or bases cannot share one workspace and are refused.
+    """
+    open_reviews = _open_reviews(task)
+    projects = set()
+    for r in open_reviews:
+        parts = _pr_repo(r).split(".")
+        if len(parts) > 2 and parts[0] == "project":
+            projects.add(parts[1])
+    if len(projects) > 1:
+        raise ValueError("the PRs span several projects (" + ", ".join(sorted(projects))
+                         + "); one workspace cannot review them together")
+    bases = _pr_bases(task)
+    if len(bases) != 1:
+        raise ValueError("the PRs target different base branches (" + ", ".join(sorted(bases))
+                         + "); one workspace cannot review them together" if bases
+                         else "could not determine the PRs' base branch")
+    return {"project": projects.pop() if projects else "", "revision": bases.pop()}
+
+
+def _need_text(need: dict) -> str:
+    return f"{need['project'] or 'any project'} @ {need['revision']}"
+
+
+def review_workspace_mismatch(rec: dict, need: dict) -> str:
+    """Why ``rec`` cannot host a review needing ``need`` ('' when it can)."""
+    if rec.get("target"):
+        return "remote workspace (auto-review runs locally)"
+    dep = wm.deployed_manifest(rec["slot"])
+    if dep.get("error"):
+        return dep["error"]
+    if need["project"] and dep["project"] != need["project"]:
+        return f"deploys project '{dep['project']}', not '{need['project']}'"
+    if dep["revision"] != need["revision"]:
+        return f"deploys revision '{dep['revision']}', not '{need['revision']}'"
+    return ""
+
+
+def pick_review_workspace(tid: str, need: dict) -> tuple[dict, bool]:
+    """(workspace record, already held by this task) or ValueError.
+
+    Only review-purpose workspaces whose *deployed* manifest (project and
+    revision from ``.repo/metadata.json``) matches the PRs are used: the
+    task's own one if it holds it, else the first free match. Nothing else is
+    borrowed; when nothing fits, the refusal says why each candidate was
+    skipped.
+    """
+    held = wm.slot_of_task(tid)
+    if held:
+        rec = wm.record(held)
+        if rec.get("purpose") != "review":
+            raise ValueError(f"{tid} already holds {rec['label']}, which is not a review "
+                             "workspace; free it first")
+        why = review_workspace_mismatch(rec, need)
+        if why:
+            raise ValueError(f"{tid} holds {rec['label']}, which cannot review "
+                             f"{_need_text(need)}: {why}; free it first")
+        return rec, True
+    skipped = []
+    for rec in wm.roster(cached_only=True):
+        if rec.get("purpose") != "review":
+            continue
+        if not wm.is_free(rec["slot"]):
+            skipped.append(f"{rec['label']}: occupied")
+            continue
+        why = review_workspace_mismatch(rec, need)
+        if why:
+            skipped.append(f"{rec['label']}: {why}")
+            continue
+        return rec, False
+    raise ValueError(f"no free review workspace with {_need_text(need)} deployed ("
+                     + ("; ".join(skipped) if skipped else "no workspace has purpose 'review'")
+                     + "); free one or add one in Workspaces")
+
+
+def has_review_draft(task: dict) -> bool:
+    return bool(task.get("review_drafts")) or any(
+        r.get("drafts") for r in task.get("reviews") or [])
+
+
+REVIEW_MODE_LABELS = {"create": "Review draft", "rereview": "Re-review"}
+
+
+def _review_task(tid: str) -> dict:
+    """The open code-review task ``tid`` with open PRs, or ValueError."""
+    task = _task(tid)
+    if task is None or task.get("category") != "code-review":
+        raise ValueError("AI review needs a code-review task")
+    if task.get("status") in {"done", "cancelled"}:
+        raise ValueError("the review task is closed")
+    if not _open_reviews(task):
+        raise ValueError("the task has no open PRs to review")
+    return task
+
+
+def _review_busy(tid: str) -> str:
+    """Why another AI review of ``tid`` cannot start now ('' when it can)."""
+    with ALIGN_LOCK:
+        for other in ALIGN_JOBS.values():
+            if (other.get("kind") == "auto-review" and other.get("task_id") == tid
+                    and other.get("status") in {"queued", "running"}):
+                return f"an AI review draft of {tid} is already queued"
+    if AI_STORE.chats(tid, open_only=True):
+        return f"an interactive review of {tid} is open; resume or end it first"
+    return ""
+
+
+def start_auto_review(tid: str, mode: str = "create") -> dict:
+    cfg = portal_settings.load()["ai"]
+    if not cfg["enabled"]:
+        raise ValueError("AI is turned off in Settings")
+    if mode not in ai.REVIEW_MODES:
+        raise ValueError("mode must be create or rereview")
+    task = _review_task(tid)
+    if mode == "create" and has_review_draft(task):
+        raise ValueError(f"{tid} already has a review draft; use Re-review")
+    if mode == "rereview" and not has_review_draft(task):
+        raise ValueError(f"{tid} has no review draft yet; use Create review draft")
+    busy = _review_busy(tid)
+    if busy:
+        raise ValueError(busy)
+    need = review_requirement(task)
+    rec, held = pick_review_workspace(tid, need)
+    AI_STORE.reserve(cfg["daily_cap"])
+    label = REVIEW_MODE_LABELS[mode]
+    run = ai.new_run("auto-review", section="work", task_id=tid, mode=mode,
+                     question=f"{label} {tid}: {task.get('title', '')}",
+                     workspace=rec["label"])
+    AI_STORE.save(run)
+    title = f"{label} {tid} \u00b7 {rec['label']}"
+    job_id = enqueue_action({"kind": "auto-review", "task_id": tid, "run_id": run["id"],
+                             "ws_id": rec["id"], "ws_slot": rec["slot"], "held": held,
+                             "mode": mode,
+                             "need": need, "title": title, "slot": title, "current": "queued",
+                             "message": "", "repos": [], "steps": [], "total": 4,
+                             "link": f"task/{tid}"})
+    return {"run_id": run["id"], "job": job_id, "workspace": rec["label"],
+            "manifest": _need_text(need), "mode": mode}
+
+
+def _wait_action(job_id: str, timeout: int = AUTO_REVIEW_WAIT) -> dict:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        with ALIGN_LOCK:
+            sub = dict(ALIGN_JOBS.get(job_id) or {})
+        if sub.get("status") in {"done", "error", "approval_required"}:
+            return sub
+        time.sleep(2)
+    raise TimeoutError(f"action {job_id} did not finish in {timeout}s")
+
+
+def _pr_bases(task: dict) -> set[str]:
+    bases = set()
+    for r in _open_reviews(task):
+        out = subprocess.run(["gh", "pr", "view", r["pr_url"], "--json", "baseRefName",
+                              "-q", ".baseRefName"], capture_output=True, text=True,
+                             timeout=60, check=False)
+        if out.returncode != 0:
+            raise ValueError(f"cannot read the base branch of {r['pr_url']}: "
+                             f"{(out.stderr or '').strip()[:200]}")
+        bases.add(out.stdout.strip())
+    return bases
+
+
+def run_auto_review(job: dict) -> None:
+    run = AI_STORE.get(job.get("run_id", "")) or {}
+    if not run:
+        raise ValueError("auto-review run record is missing")
+    cfg = portal_settings.load()["ai"]
+    tid, slot = job["task_id"], job["ws_slot"]
+    occupied_here = False
+
+    def step(key: str, label: str, state: str = "running", detail: str = "") -> None:
+        with ALIGN_LOCK:
+            steps = job.setdefault("steps", [])
+            if steps and steps[-1]["state"] == "running":
+                steps[-1]["state"] = "done"
+            if state == "running":
+                steps.append({"key": key, "label": label, "state": state,
+                              "started": wm.stamp(), "errors": [], "detail": detail})
+            elif steps:
+                steps[-1].update(state=state, detail=detail or steps[-1].get("detail", ""))
+            job["current"] = label if state == "running" else None
+
+    def fail(message: str) -> None:
+        step("", "", "error", message)
+        run.update(status="error", error=message, finished=ai.now_iso())
+        AI_STORE.save(run)
+        with ALIGN_LOCK:
+            job.update(status="error", current=None, message=message)
+
+    run.update(status="running", started=ai.now_iso())
+    AI_STORE.save(run)
+    try:
+        task = _task(tid)
+        if task is None:
+            return fail(f"{tid} no longer exists")
+        rec = wm.record(slot)
+        need = job.get("need") or review_requirement(task)
+        step("manifest", f"Checking {rec['label']} deploys {_need_text(need)}")
+        # Re-read at execution: the workspace may have been re-synced while queued.
+        why = review_workspace_mismatch(rec, need)
+        if why:
+            return fail(f"{rec['label']} can no longer review {_need_text(need)}: {why}")
+        if not job.get("held"):
+            step("occupy", f"Occupying and aligning {rec['label']}")
+            sub_id = start_workspace_job("occupy", slot,
+                                         {"action": "occupy", "type": "task", "task_id": tid})
+            sub = _wait_action(sub_id)
+            if sub.get("status") != "done":
+                return fail(f"occupy/align failed: {sub.get('message') or sub.get('status')}")
+            occupied_here = True
+        before = _draft_marks(_task(tid) or task)
+        step("review", f"AI review in {rec['label']}")
+        mode = job.get("mode") or "create"
+        argv = ai.build_argv(ai.review_prompt(task, rec["path"], need["revision"], mode),
+                             model=cfg["model"], profile="review",
+                             allow_reads=cfg["allow_jira_github_reads"])
+        result = ai.run_copilot(argv, cwd=rec["path"], timeout=cfg["review_timeout_s"],
+                                on_line=_ai_progress(job))
+        _ai_finish(run, result)
+        after = _draft_marks(_task(tid) or task)
+        fresh = [k for k, v in after.items() if before.get(k) != v]
+        run["drafts"] = len(fresh)
+        unchanged = (mode == "rereview" and not fresh
+                     and ai.NO_CHANGE_MARK in (result.get("answer") or ""))
+        if not result.get("error") and not fresh and not unchanged:
+            run.update(status="error", error="the review finished but registered no draft")
+        AI_STORE.save(run)
+        if fresh:
+            what = "initial auto review draft" if mode == "create" else "AI re-review draft"
+            tm_note(tid, f"{what} done ({len(fresh)} draft(s), portal {run['id']})")
+        outcome = run["error"] or (
+            f"no new commits since the last review of {tid}; draft unchanged" if unchanged
+            else f"{len(fresh)} draft(s) registered on {tid}")
+        step("", "", "error" if run["error"] else "done", outcome)
+        release = ""
+        if occupied_here:
+            step("free", f"Releasing {rec['label']}")
+            sub = _wait_action(start_workspace_job("free", slot, {}))
+            if sub.get("status") == "done":
+                release = f"; {rec['label']} released"
+                step("", "", "done")
+            else:
+                release = (f"; {rec['label']} NOT released "
+                           f"({sub.get('message') or sub.get('status')}) - free it in Workspaces")
+                step("", "", "error", release)
+        with ALIGN_LOCK:
+            job.update(status="error" if run["error"] else "done", current=None,
+                       message=outcome + release)
+    except Exception as error:                                   # noqa: BLE001
+        fail(str(error))
+        if occupied_here:
+            try:
+                start_workspace_job("free", slot, {})
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------- review chat ----
+# Interactive review: a server-side /pr-review local conversation held in a
+# review workspace. Every user message is one queued ``--resume`` turn; the
+# chat record (state/ai/chats/rc-*.json) ties the session, the workspace and
+# the turns together. Posting to GitHub needs a preview the user confirmed.
+REVIEW_CHAT_IDLE_S = 24 * 3600
+REVIEW_CHAT_SWEEP_EVERY = 600
+REVIEW_CHAT_LOCK = _threading.RLock()
+CHAT_OPS = {"open", "turn", "preview", "submit", "end"}
+# A start cut off by a portal restart: the chat and its workspace are kept
+# and the user can Retry start or End review (nothing is replayed unasked).
+CHAT_INTERRUPTED = "interrupted"
+
+
+def _chat_update(chat_id: str, **fields) -> dict:
+    with REVIEW_CHAT_LOCK:
+        chat = AI_STORE.get_chat(chat_id)
+        if chat is None:
+            raise ValueError("unknown review chat")
+        chat.update(fields)
+        return AI_STORE.save_chat(chat)
+
+
+def _chat_job(chat_id: str) -> dict | None:
+    with ALIGN_LOCK:
+        for job in ALIGN_JOBS.values():
+            if (job.get("kind") == "review-chat" and job.get("chat_id") == chat_id
+                    and job.get("status") in {"queued", "running"}):
+                return dict(job)
+    return None
+
+
+def review_chat_public(chat: dict) -> dict:
+    turns = []
+    for run_id in chat.get("turns") or []:
+        run = AI_STORE.get(run_id)
+        turns.append(ai_public(run) if run else
+                     {"id": run_id, "status": "error", "error": "this turn has expired"})
+    busy = _chat_job(chat["id"])
+    return {**chat, "turns": turns, "busy": bool(busy),
+            "busy_op": (busy or {}).get("op"), "progress": (busy or {}).get("current"),
+            "usage": ai_usage_payload()}
+
+
+def review_chat_summary(chat: dict) -> dict:
+    return {k: chat.get(k) for k in ("id", "task_id", "status", "workspace", "created",
+                                    "last_activity", "ended", "end_reason")}
+
+
+def _enqueue_chat(chat: dict, op: str, run_id: str | None = None, **extra) -> str:
+    title = {"open": "Interactive review", "turn": "Review chat", "preview": "Review preview",
+             "submit": "Submit review", "end": "End interactive review"}[op]
+    title = f"{title} {chat['task_id']} \u00b7 {chat.get('workspace', '')}"
+    return enqueue_action({"kind": "review-chat", "op": op, "chat_id": chat["id"],
+                           "run_id": run_id, "task_id": chat["task_id"],
+                           "ws_id": chat.get("ws_id"), "title": title, "slot": title,
+                           "current": "queued", "message": "", "repos": [], "total": 0,
+                           "link": f"review-chat/{chat['id']}", **extra})
+
+
+def start_review_chat(tid: str) -> dict:
+    cfg = portal_settings.load()["ai"]
+    if not cfg["enabled"]:
+        raise ValueError("AI is turned off in Settings")
+    task = _review_task(tid)
+    existing = AI_STORE.chats(tid, open_only=True)
+    if existing:
+        return {"chat_id": existing[0]["id"], "resumed": True,
+                "workspace": existing[0].get("workspace")}
+    busy = _review_busy(tid)
+    if busy:
+        raise ValueError(busy)
+    need = review_requirement(task)
+    rec, held = pick_review_workspace(tid, need)
+    AI_STORE.reserve(cfg.get("interactive_daily_cap", 150), "interactive")
+    chat = ai.new_chat(tid, workspace=rec["label"], ws_id=rec["id"], ws_slot=rec["slot"],
+                       ws_path=rec["path"], need=need, held=held,
+                       title=task.get("title", ""))
+    run = ai.new_run("review-turn", section="work", task_id=tid, chat_id=chat["id"],
+                     role="open", question="Start the interactive review")
+    chat["turns"] = [run["id"]]
+    AI_STORE.save(run)
+    AI_STORE.save_chat(chat)
+    job_id = _enqueue_chat(chat, "open", run["id"])
+    return {"chat_id": chat["id"], "job": job_id, "resumed": False,
+            "workspace": rec["label"], "manifest": _need_text(need)}
+
+
+def review_chat_action(chat_id: str, op: str, body: dict) -> dict:
+    """Queue a user message, a submit preview/confirmation, a start retry or the end."""
+    cfg = portal_settings.load()["ai"]
+    if op not in {"turn", "preview", "submit", "end", "retry"}:
+        raise ValueError("unknown review chat action")
+    with REVIEW_CHAT_LOCK:
+        chat = AI_STORE.get_chat(chat_id)
+        if chat is None:
+            raise LookupError("unknown review chat")
+        if chat["status"] == "ended":
+            raise ValueError("this interactive review has ended")
+        if _chat_job(chat_id):
+            raise ValueError("wait for the current answer first")
+        if op == "end":
+            free = body.get("free", True)
+            if not isinstance(free, bool):
+                raise ValueError("free must be true or false")
+            return {"job": _enqueue_chat(chat, "end", None, free=free, reason="ended by user")}
+        if not cfg["enabled"]:
+            raise ValueError("AI is turned off in Settings")
+        if op == "retry":
+            if chat["status"] != CHAT_INTERRUPTED:
+                raise ValueError("only an interrupted start can be retried")
+            AI_STORE.reserve(cfg.get("interactive_daily_cap", 150), "interactive")
+            run = ai.new_run("review-turn", section="work", task_id=chat["task_id"],
+                             chat_id=chat_id, role="open",
+                             question="Start the interactive review (retry)")
+            AI_STORE.save(run)
+            chat["turns"].append(run["id"])
+            chat.update(status="starting", last_activity=ai.now_iso(), interrupted=None)
+            AI_STORE.save_chat(chat)
+            return {"job": _enqueue_chat(chat, "open", run["id"]), "run_id": run["id"]}
+        if chat["status"] != "open" or not chat.get("session_id"):
+            raise ValueError("the review session is not ready")
+        extra: dict = {}
+        if op == "turn":
+            message = body.get("message")
+            if not isinstance(message, str) or not message.strip():
+                raise ValueError("a message is required")
+            question, role = message.strip()[:8000], "turn"
+        elif op == "preview":
+            question, role = "Submit: preview the final review", "preview"
+        else:
+            preview = AI_STORE.get(str(body.get("preview_run") or ""))
+            if (not preview or preview.get("chat_id") != chat_id
+                    or preview["id"] != chat.get("preview_run")
+                    or preview.get("status") != "done"):
+                raise ValueError("confirm the latest submit preview first")
+            if chat.get("turns") and chat["turns"][-1] != preview["id"]:
+                raise ValueError("the conversation moved on after that preview; "
+                                 "press Submit again for a fresh preview")
+            question, role = "Submit: post the confirmed review", "submit"
+            extra["preview_run"] = preview["id"]
+        AI_STORE.reserve(cfg.get("interactive_daily_cap", 150), "interactive")
+        run = ai.new_run("review-turn", section="work", task_id=chat["task_id"],
+                         chat_id=chat_id, role=role, question=question)
+        AI_STORE.save(run)
+        chat["turns"].append(run["id"])
+        chat["last_activity"] = ai.now_iso()
+        AI_STORE.save_chat(chat)
+        return {"job": _enqueue_chat(chat, op, run["id"], **extra), "run_id": run["id"]}
+
+
+def _free_chat_workspace(chat: dict) -> str:
+    if not chat.get("occupied_here"):
+        return ""
+    sub = _wait_action(start_workspace_job("free", chat["ws_slot"], {}))
+    if sub.get("status") == "done":
+        return f"{chat['workspace']} released"
+    return (f"{chat['workspace']} NOT released ({sub.get('message') or sub.get('status')})"
+            " - free it in Workspaces")
+
+
+def _end_chat(job: dict, chat: dict, reason: str, free: bool) -> str:
+    release = _free_chat_workspace(chat) if free else ""
+    if not free and chat.get("occupied_here"):
+        release = f"{chat['workspace']} kept for {chat['task_id']}"
+    _chat_update(chat["id"], status="ended", ended=ai.now_iso(), end_reason=reason,
+                 occupied_here=bool(chat.get("occupied_here")) and not release.endswith("released"))
+    tm_note(chat["task_id"], f"interactive AI review ended ({reason}; portal {chat['id']})")
+    message = f"interactive review of {chat['task_id']} ended ({reason})" + (
+        f"; {release}" if release else "")
+    with ALIGN_LOCK:
+        job.update(status="error" if "NOT released" in release else "done",
+                   current=None, message=message)
+    return message
+
+
+def run_review_chat_job(job: dict) -> None:
+    op = job.get("op")
+    if op not in CHAT_OPS:
+        raise ValueError("unknown review chat operation")
+    chat = AI_STORE.get_chat(job.get("chat_id", ""))
+    if chat is None:
+        raise ValueError("review chat record is missing")
+    if op == "end":
+        _end_chat(job, chat, job.get("reason") or "ended", bool(job.get("free", True)))
+        return
+    run = AI_STORE.get(job.get("run_id") or "")
+    if run is None:
+        raise ValueError("review chat turn is missing")
+    cfg = portal_settings.load()["ai"]
+
+    def progress(text: str) -> None:
+        with ALIGN_LOCK:
+            job["current"] = text
+
+    run.update(status="running", started=ai.now_iso())
+    AI_STORE.save(run)
+    try:
+        task = _task(chat["task_id"])
+        if task is None:
+            raise ValueError(f"{chat['task_id']} no longer exists")
+        profile = "review"
+        if op == "open":
+            rec = wm.record(chat["ws_slot"])
+            need = chat["need"]
+            progress(f"checking {rec['label']} deploys {_need_text(need)}")
+            why = review_workspace_mismatch(rec, need)
+            if why:
+                raise ValueError(f"{rec['label']} can no longer review {_need_text(need)}: {why}")
+            if (not chat.get("held") and not chat.get("occupied_here")
+                    and wm.slot_of_task(chat["task_id"]) == chat["ws_slot"]):
+                # A start interrupted by a restart already occupied it.
+                chat = _chat_update(chat["id"], occupied_here=True)
+            if not chat.get("held") and not chat.get("occupied_here"):
+                progress(f"occupying and aligning {rec['label']}")
+                sub = _wait_action(start_workspace_job(
+                    "occupy", chat["ws_slot"],
+                    {"action": "occupy", "type": "task", "task_id": chat["task_id"]}))
+                if sub.get("status") != "done":
+                    raise ValueError(f"occupy/align failed: "
+                                     f"{sub.get('message') or sub.get('status')}")
+                chat = _chat_update(chat["id"], occupied_here=True)
+            prompt = ai.chat_open_prompt(task, chat["ws_path"], need["revision"])
+            resume = None
+        elif op == "turn":
+            prompt, resume = ai.chat_turn_prompt(run["question"]), chat["session_id"]
+        elif op == "preview":
+            prompt, resume = ai.submit_preview_prompt(), chat["session_id"]
+        else:
+            preview = AI_STORE.get(job.get("preview_run") or "") or {}
+            if not preview.get("answer"):
+                raise ValueError("the confirmed preview is no longer available")
+            prompt, resume = ai.submit_prompt(preview["answer"]), chat["session_id"]
+            profile = "review-submit"
+        progress("AI is working")
+        argv = ai.build_argv(prompt, model=cfg["model"], profile=profile,
+                             allow_reads=cfg["allow_jira_github_reads"], resume=resume)
+        result = ai.run_copilot(argv, cwd=chat["ws_path"], timeout=cfg["review_timeout_s"],
+                                on_line=_ai_progress(job))
+        _ai_finish(run, result)
+    except Exception as error:                                   # noqa: BLE001
+        run.update(status="error", error=str(error), finished=ai.now_iso())
+        AI_STORE.save(run)
+    fields: dict = {"last_activity": ai.now_iso()}
+    ok = run.get("status") == "done"
+    if op == "open":
+        if ok and run.get("session_id"):
+            fields.update(status="open", session_id=run["session_id"])
+        else:
+            chat = AI_STORE.get_chat(chat["id"]) or chat
+            _end_chat(job, chat, f"failed to start: {run.get('error') or 'no session'}",
+                      free=True)
+            with ALIGN_LOCK:
+                job.update(status="error")
+            return
+    elif ok and run.get("session_id"):
+        fields["session_id"] = run["session_id"]
+    if op == "preview" and ok:
+        fields["preview_run"] = run["id"]
+    if op == "submit" and ok:
+        fields.update(submitted_run=run["id"], preview_run=None)
+        tm_note(chat["task_id"], f"interactive AI review submitted to GitHub "
+                                 f"(portal {chat['id']})")
+    _chat_update(chat["id"], **fields)
+    first = (run.get("answer") or "").strip().splitlines() or [""]
+    with ALIGN_LOCK:
+        job.update(status="done" if ok else "error", current=None,
+                   message=run.get("error") or first[0][:200])
+
+
+def sweep_review_chats(now: float | None = None) -> list[str]:
+    """End chats idle past REVIEW_CHAT_IDLE_S (workspace freed, draft kept)."""
+    now = time.time() if now is None else now
+    ended = []
+    for chat in AI_STORE.chats(open_only=True):
+        try:
+            last = datetime.fromisoformat(chat.get("last_activity") or chat["created"])
+        except (KeyError, ValueError):
+            continue
+        if now - last.timestamp() < REVIEW_CHAT_IDLE_S:
+            continue
+        with REVIEW_CHAT_LOCK:
+            if _chat_job(chat["id"]):
+                continue
+            _enqueue_chat(chat, "end", None, free=True,
+                          reason="idle 24 h - workspace released, draft kept")
+        ended.append(chat["id"])
+    return ended
+
+
+def recover_review_chats() -> None:
+    """After a restart, keep every chat (the conversation survives a restart).
+
+    Chat jobs still queued are resumed by the action queue and are left alone.
+    A turn whose job was cut off mid-run is marked failed ("send it again");
+    the chat stays open on its session. A start cut off mid-run becomes
+    ``interrupted``: the workspace stays with the task (an occupy that already
+    happened is recorded) and the panel offers Retry start / End review. The
+    24 h idle release still applies.
+    """
+    with ALIGN_LOCK:
+        pending = {job.get("run_id") for job in ALIGN_JOBS.values()
+                   if job.get("kind") == "review-chat"
+                   and job.get("status") in {"queued", "running"}}
+    for chat in AI_STORE.chats(open_only=True):
+        for run_id in chat.get("turns") or []:
+            run = AI_STORE.get(run_id)
+            if run and run.get("status") in {"queued", "running"} and run_id not in pending:
+                run.update(status="error", error="interrupted by a portal restart; "
+                                                 "send the message again",
+                           finished=ai.now_iso())
+                AI_STORE.save(run)
+        if chat.get("status") != "starting" or _chat_job(chat["id"]):
+            continue
+        fields: dict = {"status": CHAT_INTERRUPTED,
+                        "interrupted": "start interrupted by a portal restart"}
+        if (not chat.get("held") and not chat.get("occupied_here")
+                and wm.slot_of_task(chat["task_id"]) == chat.get("ws_slot")):
+            fields["occupied_here"] = True
+        _chat_update(chat["id"], **fields)
+
+
+def run_review_chat_sweeper(stop: _threading.Event) -> None:
+    while not stop.wait(REVIEW_CHAT_SWEEP_EVERY):
+        try:
+            sweep_review_chats()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def live_payload() -> dict:
+    return {"links": LIVE.snapshot() if LIVE else {}, "changed": LIVE_STATE["changed"]}
+
+
+ACTION_TITLES = {"pr-scan": "Scan PRs", "review-scan": "Scan reviews", "align": "Align workspace",
+                 "pldm": "Submit PLDM test", "vm-refresh": "Refresh machine activity",
+                 "ai": "AI", "auto-review": "AI review draft",
+                 "review-chat": "Interactive review"}
+
+
+def action_title(job: dict) -> str:
+    if job.get("title"):
+        return str(job["title"])
+    kind = job.get("kind", "action")
+    head = job.get("action") if kind == "workspace-action" else ACTION_TITLES.get(kind, kind)
+    tail = job.get("slot") or job.get("target") or ""
+    return f"{head} \u00b7 {tail}" if tail else str(head)
+
+
+def notify_action(job: dict) -> None:
+    """Queue completion -> notification (AI kinds report under 'ai')."""
+    status = job.get("status")
+    if status not in {"done", "error", "approval_required"}:
+        return
+    if status == "done" and job.get("kind") == "vm-refresh":
+        return
+    # Chat replies show up in the open panel; only failures pop up.
+    if (status == "done" and job.get("kind") == "review-chat"
+            and job.get("op") in {"turn", "preview"}):
+        return
+    label = action_title(job)
+    kind = "ai" if job.get("kind") in {"ai", "auto-review", "review-chat"} else "queue"
+    text = {"done": "finished", "error": "failed",
+            "approval_required": "needs approval"}[status]
+    EVENTS.publish(kind, f"{label} {text}", (job.get("message") or "")[:300],
+                   {"done": "ok", "error": "bad"}.get(status, "warn"),
+                   job.get("link") or "")
+
+
+def execute_and_notify(job: dict, store_lock=None) -> None:
+    try:
+        execute_action(job, store_lock)
+    except Exception as error:
+        notify_action({**job, "status": "error", "message": str(error)})
+        raise
+    notify_action(job)
+
+
 def start_vm_refresh_job(target: str | None = None) -> str:
-    """Queue a VM probe and return its id."""
+    """Queue a machine activity probe and return its id."""
+    slot = f"Machine activity \u00b7 {target}" if target else "Machine activity"
     job = {
-        "kind": "vm-refresh", "slot": f"VM jobs \u00b7 {target}" if target else "VM jobs",
+        "kind": "vm-refresh", "slot": slot,
         "target": target or "",
         "current": None, "total": 0, "message": "", "repos": [],
     }
@@ -2102,8 +3056,8 @@ def run_review_scan(job: dict) -> None:
         message=" \u00b7 ".join(parts))
 
 
-def start_review_scan_job(task_ids: list[str]) -> str:
-    """Queue a review scan for selected tasks."""
+def start_review_scan_job(task_ids: list[str] | None) -> str:
+    """Queue a review scan for selected tasks, or every open review PR (None)."""
     job = {
         "kind": "review-scan", "slot": "reviews",
         "task_ids": task_ids,
@@ -2427,11 +3381,63 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except OSError as exc:
                     print(f"[portal/review-draft] read failed: {exc}", file=sys.stderr)
                     return self._send(500, json.dumps({"error": "Draft could not be read; check service logs"}))
+            route = urlparse(self.path).path
+            if route == "/term":
+                return self._send(200, render_term_page(), "text/html; charset=utf-8")
+            if route == "/ws/term":
+                token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+                spec = terminal.take_token(token)
+                if not spec:
+                    return self._send(403, json.dumps({"error": "terminal token expired or used"}))
+                if not terminal.handshake(self, f"http://{self.headers.get('Host')}"):
+                    return None
+                self.close_connection = True
+                env = vd.agent_env()[0] if vd is not None else None
+                terminal.serve(self.connection, spec, env)
+                return None
+            if route == "/api/events":
+                try:
+                    seq = int(parse_qs(urlparse(self.path).query).get("since", ["0"])[0])
+                except ValueError:
+                    seq = 0
+                body = EVENTS.since(seq)
+                body["live"] = live_payload()
+                body["ai"] = ai_usage_payload()
+                return self._send(200, json.dumps(body))
+            if route == "/api/ai/runs":
+                query = parse_qs(urlparse(self.path).query)
+                section = query.get("section", [None])[0]
+                runs = AI_STORE.recent(30, section)
+                if self.headers.get("X-Team-Private") != "1":
+                    runs = [r for r in runs if r.get("section") != "team"]
+                return self._send(200, json.dumps({"runs": runs, "usage": ai_usage_payload()},
+                                                  ensure_ascii=False))
+            if route.startswith("/api/ai/run/"):
+                run = AI_STORE.get(route.rsplit("/", 1)[-1])
+                if run is None:
+                    return self._send(404, json.dumps({"error": "unknown AI run"}))
+                if run.get("private") and self.headers.get("X-Team-Private") != "1":
+                    return self._send(403, json.dumps({"error": "enable private mode to read this answer"}))
+                return self._send(200, json.dumps(ai_public(run), ensure_ascii=False))
+            if route == "/ai-chat":
+                return self._send(200, render_aichat_page(), "text/html; charset=utf-8")
+            if route == "/api/ai/review-chats":
+                query = parse_qs(urlparse(self.path).query)
+                chats = AI_STORE.chats(query.get("task", [None])[0],
+                                       open_only=query.get("open", ["0"])[0] == "1")
+                return self._send(200, json.dumps({"chats": [review_chat_summary(c)
+                                                             for c in chats[:50]]}))
+            if route.startswith("/api/ai/review-chat/"):
+                chat = AI_STORE.get_chat(route.rsplit("/", 1)[-1])
+                if chat is None:
+                    return self._send(404, json.dumps({"error": "unknown review chat"}))
+                return self._send(200, json.dumps(review_chat_public(chat), ensure_ascii=False))
+            if route == "/api/term/active":
+                return self._send(200, json.dumps({"sessions": terminal.active()}))
             if self.path.startswith("/assets/"):
                 name = self.path[len("/assets/"):].split("?")[0]
                 ctype = ASSET_TYPES.get(Path(name).suffix)
-                # Only the three known asset names, so a crafted path cannot escape.
-                if name not in ("portal.css", "portal.js", "team.js") or not ctype:
+                if name not in ASSET_NAMES or not ctype:
                     return self._send(404, json.dumps({"error": "not found"}))
                 return self._send(200, asset_text(name), ctype)
             if self.path in ("/", "/index.html"):
@@ -2488,6 +3494,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(404, json.dumps({"error": f"no such note: {name}"}))
                 return self._send(200, json.dumps({"name": name, "text": text},
                                                   ensure_ascii=False))
+            if self.path == "/api/settings":
+                return self._send(200, json.dumps(portal_settings.payload(), ensure_ascii=False))
             if self.path == "/api/overview":
                 with lock:
                     return self._send(200, json.dumps(overview_payload(), ensure_ascii=False))
@@ -2497,8 +3505,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if self.path == "/api/raid":
                 with RAID_LOCK:
                     return self._send(200, json.dumps(raid_payload(), ensure_ascii=False))
-            if self.path == "/api/pldm-jobs":
-                return self._send(200, json.dumps(pldmq_payload(), ensure_ascii=False))
             if self.path == "/api/vm-jobs":
                 return self._send(200, json.dumps(vmlog_payload(), ensure_ascii=False))
             if self.path == "/api/actions":
@@ -2516,11 +3522,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     job = ALIGN_JOBS.get(jid)
                     body = json.dumps({k: v for k, v in job.items() if k != "request"},
                                       ensure_ascii=False) if job else None
-                if job and job["status"] == "queued" and ACTION_QUEUE is not None:
-                    queued = next((j for j in ACTION_QUEUE.snapshot()["actions"]
-                                   if j["id"] == jid), None)
-                    if queued:
-                        body = json.dumps(queued, ensure_ascii=False)
+                if job and ACTION_QUEUE is not None:
+                    try:
+                        snapshot = ACTION_QUEUE.snapshot()
+                    except (sqlite3.Error, OSError) as e:
+                        return self._send(503, json.dumps({"error": f"Action queue storage unavailable: {e}"}))
+                    reading = next((j for j in snapshot["actions"] if j["id"] == jid), None)
+                    if reading:
+                        body = json.dumps(reading, ensure_ascii=False)
                 if body is None:
                     return self._send(404, json.dumps({"error": "unknown job"}))
                 return self._send(200, body)
@@ -2565,18 +3574,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 if pm is None:
                     return self._send(503, json.dumps({"error": "pr-monitor not installed"}))
                 only = None
+                jira = True
                 n = int(self.headers.get("Content-Length") or 0)
                 if n:
                     try:
-                        ids = json.loads(self.rfile.read(n) or b"{}").get("feature_ids")
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                        ids = body.get("feature_ids")
                         if ids is not None:
                             only = [int(i) for i in ids]
                     except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
                         return self._send(400, json.dumps({"error": "feature_ids must be a list of ids"}))
                     if only is not None and not only:
                         return self._send(400, json.dumps({"error": "no features selected"}))
+                    jira = body.get("jira_sync", True)
+                    if not isinstance(jira, bool):
+                        return self._send(400, json.dumps({"error": "jira_sync must be a boolean"}))
                 try:
-                    jid = start_pr_scan_job(only)
+                    jid = start_pr_scan_job(only) if jira else start_pr_scan_job(only, jira=False)
                 except Exception as e:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "job": jid}))
@@ -2611,22 +3625,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
 
-            # The PLDM queue scan follows every active tracked job through the
-            # gh CLI (bodyless, slow-ish, zero tokens). It returns the refreshed
-            # payload directly so the section can re-render in place.
-            if self.path == "/api/pldm-scan":
-                if pjq is None:
-                    return self._send(503, json.dumps({"error": "pldm-job-queue not installed"}))
-                if not PLDMQ_SCAN_LOCK.acquire(blocking=False):
-                    return self._send(409, json.dumps({"error": "a PLDM scan is already running"}))
-                try:
-                    result = pjq.portal_scan()
-                except Exception as e:
-                    return self._send(500, json.dumps({"error": str(e)}))
-                finally:
-                    PLDMQ_SCAN_LOCK.release()
-                return self._send(200, json.dumps(result, ensure_ascii=False))
-
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -2637,7 +3635,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
             # Only selected task IDs may enter a review scan. The task-manager
             # owner applies its own eligibility and unresolved-PR rules.
+            # {"scope": "all"} (daily maintenance) re-probes every open review PR.
             if self.path == "/api/review-scan":
+                if "scope" in payload and payload != {"scope": "all"}:
+                    return self._send(400, json.dumps({"error": 'scope must be exactly {"scope": "all"}'}))
+                if payload == {"scope": "all"}:
+                    try:
+                        jid = start_review_scan_job(None)
+                    except Exception as e:
+                        return self._send(500, json.dumps({"error": str(e)}))
+                    return self._send(200, json.dumps({"ok": True, "align_job": jid}))
                 task_ids = payload.get("task_ids")
                 if (not isinstance(task_ids, list) or not task_ids
                         or any(not isinstance(ident, str) or not ident for ident in task_ids)
@@ -2649,6 +3656,91 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except Exception as e:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "align_job": jid}))
+
+            # Daily maintenance: drop finished ("done") queue history older than
+            # the retention window. Pending, running, failed and approval
+            # results are kept. Same-origin only; no browser control calls it.
+            if self.path == "/api/maintenance/queue-retention":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                days = payload.get("days")
+                if set(payload) != {"days"} or not isinstance(days, int) or isinstance(days, bool) \
+                        or days < 7:
+                    return self._send(400, json.dumps({"error": "days must be an integer >= 7"}))
+                if ACTION_QUEUE is None:
+                    return self._send(503, json.dumps({"error": "Action queue unavailable"}))
+                try:
+                    result = ACTION_QUEUE.prune(days)
+                except (sqlite3.Error, OSError) as e:
+                    return self._send(503, json.dumps({"error": f"Action queue storage unavailable: {e}"}))
+                return self._send(200, json.dumps({"ok": True, **result}))
+
+            # Portal-owned settings. Same-origin only; revision-checked; each
+            # change is journaled. Schedule edits rewrite the timer drop-in.
+            chat_route = re.fullmatch(r"/api/ai/review-chat(?:/(rc-[0-9a-f]{32})/(turn|preview|submit|end|retry))?",
+                                      self.path)
+            if self.path in ("/api/ai/run", "/api/ai/auto-review") or chat_route:
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                try:
+                    if self.path == "/api/ai/run":
+                        result = start_ai_run(payload, self.headers.get("X-Team-Private") == "1")
+                    elif chat_route and chat_route.group(1):
+                        result = review_chat_action(chat_route.group(1), chat_route.group(2),
+                                                    payload)
+                    else:
+                        tid = payload.get("task_id")
+                        if not isinstance(tid, str) or not re.fullmatch(r"T-\d+", tid):
+                            raise ValueError("task_id must be a task id")
+                        if chat_route:
+                            result = start_review_chat(tid)
+                        else:
+                            result = start_auto_review(tid, payload.get("mode") or "create")
+                except LookupError as e:
+                    return self._send(404, json.dumps({"error": str(e)}))
+                except ai.CapReached as e:
+                    return self._send(429, json.dumps({"error": str(e)}))
+                except PermissionError as e:
+                    return self._send(403, json.dumps({"error": str(e)}))
+                except (ValueError, RuntimeError) as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, **result}))
+
+            if self.path == "/api/term/open":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                try:
+                    spec = term_spec(payload)
+                    token = terminal.issue_token(spec)
+                except terminal.TermError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"token": token, "title": spec["title"],
+                                                   "kind": spec["kind"]}, ensure_ascii=False))
+
+            if self.path == "/api/settings":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if set(payload) != {"revision", "settings"}:
+                    return self._send(400, json.dumps({"error": "send exactly {revision, settings}"}))
+                try:
+                    result = portal_settings.save(payload["settings"], payload["revision"])
+                except portal_settings.SettingsError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                except portal_settings.RevisionConflict as e:
+                    return self._send(409, json.dumps({"error": str(e)}))
+                except portal_settings.ApplyError as e:
+                    _journal_settings("failed", str(e), "")
+                    return self._send(500, json.dumps({"error": str(e)}))
+                if result["changed"]:
+                    _journal_settings("completed", "; ".join(result["changed"]), result["applied"])
+                    if LIVE is not None:
+                        threading.Thread(target=LIVE.sync, daemon=True).start()
+                return self._send(200, json.dumps({"ok": True, **result,
+                                                   **portal_settings.payload()}, ensure_ascii=False))
 
             if self.path == "/api/tasks/bulk-edit":
                 edits = payload.get("edits")
@@ -2791,7 +3883,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 ok, msg, _slot = wm.track(
                     payload.get("path", ""), label=payload.get("label"),
                     rev=payload.get("rev"), group=payload.get("group"),
-                    badge=payload.get("badge"), target=payload.get("target"))
+                    badge=payload.get("badge"), target=payload.get("target"),
+                    purpose=payload.get("purpose", "general"))
                 if not ok:
                     return self._send(400, json.dumps({"error": msg}))
                 return _roster_reply(msg)
@@ -2812,7 +3905,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if self.path.startswith("/api/ws-meta/"):
                 slot = unquote(self.path[len("/api/ws-meta/"):])
                 try:
-                    ok, msg = wm.set_slot_fields(slot, payload)
+                    if ("purpose" in payload and ACTION_QUEUE is not None
+                            and payload["purpose"] != wm.record(slot).get("purpose", "general")):
+                        with ACTION_QUEUE.idle_resources({"workspace:" + wm.record(slot)["id"]}):
+                            ok, msg = wm.set_slot_fields(slot, payload)
+                    else:
+                        ok, msg = wm.set_slot_fields(slot, payload)
                 except ValueError as e:
                     return self._send(409, json.dumps({"error": str(e)}))
                 if not ok:
@@ -2919,7 +4017,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # Owner transactions also protect independent CLI writers.
             if self.path in ("/api/pr-track", "/api/pr-untrack",
                              "/api/feature-track", "/api/feature-untrack",
-                             "/api/feature-edit"):
+                             "/api/feature-edit", "/api/feature-jira-coverage"):
                 if pm is None:
                     return self._send(503, json.dumps({"error": "pr-monitor not installed"}))
                 if not PR_SCAN_LOCK.acquire(blocking=False):
@@ -2985,7 +4083,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     httpd = Server(("127.0.0.1", args.port), Handler)
     ACTION_QUEUE = ActionQueue(
         STATE_DIR / "action-queue.db",
-        lambda job: execute_action(job, lock), ALIGN_JOBS, ALIGN_LOCK)
+        lambda job: execute_and_notify(job, lock), ALIGN_JOBS, ALIGN_LOCK,
+        resources=action_resources, max_workers=4)
     ACTION_QUEUE.start()
     PID_FILE.write_text(str(os.getpid()))
 
@@ -2996,9 +4095,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     worker = threading.Thread(target=httpd.serve_forever, daemon=True)
     worker.start()
 
-    # Keeps VM job statuses honest without a click: see run_vm_watchdog.
+    # Keeps delegated machine job statuses honest without a click.
     if vd is not None:
         threading.Thread(target=run_vm_watchdog, args=(stop,), daemon=True).start()
+        start_live_status()
+    try:
+        recover_review_chats()
+    except Exception as error:                                   # noqa: BLE001
+        print(f"[portal/review-chat] recovery failed: {error}", file=sys.stderr)
+    threading.Thread(target=run_review_chat_sweeper, args=(stop,), daemon=True).start()
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     print(f"[tm] serving editable dashboard at http://127.0.0.1:{args.port} (Ctrl-C to stop)")
@@ -3007,6 +4112,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if LIVE is not None:
+            LIVE.stop()
         ACTION_QUEUE.stop()
         httpd.shutdown()
         httpd.server_close()

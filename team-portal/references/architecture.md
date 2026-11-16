@@ -13,10 +13,13 @@ NFS or share them between machines without a supported database service.
 | Workspace roster/occupancy | `workspace-manager/wm.py` | `~/tasks/workspaces.db` |
 | Outgoing features/PR observations | `pr-monitor/pm.py` | `~/tasks/prs.db` |
 | RAID | `team-planner/rd.py` | `~/tasks/raid.db` |
-| Local PLDM tracking | `pldm-job-queue/pjq.py` | `~/tasks/pldm.db` |
+| Local PLDM tracking (not surfaced in the portal; the job queue lives in the company PLDM portal) | `pldm-job-queue/pjq.py` | `~/tasks/pldm.db` |
 | Delegation observations/history | `vm-delegate/vd.py` | `~/tasks/delegation.db` |
 | Website maintenance actions | `../team-portal/maintenance.py` | `~/.copilot-private/team-portal/state/portal-maintenance.db` |
 | Portal action scheduling | `../team-portal/action_queue.py`, `portal.py` | `~/.copilot-private/team-portal/state/action-queue.db` |
+| Daily maintenance brief (derived) | `../team-portal/routine.py` | `~/.copilot-private/team-portal/state/morning-brief.json` |
+| Portal settings (routine schedule/behaviour) | `../team-portal/portal_settings.py` via `/api/settings` | `~/.copilot-private/team-portal/state/portal-settings.json` |
+| AI runs and daily usage (derived answers, not domain data) | `../team-portal/ai.py`, `portal.py` | `~/.copilot-private/team-portal/state/ai/` (`runs/*.json`, `chats/rc-*.json`, `usage.json`) |
 
 Paths in the API column are relative to `~/.copilot/skills/`.
 Use the owning skill's supported CLI/API; never directly mutate SQLite.
@@ -24,11 +27,44 @@ Use the owning skill's supported CLI/API; never directly mutate SQLite.
 mechanics, not business rules.
 
 All portal source lives under `~/.copilot/team-portal/`: implementation, assets,
-tests, these references and the canonical `deploy/task-dashboard.service` unit.
+tests, these references and the canonical `deploy/` units (`task-dashboard.service`,
+`portal-maintenance.service`/`.timer`).
 Private runtime state lives under `~/.copilot-private/team-portal/state/`
-(journal, PID, static export, migration report and recovery snapshots). The skill folder holds only `SKILL.md`. The systemd
-user folder has a registration symlink, not another copy of the unit.
+(journal, PID, static export, migration report, morning brief and recovery
+snapshots, including the rotating `backups/daily/`). The skill folder holds only `SKILL.md`. The systemd
+user folder has registration symlinks, not other copies of the units. The one
+generated file there is `portal-maintenance.timer.d/schedule.conf`, which
+`portal_settings.py` owns and rewrites from the Settings schedule. Never edit it
+by hand.
 Domain-owned code/data and the shared SQLite helper are intentionally external.
+The Overview owns no data. `assets/pulse.js` is a pure module (no DOM, no
+fetches) that turns the payloads other sections already serve into the Live
+pulse cards, hygiene rules and per-member activity summaries. The page,
+`team.js` and the routine all run that one module: the routine's `pulse` step
+pipes owner-API payloads into `node assets/pulse.js --snapshot` and stores the
+numbers in the morning brief so the page can show deltas. `GET /api/overview`
+returns only the brief.
+The one narrow exception to "never open domain databases" is the daily
+routine's `PRAGMA integrity_check`, which opens `~/tasks/*.db` with
+`mode=ro` and never writes; every domain refresh still goes through owner APIs.
+
+## AI, terminal, live link and events
+
+- **AI** (`ai.py`) runs the Copilot CLI headless; the portal is only its scheduler and
+  context builder. Context comes from the same payloads the section renders (owner APIs),
+  never from direct database reads. AI output is advisory and stored as portal-owned
+  derived records; it changes no domain data. The AI paths that write are the review
+  ones (draft, re-review, interactive), and they do so only through owners: workspace
+  occupy/free via the workspace actions, draft registration via `tm.py review-draft`, and
+  task notes via `tm`'s transaction. Posting to GitHub happens only in an interactive
+  review's submit run, after the user confirmed its preview, under a dedicated profile.
+- **Terminal** (`terminal.py`, `assets/term.js`) is an in-process WebSocket↔pty bridge
+  around `mctl -t <target> term`. Machine access and tmux state stay with the machine
+  tooling; the portal holds no session state across restarts (tmux keeps the remote side).
+- **Live link** (`live_status.py`) is one `mctl jobs-watch` ssh session per target;
+  readings still land in `delegation.db` only through `vd.refresh(preprobed=…)`.
+- **Events** (`events.py`) is an in-memory bus (last 200) for notifications; it is not a
+  record and is lost on restart by design.
 
 ## Authority
 
@@ -63,13 +99,37 @@ recoverable. Portal locks coordinate HTTP jobs; they do not replace owner
 storage concurrency control for independent CLI processes.
 
 The portal's action queue owns execution order and job readings, not domain
-records. A single worker executes FIFO descriptors through the existing owner
-APIs. Submission is durable before acknowledgement. Pending descriptors resume
+records. A resource-aware scheduler runs at most three descriptors concurrently
+through existing owner APIs. Conflicting actions retain submission order;
+independent actions may bypass a blocked action. Canonical workspace IDs,
+remote machine targets and shared owner domains provide exclusive claims.
+Batch actions claim their complete resource set atomically. Review scans and
+task reassignment claim all workspaces because they can release other holds;
+automatic PLDM workspace selection and unknown action kinds run exclusively.
+Mirror operations also claim their source workspace. Claims are resolved from
+owner APIs at dispatch, not accepted from clients or persisted as authority.
+Submission is durable before acknowledgement. Pending descriptors resume
 after a restart; an interrupted running action is marked failed, never replayed
 automatically, because its external side effects may already have occurred.
 Domain locks and checkout guards are acquired/rechecked at execution, not while
-waiting. Inline mutations and the automatic VM watchdog retain their existing
-owner locks and are not part of this user-action FIFO.
+waiting. Claims remain held until results are persisted, including failures.
+Inline mutations (including Team member operations) remain outside this queue
+and retain owner validation and locks. Remote workspace jobs additionally take
+the existing VM lock to exclude inline machine controls and watchdog probes.
+These portal claims do not coordinate independent external CLI operations.
+
+Workspace dedication is owned by `workspace-manager/wm.py`, persisted on roster
+records in `workspaces.db`. General is the backward-compatible default; Review,
+Development, Build root and Mirror carry owner-defined exclusive-use policies.
+The portal renders owner-provided permissions and uses the same assignment APIs;
+it does not maintain a second classification cache. Purpose changes in the
+portal take a scheduler resource guard so queued/running work cannot race the
+metadata write. Workspace operation locks and delegation observations prevent
+repurposing while managed dispatches or unverified jobs reserve the checkout.
+The owner policy also guards supported `mctl` operations, resolving remote
+physical aliases and requiring status reconciliation before dispatch when a
+tracked path differs. Independent arbitrary terminal commands remain outside
+this application-level enforcement.
 
 Imports must be backed up, repeat-safe and verified against their source.
 Common import backups live under `~/tasks/migration-backups/<database>/`.

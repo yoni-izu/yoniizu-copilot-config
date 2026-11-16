@@ -31,6 +31,14 @@ class TeamApiMutationShapeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown member"):
                 team_api.mutate("activity-scan", {"member_key": "missing"})
 
+    def test_onboarding_actions_are_delegated_unchanged(self):
+        intake = {"member_key": "newbie", "display_name": "New", "onboarding_date": "2026-12-01",
+                  "plan_revision": "rev"}
+        for action in ("onboarding-preview", "onboarding-apply"):
+            with patch.object(team_api, "TeamStore") as store:
+                team_api.mutate(action, dict(intake))
+            store.return_value.portal_mutate.assert_called_once_with(action, intake)
+
     def test_assignment_set_legacy_shape_is_flattened(self):
         with patch.object(team_api, "TeamStore") as store:
             inst = store.return_value

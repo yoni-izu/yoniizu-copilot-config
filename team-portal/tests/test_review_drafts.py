@@ -41,7 +41,7 @@ class DraftViewerTests(unittest.TestCase):
             "[unsafe](javascript:alert(1))\n\n"
             "</pre><script>alert('unsafe')</script>\nFinding"
         )
-        self.draft = portal.tm.attach_review_draft("T-001", self.url, str(self.file), "a" * 40)
+        self.draft = portal.tm.attach_review_draft("T-001", str(self.file), {self.url: "a" * 40})
         self.url_path = f'/review-drafts/T-001/{self.draft["id"]}'
         captured = {}
 
@@ -93,6 +93,19 @@ class DraftViewerTests(unittest.TestCase):
         self.assertNotIn("<script>", result["body"])
         self.assertIn("&lt;script&gt;", result["body"])
 
+    def test_legacy_per_pr_attachment_still_renders_with_its_pr_title(self):
+        legacy = self.drafts / "legacy.md"
+        legacy.write_text("Legacy finding", encoding="utf-8")
+        with portal.tm.task_store.transaction() as data:
+            data["tasks"][0]["reviews"][0]["drafts"] = [
+                {"id": "c" * 32, "file": "legacy.md", "head_sha": "b" * 40,
+                 "created_at": "2026-10-28", "updated_at": "2026-10-28"}]
+        result = self.request("/review-drafts/T-001/" + "c" * 32)
+        self.assertEqual(result["status"], 200)
+        self.assertIn("Legacy finding", result["body"])
+        self.assertIn("T-001 - repo#1", result["body"])
+        self.assertIn("b" * 40, result["body"])
+
     def test_missing_file_surfaces_error_without_filename(self):
         self.file.unlink()
         result = self.request(self.url_path)
@@ -133,7 +146,7 @@ class DraftViewerTests(unittest.TestCase):
         with patches[0], patches[1], patches[2]:
             response = self.request("/api/tasks")
         task = json.loads(response["body"])["tasks"][0]
-        self.assertEqual(task["reviews"][0]["drafts"][0]["id"], self.draft["id"])
+        self.assertEqual(task["review_drafts"][0]["id"], self.draft["id"])
         self.assertNotIn("Finding", response["body"])
         with patch.object(portal, "ws_ui_payload", return_value={}), \
                 patch.object(portal, "bug_payload", return_value={}), \
@@ -141,11 +154,10 @@ class DraftViewerTests(unittest.TestCase):
                 patch.object(portal, "overview_payload", return_value={}), \
                 patch.object(portal, "pr_payload", return_value={}), \
                 patch.object(portal, "raid_payload", return_value={}), \
-                patch.object(portal, "pldmq_payload", return_value={}), \
                 patch.object(portal, "vmlog_payload", return_value={}), \
                 patch.object(portal.team_api, "payload", return_value={}):
             boot = json.loads(portal.boot_payload(data["tasks"], {"slots": {}}))
-        self.assertEqual(boot["tasks"][0]["reviews"][0]["drafts"][0]["id"], self.draft["id"])
+        self.assertEqual(boot["tasks"][0]["review_drafts"][0]["id"], self.draft["id"])
         self.assertNotIn("Finding", json.dumps(boot))
 
 

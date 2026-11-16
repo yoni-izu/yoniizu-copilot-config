@@ -11,15 +11,58 @@ a single page with a top-level section nav:
 
 | Section | Data source | Owning skill | State |
 |---------|-------------|--------------|-------|
-| **Overview** | all of the below + `~/team-planner/` | `portal-maintainer` (aggregator) | live, **landing section** |
+| **Overview** | all of the below (read-only, via each section's API) | `portal-maintainer` (aggregator) | live, **landing section** |
 | **Tasks** | `~/tasks/tasks.db` | `task-manager` | live |
 | **Workspaces** | `~/tasks/workspaces.db` | `workspace-manager` | live |
 | **Bugs** | `~/tasks/bugs.db` (bugs, families, phenomena) + `~/.copilot-private/skills/bug-triage/investigations/*.md` | `bug-monitor` + `bug-triage` | live |
 | **PRs** | `~/tasks/prs.db` | `pr-monitor` | live |
-| **PLDM** | the PLDM job queue | `pldm-job-queue` | live |
-| **VM jobs** | `~/tasks/delegation.db` (mctl log ingestion) | `vm-delegate` | live |
+| **Machines** | `~/tasks/delegation.db` (mctl log ingestion for VMs and lab machines) | `vm-delegate` | live |
 | **RAID** | `~/tasks/raid.db` | `team-planner` | live |
 | **Team** | `~/tasks/team.db` via `team-manager` | `team-manager` | live: Overview / Plan / Members |
+| **Settings** | `state/portal-settings.json` (server) + browser `localStorage` `team-portal-prefs-v1` | `portal-maintainer` | live; editable only when served |
+
+The PLDM job queue section was discontinued (the queue is maintained in the company
+PLDM portal); `/api/pldm-jobs` and `/api/pldm-scan` no longer exist. PLDM test
+submission, status badge and filter remain in **PRs**.
+
+### Settings section
+
+Three tiles:
+
+- **Daily maintenance routine** (server-side, `GET`/`POST /api/settings`):
+  - on/off, run time and run days (Sun–Sat checkboxes with Every day / Sun–Thu / Mon–Fri presets)
+  - per-step toggles for reviews, PRs, bugs, workspaces and team (a turned-off step shows as `off` and does not degrade the run)
+  - auto-restart on failed health
+  - snapshot retention (1–60 days)
+  - action-queue retention (7–365 days)
+  - team activity window (1–168 h)
+  - brief stale threshold (1–168 h)
+
+  Saving:
+  - is revision-checked: a stale form gets 409 and reloads
+  - is validated server-side
+  - is journaled as component `portal-settings`
+
+  A schedule change rewrites the managed timer drop-in and restarts the timer. If the apply fails, the file and the timer are rolled back.
+- **Grouped settings** (same endpoint, same revision check), one tile per group:
+  - **AI assistance**: allow AI runs, model (`fusion` = Copilot picks), runs per day
+    (hard cap across every AI kind; 0 disables), interactive-review messages per day
+    (separate cap, default 150, 0 disables), run timeout, review timeout and
+    whether Explain/Ask may *read* Jira/GitHub. The routine's `ai` step toggle sits with
+    the other step toggles.
+  - **Machines**: terminal targets (get a `>_ Terminal` button), live-status targets
+    (persistent ssh link) and the live update interval (5–300 s).
+  - **Notifications**: master switch, the four kinds (action queue, machine jobs, AI,
+    machine reachability) and the Windows toast fallback.
+- **Routine status**: timer active/enabled, next and last trigger, linger, last brief result, and any schedule problem.
+- **This browser**:
+  - landing section (last visited or a fixed section)
+  - clock 12/24 h/auto
+  - compact tables
+  - action and VM poll intervals
+  - nav order and visibility
+
+  Settings itself can never be hidden. These preferences are per browser and never reach the server.
 
 ### Date presentation standard
 
@@ -37,6 +80,17 @@ Team includes the lead and all engineers. Member pages show focus assignments,
 saved activity, 1:1 sessions and incoming reviews. Sessions and assignments use
 the owner payload's top-level collections, filtered by member key.
 `#member/<key>` and `#team/plan` open the corresponding views.
+
+**Add member (onboarding).** Private mode only (needs `onboarding_spec`), top
+mode bar. The dialog is generated from the owner's intake spec; first submit
+posts `onboarding-preview` (no write) and renders blocking errors, readiness
+gaps with impact, the dated checklist and what registration does not do; the
+button becomes **Register**, and any input change invalidates the preview.
+Register posts `onboarding-apply` with the reviewed `plan_revision`, then opens
+the new member's Items. Overview shows an `Onboarding done/total · N overdue`
+badge until the checklist completes; the member header shows progress, next
+step and (Private only) missing readiness fields. Edit profile exposes role,
+employment type, Jira account ID and GitHub handle to close those gaps.
 
 Presentation mode is the default on every page load. Private mode is explicit
 and is not remembered across reloads. Leaving Team or switching to presentation
@@ -185,28 +239,48 @@ planning dashboard or target-hit forecast.
 
 ### Action queue
 
-All progress-popup jobs use one durable server-side FIFO: workspace status
-checks, Sync, occupy/free, automatic review alignment, PR/review scans, VM job
-refreshes and PLDM submissions. Only one queued action executes at a time.
+All progress-popup jobs use one durable resource-aware queue: workspace status
+checks, Sync, occupy/free, automatic review alignment, PR/review scans, machine
+activity refreshes and PLDM submissions. Up to three independent actions execute at once.
+Actions sharing a workspace, remote machine or affected owner domain wait in
+submission order; unrelated actions can bypass them. Whole-workspace scans claim
+every selected workspace. Shared task-store updates and PR operations remain
+conservatively serialized within their domains. Auto-selected PLDM workspaces
+and unrecognized action kinds run exclusively. Future queued action kinds must
+declare all affected resources (including member IDs for member-scoped actions)
+before opting into concurrency.
 Busy actions wait rather than being rejected because another queued action
 holds their resource. Owner validation and resource locks still apply at
 execution; failed actions show an error and the queue advances.
 
-The top-bar **Actions** button reopens the popup. Its list shows running,
-waiting positions and the latest 20 finished actions; select an entry to see
+The top-bar **Actions** card is wide and live: it names the running action
+(or "N running" when several run) and clicking it toggles a dropdown anchored
+to the card, not a modal popup. The dropdown lists running,
+waiting positions and the latest 20 finished actions; positions describe
+submission order, not a promise of execution order. Select an entry to see
 its progress/result. Collapse hides the list and details while retaining the
 selected action's header. Dismiss does not cancel or clear the queue. Reloading
 reattaches to the queue and completed observed actions refresh saved section
 data without starting external scans.
 
 `GET /api/actions` returns active jobs and recent history; existing submission
-URLs and `GET /api/align/<id>` remain supported. Job states are `queued`,
+URLs and `GET /api/align/<id>` remain supported. The queue response includes
+`max_workers`; scheduled waiting jobs expose `blocked_by` action IDs and a
+`waiting_reason` (resource conflict or execution capacity). Job states are `queued`,
 `running`, `done` and `error`; clients must keep polling while queued or running.
 Pending jobs survive server restarts in the private portal queue database.
 Interrupted running jobs become explicit errors, never automatic retries.
 Check the external state before submitting an interrupted action again.
-Inline actions outside the popup (for example Jira scans and `/ci` posting)
-and automatic watchdog sweeps are unchanged.
+AI kinds join the same queue: `ai` (Explain/Ask/brief) claims only its own
+run id, so AI calls run in parallel with everything else; `auto-review` claims
+`auto-review:<workspace id>` and *not* the workspace itself, because it submits
+its own occupy/free workspace actions and waits for them (claiming the
+workspace would deadlock on its own sub-jobs). `review-chat` claims
+`review-chat:<chat id>` (one turn at a time per chat); its `open` operation also
+claims `auto-review:<workspace id>`.
+Inline actions outside the popup (including Team member operations, Jira scans
+and `/ci` posting) retain their existing behavior. Remote workspace actions
+also acquire the VM owner lock to exclude VM controls and watchdog probes.
 
 ### Workspace lifecycle
 
@@ -225,11 +299,35 @@ Live checks save owner readings and reload the display after completion; errors
 remain explicit rather than making an old reading look freshly verified.
 
 Each served workspace card has an **Edit** button for its saved label, badge,
-group and revision. The form is prefilled and saves only changed fields through
+group, revision and **Dedicated purpose**. The form is prefilled and saves only changed fields through
 the workspace owner's metadata API. Revision is locked while occupied or
-mirrored; label, badge and group remain editable. Saving metadata does not run
+mirrored; purpose is also locked while held or mirrored. Label, badge and group remain editable. Saving metadata does not run
 a checkout, Sync or status check. Paths, machine targets, IDs, occupancy and
 live readings are not editable in this form. Static exports remain read-only.
+
+**Dedicated purpose** is persistent workspace-owner metadata, not a hold. Track
+defaults to **General**; legacy records without the field retain General behavior.
+Dedicated cards show an `<purpose> only` badge. The Workspaces **Purpose** filter
+is multi-select (none means all), independent of grouping. Task choices and
+ad-hoc tags are filtered using owner-provided `allowed_uses`; server APIs recheck
+compatibility at execution and never accept client-supplied permissions.
+
+| Purpose | Compatible work |
+|---|---|
+| General | Existing behavior |
+| Review | Code-review tasks, review holds, outgoing source mirroring |
+| Development | Non-review tasks, development/debug/experiment holds, outgoing source mirroring |
+| Build root / Mirror | Incoming mirrors, build/test jobs and build/test holds; no ordinary task/review assignment |
+
+Build root and Mirror retain distinct names but share a policy. Review and
+Development slots may source delegated builds, not execute them. Automatic PLDM
+workspace selection and its explicit choices include only build-compatible local
+baseline slots. Forced use cannot bypass dedication. Free retains purpose.
+Changing purpose requires a free, non-mirrored workspace, no running operation,
+no matching running/unverified delegated job, and, for portal edits, no conflicting
+queued portal action. Queued actions revalidate assignment/selection on execution. No physical
+workspace is reclassified automatically. Generic remote commands are refused
+on dedicated destinations; the metadata is not an OS sandbox.
 
 **Stop tracking** opens a confirmation dialog with an unchecked **Override
 occupancy/mirror checks** option. `POST /api/ws-untrack/<slot>` accepts a boolean
@@ -278,11 +376,11 @@ manifests, incomplete repository coverage, and failed stashes block the
 operation. The hold or mirror clears only after return, sync, and verification
 succeed; a partial failure reports saved stashes for recovery.
 
-The section badge counts are *attention* counts, not totals: **Overview** shows bugs needing
-attention plus hot RAID rows, **Tasks** shows active tasks, **Workspaces** shows occupied
+The section badge counts are *attention* counts, not totals: **Overview** shows the number of
+visible Live pulse cards whose tone is bad, **Tasks** shows active tasks, **Workspaces** shows occupied
 slots, **Bugs** shows open bugs that
 are stalled, untriaged, or unassigned, **PRs** shows features with at least one blocked PR,
-**VM jobs** shows jobs running right now, and
+**Machines** shows jobs running right now, and
 **RAID** shows open rows at Red or Orange.
 
 Each section keeps its own filters, sort and expandable detail rows, plus tabs where applicable.
@@ -315,62 +413,76 @@ scans unselected tasks. A completed scan clears the selection because review/tas
 have changed. Static exports remain read-only.
 Status-bearing tables expose an independent **Open only** checkbox: outgoing PRs exclude merged
 and closed PR rows, member tasks exclude done and cancelled assignments, phenomena exclude
-closed/not-a-bug/not-ours/merged records, RAID excludes closed rows, and VM job history shows
+closed/not-a-bug/not-ours/merged records, RAID excludes closed rows, and Machine job history shows
 only running jobs. Bugs already have an **Open only** filter. Each view preserves its existing
 default visibility; workspaces are an occupancy roster rather than a completed/closed record list
 and do not get this lifecycle filter. The existing `#work` and `#task/<id>` links still work.
-**Every filter dropdown is multi-select** (Tasks, PRs, Bugs, Phenomena, VM target): tick any
+**Every filter dropdown is multi-select** (Tasks, PRs, Bugs, Phenomena, machine target): tick any
 number of values; a row passes when it matches **any** ticked value of that dropdown (OR within a
 field, AND across fields), and an empty dropdown means *All*. This is a **portal design
-standard** — see *Filters are always multi-select* under the styling rules. In VM jobs,
+standard** — see *Filters are always multi-select* under the styling rules. In Machines,
 **Refresh** is scoped only when exactly one target is ticked; with several it probes the whole
 fleet. Switching
 sections never loses the other section's filter state.
 
-### Overview section (the storefront)
+### Overview section (morning brief + live pulse)
 
-The page opens here. It is **read-only by design** — every panel points at the section or tool
-that owns the underlying data. No panel calls Jira or GitHub; everything is computed from
-local stores at render time.
+The page opens here. It is **read-only by design**: every panel links to the section that
+owns the underlying data. No panel calls Jira or GitHub. Long-range planning views (milestones,
+burn-down, per-IP scoreboards) belong in the **Team** section's planning overview, not here.
 
 | Panel | What it shows | Source |
 |-------|---------------|--------|
-| **Report header** | Title band with the as-of line (date, bugs mirrored, current sprint, live vs static) and the sprint slicer pills — MS8.1 / MS8.2 / MS8.3, current one filled | `guidelines.md`, `bugs.db` |
-| **KPI band** | Six colour-coded cards: days to Power-on and to the A1 big delivery (with a run-up progress bar), open bugs + attention share (with a background sparkline of the 12-week trend), reviews on me, open RAID + red/orange share, workspace occupancy | `guidelines.md`, `bugs.db`, `tasks.db`, `raid.db`, `workspaces.db` |
-| **What changed since your last visit** | Full-width feed merging every dated trail the stores already keep — bug field-change log and newly mirrored bugs, pr-monitor feature notes, task notes — newer than a day watermark, newest first, 10 shown with *+N more*. **✓ mark all seen** moves the watermark to today and remembers the ids already acknowledged today (dates are day-granular); **↺ last 7 days** resets. Each row jumps to its item. Seen-state is browser-local | `bugs.db`, pr-monitor database, `tasks.db` |
-| **Bug flow — open vs closed** | 90-day cumulative stacked area of closed vs still-open bugs, from each bug's created/resolved date. Gradient-filled with end-of-line data labels | `bugs.db` |
-| **Bug backlog health** | Three semicircular gauges — share of open bugs that are triaged, that carry both a milestone and a sprint, and that have an assignee. Green ≥80%, amber ≥50%, red below | `bugs.db` |
-| **Mean time to close — monthly** | Bars of the average created→resolved age, bucketed by the month the bug **closed** (so a bucket is final once the month ends). Dashed red line = the all-months average; bars above it are orange. Caption calls the direction vs the previous month | `bugs.db` |
-| **Open bugs by IP** | Donut; components mapped to an IP via the team-weekly scoreboard hints | `bugs.db` + `ip-scoreboard.md` |
-| **Open bugs by owner** | Donut — who actually carries the open bug load | `bugs.db` |
-| **Per-IP scoreboard** | Per IP: owner, open bugs, attention count, worst idle, review pressure, and a **12-week sparkline** of that IP's open-bug count. The sparkline is coloured by the IP's worst current signal, so one cell carries both the trajectory and the severity | `bugs.db` + `tasks.db` |
-| **Bug hygiene** | Open bugs carrying each flag (untriaged / no-milestone / no-sprint / no-estimate / aging / overdue) as a share of open bugs — the Jira gaps to close. Each row is a link to a Jira issue search (`key in (…)`) of exactly those bugs, so the gap is closed **in Jira**; the portal itself never writes Jira | `bugs.db` (`bm.flags_of`) |
-| **Development hygiene** | Full-width tile: a "pipeline clean" gauge plus seven pass/fail rules over the *delivery* pipe — CI green on open PRs, rebased on target, approved PRs landed, PRs moving (no 7-day stall), features PLDM-tested, reviews answered within 3 days, and WIP bound to a workspace. Each row shows `good / total`, a bar, and the count plus a plain-English hint. Rules with no population are dropped, so an empty PR queue can't flatter the score | `pr-monitor` cache + `tasks.db` |
-| **Review queue** | Incoming PR reviews bucketed by consolidated review status | `tasks.db` |
-| **RAID — open rows** | Open RAID rows, worst RAG then worst score; overdue dates in red | `raid.db` |
-| **Needs you now** | One ranked feed across bugs, RAID, reviews and blocked tasks, each row carrying a kind-coloured left border. Bugs outrank reviews at equal urgency, and RAID is capped at 3 rows so a long risk backlog cannot crowd out live bugs | all |
-| **Workspace occupancy** | Every physical slot and what holds it | `workspaces.db` |
+| **Header** | Title plus an as-of line (last refresh time, live vs static) | client clock |
+| **Morning brief** | Full-width result of the latest daily maintenance run (`routine.py`, scheduled in Settings). The caption shows run time, status (ok/degraded/failed) and journal id, with a **stale** warning when the brief is older than 26 h. Step pills (health, queue, integrity, reviews, PRs, bugs, workspaces, team, housekeeping, pulse snapshot, AI summary, self-test) carry their summary as a tooltip. When the routine's `ai` step produced one, an escaped **✦ AI summary** paragraph sits above the sections. Sections are ordered bad → warn → ok, and each item jumps to its task, PR feature, bug, member or section via `goItem` | `state/morning-brief.json` (written only by the routine) |
+| **Freshness strip** | Sits between the brief and the pulse cards. One chip per source: bugs scan, PR scan, team activity scan, workspace check, machine activity, and the daily routine. Each chip shows *N ago*, and is marked **stale** (amber) when it is missing or older than 26 h. Clicking a chip opens that section | each section's payload |
+| **Live pulse** | One card per section (below), computed in the browser by `assets/pulse.js` from the payloads the sections already serve. Each card has a headline number, a tone (ok/warn/bad, coloured top border and dot) and a short stat list. The header opens the section; stats with a tooltip explain their rule | all section APIs |
+| **What changed since your last visit** | Full-width feed merging the dated trails the stores already keep (bug field-change log and newly mirrored bugs, pr-monitor feature notes, task notes) that are newer than a day watermark. Newest first, 10 shown with *+N more*. **✓ mark all seen** moves the watermark to today; **↺ last 7 days** resets it. Seen-state is browser-local | `bugs.db`, pr-monitor database, `tasks.db` |
 
-The portal uses a **dark cosmic shell** with a collapsible, grouped section rail, live
-attention badges, a compact top bar, and responsive horizontal navigation on narrow screens.
-The Tasks table keeps its full set of columns in a local horizontal scroll container on
-narrow screens, so it does not widen the page. The portal remembers the selected section and
-sidebar state in browser-local storage, and each Overview tile can be collapsed independently
-with its state remembered locally; neither preference changes shared data or server workflows.
-The Overview remains a **Power BI style report canvas**: an as-of line and sprint slicer pills,
-a 6-card KPI band, then a 12-column tile grid
-(`.ov-canvas` + `.t2`…`.t12` span classes, collapsing at 1240px and 780px). Colours come
-from the `PBI` / `PALETTE` objects, which mirror the Power BI default theme.
+Pulse cards (ids in `PortalPulse.CARD_IDS`):
 
-Charts are **hand-rolled inline SVG** (`svgDonut`, `svgGauge`, `svgStackedArea`, `svgBars`,
-`svgSparkline`, `barTable`) — the portal carries no third-party JS dependency and works
-offline. Each chart is a **single** svg with an intrinsic `viewBox` and no explicit height,
-so it scales inside its tile without the plot/label drift a split-svg layout suffers from.
+| Card | Headline | Stats | Tone |
+|------|----------|-------|------|
+| **Tasks** | open tasks, excluding code reviews | in progress, blocked, overdue, due ≤ 7 days, WIP without a workspace | bad on overdue, warn on blocked |
+| **Bugs** | open mirrored bugs | need attention, untriaged, new, open phenomena, escaped/regressed phenomena | bad on an alarm phenomenon or >25% needing attention, warn on any attention |
+| **My PRs** | features in flight | CI failing, needs rebase, approved-not-landed, idle 7d+, not PLDM-tested, hygiene score | bad on CI failing, warn on the other rules |
+| **Reviews on me** | reviews waiting on me | in queue, waiting on author, past 3-day turnaround | bad past turnaround, warn while any wait |
+| **Workspaces** | slots in use / total | free, with dirty repos, free but off baseline, not checked 26h+ | warn on dirty or stray |
+| **Machines** | jobs running now | passed 24h, failed 24h, stale, machines unreachable | warn on any failure, stale job or unreachable machine |
+| **RAID** | open rows | red/orange, overdue, risks | bad on red/orange, warn on overdue |
+| **Team** (full width) | members active in the last 7 days / members | PRs and reviews (7d), overdue tasks, onboarding overdue, on leave; plus one activity line per member | warn on overdue work or a quiet member |
+| **Portal** | actions running or queued | daily routine status/next run | warn when the last run was degraded, bad when it failed |
 
-> The Overview reads RAID through `rd.py` and parses `~/team-planner/guidelines.md` and
-> `~/.copilot/skills/team-weekly/references/ip-scoreboard.md` **read-only**, each behind its
-> own `try/except` with a hardcoded fallback. A missing or reformatted team-planner file
-> degrades one panel, never the page. Endpoint: `GET /api/overview`.
+The My PRs card carries the former **development hygiene** score as its note: seven pass/fail
+rules over the delivery pipeline (CI green, rebased, approved PRs landed, PRs moving with no
+7-day stall, features PLDM-tested, reviews answered within 3 days, WIP bound to a workspace).
+Rules with no population are dropped, so an empty queue can't flatter the score.
+
+**Deltas.** Each daily run calls `node assets/pulse.js --snapshot` (routine step `pulse`) and
+stores the numbers in the brief as `pulse: {taken_at, values}`. Every headline and stat then shows
+▲/▼ *N* against that snapshot: green when it moved the right way, red when it moved the wrong
+way, muted when direction has no meaning. Without a snapshot (no node, or before the first run
+after deployment) the deltas are simply absent.
+
+**Member activity summary.** `PortalPulse.memberActivity` turns the Team payload into one
+summary per member: PRs, reviews and Jira events in the last 7 days, open/overdue assigned
+tasks, open items, onboarding progress, leave, and source gaps (a GitHub or Jira link that has
+never been scanned). The same chips render on the Overview Team card, in the **Activity (7
+days)** column of the Team overview table, and in each member's header. When the scan returned
+its full 100-observation window, counts are shown as a floor (`100+`). A member on leave is
+never marked quiet.
+
+**Refresh.** While the Overview is visible it re-fetches all section payloads in parallel at the
+interval chosen in Settings (*Overview live refresh*: off, 30 s, 1 min or 5 min; default 1 min).
+Polling pauses while the tab is hidden and resumes on return. A failed source leaves its card
+on the last good data.
+
+**Customization (browser-local).** Settings → Browser lets you hide cards and reorder them. The
+Overview nav badge counts the **visible cards whose tone is bad**.
+
+The canvas keeps the 12-column tile grid (`.ov-canvas` + `.t*` spans) and per-tile collapse
+state in browser-local storage. Endpoint: `GET /api/overview` returns only
+`{brief, today, errors}`; every other number comes from the owning section's API.
 
 ### Bugs section
 
@@ -387,8 +499,8 @@ Tabs are saved filter presets: **Open · New · Untriaged · Needs attention · 
   **derived at render time** by `bm.py` — they are never stored.
 - The **📣 column** is the count of times **Oded chased that bug** for progress/status — external
   escalation pressure, unrelated to Jira. It is sortable (*Sort by → Pings from Oded*), it raises a
-  `pinged` flag at 2+, and a pinged bug counts as **Needs attention** and leads the Overview action
-  feed. Read it against idle days: *pinged + stalled* is a real problem; *pinged + moving* is a
+  `pinged` flag at 2+, and a pinged bug counts as **Needs attention** (and so in the Overview Bugs card).
+  Read it against idle days: *pinged + stalled* is a real problem; *pinged + moving* is a
   communication problem.
 - Expanding a row shows the Jira mirror (components, milestone, sprint, estimate, due,
   links, description), the activity summary (comments, field changes, last status change),
@@ -431,8 +543,8 @@ Tabs are saved filter presets: **Open · New · Untriaged · Needs attention · 
   so is a sighting sourced `customer`/`email`, a customer Jira label, or a link to a customer
   phenomenon. Everything else is internal. Override with a `customer`/`internal` **tag** on a
   phenomenon, or the **Origin** select in the bug triage editor (`triage.origin`, local only).
-- The Overview *Needs you now* feed carries a `phenom` kind for open phenomena flagged
-  escaped / regressed / unexplained-recurring; clicking it opens the phenomenon in the Bugs tab.
+- The Overview Bugs card counts open phenomena flagged escaped / regressed /
+  unexplained-recurring as *Escaped / regressed*, which turns the card red.
 
 Server endpoints added for this section: `GET /api/bugs` (full payload), `GET /api/triage`
 (phenomena + note index), `GET /api/investigation?name=`, `POST /api/phenomenon/<ID>`,
@@ -486,6 +598,30 @@ opposed to the incoming review queue that lives under Tasks.
   `gh pr checks` for every tracked PR in parallel, then the new statuses are written back into
   the domain store. **This costs zero tokens** — no model is involved. ~30 PRs take ~15s. The button
   is disabled on a static dashboard file; it needs `serve`.
+- Explicit CLI/Portal scans also run owner-managed Jira synchronization and retry archived
+  features' pending Jira syncs. There is no polling daemon; rendering, navigation and
+  payload refreshes do not scan or transition Jira. A scan is therefore not read-only:
+  opted-in tickets may move to **In Review / Done** under the owner's lifecycle rules.
+- Each active feature's Jira ticket has **Confirm full PR coverage** / **Revoke coverage**.
+  The confirmation dialog identifies the whole current PR set and explicitly asserts that
+  it fully implements that ticket. Approval is per ticket and exact PR set, not inferred
+  from a Jira key, link, PR title or partial implementation. Changing the set invalidates
+  coverage. Automatic transitions require assignment to the authenticated Jira user;
+  approval does not override this guard. Revocation does not undo past transitions.
+  Static exports show coverage and sync readings but no mutation controls.
+- `POST /api/feature-jira-coverage` uses the PR mutation lock and delegates to
+  `pm.confirm_jira(feature_id, key, confirmed=..., expected_revision=...)`. It requires
+  an integer feature ID and revision (not booleans), string key and explicit boolean
+  `confirmed`. The dialog sends the revision it displayed; stale edits remain owner-rejected.
+  This endpoint records approval only; it does not scan or update Jira.
+- Feature cards display owner-provided per-ticket `jira_sync` state, target and message,
+  explicitly labelled **Last Jira sync result**. These historical readings may predate
+  revocation and do not imply that automatic updates remain approved.
+  Scan results retain all top-level `jira_sync` rows, including archived retries, and
+  expose counts for updated, unchanged, blocked and error. Blocked/error Jira outcomes
+  mark the scan job as error with a clear partial-success warning and feature/ticket
+  failure details, while retaining refreshed PR results. They never appear as an
+  entirely successful PR scan.
 - Each feature row has a **tick box** (plus select-all in the header). Ticking at least one
   reveals **↻ Scan selected PRs (N)** next to *Scan PRs*, which POSTs
   `/api/pr-scan` with `{"feature_ids": [..]}` → `pm.refresh(only=[..])`: only those features'
@@ -548,11 +684,16 @@ Endpoints: `GET /api/prs`, `POST /api/pr-scan` and `POST /api/pldm-test` (serial
 `POST /api/feature-untrack`, `POST /api/pr-track`, and `POST /api/pr-untrack`; CI reruns use
 `POST /api/pr-ci`. Without the `pr-monitor` skill the section renders empty and the scans return 503.
 
-### VM jobs section
+### Machines section
 
 A read-only view over [`vm-delegate`](../../skills/vm-delegate/SKILL.md)'s delegation history, driven by
-`vd.py`: an EC2 power strip (state dot, lease countdown, Start/Stop), the job running right now,
+`vd.py`: an EC2 power strip (state dot, lease countdown, Start/Stop), VM and lab-machine target status,
+the job running right now,
 KPI counts, and the full history table.
+
+The short **Machines** section name covers both VM and lab-machine targets. The
+navigation badge continues to count confirmed running delegated jobs; the separate
+**Check VM status** control remains an EC2-only `octl vm list` check.
 
 - **Refresh status** (`POST /api/vm-refresh`) is a **background job**, polled through
   `/api/align/<id>` like the PR scan, and it streams one row per target into the align banner.
@@ -561,18 +702,36 @@ KPI counts, and the full history table.
   section then never re-rendered and the whole tab looked broken while the probe was succeeding
   on the server.
 - **Refresh one machine** with the `↻` on its EC2 card, or on its chip in the bare-metal target
-  strip; the toolbar button follows the target filter and relabels to *Refresh vm*. Same
-  endpoint with `{"target": "<name>"}`. This is the difference between ~4 s and minutes: a
+  strip; the toolbar button follows the target filter. Same endpoint with
+  `{"target": "<name>"}`. Refresh covers both VM and lab-machine targets. This is the difference
+  between ~4 s and minutes: a
   fleet refresh waits out the ssh timeout of every dead lab desktop. Each card and chip shows
   its **own** age, because a scoped refresh must not make the untouched targets look fresh —
   and `octl vm list` is skipped entirely for a target with no instance behind it.
 - **Check VM status** (`POST /api/vm-machines`) re-reads only `octl vm list`; **Sync logs**
-  (`POST /api/vm-sync`) only rsyncs the remote job logs, also scoped by the target filter. Both
-  are narrower than a full refresh.
-- The **Log** column opens the mirrored log (`POST /api/vm-log`); for a *running* job it opens a
-  **live tail** (`POST /api/vm-tail`) that re-polls every 5 s with **Follow** on. Each poll is
-  one `tail -n` over ssh — no websocket, nothing to tear down but a `setInterval`. Neither
-  endpoint takes `VM_REFRESH_LOCK`: reading a log must never be blocked by an in-flight probe.
+  (`POST /api/vm-sync`) only rsyncs VM and lab-machine job logs, also scoped by the target filter.
+  Both are narrower than a full refresh.
+- The **Log** column (and the live-job cards) open the log in a **browser terminal**
+  window that always runs `tail` **on the machine** (`vd.log_view(job_id)` builds it):
+  `tail -F` for a running job, the last 20 000 lines (the terminal's scrollback) of a
+  finished one, and for a run whose slot a later run reused, its timestamped
+  `runs/<kind>-<stamp>-<pid>.log` archive on the machine. No pager, no download, and the
+  local mirror is never shown; a run with no archive reports an error.
+  The job id binds the log to its run. `POST /api/vm-log` / `/api/vm-tail` remain for
+  compatibility but the page no longer uses them.
+- **`>_ Terminal`** on a machine card (targets listed in Settings > Machines) opens
+  `/term` in a pop-up window: xterm.js over a same-origin WebSocket (`/ws/term`) to a
+  local pty running `mctl -t <target> term`, attached to the remote tmux session
+  `portal` (`tmux new -A`), so closing the window only detaches and reopening resumes.
+  `POST /api/term/open` validates the request and returns a one-time token (120 s TTL)
+  naming a server-built spec; nothing sent over the socket can change what runs. At
+  most 8 sessions; `GET /api/term/active` lists them. The socket checks Origin.
+- **Live status link**: each live target (Settings > Machines) keeps one long-lived
+  `mctl -t <target> jobs-watch <interval>` ssh session that streams a jobs probe every
+  interval; each block is reconciled through `vd.refresh(preprobed=…)`. The machine card
+  shows a `live` / `reconnecting` / `down` badge. The link never powers a VM on, backs
+  off 5→120 s when dropped, and the manual refresh and watchdog remain the fallback.
+  Reachability transitions (after the first known state) raise notifications.
 - The header and the power strip print how **stale** each reading is (`refresh_age_h`,
   `machines_age_h`). Without that, a day-old `stopped` is indistinguishable from a live one.
 
@@ -581,7 +740,7 @@ Without the `vm-delegate` skill the section renders empty and the scans return 5
 ### RAID section
 
 A full editor over [`team-planner`](../../skills/team-planner/SKILL.md)'s `~/tasks/raid.db`, driven
-by `rd.py`. The Overview keeps its read-only RAID tile; this is where rows are actually changed.
+by `rd.py`. The Overview RAID card is a read-only count; this is where rows are actually changed.
 
 - KPI band by RAG (Red / Orange / Yellow / Green) plus Overdue and Closed, over a table sorted
   worst-RAG-then-worst-score. **Show closed** reveals resolved rows.
@@ -598,6 +757,122 @@ by `rd.py`. The Overview keeps its read-only RAID tile; this is where rows are a
 Endpoints: `GET /api/raid`, `POST /api/raid/<ID>` (field edit, or `{close: "..."}`) and
 `POST /api/raid-new`, all serialised by `RAID_LOCK` in addition to the RAID owner's database transactions.
 
+### AI assistant (Explain / Ask)
+
+The top-bar **✦ AI** button opens a right-side drawer for the current section.
+**Explain this view** and **Ask** queue an `ai` action (`POST /api/ai/run`,
+`{kind, section, question?, focus?, parent?}`) that runs one headless Copilot CLI call
+(`copilot -p … --output-format json`) with the section's own payload as context,
+compacted to ~30 KB (lists keep their head and say what was dropped; the answer is told
+when data is partial). Follow-ups resume the CLI session (`--resume`). Answers are
+Markdown rendered server-side with raw HTML disabled.
+
+- **Read-only profile**: shell and write tools are denied, the GitHub write server and
+  WorkIQ are always denied, and Atlassian write tools are denied by name. Jira/GitHub
+  *reads* are allowed only when Settings > AI allows them; otherwise all MCP servers are
+  disabled. No custom instructions are loaded.
+- **Budget**: every run (any kind) reserves against the daily cap before it is queued
+  (429 when reached); premium requests are added from the CLI's result event. The drawer
+  header and `GET /api/events` (`ai`) show `used/cap · premium · model`.
+- **Privacy**: Team runs carry the private flag when started in private mode; such runs
+  (and their history) are served only with `X-Team-Private: 1`. Other sections never
+  receive Team data.
+- Runs are stored as JSON under `state/ai/runs/` (last 300); `GET /api/ai/runs?section=`
+  lists, `GET /api/ai/run/<id>` returns one (prompt and raw context stripped). The
+  deep link `#ai/<id>` reopens a run; AI notifications link there.
+- **⧉ Pop out** detaches the current thread into its own window (`/ai-chat?run=<id>`,
+  plus `&private=1` for Team runs); follow-ups from the window continue the same thread.
+- The **morning brief** gets an AI paragraph from the routine's `ai` step: the routine
+  posts its own sections as context (`kind: brief`), waits for the job and stores the
+  text in the brief. A cap/disabled answer is a step warning, never a failed run.
+
+### AI review (draft / re-review / interactive)
+
+An open code-review task with open PRs shows the AI review buttons in its expanded
+detail, and compact versions in the review row (served portal, AI enabled):
+
+- **✦ Create review draft** only while the task has no review draft, and **↻ Re-review**
+  only once it has one;
+- **✦ Interactive review**, which becomes **✦ Resume interactive review** while a chat
+  for the task is open.
+
+At most one AI review (queued draft run or open chat) per task.
+
+**Draft runs** (`POST /api/ai/auto-review {task_id, mode: create|rereview}`) queue an
+`auto-review` action (title "AI review draft"):
+
+1. derives the required manifest at click time: **revision** = the open PRs' common base
+   branch (`gh pr view`), **project** = the `<name>` of any `project.<name>.*` PR repo
+   (none for project-neutral `ip.*` repos = any project). Mixed bases or projects are
+   refused;
+2. picks a workspace whose **deployed** manifest matches — the project and
+   `manifest_revision` in its `.repo/metadata.json` (`wm.deployed_manifest`), not the
+   tracked `rev` label: the review-purpose workspace the task already holds, else the
+   first free local workspace with purpose `review` that matches, skipping occupied or
+   mismatched ones. Nothing else is borrowed; when none fits the 400 lists why each
+   review workspace was skipped. The deployed manifest is re-checked when the job
+   runs, before occupying;
+3. occupies the workspace for the task through the normal occupy/align action (unless
+   already held) and waits for it;
+4. runs Copilot in the workspace with the **review profile** — `/pr-review local
+   draft-only` (create) or `/pr-review local re-review draft-only` (re-review): shell/write
+   allowed, but `git push/reset/clean/stash`, `gh pr
+   comment/review/merge/edit/close/create/ready/reopen`, `gh api`, `wip`, `rm`, `sudo`,
+   the GitHub write server and Atlassian writes are denied. Custom instructions and
+   skills load. Timeout from Settings (default 40 min);
+5. requires a new/updated draft registered through `tm.py review-draft` and appends the
+   task note "initial auto review draft done (…)" or "AI re-review draft done (…)". A
+   re-review that finds no new commits answers `PORTAL-RESULT: no-change` and counts as
+   done with the draft unchanged;
+6. frees the workspace if this run occupied it (a failed release is reported, not hidden).
+
+Draft runs post nothing to GitHub.
+
+**Interactive review** (`POST /api/ai/review-chat {task_id}`) is a server-side
+`/pr-review local` conversation in a review workspace, shown in a right-side panel and
+detachable with **⧉** into `/ai-chat?chat=<id>`. The chat record lives in
+`state/ai/chats/rc-*.json`; each message is one queued `review-chat` action that resumes
+the same Copilot session.
+
+- **open**: picks and checks the workspace exactly like a draft run, occupies it, then
+  starts pr-review in walkthrough style (summary, then findings one at a time; the draft
+  is kept up to date). A failed start ends the chat and frees the workspace.
+- **turn** (`…/<id>/turn {message}`): one user message (≤ 8000 chars), review profile,
+  nothing posted. One turn at a time; a busy chat refuses new messages.
+- **Submit** is two steps. `…/<id>/preview` asks for exactly what would be posted,
+  without posting it. The panel shows **Confirm & post** only while that preview is the
+  latest turn. `…/<id>/submit {preview_run}` then posts that confirmed preview with the
+  **review-submit profile**:
+  - `gh pr review` and `gh pr comment` are allowed, as are the GitHub MCP review tools;
+  - merge/edit/close, `gh api`, the GitHub MCP non-review write tools, pushes and
+    destructive git stay denied.
+
+  Submitting records a task note.
+- **End** (`…/<id>/end {free}`): ends the chat and, by default, releases the workspace
+  it occupied. The draft and the task note remain.
+- **Idle**: a chat idle for 24 h is ended and its workspace released, keeping the draft.
+- **Restart**: chats survive a portal restart. Chat jobs that were still queued resume with
+  the action queue. A turn cut off mid-answer is marked failed ("send the message again"),
+  and the chat stays open on its session. A start cut off mid-run becomes `interrupted`:
+  the workspace stays with the task (an occupy that had already happened is recorded) and
+  the panel offers **Retry start** (`…/<id>/retry`, which re-runs open without
+  re-occupying) or **End review**. Nothing is replayed automatically, and the 24 h idle
+  release still applies.
+- **Budget**: each message, preview, submit or start retry reserves against the separate interactive
+  daily cap, not the general one.
+- `GET /api/ai/review-chats?task=&open=1` lists chats; `GET /api/ai/review-chat/<id>`
+  returns the chat with its turns, busy state and usage. Deep link `#review-chat/<id>`.
+  A finished chat message is silent; start, submit, end and errors notify.
+
+### Notifications
+
+`GET /api/events?since=<seq>` (polled by every open tab, also a presence heartbeat)
+returns new events plus the live-link and AI usage state. Kinds: action-queue results,
+delegated machine-job completions, AI answers and machine reachability changes, each
+switchable in Settings > Notifications. A tab shows them as browser notifications
+(in-page cards as fallback) and clicking one follows its deep link. When no tab has
+polled for 90 s the server raises a Windows toast through `powershell.exe` instead.
+
 ### Jump palette, deep links and keyboard
 
 - **Ctrl/⌘+K** (or **⌕ Jump** in the top bar) opens a palette over every store: sections,
@@ -608,7 +883,7 @@ Endpoints: `GET /api/raid`, `POST /api/raid/<ID>` (field edit, or `{close: "..."
   `#pr/17`, `#raid/I-007` — so any view is bookmarkable, and it is honoured on load and on
   `hashchange`. Updated with `replaceState`, so it does not flood history.
 - **Keyboard** (ignored while typing): `j`/`k` move a row cursor, `Enter`/`e` expand,
-  `x` ticks (Bugs, PRs), `/` focuses the section search, `g` then `o w s b p l v r` switches
+  `x` ticks (Bugs, PRs), `/` focuses the section search, `g` then `o w s b p v r` switches
   section, `?` shows the cheat sheet, `Esc` closes / leaves a field.
 
 ## Dashboard server (`serve`) — operational notes
@@ -673,12 +948,17 @@ Styling rules worth keeping:
 
 ### Review draft documents
 
-Each PR in an expanded review task may show an **Open review draft** button,
-the saved timestamp and full reviewed head SHA. Earlier passes are available
-under **Earlier drafts**; PRs without an attachment show no button. Drafts are
-registered through task-manager's `review-draft` CLI, never inferred from
-filenames or free-text notes. Review workflows must register new drafts before
-reporting success; manual workspace assignment still runs no AI review.
+A review task has **one report per review pass**, not one file per PR. Below the
+PR list, an expanded review task shows a single **Open review draft** button for
+the newest report, with its saved timestamp and every PR it covers with that PR's
+full reviewed head SHA (`repo#N <sha>`). Earlier passes, including legacy per-PR
+drafts (labelled *Per-PR draft*) and reports combined from them (labelled
+*Combined from per-PR drafts*), are under **Earlier drafts**. Tasks without an
+attachment show no button. Drafts are registered through task-manager's
+`review-draft` CLI (one `--head PR_URL=SHA` per covered PR), never inferred from
+filenames or free-text notes. Review workflows must register the report before
+reporting success, and Auto-review counts task-level reports. Manual workspace
+assignment still runs no AI review.
 
 The served portal opens `/review-drafts/<task-id>/<attachment-id>` in a new tab.
 The viewer renders GitHub-flavored Markdown (including tables, fenced code,

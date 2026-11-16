@@ -107,6 +107,156 @@ test("dynamic content is escaped, including the scroll region's accessible name"
   assert.match(html, /aria-label="Pull requests for Bad&quot;&gt;&lt;img src=x&gt;" tabindex="0"/);
 });
 
+test("Jira coverage is per ticket and sync readings escape all owner values", () => {
+  const f = feature();
+  f.jira = ["TEST-42", 'BAD"><img src=x>'];
+  f.jira_coverage = ["TEST-42"];
+  f.jira_sync = [{key: 'BAD"><img src=x>', state: "error", target: "<Done>",
+    message: "<script>fail</script>"}];
+  const html = harness().context.prFeatureRow(f);
+  assert.match(html, /data-jira-coverage="8" data-jira-key="TEST-42">Revoke coverage/);
+  assert.match(html, /data-jira-key="BAD&quot;&gt;&lt;img src=x&gt;">Confirm full PR coverage/);
+  assert.match(html, /Full PR coverage confirmed/);
+  assert.match(html, /error → &lt;Done&gt;: &lt;script&gt;fail&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<img|<script>/);
+  const readonly = harness(false).context.prFeatureRow(f);
+  assert.doesNotMatch(readonly, /data-jira-coverage|Confirm full PR coverage|Revoke coverage/);
+  assert.match(readonly, /Full PR coverage confirmed/);
+  assert.match(readonly, /error → &lt;Done&gt;/);
+});
+
+test("a retained sync result after revocation is historical, not active coverage", () => {
+  const f = feature();
+  f.jira_coverage = [];
+  f.jira_sync = [{key: "TEST-42", state: "updated", target: "In Review", message: "transitioned"}];
+  const html = harness().context.prFeatureRow(f);
+  assert.match(html, /Last Jira sync result · TEST-42 · updated → In Review/);
+  assert.match(html, /data-jira-key="TEST-42">Confirm full PR coverage/);
+  assert.doesNotMatch(html, /Full PR coverage confirmed|Revoke coverage/);
+});
+
+function coverageHarness(served = true) {
+  const h = harness(served);
+  const {context} = h;
+  const f = feature();
+  f.revision = 7;
+  context.PRS = {features: [f]};
+  context.prModal = (html, submit) => { h.dialog = {html, submit}; };
+  context.prNote = text => { h.note = text; };
+  context.renderPrs = () => { h.renders = (h.renders || 0) + 1; };
+  context.buildSections = () => {};
+  context.fetch = async (url, options) => {
+    h.request = {url, body: JSON.parse(options.body)};
+    return {ok: true, json: async () => ({message: "saved", prs: {features: []}})};
+  };
+  vm.runInContext(source.slice(source.indexOf("async function prPost("),
+    source.indexOf("async function saveFeaturePriority(")), context);
+  h.button = {disabled: false};
+  h.message = {textContent: ""};
+  h.overlay = {querySelector: selector => selector === ".ws-modal-ok" ? h.button : h.message};
+  h.close = () => { h.closed = true; };
+  return h;
+}
+
+test("coverage confirmation explicitly grants guarded sync for the displayed PR set", async () => {
+  const h = coverageHarness();
+  h.context.PRS.features[0].name = "<script>feature</script>";
+  h.context.prJiraCoverageDialog(8, "TEST-42");
+  assert.match(h.dialog.html, /entire current PR set fully implements TEST-42/);
+  assert.match(h.dialog.html, /In Review \/ Done/);
+  assert.match(h.dialog.html, /assigned to the authenticated Jira user/);
+  assert.match(h.dialog.html, /Changing the PR set invalidates this confirmation/);
+  assert.match(h.dialog.html, /example\/repo #12/);
+  assert.doesNotMatch(h.dialog.html, /<script>/);
+  assert.equal(h.request, undefined);
+  // Keep the displayed revision even if a background payload refresh occurs.
+  h.context.PRS.features[0].revision = 8;
+  await h.dialog.submit(h.overlay, h.close);
+  assert.deepEqual(h.request, {url: "/api/feature-jira-coverage",
+    body: {feature_id: 8, key: "TEST-42", confirmed: true, expected_revision: 7}});
+  assert.equal(h.closed, true);
+  assert.equal(h.renders, 1);
+});
+
+test("coverage revocation sends false and owner rejection stays visible", async () => {
+  const h = coverageHarness();
+  h.context.PRS.features[0].jira_coverage = ["TEST-42"];
+  h.context.prJiraCoverageDialog("8", "TEST-42");
+  assert.match(h.dialog.html, /does not undo Jira transitions already made/);
+  h.context.fetch = async (url, options) => {
+    h.request = JSON.parse(options.body);
+    return {ok: false, json: async () => ({error: "feature changed; reload"})};
+  };
+  await h.dialog.submit(h.overlay, h.close);
+  assert.equal(h.request.confirmed, false);
+  assert.equal(h.request.expected_revision, 7);
+  assert.equal(h.closed, undefined);
+  assert.equal(h.message.textContent, "feature changed; reload");
+  assert.equal(h.button.disabled, false);
+});
+
+test("coverage controls are delegated and static or missing tickets cannot open dialogs", () => {
+  const h = coverageHarness();
+  h.listeners.click({target: {closest: () =>
+    ({dataset: {jiraCoverage: "8", jiraKey: "TEST-42"}})}});
+  assert.match(h.dialog.html, /Confirm full PR coverage/);
+  for (const [served, id, key] of [[false, 8, "TEST-42"], [true, 99, "TEST-42"],
+    [true, 8, "OTHER-1"]]) {
+    const readonly = coverageHarness(served);
+    readonly.context.prJiraCoverageDialog(id, key);
+    assert.equal(readonly.dialog, undefined);
+    assert.equal(readonly.request, undefined);
+  }
+});
+
+test("partial scan adopts fresh PR data but reports archived Jira failure rather than success", async () => {
+  const h = coverageHarness();
+  const elements = {};
+  h.context.document.getElementById = id => elements[id] ||= {};
+  h.context.syncPrSelection = () => {};
+  const result = {features: [], scanned: 1, jira_sync: [
+    {feature_id: 90, key: "TEST-90", state: "error", message: "Jira unavailable"}]};
+  h.context.fetch = async () => ({ok: true, json: async () => ({job: "scan-1"})});
+  h.context.pollAlign = async () => ({status: "error", result,
+    message: "Jira sync: 1 error; archived retries: feature 90 / TEST-90: Jira unavailable"});
+  vm.runInContext(source.slice(source.indexOf("async function scanPrs("),
+    source.indexOf('document.getElementById("pr-scan").addEventListener')), h.context);
+  await h.context.scanPrs();
+  assert.equal(h.context.PRS, result);
+  assert.equal(h.renders, 1);
+  assert.match(elements["pr-scan-note"].textContent, /Scan failed: Jira sync: 1 error; archived retries/);
+  assert.equal(elements["pr-scan"].disabled, false);
+});
+
+test("successful scan shows escaped Jira outcome counts in its completion note", async () => {
+  const h = coverageHarness();
+  const elements = {};
+  h.context.document.getElementById = id => elements[id] ||= {};
+  h.context.syncPrSelection = () => {};
+  h.context.fetch = async () => ({ok: true, json: async () => ({job: "scan-1"})});
+  h.context.pollAlign = async () => ({status: "done", result: {features: [], scanned: 1},
+    message: "Jira sync: 1 updated, 0 error <unsafe>"});
+  vm.runInContext(source.slice(source.indexOf("async function scanPrs("),
+    source.indexOf('document.getElementById("pr-scan").addEventListener')), h.context);
+  await h.context.scanPrs();
+  assert.match(elements["pr-scan-note"].innerHTML, /Jira sync: 1 updated, 0 error &lt;unsafe&gt;/);
+});
+
+test("scan action banner never shows green success for archived Jira failures", () => {
+  const {context} = harness();
+  const elements = {};
+  context.document.getElementById = id => elements[id] ||= {style: {}};
+  context.alignRepoRow = () => "";
+  vm.runInContext(source.slice(source.indexOf("function renderAlign("),
+    source.indexOf("async function pollAlign(")), context);
+  context.renderAlign({kind: "pr-scan", status: "error", repos: [],
+    result: {jira_sync: [{feature_id: 90, key: "TEST-90", state: "error"}]},
+    message: "Jira sync: 1 error; archived retries: TEST-90 <unavailable>"});
+  assert.match(elements["align-title"].innerHTML, /ab-bad/);
+  assert.doesNotMatch(elements["align-title"].innerHTML, /ab-ok|✓/);
+  assert.match(elements["align-body"].innerHTML, /1 error; archived retries: TEST-90 &lt;unavailable&gt;/);
+});
+
 test("merged and closed PRs cannot rerun CI; completed notice remains in details", () => {
   const f = feature([
     {...feature().prs[0], status: "merged"},

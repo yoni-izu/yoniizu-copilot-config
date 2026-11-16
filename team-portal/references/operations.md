@@ -45,6 +45,10 @@ The managed service remains `task-dashboard.service`, using
 `~/.config/systemd/user/task-dashboard.service`, a symlink to the canonical
 `~/.copilot/team-portal/deploy/task-dashboard.service`. Do not start a second
 server beside it. After editing a unit, run `systemctl --user daemon-reload`.
+The unit explicitly includes `~/.local/bin` and `~/bin` in `PATH` so portal
+actions can find `octl` and other user-installed tools without a login shell.
+After changing this environment, restart the service; daemon-reload alone
+does not update the environment of the running process.
 
 All portal implementation and supporting files belong in `team-portal/`, not
 in the skill directory. Only `skills/portal-maintainer/SKILL.md` stays there.
@@ -61,16 +65,68 @@ Portal Python dependencies are listed in `team-portal/requirements.txt`; install
 them into the portal's private runtime directory with
 `python3 -m pip install --target ~/.copilot-private/team-portal/python -r ~/.copilot/team-portal/requirements.txt`.
 
+## Daily maintenance (timer)
+
+`portal-maintenance.timer` runs `routine.py daily`. The unit default is daily
+08:00 (`Persistent=true`: a missed run fires at the next login). The
+**Settings** section controls:
+
+- on/off, run time and run days (any subset of Sun–Sat; weekends included by default), by rewriting the drop-in
+  `~/.config/systemd/user/portal-maintenance.timer.d/schedule.conf`, then
+  daemon-reload and a timer restart or disable
+- per-step toggles
+- auto-restart
+- the retention and activity values below, read from
+  `state/portal-settings.json` at each run
+
+Moving the time earlier than now can fire an immediate catch-up run when today's
+run has not happened yet. To revert to the unit default, delete the drop-in and
+`portal-settings.json`, then run `systemctl --user daemon-reload`. It is a deterministic
+script, not an agent, and drives every domain refresh through the running
+portal's HTTP API so the action queue, scan locks and owner validation apply.
+
+| Step | What it does |
+|------|--------------|
+| health | `/health`; if unhealthy **and** no action is queued/running, restarts `task-dashboard` once |
+| queue | Reports failed (24 h), approval-pending and >6 h running actions |
+| integrity | `PRAGMA integrity_check` on portal DBs and `~/tasks/*.db` opened read-only |
+| reviews | `POST /api/review-scan {"scope":"all"}` + read-only `tm.py scan-reviews --json` (untracked requests are listed, never added) |
+| prs | `POST /api/pr-scan {"jira_sync":false}` — GitHub only, never transitions Jira |
+| bugs | `POST /api/bug-scan` (Jira read) |
+| workspaces | `POST /api/ws-refresh` (local, read-only status) |
+| team | Per-member `activity-scan`, then activity summary over the configured window (default 24 h) |
+| housekeeping | Portal DB snapshots to `state/backups/daily/YYYY-MM-DD/` (keep N, default 14; other backups untouched), `POST /api/maintenance/queue-retention {"days":N}` (default 90; deletes only `done` actions), journal `VACUUM`, static export |
+| selftest | Portal Python and JS test suites |
+
+Steps are isolated; the run writes `state/morning-brief.json` (Overview
+**Morning brief** tile) and one started/terminal journal pair
+(component `portal-routine`).
+
+```bash
+systemctl --user list-timers portal-maintenance.timer
+systemctl --user start portal-maintenance.service      # run now
+journalctl --user -u portal-maintenance.service -n 100
+rtk proxy python3 ~/.copilot/team-portal/routine.py brief
+```
+
+Install/refresh: symlink both units from `team-portal/deploy/` into
+`~/.config/systemd/user/`, `systemctl --user daemon-reload`, then
+`systemctl --user enable --now portal-maintenance.timer`. User timers only fire
+while the user manager runs; without `loginctl enable-linger` a machine that is
+logged out at 08:00 runs the routine at the next login.
+
 ## Action queue recovery
 
 User-initiated progress jobs are durably scheduled in
 `~/.copilot-private/team-portal/state/action-queue.db`. The managed portal is
-the only queue worker; do not run a second portal process against that store.
+the only queue scheduler; do not run a second portal process against that store.
+It runs at most three independent actions concurrently, with exclusive resource
+claims and FIFO ordering for conflicts. Unknown/dynamic scopes run exclusively.
 The **Actions** button and read-only `GET /api/actions` show pending/running
 work and the latest 20 results. The database retains older results.
 
 Before deploying, check that no action is running. Stop/restart retains queued
-work, which resumes FIFO. A running action interrupted by restart is marked
+work, which resumes with the same conflict-ordering policy. Every running action interrupted by restart is marked
 failed on startup and is never automatically retried. Inspect the affected
 owner's status/history and external system before resubmitting; a failed action
 may already have performed side effects. Do not repair a queue by editing SQL
@@ -111,11 +167,22 @@ bash ~/.copilot/team-portal/tests/test_portalctl.sh
 Use the smallest relevant tests, with temporary paths/mocked external calls:
 
 ```bash
-rtk proxy python3 -m unittest discover \
-  -s ~/.copilot/team-portal/tests -p 'test_*.py'
-rtk proxy node --test ~/.copilot/team-portal/tests/test_portal_tasks.js
+cd ~/.copilot/team-portal && rtk proxy python3 -m unittest \
+  $(cd tests && ls test_*.py | sed 's/\.py$//; s/^/tests./')
+rtk proxy node --test ~/.copilot/team-portal/tests/*.js
+rtk proxy node --check ~/.copilot/team-portal/assets/pulse.js
 rtk proxy node --check ~/.copilot/team-portal/assets/portal.js
+rtk proxy node --check ~/.copilot/team-portal/assets/term.js
 ```
+
+AI tests (`tests/test_ai.py`, `tests/test_portal_ai.py`) use fake `copilot` scripts
+and a mocked `ai.run_copilot`; they never call the real CLI. Any routine test that
+calls `daily()` must stub `ai_brief` (or `routine.http`), otherwise it reaches the live
+portal and spends a real AI run.
+
+Use package-qualified module names: plain `unittest discover` fails because
+`tests/test_review_drafts.py` collides with the same-named module in
+`skills/task-manager` once `portal` is imported.
 
 Run affected owner tests as well. Validate served/static rendering, payload
 shapes, empty/error states and lost-update behavior. Never run tests against
@@ -126,13 +193,40 @@ then check the actual page with browser tools. Verify counts and representative
 fields against owner APIs without exposing personal content in chat.
 Do not click refresh/scan/action buttons during a read-only smoke test.
 
+## AI, terminal, live link and notifications
+
+- **AI runs** show in the Actions dropdown as `Explain …`, `Ask …`, `AI brief`,
+  `Review draft T-…` / `Re-review T-…`, or `Interactive review` / `Review chat` /
+  `Review preview` / `Submit review` / `End interactive review T-…`. A failed run keeps its error on the run record
+  (`GET /api/ai/run/<id>`). The CLI binary is resolved from PATH, then
+  `~/.nvm/versions/node/*/bin/copilot`; its directory is prepended to PATH because the
+  systemd unit has no nvm. A timed-out run kills the whole process group. Usage resets
+  daily (`state/ai/usage.json`); raise the cap or turn AI off in Settings > AI.
+- **Auto-review stuck or failed**: check the action's steps. If it failed after
+  occupying and reports "NOT released", free the workspace in Workspaces. Drafts land
+  in `~/.copilot-private/skills/pr-review/drafts/` and are registered on the task.
+- **Interactive review**: a chat that cannot start (manifest mismatch, occupy failure, no
+  CLI session) ends itself and frees the workspace. A stuck chat can be ended from its
+  panel; if its end reports "NOT released", free the workspace in Workspaces. Chats are
+  `state/ai/chats/rc-*.json`; turns whose run aged out (last 300 runs kept) show as
+  expired. The idle sweeper runs every 10 min and ends chats idle for 24 h.
+- **Terminal**: `/term` needs the portal served; pop-ups must be allowed. A closed
+  window leaves the remote tmux session `portal` running (`tmux kill-session -t portal`
+  on the machine to end it). The `mctl term` subcommand is what runs.
+- **Live link**: `GET /api/events` → `live.links.<target>.state`
+  (`connected` / `reconnecting` / `down`, with `error` and `retry_at`). A restart
+  reconnects automatically; the link never starts a stopped VM.
+- **Notifications**: the Windows toast requires `powershell.exe` under `/mnt/c`; it fires
+  only when no portal tab has polled for 90 s.
+
 ## Remote workspace SSH authentication
 
 Remote workspace operations resolve a key-bearing SSH agent through
 `vm-delegate/vd.py` before each `mctl workspace` invocation, including the
-progress-streaming path. They revalidate rather than reuse the VM-jobs probe
-cache, so an empty or replaced service-inherited agent can be bypassed without
-restarting the portal or importing a login-specific socket into systemd.
+progress-streaming path. They revalidate rather than reuse a cached
+machine-activity probe, so an empty or replaced service-inherited agent can be
+bypassed without restarting the portal or importing a login-specific socket into
+systemd.
 Local workspace operations retain their inherited environment.
 
 This does not load keys or provision credentials. If no agent holds identities,

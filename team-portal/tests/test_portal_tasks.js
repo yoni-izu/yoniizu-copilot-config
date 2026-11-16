@@ -10,7 +10,10 @@ const dateHelpersStart = source.indexOf("function validPortalDate");
 const dateHelpersEnd = source.indexOf("let TASKS", dateHelpersStart);
 assert.notEqual(dateHelpersStart, -1);
 assert.notEqual(dateHelpersEnd, -1);
+const pulseSource = fs.readFileSync(path.join(__dirname, "..", "assets", "pulse.js"), "utf8");
+const Pulse = require(path.join(__dirname, "..", "assets", "pulse.js"));
 function installDateHelpers(context){
+  vm.runInContext(pulseSource,context);
   vm.runInContext(source.slice(dateHelpersStart,dateHelpersEnd),context);
 }
 function block(start, end) {
@@ -64,11 +67,13 @@ function draftHarness(served=true) {
     esc: value=>String(value).replaceAll("&","&amp;").replaceAll("<","&lt;")
       .replaceAll('"',"&quot;"),
     editorHtml: ()=>"",
+    AI_USAGE: {},
   });
   installDateHelpers(context);
   vm.runInContext(block("function daysSince(", "// ---- workspace alignment")+
     block("function feature(", "// ---- build filter dropdowns")+
-    block("function reviewDraftsHtml(", "function wireEditor("), context);
+    block("function reviewDraftsHtml(", "function wireEditor(")+
+    block("function taskHasOpenReview(", "function selectedVisibleTasks("), context);
   return context;
 }
 
@@ -85,46 +90,61 @@ test("date display is fixed dd/mm/yyyy and date entry round-trips strictly to IS
   assert.equal(context.parsePortalDateInput(""),"");
 });
 
-test("review task renders a per-PR draft button, reviewed SHA and earlier passes", () => {
+test("review task renders one task-level report button with every reviewed head and earlier passes", () => {
   const context=draftHarness();
   const task={id:"T-001",created:"2026-10-01",updated:"2026-10-02T09:10:00Z",
-    due:"2026-10-31",completed:"2026-10-03",reviews:[
-    {repo:"one",pr_number:1,pr_url:"https://github.com/example/one/pull/1",drafts:[
-      {id:"old",updated_at:"2026-10-27",head_sha:"a".repeat(40)},
-      {id:"new",updated_at:"2026-10-28",head_sha:"b".repeat(40)},
-    ]},
-    {repo:"two",pr_number:1,pr_url:"https://github.com/example/two/pull/1"},
+    due:"2026-10-31",completed:"2026-10-03",
+    review_drafts:[
+      {id:"old",kind:"report",updated_at:"2026-10-27",heads:[{repo:"one",pr_number:1,head_sha:"a".repeat(40)}]},
+      {id:"new",kind:"report",updated_at:"2026-10-28",heads:[
+        {repo:"one",pr_number:1,head_sha:"b".repeat(40)},{repo:"two",pr_number:1,head_sha:"c".repeat(40)}]},
+    ],
+    reviews:[
+      {repo:"one",pr_number:1,pr_url:"https://github.com/example/one/pull/1",drafts:[
+        {id:"legacy",updated_at:"2026-10-20",head_sha:"d".repeat(40)}]},
+      {repo:"two",pr_number:1,pr_url:"https://github.com/example/two/pull/1"},
   ]};
   const html=context.detailRow(task,8);
   assert.match(html,/class="btn review-draft-link" href="\/review-drafts\/T-001\/new"/);
-  assert.match(html,/Open review draft/);
-  assert.match(html,/Earlier drafts \(1\)/);
+  assert.equal((html.match(/Open review draft/g)||[]).length,1);
+  assert.match(html,/one#1 <code>b{40}<\/code>, two#1 <code>c{40}<\/code>/);
+  assert.match(html,/Earlier drafts \(2\)/);
   assert.match(html,/\/review-drafts\/T-001\/old/);
-  assert.match(html,/b{40}/);
+  assert.match(html,/Per-PR draft · Saved 20\/10\/2026 · one#1 <code>d{40}<\/code>/);
   assert.match(html,/Saved 28\/10\/2026/);
   assert.match(html,/Created:<\/b> 01\/10\/2026/);
   assert.match(html,/Updated:<\/b> 02\/10\/2026 09:10:00Z/);
   assert.match(html,/Due:<\/b> 31\/10\/2026/);
   assert.match(html,/Completed:<\/b> 03\/10\/2026/);
-  assert.equal((html.match(/Open review draft/g)||[]).length,1);
-  assert.equal(task.reviews[0].drafts[0].id,"old");
+  assert.ok(html.indexOf("review-drafts")>html.lastIndexOf('class="pr"'));
+  assert.equal(task.review_drafts[0].id,"old");
+});
+
+test("combined reports are labelled and legacy-only tasks still get a button", () => {
+  const html=draftHarness().reviewDraftsHtml({id:"T-002",
+    review_drafts:[{id:"comb",kind:"combined",updated_at:"2026-11-15",heads:[]}],
+    reviews:[{repo:"one",pr_number:2,drafts:[{id:"x",updated_at:"2026-10-01",head_sha:"e".repeat(40)}]}]});
+  assert.match(html,/href="\/review-drafts\/T-002\/comb"[^]*Combined from per-PR drafts/);
+  const legacyOnly=draftHarness().reviewDraftsHtml({id:"T-003",
+    reviews:[{repo:"one",pr_number:2,drafts:[{id:"x",updated_at:"2026-10-01",head_sha:"e".repeat(40)}]}]});
+  assert.match(legacyOnly,/Open review draft/);
 });
 
 test("static draft metadata avoids broken relative links and never embeds contents", () => {
   const context=draftHarness(false);
-  const html=context.reviewDraftsHtml({id:"T-001"},{drafts:[
-    {id:"one",updated_at:"2026-10-28",head_sha:"a".repeat(40),content:"PRIVATE BODY"},
+  const html=context.reviewDraftsHtml({id:"T-001",review_drafts:[
+    {id:"one",updated_at:"2026-10-28",heads:[{repo:"r",pr_number:1,head_sha:"a".repeat(40)}],content:"PRIVATE BODY"},
   ]});
   assert.match(html,/open the served portal to read/);
   assert.doesNotMatch(html,/href=|PRIVATE BODY/);
-  assert.equal(context.reviewDraftsHtml({id:"T-001"},{}),"");
+  assert.equal(context.reviewDraftsHtml({id:"T-001"}),"");
 });
 
 test("draft metadata is escaped and URL segments are encoded", () => {
-  const html=draftHarness().reviewDraftsHtml({id:'T-001" onmouseover="evil'}, {drafts:[
-    {id:"../bad",updated_at:"<script>",head_sha:'"><img src=x>'},
+  const html=draftHarness().reviewDraftsHtml({id:'T-001" onmouseover="evil',review_drafts:[
+    {id:"../bad",updated_at:"<script>",heads:[{repo:"<b>",pr_number:"<i>",head_sha:'"><img src=x>'}]},
   ]});
-  assert.doesNotMatch(html,/<script>|<img|href="[^"]*" onmouseover/);
+  assert.doesNotMatch(html,/<script>|<img|<b>|<i>|href="[^"]*" onmouseover/);
   assert.match(html,/%22/);
   assert.match(html,/\.\.%2Fbad/);
 });
@@ -469,7 +489,9 @@ function bannerHarness(jobs=[]) {
     "align-banner": {style: {}}, "align-spin": {style: {}},
     "align-title": {textContent: ""}, "align-body": {innerHTML: "", hidden: false},
     "action-queue": {innerHTML: "", hidden: false},
-    "action-queue-open": {textContent: "", hidden: true},
+    "action-queue-open": {textContent: "", hidden: true, dataset: {}, title: "",
+      attributes: {}, setAttribute(name, value) { this.attributes[name] = value; }},
+    "aq-summary": {textContent: ""}, "aq-spin": {style: {}},
     "align-toggle": {textContent: "Collapse", attributes: {"aria-expanded": "true"},
       setAttribute(name, value) { this.attributes[name] = value; }},
   };
@@ -482,7 +504,9 @@ function bannerHarness(jobs=[]) {
     setTimeout: callback => callback(),
   });
   vm.runInContext(block("// ---- workspace alignment", "function feature("), context);
-  return {context, elements, click: id => click({target: elements[id] || {id}}),
+  const target = id => Object.assign(elements[id] || {}, {id,
+    closest: sel => (sel === "#" + id ? elements[id] : null)});
+  return {context, elements, click: id => click({target: target(id)}),
     toggle() { click({target: Object.assign(elements["align-toggle"], {id: "align-toggle"})}); },
     requests: () => requests};
 }
@@ -512,7 +536,7 @@ test("collapsed operation banner keeps polling and retains completion and error 
   const result=await context.pollAlign("synthetic");
   assert.equal(result, done);
   assert.equal(requests(), 2);
-  assert.equal(elements["align-banner"].style.display, "block");
+  assert.notEqual(elements["align-banner"].style.display, "block");
   assert.equal(elements["align-body"].hidden, true);
   assert.match(elements["align-title"].innerHTML, /Checked 2 review PR/);
   assert.match(elements["align-body"].innerHTML, /Finished scan/);
@@ -524,14 +548,34 @@ test("collapsed operation banner keeps polling and retains completion and error 
   assert.match(elements["align-body"].innerHTML, /Synthetic failure/);
 });
 
-test("operation banner dismiss remains separate from collapse", () => {
+test("operation drop-down dismiss remains separate from collapse and never auto-opens", () => {
   const {context, elements, toggle, click}=bannerHarness();
   toggle();
+  click("action-queue-open");
+  assert.equal(elements["align-banner"].style.display, "block");
+  assert.equal(elements["action-queue-open"].attributes["aria-expanded"], "true");
   click("align-close");
   assert.equal(elements["align-banner"].style.display, "none");
+  assert.equal(elements["action-queue-open"].attributes["aria-expanded"], "false");
   context.renderAlign({kind: "review-scan", status: "done", repos: []});
-  assert.equal(elements["align-banner"].style.display, "block");
+  assert.equal(elements["align-banner"].style.display, "none");
   assert.equal(elements["align-body"].hidden, true);
+  click("action-queue-open");
+  click("somewhere-else");
+  assert.equal(elements["align-banner"].style.display, "none");
+});
+
+test("actions card summarises one running action, several, waiting and approvals", () => {
+  const {context}=bannerHarness();
+  const sum=a=>context.actionCardSummary(a);
+  assert.deepEqual({...sum([])},{tone:"idle",busy:false,text:"Idle"});
+  const one=sum([{kind:"pr-scan",slot:"PRs",status:"running",current:"repo-a"},
+    {kind:"pr-scan",slot:"PRs",status:"queued"}]);
+  assert.equal(one.text,"Scan PRs · PRs · repo-a · 1 waiting");
+  assert.equal(one.busy,true);
+  assert.equal(sum([{status:"running",kind:"pr-scan"},{status:"running",kind:"pr-scan"}]).text,"2 running");
+  assert.equal(sum([{status:"queued",kind:"pr-scan"}]).text,"1 waiting");
+  assert.equal(sum([{status:"approval_required",kind:"pr-scan"}]).tone,"warn");
 });
 
 test("queue popup keeps polling waiting jobs instead of treating queued as completion", async () => {
@@ -556,7 +600,8 @@ test("queue popup lists positions and errors, selects jobs, and retains collapse
   context.renderActionQueue(data);
   assert.match(elements["action-queue"].innerHTML,/Waiting #1/);
   assert.match(elements["action-queue"].innerHTML,/ab-bad/);
-  assert.equal(elements["action-queue-open"].textContent,"Actions (2)");
+  assert.match(elements["aq-summary"].textContent,/^sync · one · 1 waiting$/);
+  assert.equal(elements["action-queue-open"].hidden,false);
   toggle();
   context.renderActionQueue(data);
   assert.equal(elements["action-queue"].hidden,true);
@@ -567,8 +612,28 @@ test("queue popup lists positions and errors, selects jobs, and retains collapse
   click("align-close");
   context.renderActionQueue(data);
   assert.equal(elements["align-banner"].style.display,"none");
-  assert.equal(vm.runInContext("ACTION_UI.dismissed",context),true);
+  assert.equal(vm.runInContext("ACTION_UI.open",context),false);
   assert.match(template,/id="action-queue-open"/);
+});
+
+test("queue popup shows concurrent jobs and explains resource or capacity waits", () => {
+  const {context,elements}=bannerHarness();
+  const actions=[
+    {id:"one",kind:"pr-scan",status:"running",repos:[]},
+    {id:"two",kind:"review-scan",status:"running",repos:[]},
+    {id:"three",kind:"pr-scan",status:"queued",queue_position:1,
+      waiting_reason:"Waiting for conflicting actions",blocked_by:["one"]},
+  ];
+  context.renderActionQueue({actions,max_workers:3});
+  assert.match(elements["action-queue"].innerHTML,/2 running · 1 waiting/);
+  context.renderAlign(actions[2]);
+  assert.match(elements["align-body"].textContent,/conflicting actions/);
+  assert.match(elements["align-body"].textContent,/Independent actions may run first/);
+  context.renderAlign({...actions[2],waiting_reason:"Waiting for an execution slot"});
+  assert.match(elements["align-body"].textContent,/execution slot/);
+  context.renderAlign({...actions[2],waiting_reason:undefined});
+  assert.match(elements["align-body"].textContent,/resources and an execution slot/);
+  assert.doesNotMatch(elements["align-body"].textContent,/after earlier actions finish/);
 });
 
 test("finishing a non-selected polled action does not overwrite selected action details", async () => {
@@ -589,7 +654,7 @@ test("queue API failure is explicit and retains last known readings", async () =
   context.fetch=async()=>({ok:false,json:async()=>({error:"Storage unavailable"})});
   await context.refreshActionQueue();
   assert.match(elements["action-queue"].textContent,/Storage unavailable/);
-  assert.equal(elements["action-queue-open"].textContent,"Actions (unavailable)");
+  assert.equal(elements["aq-summary"].textContent,"Unavailable");
   assert.equal(vm.runInContext("ACTION_UI.jobs.length",context),1);
 });
 
@@ -622,9 +687,11 @@ function workspaceEditHarness({holder=null, mirror=null, served=true, result={ok
   untrack=false}={}){
   const workspace={slot:"slot / one",label:'A "workspace"',badge:"ONE",
     group:"dev",rev:"main",path:"/synthetic/one",status:{mirror}};
-  const controls=Object.fromEntries(["label","badge","group","rev"].map(key=>[key,{
+  workspace.purpose="general";
+  const controls=Object.fromEntries(["label","badge","group","rev","purpose"].map(key=>[key,{
     value:workspace[key],disabled:key==="rev"&&!!(holder||mirror),focus(){},
   }]));
+  controls.purpose.disabled=!!(holder||mirror);
   controls.force={checked:false,focus(){}};
   const handlers={}, requests=[];
   const save={disabled:false}, message={textContent:""}, cancel={addEventListener(){},focus(){}};
@@ -636,6 +703,8 @@ function workspaceEditHarness({holder=null, mirror=null, served=true, result={ok
     addEventListener(){},remove(){ this.removed=true; }};
   let appended=false;
   const context=vm.createContext({
+    WORKSPACES:{purposes:{general:"General",review:"Review",development:"Development",
+      "build-root":"Build root",mirror:"Mirror"}},
     SERVED:served,wsRoster:()=>[workspace],wsHolder:()=>holder,
     wsGroups:()=>[{id:"dev",name:"Development"}],
     esc:value=>String(value).replaceAll('"',"&quot;"),encodeURIComponent,
@@ -648,7 +717,8 @@ function workspaceEditHarness({holder=null, mirror=null, served=true, result={ok
       return result;
     },
   });
-  vm.runInContext(block("function wsUntrackDialog(", '// Modal for "+ Track workspace"'),context);
+  vm.runInContext(block("function wsAllows(", "let wsPurposeFilter=")+
+    block("function wsUntrackDialog(", '// Modal for "+ Track workspace"'),context);
   if(untrack) context.wsUntrackDialog(workspace.slot);
   else context.wsEditDialog(workspace.slot);
   return {overlay,controls,requests,message,save,appended,
@@ -677,12 +747,82 @@ test("workspace editor locks held or mirrored revisions but allows presentation 
   for(const options of [{holder:{type:"task"}},{mirror:{state:"active"}}]){
     const {overlay,controls,requests,submit}=workspaceEditHarness(options);
     assert.match(overlay.innerHTML,/name="rev"[^>]*disabled/);
+    assert.match(overlay.innerHTML,/name="purpose"[^>]*disabled/);
     assert.match(overlay.innerHTML,/Free the workspace or release its mirror/);
     controls.rev.value="ignored";
     controls.label.value="Updated label";
     await submit();
     assert.deepEqual(JSON.parse(JSON.stringify(requests[0].payload)),{label:"Updated label"});
   }
+});
+
+test("dedicated purpose editor saves its changed value without checkout operations", async () => {
+  const h=workspaceEditHarness();
+  assert.match(h.overlay.innerHTML,/Dedicated purpose/);
+  h.controls.purpose.value="review";
+  await h.submit();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.requests[0].payload)),{purpose:"review"});
+});
+
+test("workspace compatibility uses the owner policy and fails closed for unknown purposes", () => {
+  const context=vm.createContext({WORKSPACES:{},esc:String});
+  vm.runInContext(block("function wsAllows(", "let wsPurposeFilter="),context);
+  const review={purpose:"review",allowed_uses:["review","adhoc:review","mirror-source"]};
+  const build={purpose:"build-root",allowed_uses:["build","test","mirror","adhoc:build"]};
+  assert.equal(context.wsTaskAllows(review,{category:"code-review"}),true);
+  assert.equal(context.wsTaskAllows(review,{category:"development"}),false);
+  assert.equal(context.wsTaskAllows(build,{category:"code-review"}),false);
+  assert.equal(context.wsTaskAllows(build,{category:"development"}),false);
+  assert.equal(context.wsAllows(build,"build"),true);
+  assert.equal(context.wsAllows({purpose:"unknown"},"development"),false);
+  assert.equal(context.wsAllows({},"development"),true);
+  assert.match(block("function wsCard(", "// Per-card group picker"),/wsTaskAllows\(s,t\)/);
+  assert.match(block("function renderWorkspaces()", "// ---- column toggles"),
+    /class="ws-purpose-filter" data-filter multiple/);
+});
+
+test("dedicated cards expose only compatible tasks and hold tags", () => {
+  const context=vm.createContext({
+    WORKSPACES:{purposes:{review:"Review","build-root":"Build root"}},
+    SERVED:true,esc:String,wsHolder:()=>null,wsUnknown:()=>false,wsGroupMenu:()=>"",
+    activeTaskList:()=>[
+      {id:"T-review",category:"code-review",title:"Review"},
+      {id:"T-dev",category:"development",title:"Development"}],
+  });
+  vm.runInContext(block("function wsAllows(", "let wsPurposeFilter=")+
+    source.match(/const WS_ADHOC_TAGS=.*;/)[0]+
+    block("function wsCard(", "// Per-card group picker"),context);
+  const review=context.wsCard({slot:"review",purpose:"review",status:{},
+    allowed_uses:["review","adhoc:review","mirror-source"]});
+  assert.match(review,/Review only/);
+  assert.match(review,/option value="T-review"/);
+  assert.doesNotMatch(review,/option value="T-dev"/);
+  assert.match(review,/option value="review">review/);
+  assert.doesNotMatch(review,/option value="debug"/);
+  const build=context.wsCard({slot:"build",purpose:"build-root",status:{},
+    allowed_uses:["build","test","mirror","adhoc:build","adhoc:test"]});
+  assert.match(build,/Build root only/);
+  assert.doesNotMatch(build,/option value="T-/);
+  assert.match(build,/ws-occupy-task" disabled/);
+  assert.match(build,/option value="build">build/);
+  assert.match(build,/option value="test">test/);
+});
+
+test("workspace purpose filter matches any selected purpose and empty means all", () => {
+  const rows=[{slot:"legacy"},{slot:"r",purpose:"review"},{slot:"d",purpose:"development"},
+    {slot:"b",purpose:"build-root"},{slot:"m",purpose:"mirror"}];
+  const context=vm.createContext({
+    wsRoster:()=>rows,wsPurposeFilter:[],document:{getElementById:()=>({})},
+  });
+  vm.runInContext(block("function renderWorkspaces(){","  const occupied=")+
+    "\nreturn roster;\n}",context);
+  assert.equal(context.renderWorkspaces().length,5);
+  context.wsPurposeFilter=["review","development"];
+  assert.deepEqual(Array.from(context.renderWorkspaces(),r=>r.slot),["r","d"]);
+  context.wsPurposeFilter=["general"];
+  assert.deepEqual(Array.from(context.renderWorkspaces(),r=>r.slot),["legacy"]);
+  context.wsPurposeFilter=[];
+  assert.equal(context.renderWorkspaces().length,5);
 });
 
 test("workspace metadata editor preserves edits after server or network failures", async () => {
@@ -906,4 +1046,281 @@ test("workspace action keeps failed submissions visible without accepting them",
   assert.equal(accepted,0);
   assert.equal(polled,0);
   assert.match(msg.textContent,/approval expired/);
+});
+
+test("morning brief renders steps, linked items, stale and error states safely", () => {
+  const context = vm.createContext({Date});
+  vm.runInContext(block("// --- morning brief (pure renderer", "// --- end morning brief ---"), context);
+  const generated = "2026-11-12T08:00:00+00:00";
+  const now = Date.parse(generated) + 3600 * 1000;
+  const brief = {schema: 1, generated_at: generated, run: {status: "degraded", journal_id: 7},
+    steps: [{id: "prs", label: "PRs", status: "warn", summary: "1 blocked", duration_s: 2}],
+    sections: [{id: "prs", title: "My PRs", tone: "warn", summary: "<b>x</b>", items: [
+      {text: "Feat", link: {k: "pr", id: 7}},
+      {text: "Ext", link: {href: "https://github.com/o/r/pull/1"}},
+      {text: "Bad", link: {href: "javascript:alert(1)"}}]}]};
+  const fresh = context.briefHtml(brief, now);
+  assert.match(fresh.cap, /degraded/);
+  assert.match(fresh.cap, /journal #7/);
+  assert.doesNotMatch(fresh.cap, /stale/);
+  assert.match(fresh.body, /brief-step warn/);
+  assert.match(fresh.body, /data-k="pr" data-id="7"/);
+  assert.match(fresh.body, /href="https:\/\/github.com\/o\/r\/pull\/1"/);
+  assert.doesNotMatch(fresh.body, /javascript:/);
+  assert.match(fresh.body, /&lt;b&gt;x&lt;\/b&gt;/);
+  assert.match(context.briefHtml(brief, now + 30 * 3600 * 1000).cap, /stale/);
+  assert.match(context.briefHtml(null, now).body, /No brief yet/);
+  assert.match(context.briefHtml({error: "bad <file>"}, now).body, /brief-error">bad &lt;file&gt;/);
+});
+
+test("morning brief staleness follows the configured threshold", () => {
+  const context = vm.createContext({Date});
+  vm.runInContext(block("// --- morning brief (pure renderer", "// --- end morning brief ---"), context);
+  const generated = "2026-11-12T08:00:00+00:00";
+  const brief = {schema: 1, generated_at: generated, run: {status: "ok"}, steps: [], sections: []};
+  const later = Date.parse(generated) + 5 * 3600 * 1000;
+  assert.doesNotMatch(context.briefHtml(brief, later).cap, /stale/);
+  assert.match(context.briefHtml(brief, later, 4).cap, /no run in the last 4 h/);
+  assert.equal(context.localDmyHm(new Date(2026, 10, 5, 7, 4).getTime()), "05/11/2026 07:04");
+  assert.match(context.briefHtml(brief, later).cap, /\d{2}\/\d{2}\/2026 \d{2}:\d{2}/);
+});
+
+test("routine run days are labelled by preset or listed in week order", () => {
+  const context = vm.createContext({});
+  vm.runInContext(block("// --- routine days (pure", "// --- end routine days ---"), context);
+  const label = context.scheduleDaysLabel;
+  assert.equal(label(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]), "daily");
+  assert.equal(label(["Thu", "Wed", "Tue", "Mon", "Sun"]), "Sun–Thu");
+  assert.equal(label(["Mon", "Tue", "Wed", "Thu", "Fri"]), "Mon–Fri");
+  assert.equal(label(["Sat", "Fri"]), "Fri, Sat");
+  assert.equal(label([]), "no days");
+});
+
+test("browser prefs are validated and drive nav order and visibility", () => {
+  const context = vm.createContext({});
+  vm.runInContext(block("// --- browser prefs (pure", "// --- end browser prefs ---"), context);
+  const ids = ["overview", "work", "bugs", "settings"];
+  const sections = ids.map(id => ({id}));
+  const defaults = context.readPrefs(null, ids);
+  assert.equal(defaults.landing, "last");
+  assert.equal(defaults.actionPollMs, 1500);
+  assert.equal(context.readPrefs("{broken", ids).clock, "auto");
+  const p = context.readPrefs(JSON.stringify({landing: "bugs", hidden: ["work", "settings", "nope"],
+    order: ["bugs", "bugs", "x", "overview"], clock: "24", compact: true,
+    actionPollMs: 7, vmPollMs: 30000}), ids);
+  assert.equal(p.landing, "bugs");
+  assert.deepEqual([...p.hidden], ["work"]);
+  assert.deepEqual([...p.order], ["bugs", "overview"]);
+  assert.equal(p.clock, "24");
+  assert.equal(p.compact, true);
+  assert.equal(p.actionPollMs, 1500);
+  assert.equal(p.vmPollMs, 30000);
+  assert.equal(context.readPrefs(JSON.stringify({landing: "gone"}), ids).landing, "last");
+  assert.deepEqual(context.navSections(sections, p).map(s => s.id), ["bugs", "overview", "settings"]);
+});
+
+
+// ---- Overview live pulse (assets/pulse.js) ----
+const NOW = new Date("2026-11-15T12:00:00").getTime();
+const DAY = 864e5;
+const localIso = ms => { const d=new Date(ms); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); };
+function pulseFixture(){
+  return {
+    tasks:[
+      {id:"T-1",status:"in-progress",category:"development",due:localIso(NOW-2*DAY)},
+      {id:"T-2",status:"blocked",category:"development",workspace:"one"},
+      {id:"T-3",status:"done",category:"development",due:localIso(NOW-9*DAY)},
+      {id:"T-4",status:"todo",category:"code-review",updated:localIso(NOW-5*DAY),reviews:[{review_status:"pending"}]},
+      {id:"T-5",status:"todo",category:"code-review",updated:localIso(NOW),reviews:[{review_status:"commented"}]},
+    ],
+    workspaces:{slots:{one:{holder:{type:"task"}},two:{}},roster:[
+      {slot:"one",status:{checked:new Date(NOW-3600e3).toISOString(),repos:[{dirty:true}]}},
+      {slot:"two",status:{checked:null,repos:[{branch:"dev/x",revision:"main"}]}}]},
+    bugs:{last_scan:"2026-11-15 10:00",bugs:[
+      {key:"B-1",open:true,assignee:"a",signal:"active",triage:{state:"triaged"}},
+      {key:"B-2",open:true,assignee:"",signal:"active",triage:{state:"untriaged"},is_new:true},
+      {key:"B-3",open:false}]},
+    triage:{phenomena:[{status:"active",flags:["regressed"]},{status:"closed",flags:["escaped"]}]},
+    prs:{last_scan:"2026-11-15 11:00",features:[
+      {complete:false,pldm:"not-tested",prs:[{status:"ci-fail",updated:localIso(NOW)},{status:"approved",updated:localIso(NOW-8*DAY)}]},
+      {complete:true,prs:[{status:"merged"}]}]},
+    raid:{rows:[{rag:"red",type:"Risk"},{rag:"green",due:localIso(NOW-DAY),type:"Issue"},{rag:"red",closed:true}]},
+    vmlog:{running:[{}],stale_n:0,unreachable:[],jobs:[{status:"failed",started_ts:NOW/1000-3600},{status:"passed",started_ts:NOW/1000-90000}]},
+    team:{members:[{member_key:"ann",display_name:"Ann"},{member_key:"bob",display_name:"Bob",leave:{current_leave:{end_date:"2026-11-20"}}}],
+      assignments:[{member_key:"ann",status:"todo",target_date:localIso(NOW-DAY)}],
+      items:[{member_key:"ann",status:"open"},{member_key:"ann",status:"done"}],
+      onboarding:{ann:{done:1,total:4,overdue:2,complete:false}},
+      activity:{members:{
+        ann:{known:true,sources:{jira:{last_success_at:new Date(NOW-7200e3).toISOString()},github:{last_success_at:null}},
+          observations:[{kind:"github-pr-authored",observed_at:new Date(NOW-DAY).toISOString()},
+                        {kind:"github-pr-review",observed_at:new Date(NOW-2*DAY).toISOString()},
+                        {kind:"jira-assigned",observed_at:new Date(NOW-10*DAY).toISOString()}]},
+        bob:{known:true,sources:{jira:{last_success_at:new Date(NOW-7200e3).toISOString()}},observations:[]}}}},
+    actions:[{status:"running"}],
+    settings:{status:{timer:{active:"active",next:"Mon 08:00"},last_run:{status:"ok",generated_at:new Date(NOW-3600e3).toISOString()}}},
+    brief:{generated_at:new Date(NOW-30*3600e3).toISOString()},
+  };
+}
+const card = (cards,id) => cards.find(c=>c.id===id);
+const statOf = (c,k) => c.stats.find(s=>s.k===k).v;
+
+test("pulse cards count each section and pick the worst tone", () => {
+  const cards = Pulse.cards(pulseFixture(), NOW);
+  assert.deepEqual(cards.map(c=>c.id), Pulse.CARD_IDS);
+  const tasks = card(cards,"tasks");
+  assert.equal(tasks.value, 2);                        // reviews and done excluded
+  assert.equal(statOf(tasks,"overdue"), 1);
+  assert.equal(statOf(tasks,"wip"), 1);                // T-1 in progress with no workspace
+  assert.equal(tasks.tone, "bad");
+  const bugs = card(cards,"bugs");
+  assert.equal(bugs.value, 2);
+  assert.equal(statOf(bugs,"attention"), 1);
+  assert.equal(statOf(bugs,"alarm"), 1);               // closed phenomena never alarm
+  assert.equal(bugs.tone, "bad");
+  const prs = card(cards,"prs");
+  assert.equal(prs.value, 1);
+  assert.equal(statOf(prs,"ci"), 1);
+  assert.equal(statOf(prs,"landed"), 1);
+  assert.equal(statOf(prs,"stale"), 1);
+  assert.equal(statOf(prs,"pldm"), 1);
+  assert.equal(prs.tone, "bad");
+  assert.match(prs.note, /Pipeline clean \d+%/);
+  const rv = card(cards,"reviews");
+  assert.equal(rv.value, 1);                           // T-5 waits on the author
+  assert.equal(statOf(rv,"sla"), 1);
+  assert.equal(statOf(rv,"author"), 1);
+  const ws = card(cards,"workspaces");
+  assert.equal(ws.value, 1); assert.equal(ws.total, 2);
+  assert.equal(statOf(ws,"dirty"), 1);
+  assert.equal(statOf(ws,"stray"), 1);
+  assert.equal(statOf(ws,"unchecked"), 1);
+  const vmC = card(cards,"vm");
+  assert.equal(vmC.value, 1);
+  assert.equal(statOf(vmC,"failed"), 1);
+  assert.equal(statOf(vmC,"passed"), 0);               // older than 24 h
+  const raid = card(cards,"raid");
+  assert.equal(raid.value, 2); assert.equal(statOf(raid,"hot"), 1); assert.equal(raid.tone, "bad");
+  const team = card(cards,"team");
+  assert.equal(team.value, 1); assert.equal(team.total, 2);
+  assert.equal(statOf(team,"overdue"), 1);
+  assert.equal(statOf(team,"onboarding"), 2);
+  assert.equal(statOf(team,"leave"), 1);
+  assert.equal(card(cards,"portal").value, 1);
+  assert.equal(card(cards,"portal").tone, "ok");
+});
+
+test("pulse hygiene rules keep the former Overview definitions", () => {
+  const rules = Pulse.hygieneRules(pulseFixture(), NOW);
+  assert.deepEqual(rules.map(r=>[r.id,r.bad,r.total]), [
+    ["ci",1,2],["rebase",0,2],["landed",1,2],["moving",1,2],["pldm",1,1],["sla",1,1],["wip",1,1]]);
+  assert.deepEqual(Pulse.hygieneScore(rules), {pct:45, bad:6, all:11});
+  assert.equal(Pulse.hygieneScore([{bad:0,total:0}]), null);
+});
+
+test("pulse snapshot and delta compare against the morning brief", () => {
+  const cards = Pulse.cards(pulseFixture(), NOW);
+  const snap = Pulse.snapshot(cards, NOW);
+  assert.equal(snap.values.tasks, 2);
+  assert.equal(snap.values["bugs.attention"], 1);
+  assert.equal("portal.last" in snap.values, false);   // text-only stats are not numbers
+  assert.equal(Pulse.delta(snap, "tasks", 5), 3);
+  assert.equal(Pulse.delta(snap, "missing", 5), null);
+  assert.equal(Pulse.delta(null, "tasks", 5), null);
+});
+
+test("pulse member activity counts the last 7 days and flags gaps", () => {
+  const d = pulseFixture();
+  const ann = Pulse.memberActivity(d.team, "ann", NOW);
+  assert.deepEqual([ann.prs, ann.reviews, ann.jira, ann.events], [1,1,0,2]);
+  assert.deepEqual([ann.openTasks, ann.overdueTasks, ann.openItems], [1,1,1]);
+  assert.deepEqual(ann.onboarding, {done:1,total:4,overdue:2});
+  assert.deepEqual(ann.gaps, ["github"]);
+  assert.equal(ann.capped, false);
+  const bob = Pulse.memberActivity(d.team, "bob", NOW);
+  assert.deepEqual(bob.onLeave, {until:"2026-11-20"});
+  const html = Pulse.memberSummaryHtml(bob, NOW);
+  assert.match(html, /On leave/);
+  assert.doesNotMatch(html, /Quiet/);                  // on leave is not quiet
+  assert.match(Pulse.memberSummaryHtml(ann, NOW), /No github link/);
+  // A full 100-observation window that is all recent is shown as a floor.
+  const many = Array.from({length:100}, () => ({kind:"github-pr-review", observed_at:new Date(NOW-DAY).toISOString()}));
+  const capped = Pulse.memberActivity({members:[{member_key:"c"}], activity:{members:{c:{known:true,sources:{},observations:many}}}}, "c", NOW);
+  assert.equal(capped.capped, true);
+  assert.match(Pulse.memberSummaryHtml(capped, NOW), /Reviews <b>100\+<\/b>/);
+  assert.match(Pulse.memberSummaryHtml({...ann, name:"<x>"}, NOW), /^<span class="ma">/);
+});
+
+test("pulse freshness reports each source and marks stale ones", () => {
+  const f = Pulse.freshness(pulseFixture(), NOW);
+  const by = Object.fromEntries(f.map(x=>[x.id,x]));
+  assert.equal(by.bugs.ago, "2h ago"); assert.equal(by.bugs.stale, false);
+  assert.equal(by.team.stale, false);
+  assert.equal(by.vm.ago, "never"); assert.equal(by.vm.stale, true);
+  assert.equal(by.ws.ago, "1h ago");
+  assert.equal(by.routine.stale, true);                // 30 h old
+});
+
+test("pulse snapshot CLI prints values for the routine", () => {
+  const out = require("node:child_process").execFileSync(process.execPath,
+    [path.join(__dirname, "..", "assets", "pulse.js"), "--snapshot"],
+    {input: JSON.stringify(pulseFixture())});
+  const snap = JSON.parse(out);
+  assert.equal(typeof snap.taken_at, "string");
+  assert.equal(snap.values["raid.hot"], 1);
+});
+
+test("browser prefs validate pulse cards and order visible cards", () => {
+  const context = vm.createContext({});
+  vm.runInContext(block("// --- browser prefs (pure", "// --- end browser prefs ---"), context);
+  const ids = ["overview","settings"], cardIds = ["tasks","bugs","prs"];
+  const p = context.readPrefs(JSON.stringify({pulseHidden:["bugs","nope"], pulseOrder:["prs","prs","x","tasks"], pulsePollMs:30000}), ids, cardIds);
+  assert.deepEqual([...p.pulseHidden], ["bugs"]);
+  assert.deepEqual([...p.pulseOrder], ["prs","tasks"]);
+  assert.equal(p.pulsePollMs, 30000);
+  assert.equal(context.readPrefs(JSON.stringify({pulsePollMs:7}), ids, cardIds).pulsePollMs, 60000);
+  assert.deepEqual([...context.readPrefs("{}", ids).pulseHidden], []);
+  const cards = cardIds.map(id=>({id}));
+  assert.deepEqual(context.pulseVisible(cards, p).map(c=>c.id), ["prs","tasks"]);
+  assert.deepEqual(context.pulseVisible(cards, p, true).map(c=>c.id), ["prs","tasks","bugs"]);
+});
+
+test("overview template keeps brief, pulse and changes and drops the old storefront", () => {
+  for (const id of ["ov-brief","ov-pulse","ov-changes","ov-fresh","ov-asof"]) assert.match(template, new RegExp('id="'+id+'"'));
+  for (const id of ["ov-kpis","ov-sprints","ov-feed","ov-hygiene","ov-raid","ov-slots","ov-scoreboard"]) assert.doesNotMatch(template, new RegExp('id="'+id+'"'));
+  assert.match(source, /if\(id==="overview"\) return pulseShown\(\)\.filter\(c=>c\.tone==="bad"\)\.length;/);
+});
+
+test("open code-review tasks offer draft / re-review / interactive AI review by state", () => {
+  const task={id:"T-009",category:"code-review",status:"in-progress",reviews:[
+    {repo:"one",pr_number:1,pr_url:"https://github.com/example/one/pull/1"}]};
+  const served=draftHarness();
+  const fresh=served.detailRow(task,8);
+  assert.match(fresh,/data-ai-review="create"/);
+  assert.match(fresh,/data-ai-review="interactive"/);
+  assert.doesNotMatch(fresh,/data-ai-review="rereview"/);
+  const drafted=served.detailRow({...task,review_drafts:[{id:"d",file:"x.md",heads:[]}]},8);
+  assert.match(drafted,/data-ai-review="rereview"/);
+  assert.doesNotMatch(drafted,/data-ai-review="create"/);
+  assert.match(served.aiReviewButtons(task,true),/class="ai-rv-row"/);
+  vm.runInContext('REVIEW_CHATS={"T-009":{id:"rc-1",workspace:"rv0"}}',served);
+  const open=served.detailRow(task,8);
+  assert.match(open,/data-ai-review="resume"[^>]*data-chat="rc-1"/);
+  assert.doesNotMatch(open,/data-ai-review="(create|rereview|interactive)"/);
+  served.AI_USAGE={enabled:false};
+  assert.doesNotMatch(served.detailRow(task,8),/data-ai-review/);
+  assert.doesNotMatch(draftHarness(false).detailRow(task,8),/data-ai-review/);
+  assert.doesNotMatch(draftHarness().detailRow({...task,status:"done"},8),/data-ai-review/);
+});
+
+test("morning brief shows the AI paragraph escaped, above the sections", () => {
+  const context=vm.createContext({Date});
+  vm.runInContext(block("// --- morning brief (pure renderer", "// --- end morning brief ---"), context);
+  const out=context.briefHtml({generated_at:new Date().toISOString(),run:{status:"ok"},
+    ai:{text:"**Risk** first.\n\n<img src=x> second",model:"m1"},
+    sections:[{id:"a",title:"Sec",items:[]}]}, Date.now());
+  assert.match(out.body,/class="brief-ai"/);
+  assert.match(out.body,/<b>Risk<\/b> first\./);
+  assert.match(out.body,/&lt;img src=x&gt; second/);
+  assert.ok(out.body.indexOf("brief-ai")<out.body.indexOf("brief-grid"));
+  assert.doesNotMatch(context.briefHtml({run:{},sections:[]},Date.now()).body,/brief-ai/);
 });

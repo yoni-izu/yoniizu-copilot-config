@@ -33,7 +33,7 @@ function fixture(audience = "shared") {
   };
 }
 
-function harness(saved = {}, data = fixture()) {
+function harness(saved = {}, data = fixture(), pulse = null) {
   let buttons = [];
   const decode = value => value.replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   const root = {
@@ -76,7 +76,7 @@ function harness(saved = {}, data = fixture()) {
   const writes = [], alerts = [], prompts = [], confirmations = [], confirmMessages = [];
   let respond = async () => ({ok: true, json: async () => fixture()});
   const context = vm.createContext({
-    window: {__PORTAL__: {team: data},PortalDates:portalDates()},
+    window: {__PORTAL__: {team: data},PortalDates:portalDates(),...(pulse?{PortalPulse:pulse}:{})},
     document: {getElementById: id => id === "team-root" ? root : buttons.find(b => b.attrs.id === id),
       querySelectorAll: () => []},
     localStorage: {getItem: () => JSON.stringify(saved), setItem: (_, val) => writes.push(JSON.parse(val))},
@@ -788,14 +788,14 @@ test("tracked log renders current status and carried-follow-up source without le
 function instrumentTracking(data, captureDialog=()=>{}, fetch=async()=>({ok:true,json:async()=>({result:{ok:true}})})){
   const context=vm.createContext({
     window:{__PORTAL__:{team:data},PortalDates:portalDates(),captureDialog},
-    localStorage:{getItem:()=>null},fetch,
+    localStorage:{getItem:()=>null,setItem:()=>{}},fetch,
   });
   const instrumented=source
     .replace(source.slice(source.indexOf("  function formDialog("),source.indexOf("  async function editAssignment(")),
       "  function formDialog(...args){ window.captureDialog(...args); }\n")
     .replace('let mode = "presentation"','let mode = "private"')
     .replace("window.TeamUI =",`window.tracking={controls:trackingControls,values:trackingValues,
-      row:itemRow,serialize:itemRowValue,open:meetingDialog,newMeeting,editItem}; window.TeamUI =`);
+      row:itemRow,serialize:itemRowValue,open:meetingDialog,newMeeting,editItem,onboardMember,editMember}; window.TeamUI =`);
   vm.runInContext(instrumented,context);
   return context.window.tracking;
 }
@@ -878,4 +878,119 @@ test("item edit updates common tracking through the owner API rather than creati
   assert.equal(post.data.status,"done");
   assert.equal(post.data.target_date,"2026-11-12");
   assert.equal(post.data.follow_up,false);
+});
+
+const ONBOARDING_SPEC={
+  fields:[
+    {key:"member_key",label:"Member key",input:"text",need:"required"},
+    {key:"display_name",label:"Full name",input:"text",need:"required"},
+    {key:"onboarding_date",label:"Start date",input:"date",need:"required"},
+    {key:"employment_type",label:"Employment type",input:"select",options:["full-time","student"],need:"readiness",impact:"Capacity unknown."},
+    {key:"buddy_key",label:"Onboarding buddy",input:"member",need:"readiness",impact:"No buddy."},
+    {key:"goals",label:"Initial goals (private)",input:"textarea",need:"optional"},
+  ],
+  checklist:[],stages:[],
+};
+function onboardingFixture(audience="private"){
+  const data=fixture(audience);
+  data.onboarding={test:{member_key:"test",total:11,done:3,cancelled:0,open:8,overdue:2,complete:false,
+    next:"Hold the first 1:1",steps:[],...(audience==="private"?{gaps:[{field:"jira_account_id",label:"Jira account ID",impact:"Jira metrics stay unknown."}]}:{})}};
+  if(audience==="private") data.onboarding_spec=ONBOARDING_SPEC;
+  return data;
+}
+function fakeForm(){
+  const nodes={'[type="submit"]':{textContent:"Save"},".team-onboarding-preview":{innerHTML:""},".ws-modal-msg":{textContent:""}};
+  const listeners={};
+  return {nodes,listeners,querySelector:s=>nodes[s],addEventListener:(type,fn)=>{listeners[type]=fn;}};
+}
+
+test("Add member is private-only and progress shows without leaking private readiness gaps", async () => {
+  const h=harness({},onboardingFixture("shared"));
+  assert.equal(h.button("team-onboard"),undefined);
+  assert.match(h.root.innerHTML,/Onboarding 3\/11 · 2 overdue/);
+  h.ui.navigate("member/test");
+  assert.match(h.root.innerHTML,/Onboarding: 3\/11 done · <b>2 overdue<\/b> · next: Hold the first 1:1/);
+  assert.doesNotMatch(h.root.innerHTML,/Missing for readiness/);
+  h.setFetch(async()=>({ok:true,json:async()=>onboardingFixture("private")}));
+  await h.button("team-toggle-private").onclick();
+  assert.ok(h.button("team-onboard"));
+  h.ui.navigate("member/test");
+  assert.match(h.root.innerHTML,/Missing for readiness: <span title="Jira metrics stay unknown.">Jira account ID<\/span>/);
+});
+
+test("Add member previews through the owner API before registering the reviewed plan", async () => {
+  const posts=[],dialogs=[];
+  const plan={member_key:"newbie",member:{display_name:"New Member"},task_visibility:"private",
+    plan_revision:"rev-1",errors:[],gaps:[{label:"Jira account ID",impact:"unknown"}],not_done:["Nothing granted."],
+    tasks:[{stage:"Before arrival",target_date:"2026-11-26",owner_key:"newbie",title:"Request accounts and access"}]};
+  const tracking=instrumentTracking(onboardingFixture("private"),(...args)=>dialogs.push(args),async(_url,options)=>{
+    const body=JSON.parse(options.body); posts.push(body);
+    return {ok:true,json:async()=>({result:body.action==="onboarding-preview"?{entity:plan}:{id:"newbie"}})};
+  });
+  tracking.onboardMember();
+  const [title,html,onSave,options]=dialogs[0];
+  assert.equal(title,"Add team member");
+  for(const field of ["member_key","display_name","goals","task_visibility"]) assert.match(html,new RegExp(`name="${field}"`));
+  assert.match(html,/name="onboarding_date" data-date-field/);
+  assert.match(html,/<option value="test">Test engineer<\/option>/);
+  const form=fakeForm();
+  options.setup(form);
+  assert.equal(form.nodes['[type="submit"]'].textContent,"Preview");
+  const intake=new Map([["member_key","newbie"],["display_name","New Member"],["onboarding_date","2026-12-01"],["buddy_key",""]]);
+  await assert.rejects(onSave(intake,form),/Review the preview/);
+  assert.deepEqual(posts.map(p=>p.action),["onboarding-preview"]);
+  assert.equal(posts[0].data.buddy_key,undefined);
+  assert.match(form.nodes[".team-onboarding-preview"].innerHTML,/Request accounts and access/);
+  assert.match(form.nodes[".team-onboarding-preview"].innerHTML,/Missing for readiness/);
+  assert.equal(form.nodes['[type="submit"]'].textContent,"Register");
+  form.listeners.input();
+  assert.equal(form.nodes['[type="submit"]'].textContent,"Preview");
+  await assert.rejects(onSave(intake,form),/Review the preview/);
+  await onSave(intake,form);
+  assert.deepEqual(posts.map(p=>p.action),["onboarding-preview","onboarding-preview","onboarding-apply"]);
+  assert.equal(posts[2].data.plan_revision,"rev-1");
+  assert.equal(posts[2].data.member_key,"newbie");
+});
+
+test("Add member preview errors keep the dialog in preview mode", async () => {
+  const dialogs=[];
+  const tracking=instrumentTracking(onboardingFixture("private"),(...args)=>dialogs.push(args),async()=>({
+    ok:true,json:async()=>({result:{entity:{member_key:"test",member:{},plan_revision:"r",tasks:[],gaps:[],not_done:[],
+      errors:["member already exists: test"]}}})}));
+  tracking.onboardMember();
+  const [,,onSave,options]=dialogs[0], form=fakeForm();
+  options.setup(form);
+  await assert.rejects(onSave(new Map([["member_key","test"]]),form),/Fix the problems/);
+  assert.match(form.nodes[".team-onboarding-preview"].innerHTML,/member already exists: test/);
+  assert.equal(form.nodes['[type="submit"]'].textContent,"Preview");
+});
+
+test("Edit profile can complete onboarding identity gaps", async () => {
+  let save,post;
+  const tracking=instrumentTracking(onboardingFixture("private"),(_t,html,onSave)=>{
+    for(const field of ["role_title","employment_type","jira_account_id","github_handle"]) assert.match(html,new RegExp(`name="${field}"`));
+    save=onSave;
+  },async(_url,options)=>{post=JSON.parse(options.body);return {ok:true,json:async()=>({result:{ok:true}})};});
+  tracking.editMember("test");
+  await save(new Map([["jira_account_id","acc-1"],["github_handle",""],["goals_visibility","private"]]));
+  assert.equal(post.action,"member-set");
+  assert.equal(post.data.jira_account_id,"acc-1");
+  assert.equal(post.data.github_handle,null);
+  assert.equal(post.data.revision,"member-rev");
+});
+
+test("team overview and member header show the shared 7-day activity summary", () => {
+  const Pulse = require(path.join(__dirname, "..", "assets", "pulse.js"));
+  const data = fixture();
+  data.activity = {members: {test: {known: true, sources: {jira: {last_success_at: new Date().toISOString()}},
+    observations: [{kind: "github-pr-review", observed_at: new Date(Date.now() - 864e5).toISOString()}]}}};
+  const h = harness({}, data, Pulse);
+  h.ui.navigate("team/overview");
+  assert.match(h.root.innerHTML, /<th[^>]*>Activity \(7 days\)<\/th>/);
+  assert.match(h.root.innerHTML, /class="ma"[\s\S]*Reviews <b>1<\/b>/);
+  h.ui.navigate("member/test");
+  assert.match(h.root.innerHTML, /class="team-activity"[\s\S]*Reviews <b>1<\/b>/);
+  const bare = harness();
+  bare.ui.navigate("team/overview");
+  assert.doesNotMatch(bare.root.innerHTML, /class="ma"/);    // degrades silently without pulse.js
 });

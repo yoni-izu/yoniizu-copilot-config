@@ -188,28 +188,54 @@
   function modeBar(){
     return `<div class="team-mode ${isPrivate()?"private":"presentation"}">
       <button class="btn" id="team-refresh">Refresh</button>
+      ${isPrivate()&&TEAM.onboarding_spec?'<button class="btn primary" id="team-onboard">Add member</button>':""}
       <button class="btn team-mode-toggle" id="team-toggle-private" aria-pressed="${isPrivate()}">${isPrivate()?"Private":"Presentation"}</button>
     </div>`;
   }
 
+  function onboarding(memberKey){
+    const progress=TEAM.onboarding?.[memberKey];
+    return progress&&progress.total?progress:null;
+  }
+  function onboardingBadge(memberKey){
+    const p=onboarding(memberKey);
+    if(!p||p.complete) return "";
+    return ` <span class="badge team-onboarding-badge" title="Onboarding checklist">Onboarding ${p.done}/${p.total}${p.overdue?` · ${p.overdue} overdue`:""}</span>`;
+  }
+  function onboardingSummary(memberKey){
+    const p=onboarding(memberKey), gaps=TEAM.onboarding?.[memberKey]?.gaps||[];
+    if(!p&&!gaps.length) return "";
+    const progress=p?`<p class="cap">Onboarding: ${p.complete?"complete":`${p.done}/${p.total} done${p.overdue?` · <b>${p.overdue} overdue</b>`:""}${p.next?` · next: ${esc(p.next)}`:""}`}</p>`:"";
+    const missing=gaps.length?`<p class="cap team-onboarding-gaps">Missing for readiness: ${gaps.map(g=>`<span title="${esc(g.impact)}">${esc(g.label)}</span>`).join(", ")}</p>`:"";
+    return `<div class="team-onboarding">${progress}${missing}</div>`;
+  }
+
+  // Same summary as the Overview Team card (assets/pulse.js).
+  function activityHtml(key){
+    const P = window.PortalPulse;
+    if(!P) return "";
+    const now = Date.now();
+    return P.memberSummaryHtml(P.memberActivity(TEAM, key, now), now);
+  }
   function card(m){
     const leave = m.leave || {};
     const next = leave.next_approved_leave ? `${fmtDate(leave.next_approved_leave.start_date)}→${fmtDate(leave.next_approved_leave.end_date)}` : "—";
     const reviews = (TEAM.evidence?.per_member?.[m.member_key]?.reviews || []).length;
     return `<tr>
-      <td><a href="#member/${encodeURIComponent(m.member_key)}">${esc(m.display_name||m.member_key)}</a>${m.roster_role==="lead"?' <span class="badge">Lead</span>':""}</td>
+      <td><a href="#member/${encodeURIComponent(m.member_key)}">${esc(m.display_name||m.member_key)}</a>${m.roster_role==="lead"?' <span class="badge">Lead</span>':""}${onboardingBadge(m.member_key)}</td>
       <td>${esc(m.main_ip_ownership||"—")}</td>
       <td>${esc(m.base_country||"—")}</td>
       <td>${esc(m.focus||"—")}</td>
       <td>${esc(next)}</td>
       <td>${reviews}</td>
+      <td>${activityHtml(m.member_key)}</td>
       <td>${fmtDate(TEAM.evidence?.per_member?.[m.member_key]?.last_activity_at)}</td>
     </tr>`;
   }
 
   function renderOverview(){
     return `<div class="tile"><h3>Team overview</h3>
-      <table data-table-key="team-overview"><thead><tr><th>Member</th><th>Main IP</th><th>Country</th><th>Current focus</th><th>Next leave</th><th>Pending reviews</th><th data-sort-type="date">Last activity</th></tr></thead>
+      <table data-table-key="team-overview"><thead><tr><th>Member</th><th>Main IP</th><th>Country</th><th>Current focus</th><th>Next leave</th><th>Pending reviews</th><th title="Last 7 days from the Jira/GitHub activity scan, plus open tasks and items">Activity (7 days)</th><th data-sort-type="date">Last activity</th></tr></thead>
       <tbody>${(TEAM.members||[]).map(card).join("")}</tbody></table>
     </div>`;
   }
@@ -244,8 +270,10 @@
     return `<div class="tile"><h3>${esc(m.display_name||m.member_key)} ${m.roster_role==="lead"?"<span class='badge'>Lead</span>":""}</h3>
       <p class="cap">IP: ${esc(m.main_ip_ownership||"—")} · Country: ${esc(m.base_country||"—")} · Joined: ${fmtDate(m.onboarding_date)}</p>
       <p class="cap">Leave — current: ${esc(current)} · next: ${esc(next)}</p>
+      <div class="team-activity"><b>Activity — last 7 days</b> ${activityHtml(m.member_key)}</div>
       <div class="team-focus"><b>Current focus</b><p>${esc(m.focus||"Not recorded")}</p></div>
       ${m.goals?`<p>Goals: ${esc(m.goals)}</p>`:""}
+      ${onboardingSummary(m.member_key)}
       ${isPrivate()?`<div class="team-member-actions"><button class="btn team-edit-focus" data-member="${esc(m.member_key)}">Edit focus</button>
       <button class="btn team-edit-member" data-member="${esc(m.member_key)}">Edit profile</button></div>`:""}
     </div>`;
@@ -970,18 +998,85 @@
   function editMember(memberKey){
     const current = memberByKey(memberKey);
     if(!current) return;
+    const employment=TEAM.onboarding_spec?.fields?.find(f=>f.key==="employment_type")?.options||[];
+    const value=name=>esc(current[name]||"");
     formDialog("Edit member profile", `
-      <label>Main IP ownership<input name="main_ip_ownership" value="${esc(current.main_ip_ownership||"")}"></label>
-      <label>Base country<input name="base_country" value="${esc(current.base_country||"")}"></label>
+      <label>Role<input name="role_title" value="${value("role_title")}"></label>
+      ${employment.length?`<label>Employment type<select name="employment_type"><option value="">Unknown</option>${employment.map(o=>`<option value="${esc(o)}" ${o===current.employment_type?"selected":""}>${esc(o)}</option>`).join("")}</select></label>`:""}
+      <label>Main IP ownership<input name="main_ip_ownership" value="${value("main_ip_ownership")}"></label>
+      <label>Base country<input name="base_country" value="${value("base_country")}"></label>
+      <label>Jira account ID<input name="jira_account_id" value="${value("jira_account_id")}"></label>
+      <label>GitHub handle<input name="github_handle" value="${value("github_handle")}"></label>
       <label>Goals (optional)<textarea name="goals">${esc(current.goals||"")}</textarea></label>
       ${visibilitySelect("goals_visibility",current.goals_visibility||"private","Goals visibility")}`,async data=>{
+      const optional=["role_title","main_ip_ownership","base_country","jira_account_id","github_handle"];
+      if(employment.length) optional.push("employment_type");
       await mutate("member-set", {
         id:memberKey,revision:current.revision,
-        main_ip_ownership:data.get("main_ip_ownership")||null,
-        base_country:data.get("base_country")||null,
+        ...Object.fromEntries(optional.map(k=>[k,data.get(k)||null])),
         goals:data.get("goals"),goals_visibility:data.get("goals_visibility"),
       });
     });
+  }
+  function onboardingInput(f){
+    const required=f.need==="required"?" required":"";
+    const need=f.need==="required"?" *":f.need==="readiness"?' <span class="cap">(readiness)</span>':' <span class="cap">(optional)</span>';
+    const label=`${esc(f.label)}${need}`;
+    const help=f.help||f.impact?`<small class="cap">${esc(f.help||`If left empty: ${f.impact}`)}</small>`:"";
+    let control;
+    if(f.input==="date") control=dateInput(f.key,"",required);
+    else if(f.input==="textarea") control=`<textarea name="${esc(f.key)}"></textarea>`;
+    else if(f.input==="select") control=`<select name="${esc(f.key)}"><option value="">Unknown</option>${(f.options||[]).map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join("")}</select>`;
+    else if(f.input==="member") control=`<select name="${esc(f.key)}"><option value="">Not assigned yet</option>${(TEAM.members||[]).filter(m=>m.roster_role!=="lead").map(m=>`<option value="${esc(m.member_key)}">${esc(m.display_name||m.member_key)}</option>`).join("")}</select>`;
+    else control=`<input name="${esc(f.key)}"${required}>`;
+    return `<label>${label}${control}${help}</label>`;
+  }
+  function onboardingPreviewHtml(plan){
+    const list=(title,items,cls="")=>items.length?`<h4>${esc(title)}</h4><ul class="${cls}">${items.map(x=>`<li>${x}</li>`).join("")}</ul>`:"";
+    const owner=key=>esc(memberByKey(key)?.display_name||(key===plan.member_key?plan.member.display_name:key)||"—");
+    const rows=plan.tasks.map(t=>`<tr><td>${esc(t.stage)}</td><td>${fmtDate(t.target_date)}</td><td>${owner(t.owner_key)}</td><td>${esc(t.title)}</td></tr>`).join("");
+    return list("Cannot register",(plan.errors||[]).map(esc),"team-onboarding-errors")
+      +list("Warnings",(plan.warnings||[]).map(esc))
+      +list("Missing for readiness (can be completed later in Edit profile)",(plan.gaps||[]).map(g=>`<b>${esc(g.label)}</b> — ${esc(g.impact)}`))
+      +`<h4>Checklist that will be created (${plan.tasks.length} tasks, ${esc(plan.task_visibility==="shared"?"Presentation":"Private")})</h4>
+        <table class="team-onboarding-plan"><thead><tr><th>Stage</th><th>Due</th><th>Owner</th><th>Task</th></tr></thead><tbody>${rows}</tbody></table>`
+      +list("Not done by registration",(plan.not_done||[]).map(esc));
+  }
+  function onboardMember(){
+    const spec=TEAM.onboarding_spec;
+    if(!spec) return;
+    let reviewed=null;
+    formDialog("Add team member", `
+      <p class="cap">Fields marked * are required. Preview shows the exact records before anything is saved.</p>
+      ${spec.fields.map(onboardingInput).join("")}
+      ${visibilitySelect("task_visibility","private","Checklist visibility")}
+      <div class="team-onboarding-preview" aria-live="polite"></div>`, async (data, form)=>{
+      const intake=Object.fromEntries([...data.entries()].filter(([,v])=>String(v).trim()!==""));
+      const save=form.querySelector('[type="submit"]');
+      if(!reviewed){
+        const result=await mutate("onboarding-preview", intake);
+        const plan=result.entity;
+        form.querySelector(".team-onboarding-preview").innerHTML=onboardingPreviewHtml(plan);
+        if(plan.errors?.length) throw new Error("Fix the problems listed in the preview.");
+        reviewed=plan.plan_revision;
+        save.textContent="Register";
+        throw new Error("Review the preview, then select Register.");
+      }
+      const result=await mutate("onboarding-apply", {...intake, plan_revision:reviewed});
+      resetSelection();
+      view.tab="members"; view.member=result.id; view.subtab="tasks"; saveState();
+    }, {large:true, setup:form=>{
+      const save=form.querySelector('[type="submit"]');
+      save.textContent="Preview";
+      const invalidate=()=>{
+        if(!reviewed) return;
+        reviewed=null; save.textContent="Preview";
+        form.querySelector(".team-onboarding-preview").innerHTML="";
+        form.querySelector(".ws-modal-msg").textContent="Intake changed; preview again.";
+      };
+      form.addEventListener("input",invalidate);
+      form.addEventListener("change",invalidate);
+    }});
   }
 
   function attach(){
@@ -1120,6 +1215,8 @@
     };
     const refreshBtn = document.getElementById("team-refresh");
     if(refreshBtn) refreshBtn.onclick = ()=>refresh();
+    const onboardBtn = document.getElementById("team-onboard");
+    if(onboardBtn) onboardBtn.onclick = ()=>onboardMember();
     const guarded = action => async()=>{ try{ await action(); }catch(err){ alert("Team save failed: "+err.message); } };
     el.querySelectorAll(".team-edit").forEach(b=>b.onclick=guarded(async()=>{
       if(b.dataset.type==="assignment"){
@@ -1223,5 +1320,5 @@
   if(state.view) view = Object.assign(view, state.view);
   if(!Array.isArray(view.logTypes)) view.logTypes=[];
   if(view.subtab==="focus") view.subtab="tasks";
-  window.TeamUI = {render, refresh, hidePrivate, index, navigate};
+  window.TeamUI = {render, refresh, hidePrivate, index, navigate, isPrivate};
 })();

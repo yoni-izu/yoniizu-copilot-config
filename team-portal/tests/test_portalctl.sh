@@ -2,6 +2,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+grep -Fxq 'Environment="PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"' \
+    "$root/deploy/task-dashboard.service"
 tmp=$(mktemp -d)
 trap 'rm -r -- "$tmp"' EXIT
 mkdir "$tmp/bin"

@@ -50,7 +50,6 @@ let TRIAGE = BOOT.triage || {};
 let OVERVIEW = BOOT.overview || {};
 let PRS = BOOT.prs || {};
 let RAID = BOOT.raid || {};
-let PLDMQ = BOOT.pldmq || {};
 let VMLOG = BOOT.vmlog || {};
 // Oded's CI/CD pipeline explorer — linked to, never called.
 const PE_URL = (BOOT.explorer||{}).url || "";
@@ -112,7 +111,7 @@ function ensureSortMarker(th){
 }
 function rowIsDetail(row){
   return row.classList.contains("detail") || row.classList.contains("prf-detail")
-    || row.classList.contains("pq-detail") || row.classList.contains("vm-detail")
+    || row.classList.contains("vm-detail")
     || !!row.dataset.for;
 }
 function groupedRows(tbody){
@@ -243,6 +242,24 @@ window.PortalTableUI = {apply: applyTableStandards};
 // sends rather than carrying its own roster.
 function wsRoster(){ return (WORKSPACES&&WORKSPACES.roster)||[]; }
 function wsGroups(){ return (WORKSPACES&&WORKSPACES.groups)||[]; }
+function wsAllows(workspace, activity){
+  const purpose=workspace.purpose||"general";
+  const uses=workspace.allowed_uses||(WORKSPACES.purpose_uses||{})[purpose]||
+    (purpose==="general"?["*"]:[]);
+  return uses.includes("*")||uses.includes(activity);
+}
+function wsPurposeOptions(selected){
+  return Object.entries(WORKSPACES.purposes||{general:"General"}).map(([id,label])=>
+    `<option value="${esc(id)}"${id===selected?" selected":""}>${esc(label)}</option>`).join("");
+}
+function wsPurposeLabel(workspace){
+  const purpose=workspace.purpose||"general";
+  return (WORKSPACES.purposes||{})[purpose]||purpose;
+}
+function wsTaskAllows(workspace, task){
+  return wsAllows(workspace, task.category==="code-review"?"review":"development");
+}
+let wsPurposeFilter=[];
 let wsGridCols = 3;   // Workspace State grid: 3 columns (3×2) or 2 columns (2×3)
 
 const COLUMNS = [
@@ -301,17 +318,8 @@ function workedLabel(t){ const iso=lastWorked(t); if(!iso) return "—";
   const n=daysSince(iso); return n===0?"today":n+"d ago"; }
 function prs(t){ return t.reviews && t.reviews.length ? t.reviews : (t.review?[t.review]:[]); }
 // Collapse per-PR review statuses into one overall task review status.
-// Mirrors consolidate_review_status() in the Python CLI.
-function consolidateReviewStatus(pl){
-  const ss=(pl||[]).map(r=>r.review_status||"pending");
-  if(!ss.length) return "pending";
-  if(ss.every(s=>s==="merged")) return "merged";
-  if(ss.every(s=>s==="approved"||s==="merged")) return "approved";
-  if(ss.some(s=>s==="commented"||s==="changes-requested")) return "waiting-for-author";
-  if(ss.some(s=>s==="waiting-for-re-review")) return "waiting-for-re-review";
-  if(ss.some(s=>s==="in-progress")) return "in-progress";
-  return "pending";
-}
+// Mirrors consolidate_review_status() in the Python CLI; lives in pulse.js.
+function consolidateReviewStatus(pl){ return PortalPulse.consolidateReviewStatus(pl); }
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 // ---- workspace alignment (manual-review checkout) progress banner ----
@@ -338,9 +346,36 @@ function wsStepRow(st){
   return `<div class="ab-row ab-step ab-step-${esc(st.state)}"><span class="ab-${tone}">${WS_STEP_ICONS[st.state]||"\u00b7"}</span> `
     +`${esc(st.label)}${count}${live}${errs}</div>`;
 }
-const ACTION_UI={jobs:[],selected:null,dismissed:false,refreshing:false};
+const ACTION_UI={jobs:[],selected:null,dismissed:false,refreshing:false,open:false};
+// The queue lives in a drop-down under the Actions card; nothing opens it but
+// the user. The card itself carries the running summary.
+function setActionsOpen(open){
+  ACTION_UI.open=!!open;
+  const banner=document.getElementById("align-banner");
+  const opener=document.getElementById("action-queue-open");
+  if(banner) banner.style.display=ACTION_UI.open?"block":"none";
+  if(opener) opener.setAttribute("aria-expanded",String(ACTION_UI.open));
+}
+// Pure: the one-line card summary for a list of queue rows.
+function actionCardSummary(actions){
+  const running=actions.filter(job=>job.status==="running");
+  const queued=actions.filter(job=>job.status==="queued");
+  const approval=actions.filter(job=>job.status==="approval_required");
+  const wait=queued.length?` · ${queued.length} waiting`:"";
+  if(running.length===1){
+    const job=running[0];
+    const step=job.current||job.phase||"";
+    return {tone:"run",busy:true,text:actionLabel(job)+(step?" · "+step:"")+wait};
+  }
+  if(running.length>1) return {tone:"run",busy:true,text:`${running.length} running${wait}`};
+  if(queued.length) return {tone:"run",busy:false,text:`${queued.length} waiting`};
+  if(approval.length) return {tone:"warn",busy:false,text:`${approval.length} need approval`};
+  return {tone:"idle",busy:false,text:"Idle"};
+}
 function actionLabel(job){
-  const labels={"pr-scan":"Scan PRs","review-scan":"Scan reviews","vm-refresh":"Refresh VM jobs",
+  if(job.kind==="vm-refresh")
+    return "Refresh machine activity"+(job.target?" · "+job.target:"");
+  const labels={"pr-scan":"Scan PRs","review-scan":"Scan reviews",
     align:"Align workspace",pldm:"Submit PLDM test"};
   return (job.kind==="workspace-action"?job.action:labels[job.kind]||job.kind)+" · "+(job.slot||"");
 }
@@ -351,8 +386,12 @@ function renderActionQueue(data){
   const active=data.actions.filter(job=>["queued","running"].includes(job.status));
   const opener=document.getElementById("action-queue-open");
   if(opener){
+    const sum=actionCardSummary(data.actions);
     opener.hidden=false;
-    opener.textContent=`Actions (${active.length})`;
+    opener.dataset.tone=sum.tone;
+    opener.title=sum.text;
+    document.getElementById("aq-summary").textContent=sum.text;
+    document.getElementById("aq-spin").style.visibility=sum.busy?"visible":"hidden";
   }
   if(!ACTION_UI.selected||!data.actions.some(job=>job.id===ACTION_UI.selected))
     ACTION_UI.selected=(active[0]||data.actions[0])?.id||null;
@@ -363,8 +402,7 @@ function renderActionQueue(data){
       <span>${esc(actionLabel(job))}</span><b class="${job.status==="error"?"ab-bad":""}">${esc(job.status==="queued"?"Waiting #"+job.queue_position:job.status==="approval_required"?"Approval required":job.status)}</b></button>`).join("");
   if(focused) [...panel.querySelectorAll("[data-action-id]")].find(button=>button.dataset.actionId===focused)?.focus();
   const selected=data.actions.find(job=>job.id===ACTION_UI.selected);
-  if(selected&&!ACTION_UI.dismissed&&(active.length||document.getElementById("align-banner").style.display==="block"))
-    renderAlign(selected);
+  if(selected&&!ACTION_UI.dismissed) renderAlign(selected);
 }
 async function refreshActionQueue(){
   if(ACTION_UI.refreshing) return;
@@ -382,7 +420,8 @@ async function refreshActionQueue(){
     const panel=document.getElementById("action-queue");
     if(panel) panel.textContent="Action queue unavailable: "+error.message;
     const opener=document.getElementById("action-queue-open");
-    if(opener){ opener.hidden=false; opener.textContent="Actions (unavailable)"; }
+    if(opener){ opener.hidden=false; opener.dataset.tone="warn";
+      document.getElementById("aq-summary").textContent="Unavailable"; }
   }finally{ ACTION_UI.refreshing=false; }
 }
 async function refreshActionResult(job){
@@ -407,12 +446,14 @@ function renderAlign(job){
   const spin=document.getElementById("align-spin");
   const title=document.getElementById("align-title");
   const body=document.getElementById("align-body");
-  banner.style.display="block";
+  if(!banner) return;
   const running=job.status==="running";
   if(job.status==="queued"){
     spin.style.display="none";
     title.textContent=`Waiting${job.queue_position?" #"+job.queue_position:""} · ${actionLabel(job)}`;
-    body.textContent="Queued. This action will start after earlier actions finish.";
+    body.textContent=job.waiting_reason
+      ?`${job.waiting_reason}. Independent actions may run first.`
+      :"Queued. This action will start when its resources and an execution slot are available.";
     return;
   }
   const reset=job.kind==="reset";
@@ -479,8 +520,6 @@ function renderAlign(job){
 async function pollAlign(jobId,label){
   ACTION_UI.selected=jobId;
   ACTION_UI.dismissed=false;
-  const banner=document.getElementById("align-banner");
-  banner.style.display="block";
   document.getElementById("align-spin").style.display="inline-block";
   document.getElementById("align-title").textContent=label||"Aligning workspace…";
   document.getElementById("align-body").innerHTML="";
@@ -508,11 +547,13 @@ document.addEventListener("click",e=>{
     const job=ACTION_UI.jobs.find(job=>job.id===actionId);
     if(job) renderAlign(job);
   }
-  if(e.target && e.target.id==="action-queue-open"){
+  if(e.target?.closest?.("#action-queue-open")){
     ACTION_UI.dismissed=false;
-    document.getElementById("align-banner").style.display="block";
-    refreshActionQueue();
+    setActionsOpen(!ACTION_UI.open);
+    if(ACTION_UI.open) refreshActionQueue();
+    return;
   }
+  if(ACTION_UI.open&&!e.target?.closest?.("#aq-anchor")) setActionsOpen(false);
   if(e.target && e.target.id==="align-toggle"){
     const body=document.getElementById("align-body");
     body.hidden=!body.hidden;
@@ -521,9 +562,12 @@ document.addEventListener("click",e=>{
     e.target.setAttribute("aria-expanded",String(!body.hidden));
     e.target.textContent=body.hidden?"Expand":"Collapse";
   }
-  if(e.target && e.target.id==="align-close"){
-    ACTION_UI.dismissed=true;
-    document.getElementById("align-banner").style.display="none";
+  if(e.target && e.target.id==="align-close") setActionsOpen(false);
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"&&ACTION_UI.open){
+    setActionsOpen(false);
+    document.getElementById("action-queue-open")?.focus();
   }
 });
 
@@ -721,7 +765,7 @@ function cellFor(t,key){
     case "id": return `<td class="id">${esc(t.id)}</td>`;
     case "title": return `<td class="title-cell"><div class="title-line">`+
       `<button class="task-toggle" aria-expanded="false" title="Expand task details">\u25b8</button>`+
-      `<span class="title-text">${esc(t.title)}</span></div></td>`;
+      `<span class="title-text">${esc(t.title)}</span>${aiReviewButtons(t,true)}</div></td>`;
     case "category": return `<td><span class="cat">${esc(t.category)}</span></td>`;
     case "priority": return `<td><span class="badge p-${esc(t.priority)}">${esc(t.priority)}</span></td>`;
     case "status": return `<td><span class="badge s-${esc(t.status)}">${esc(t.status)}</span></td>`;
@@ -760,7 +804,11 @@ function editorHtml(t){
       <label>Category<select class="e-category">${selOpts(CATEGORIES,t.category)}</select></label>
       <label>Complexity<select class="e-complexity"><option value="">—</option>${selOpts(CPX_ORDER,t.complexity||"")}</select></label>
       <label>Est (h)<input type="number" step="0.5" class="e-cost" value="${t.cost_hours!=null?t.cost_hours:""}" style="min-width:90px"></label>
-      <label>Workspace<input type="text" class="e-workspace" value="${esc(t.workspace||"")}" style="min-width:140px"></label>
+      <label>Workspace<input class="e-workspace" type="text" list="task-workspace-${esc(t.id)}" value="${esc(t.workspace||"")}">
+        <datalist id="task-workspace-${esc(t.id)}">${
+        wsRoster().filter(s=>s.slot===t.workspace||wsTaskAllows(s,t)).map(s=>
+          `<option value="${esc(s.slot)}">${esc(s.label||s.slot)} · ${esc(wsPurposeLabel(s))}</option>`).join("")
+      }</datalist></label>
     </div>
     ${reviewRow}
     <div class="fields">
@@ -773,13 +821,19 @@ function editorHtml(t){
   </div>`;
 }
 
-function reviewDraftsHtml(t,r){
-  const drafts=[...(r.drafts||[])].sort((a,b)=>(b.updated_at||"").localeCompare(a.updated_at||""));
+function reviewDraftsHtml(t){
+  const prLabel=h=>`${h.repo||"?"}#${h.pr_number??"?"}`;
+  const drafts=[
+    ...(t.review_drafts||[]).map(d=>({...d,heads:d.heads||[]})),
+    ...prs(t).flatMap(r=>(r.drafts||[]).map(d=>({...d,legacy:true,
+      heads:[{repo:r.repo,pr_number:r.pr_number,head_sha:d.head_sha}]}))),
+  ].sort((a,b)=>(b.updated_at||"").localeCompare(a.updated_at||""));
   if(!drafts.length) return "";
   const link=(d,label)=>SERVED
     ?`<a class="btn review-draft-link" href="/review-drafts/${encodeURIComponent(t.id)}/${encodeURIComponent(d.id)}" target="_blank" rel="noopener">${label}</a>`
     :`<span>${label} (open the served portal to read)</span>`;
-  const row=(d,label)=>`${link(d,label)} <small>Saved ${esc(formatPortalDate(d.updated_at))} · head <code>${esc(d.head_sha||"")}</code></small>`;
+  const heads=d=>d.heads.map(h=>`${esc(prLabel(h))} <code>${esc(h.head_sha||"")}</code>`).join(", ");
+  const row=(d,label)=>`${link(d,label)} <small>${d.legacy?"Per-PR draft · ":d.kind==="combined"?"Combined from per-PR drafts · ":""}Saved ${esc(formatPortalDate(d.updated_at))} · ${heads(d)}</small>`;
   return `<div class="review-drafts">${row(drafts[0],"Open review draft")}`+
     (drafts.length>1?`<details><summary>Earlier drafts (${drafts.length-1})</summary><ul>`+
       drafts.slice(1).map(d=>`<li>${row(d,"Open earlier draft")}</li>`).join("")+`</ul></details>`:"")+`</div>`;
@@ -787,11 +841,12 @@ function reviewDraftsHtml(t,r){
 
 function detailRow(t,ncols){
   const p=prs(t);
-  const prHtml = p.length ? `<div><h4>Pull Requests <span class="badge rv-${esc(consolidateReviewStatus(p))}">overall: ${esc(consolidateReviewStatus(p))}</span></h4><div class="pr-list">`+
+  const autoBtn=aiReviewButtons(t,false);
+  const prHtml = p.length ? `<div><h4>Pull Requests <span class="badge rv-${esc(consolidateReviewStatus(p))}">overall: ${esc(consolidateReviewStatus(p))}</span>${autoBtn}</h4><div class="pr-list">`+
     p.map(r=>`<div class="pr"><a href="${esc(r.pr_url)}" target="_blank">${esc(r.repo)}#${esc(r.pr_number)}</a> `+
       `by ${esc(r.author||"?")} · <code>${esc(r.branch||"?")}</code> · ${r.files_changed||0} files `+
-      `+${r.additions||0}/-${r.deletions||0} · <b>${esc(r.review_status||"")}</b>${r.merged?" · merged":""}${reviewDraftsHtml(t,r)}</div>`).join("")+
-    `</div></div>` : "";
+      `+${r.additions||0}/-${r.deletions||0} · <b>${esc(r.review_status||"")}</b>${r.merged?" · merged":""}</div>`).join("")+
+    `</div>${reviewDraftsHtml(t)}</div>` : "";
   // Notes and the editor fold into collapsed disclosures so the expanded row
   // leads with the description, metadata and (for reviews) the PR list.
   const notesHtml=(t.notes||[]).length?`<details class="task-notes"><summary>Notes <span class="muted">(${t.notes.length})</span></summary><ul class="notes">`+
@@ -854,6 +909,22 @@ function taskHasOpenReview(t){
     prs(t).some(p=>!p.merged&&!p.closed&&p.review_status!=="merged"&&p.review_status!=="closed");
 }
 
+let REVIEW_CHATS={};
+function taskHasDraft(t){
+  return (t.review_drafts||[]).length>0||prs(t).some(r=>(r.drafts||[]).length>0);
+}
+function aiReviewButtons(t,compact){
+  if(!SERVED||AI_USAGE.enabled===false||!taskHasOpenReview(t)) return "";
+  const chat=REVIEW_CHATS[t.id];
+  const b=(mode,full,short,title,cls)=>`<button type="button" class="btn ai-rv${cls?" "+cls:""}" data-ai-review="${mode}" data-task="${esc(t.id)}"${chat?` data-chat="${esc(chat.id)}"`:""} title="${esc(title)}">${compact?short:full}</button>`;
+  const list=chat
+    ?[b("resume","✦ Resume interactive review","✦ Resume",chat.status==="interrupted"?`The start was interrupted by a portal restart; ${chat.workspace||"the workspace"} is kept. Open to retry or end it.`:`Open the interactive review in ${chat.workspace||"its workspace"}`,"primary")]
+    :[taskHasDraft(t)
+        ?b("rereview","↻ Re-review","↻ Re-review","A draft exists: AI follows the pr-review re-review flow (only what changed since the reviewed head) in a matching review workspace, registers the new draft and releases the workspace. Nothing is posted.")
+        :b("create","✦ Create review draft","✦ Draft","Occupy a free review workspace matching the PRs' manifest, let AI write a draft with /pr-review local, register it and release the workspace. Nothing is posted."),
+      b("interactive","✦ Interactive review","✦ Interactive","Check the PRs out in a review workspace and review them together with AI in a chat panel: walk the findings, discuss the code, reach verdicts, then submit after a confirmed preview.")];
+  return compact?`<span class="ai-rv-row">${list.join("")}</span>`:` <span class="ai-rv-group">${list.join("")}</span>`;
+}
 function selectedVisibleTasks(tasks){
   return tasks.filter(task=>selectedTaskIds.has(task.id));
 }
@@ -1067,7 +1138,7 @@ function wsUnknown(s){ return !!s.target&&(!(s.status||{}).checked||!!(s.status|
 function wsTaskById(id){ return TASKS.find(t=>t.id===id)||null; }
 function activeTaskList(){ return TASKS.filter(t=>!["done","cancelled"].includes(t.status)); }
 function ago(iso){ if(!iso) return ""; const n=daysSince(iso); return n==null?"":(n===0?"today":n+"d ago"); }
-const WS_ADHOC_TAGS=["monitor","debug","development","experiment","other"];
+const WS_ADHOC_TAGS=["monitor","debug","development","experiment","other","review","build","test"];
 
 // POST a slot occupy/free to the workspace API, then refresh the whole view.
 async function wsSlotPost(slot, payload, msgEl, onAccepted){
@@ -1283,17 +1354,18 @@ function wsCard(s){
         <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
         <span class="ws-msg"></span></div>`;
     }else{
-      const cand=activeTaskList().filter(t=>!t.workspace);
+      const cand=activeTaskList().filter(t=>!t.workspace&&wsTaskAllows(s,t));
+      const tags=WS_ADHOC_TAGS.filter(tag=>wsAllows(s,"adhoc:"+tag));
       ctlHtml=`<div class="ws-actions ws-occupy-box" data-slot="${esc(s.slot)}">
         <div class="ws-occ-row">
           <select class="ws-pick"><option value="">— occupy with a task —</option>${
             cand.map(t=>`<option value="${esc(t.id)}">${esc(t.id)} · ${esc((t.title||"").slice(0,48))}${t.workspace?` (moves from ${esc(t.workspace)})`:""}</option>`).join("")}</select>
-          <button class="primary ws-occupy-task">Occupy</button>
+          <button class="primary ws-occupy-task"${cand.length?"":" disabled"}>Occupy</button>
         </div>
         <div class="ws-occ-row">
           <input type="text" class="ws-adhoc-label" placeholder="…or an ad-hoc purpose (e.g. monitor PRs)">
-          <select class="ws-adhoc-tag">${WS_ADHOC_TAGS.map(g=>`<option value="${g}">${g}</option>`).join("")}</select>
-          <button class="ws-occupy-adhoc">Hold</button>
+          <select class="ws-adhoc-tag">${tags.map(g=>`<option value="${g}">${g}</option>`).join("")}</select>
+          <button class="ws-occupy-adhoc"${tags.length?"":" disabled"}>Hold</button>
         </div>
         <div class="ws-occ-row">
           <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
@@ -1320,6 +1392,8 @@ function wsCard(s){
       <button class="ws-mini ws-group-btn" data-slot="${esc(s.slot)}" title="Group">\u25c7</button>
       <button class="ws-mini ws-untrack" data-slot="${esc(s.slot)}" title="Stop tracking">\u2715</button>
     </span>${wsGroupMenu(s)}` : "";
+  const purposeChip=s.purpose&&s.purpose!=="general"
+    ?`<span class="badge ws-purpose" title="Dedicated use only">${esc(wsPurposeLabel(s))} only</span>`:"";
   return `<div class="ws-card ${occ?"occupied":"free"}${pinned?" special":""}" title="${esc(s.path||"")}">
     <div class="ws-head">
       <div class="ws-name"><span class="num${pinned?" special":""}">${esc(String(s.badge||s.slot))}</span>${headTitle}${revChip}${missing}</div>
@@ -1327,7 +1401,7 @@ function wsCard(s){
     </div>
     <div class="ws-body">
       <div class="ws-location"><span class="badge">${s.target?"Remote · "+esc(s.target):"Local"}</span>
-        <code class="ws-id">${esc(s.id||"")}</code></div>
+        ${purposeChip}<code class="ws-id">${esc(s.id||"")}</code></div>
       <div class="ws-path">${esc(s.path||"")}</div>
       <div class="ro-note">Last checked: ${reading.checked?esc(formatPortalDate(reading.checked)):"never"}
         ${reading.checked?" · "+(reading.clean?"clean baseline":reading.exists===false?"missing":"not clean baseline"):""}</div>
@@ -1427,7 +1501,7 @@ function wsEditDialog(slot){
   if(!workspace){ alert("Workspace is no longer tracked. Refresh the workspace list."); return; }
   const revisionLocked=!!wsHolder(slot)||!!workspace.status?.mirror;
   const values={label:workspace.label||slot, badge:workspace.badge||"",
-    group:workspace.group||"", rev:workspace.rev||"main"};
+    group:workspace.group||"", rev:workspace.rev||"main", purpose:workspace.purpose||"general"};
   const ov=document.createElement("div");
   ov.className="ws-modal-ov";
   ov.innerHTML=`<form class="ws-modal" role="dialog" aria-modal="true" aria-labelledby="ws-edit-title">
@@ -1439,6 +1513,8 @@ function wsEditDialog(slot){
       <label>Revision<input name="rev" type="text" value="${esc(values.rev)}" required ${revisionLocked?"disabled":""}></label>
     </div>
     ${revisionLocked?'<p class="ro-note">Free the workspace or release its mirror before changing revision.</p>':""}
+    <label>Dedicated purpose<select name="purpose"${revisionLocked?" disabled":""}>${wsPurposeOptions(values.purpose)}</select></label>
+    <p class="ro-note">Dedicated purpose restricts assignments and execution and persists after Free. Changing it requires an idle workspace with no hold or mirror.</p>
     <label>Group<select name="group"><option value="">— ungrouped —</option>
       ${wsGroups().map(g=>`<option value="${esc(g.id)}"${g.id===values.group?" selected":""}>${esc(g.name)}</option>`).join("")}</select></label>
     <div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>
@@ -1508,6 +1584,8 @@ function wsTrackDialog(){
       <label>Badge <span class="opt">optional</span><input type="text" id="wstk-badge" placeholder="auto" maxlength="4"></label>
     </div>
     <label>Group<select id="wstk-group"><option value="">— ungrouped —</option>${groupOpts}</select></label>
+    <label>Dedicated purpose<select id="wstk-purpose">${wsPurposeOptions("general")}</select></label>
+    <p class="ro-note">General allows any use. Review, Development, Build root and Mirror restrict this workspace to their designated work.</p>
     <div class="ws-modal-act">
       <span class="ws-modal-msg"></span>
       <button class="ws-modal-cancel">Cancel</button>
@@ -1529,6 +1607,7 @@ function wsTrackDialog(){
       label:ov.querySelector("#wstk-label").value.trim(),
       rev:ov.querySelector("#wstk-rev").value.trim(),
       badge:ov.querySelector("#wstk-badge").value.trim(),
+      purpose:ov.querySelector("#wstk-purpose").value,
       group:ov.querySelector("#wstk-group").value});
     if(ok) close(); else msg.textContent="";
   };
@@ -1604,7 +1683,7 @@ let wsGroupPanelOpen=false;
 
 function renderWorkspaces(){
   const box=document.getElementById("wsview");
-  const roster=wsRoster();
+  const roster=wsRoster().filter(s=>!wsPurposeFilter.length||wsPurposeFilter.includes(s.purpose||"general"));
   const occupied=roster.filter(s=>wsHolder(s.slot)||(s.status||{}).mirror).length;
   const free=roster.filter(s=>!wsHolder(s.slot)&&!(s.status||{}).mirror&&!wsUnknown(s)).length;
   const unknown=roster.length-occupied-free;
@@ -1629,9 +1708,15 @@ function renderWorkspaces(){
       <button class="ws-groups-btn${wsGroupPanelOpen?" on":""}">\u2699 Groups</button>
       <button class="primary ws-track-btn">\uff0b Track workspace</button>
     </div>`:"";
-  box.innerHTML = `<div class="ws-toolbar">${stats}<div class="ws-toolbar-r">${layout}${collapse}${tools}</div></div>`
+  const purposeFilter=`<label>Purpose <select class="ws-purpose-filter" data-filter multiple>
+    <option value="">All purposes</option>${Object.entries(WORKSPACES.purposes||{general:"General"}).map(([id,label])=>
+      `<option value="${esc(id)}"${wsPurposeFilter.includes(id)?" selected":""}>${esc(label)}</option>`).join("")}</select></label>`;
+  box.innerHTML = `<div class="ws-toolbar">${stats}<div class="ws-toolbar-r">${purposeFilter}${layout}${collapse}${tools}</div></div>`
     + (wsGroupPanelOpen?`<div class="ws-gpanel">${wsGroupPanelHtml()}</div>`:"")
     + wsGrids(roster);
+  box.querySelector(".ws-purpose-filter").addEventListener("change",e=>{
+    wsPurposeFilter=msVals(e.target); renderWorkspaces();
+  });
   // layout toggle
   box.querySelectorAll(".ws-seg button").forEach(b=>b.addEventListener("click",()=>{
     wsGridCols=Number(b.dataset.cols); renderWorkspaces();
@@ -1814,11 +1899,7 @@ function bugList(){ return (BUGS && BUGS.bugs) || []; }
 function bugFamilies(){ return (BUGS && BUGS.families) || []; }
 function famById(id){ return bugFamilies().find(f=>f.id===id)||null; }
 function bugTri(b){ return b.triage||{}; }
-function bugNeedsAttention(b){
-  return b.open && (["stalled","dormant"].includes(b.signal)
-                    || bugTri(b).state==="untriaged" || !b.assignee
-                    || (b.flags||[]).includes("pinged"));
-}
+function bugNeedsAttention(b){ return PortalPulse.bugNeedsAttention(b); }
 function bugMatchesTab(b, tab){
   switch(tab){
     case "open":      return b.open;
@@ -2235,8 +2316,8 @@ function renderFamilies(){
 // edit is applied server-side by ph.apply_ph_edit(), the same code path the
 // bug-triage CLI uses.
 const PH_SIGNALS = ["hot","active","slow","quiet","fixed","closed","unknown"];
-const PH_CLOSED = ["closed","not-a-bug","not-ours","merged"];
-const PH_ALARM = ["escaped","regressed","unexplained-recurring"];
+const PH_CLOSED = PortalPulse.PH_CLOSED;
+const PH_ALARM = PortalPulse.PH_ALARM;
 const SRC_LABEL = {explicit:"linked", filename:"by file name", mention:"mentioned"};
 let phFilter = {q:"", status:[], platform:[], flag:[], signal:[], origin:[], openOnly:true};
 const phOpenRows = new Set();
@@ -2244,7 +2325,7 @@ const bugOpenKeys = new Set();
 
 function phList(){ return (TRIAGE && TRIAGE.phenomena) || []; }
 function phById(id){ return phList().find(p=>p.id===id) || null; }
-function phIsOpen(p){ return !PH_CLOSED.includes(p.status); }
+function phIsOpen(p){ return PortalPulse.phIsOpen(p); }
 function phIcon(p){ return ((TRIAGE.signal_icon||{})[p.signal]) || "⚪"; }
 function invMeta(name){ return (TRIAGE.investigations||[]).find(i=>i.name===name) || {name}; }
 function noteName(path){ return String(path||"").split("/").pop(); }
@@ -2812,135 +2893,19 @@ document.getElementById("b-reset").addEventListener("click",()=>{
 });
 
 // ============================================================================
-// Overview storefront — team status at a glance. Everything is derived from
-// data already on the page; no extra fetches and no Jira calls.
+// Overview — morning brief, live pulse and "what changed". The metrics are
+// computed by assets/pulse.js from the section payloads already on the page.
 // ============================================================================
-// Power BI default theme palette — categorical, high contrast, colour-safe order.
-const PALETTE = ["#118DFF","#E66C37","#6B007B","#E044A7","#744EC2","#D9B300",
-                 "#12239E","#1AAB40","#D64550","#197278","#3599B8","#9B9B9B"];
 const PBI = {blue:"#118DFF", navy:"#12239E", orange:"#E66C37", purple:"#6B007B",
              pink:"#E044A7", violet:"#744EC2", gold:"#D9B300", green:"#1AAB40",
              red:"#D64550", teal:"#197278", grey:"#9B9B9B"};
-const RAG_RANK = {red:0, orange:1, yellow:2, green:3};
 
-function ovIps(){ return (OVERVIEW && OVERVIEW.ips) || []; }
-function ipOf(b){
-  const comps=(b.components||[]).map(c=>String(c).toLowerCase());
-  for(const ip of ovIps())
-    if(comps.some(c=>(ip.hints||[]).some(h=>c.includes(String(h).toLowerCase())))) return ip.name;
-  return "Other";
-}
-function daysUntil(iso){
-  if(!iso) return null;
-  return Math.round((new Date(iso+"T00:00:00") - new Date(new Date().toDateString()))/86400000);
-}
 // Local-calendar YYYY-MM-DD. toISOString() would shift by the UTC offset and
 // silently misplace "today" for anyone east of Greenwich.
 function isoDay(d){
   return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")
          +"-"+String(d.getDate()).padStart(2,"0");
 }
-
-// ---- SVG primitives -------------------------------------------------------
-// Charts render as ONE svg with an intrinsic viewBox and no explicit height, so
-// they scale proportionally inside the tile. That keeps text crisp and removes
-// the plot/label alignment drift a split-svg layout suffers from.
-function svgDonut(segs, size, thick, capt){
-  size=size||152; thick=thick||20;
-  const total=segs.reduce((a,s)=>a+s.v,0);
-  const cx=size/2, r=(size-thick)/2, circ=2*Math.PI*r;
-  let off=0;
-  const arcs=segs.filter(s=>s.v>0).map(s=>{
-    const len=total?circ*s.v/total:0;
-    const el='<circle class="seg" cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="'+s.c+'" stroke-width="'+thick+'"'
-      +' stroke-dasharray="'+len.toFixed(2)+' '+(circ-len).toFixed(2)+'" stroke-dashoffset="'+(-off).toFixed(2)+'">'
-      +'<title>'+esc(s.l)+': '+s.v+(total?' ('+Math.round(100*s.v/total)+'%)':'')+'</title></circle>';
-    off+=len; return el;
-  }).join("");
-  return '<svg class="donut" width="'+size+'" height="'+size+'" viewBox="0 0 '+size+' '+size+'" style="flex:none;">'
-    +'<g transform="rotate(-90 '+cx+' '+cx+')">'
-    +'<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="var(--track)" stroke-width="'+thick+'"/>'
-    +arcs+'</g>'
-    +'<text x="'+cx+'" y="'+(cx-2)+'" text-anchor="middle" dominant-baseline="middle"'
-    +' style="font:800 30px system-ui;fill:var(--text);">'+total+'</text>'
-    +'<text x="'+cx+'" y="'+(cx+20)+'" text-anchor="middle" dominant-baseline="middle"'
-    +' style="font:700 9px system-ui;fill:var(--muted);letter-spacing:.12em;">'
-    +esc(capt||"OPEN")+'</text></svg>';
-}
-// Semicircular gauge — the Power BI KPI staple. Value is a percentage.
-function svgGauge(pct, label, color, sub){
-  pct=Math.max(0,Math.min(100,pct||0));
-  const w=200, h=124, cx=w/2, cy=104, r=76, t=18;
-  const pt=(deg,rad)=>[cx+rad*Math.cos(Math.PI*deg/180), cy+rad*Math.sin(Math.PI*deg/180)];
-  const arc=(from,to,rad,col,width)=>{
-    const a=pt(from,rad), b=pt(to,rad);
-    return '<path d="M'+a[0].toFixed(1)+' '+a[1].toFixed(1)+' A'+rad+' '+rad+' 0 '
-      +((to-from)>180?1:0)+' 1 '+b[0].toFixed(1)+' '+b[1].toFixed(1)+'" fill="none" stroke="'+col
-      +'" stroke-width="'+width+'" stroke-linecap="round"/>';
-  };
-  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;max-width:220px;margin:0 auto;">'
-    +arc(180,359.9,r,"var(--track)",t)
-    +(pct>0.6?arc(180,180+180*pct/100,r,color,t):"")
-    +'<text x="'+cx+'" y="'+(cy-18)+'" text-anchor="middle" style="font:800 32px system-ui;fill:'+color+';">'
-      +Math.round(pct)+'<tspan style="font:700 15px system-ui;">%</tspan></text>'
-    +'<text x="'+cx+'" y="'+(cy-1)+'" text-anchor="middle" style="font:700 10px system-ui;fill:var(--muted);letter-spacing:.07em;">'
-      +esc(label||"")+'</text>'
-    +'<text x="'+(cx-r)+'" y="'+(cy+17)+'" text-anchor="middle" style="font:9px system-ui;fill:var(--muted);">0</text>'
-    +'<text x="'+(cx+r)+'" y="'+(cy+17)+'" text-anchor="middle" style="font:9px system-ui;fill:var(--muted);">100</text>'
-    +'<title>'+esc(sub||label||"")+'</title></svg>';
-}
-function svgLegend(segs, total){
-  return segs.filter(s=>s.v>0).map(s=>'<div class="li">'
-    +'<span class="sw" style="background:'+s.c+'"></span>'
-    +'<span style="overflow:hidden;text-overflow:ellipsis;">'+esc(s.l)+'</span>'
-    +'<span class="v">'+s.v+(total?' \u00b7 '+Math.round(100*s.v/total)+'%':'')+'</span></div>').join("");
-}
-// Stacked area over a daily x-axis. series = [{l,c,vals:[]}], stacked bottom-up.
-function svgStackedArea(labels, series, w, h){
-  w=w||780; h=h||250;
-  const L=34, R=58, T=14, B=34, iw=w-L-R, ih=h-T-B, n=labels.length;
-  if(!n) return '<div class="empty">No history yet.</div>';
-  const tops=labels.map((_,i)=>series.reduce((a,s)=>a+(s.vals[i]||0),0));
-  const max=Math.max(1,...tops);
-  const X=i=>L+(n===1?iw/2:iw*i/(n-1));
-  const Y=v=>T+ih-ih*v/max;
-  const uid="g"+Math.random().toString(36).slice(2,8);
-  const defs=[], bands=[], caps=[];
-  let base=labels.map(()=>0);
-  series.forEach((s,si)=>{
-    const top=labels.map((_,i)=>base[i]+(s.vals[i]||0));
-    const up=top.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(" ");
-    const down=base.map((_,i)=>X(n-1-i).toFixed(1)+','+Y(base[n-1-i]).toFixed(1)).join(" ");
-    defs.push('<linearGradient id="'+uid+si+'" x1="0" y1="0" x2="0" y2="1">'
-      +'<stop offset="0%" stop-color="'+s.c+'" stop-opacity=".95"/>'
-      +'<stop offset="100%" stop-color="'+s.c+'" stop-opacity=".55"/></linearGradient>');
-    bands.push('<polygon points="'+up+' '+down+'" fill="url(#'+uid+si+')"/>'
-      +'<polyline points="'+up+'" fill="none" stroke="'+s.c+'" stroke-width="2" stroke-linejoin="round"/>');
-    const ly=Math.max(T+12,(Y(top[n-1])+Y(base[n-1]))/2);
-    caps.push('<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(top[n-1]).toFixed(1)+'" r="3.6" fill="'+s.c
-      +'" stroke="var(--panel)" stroke-width="1.6"/>'
-      +'<text x="'+(w-R+9)+'" y="'+(ly+3).toFixed(1)+'" style="font:800 15px system-ui;fill:'+s.c+';">'
-      +(s.vals[n-1]||0)+'</text>'
-      +'<text x="'+(w-R+9)+'" y="'+(ly+15).toFixed(1)+'" style="font:700 8.5px system-ui;fill:var(--muted);letter-spacing:.1em;">'
-      +esc(s.l.toUpperCase())+'</text>');
-    base=top;
-  });
-  const ticks=[0,.5,1].map(f=>{
-    const v=Math.round(max*f);
-    return '<line x1="'+L+'" y1="'+Y(v)+'" x2="'+(w-R)+'" y2="'+Y(v)+'" stroke="var(--grid)"/>'
-      +'<text x="'+(L-7)+'" y="'+(Y(v)+3.5)+'" text-anchor="end" style="font:10px system-ui;fill:var(--muted);">'+v+'</text>';
-  }).join("");
-  const step=Math.max(1,Math.floor(n/6));
-  const xlab=labels.map((d,i)=>(i%step===0||i===n-1)
-    ? '<text x="'+X(i)+'" y="'+(T+ih+17)+'" text-anchor="middle" style="font:10px system-ui;fill:var(--muted);">'
-      +esc(formatPortalDate(d))+'</text>' : "").join("");
-  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;">'
-    +'<defs>'+defs.join("")+'</defs>'+ticks+bands.join("")+caps.join("")
-    +'<line x1="'+L+'" y1="'+(T+ih)+'" x2="'+(w-R)+'" y2="'+(T+ih)+'" stroke="var(--border)"/>'
-    +xlab+'</svg>';
-}
-// Horizontal bar visual — category and value share a header line above the bar.
-function jiraJql(jql){ return JIRA_BASE.replace(/browse\/$/,"issues/?jql=")+encodeURIComponent(jql); }
 
 // ---- "what changed since your last visit" ----
 // Every store already keeps a dated trail (bug change log, pr-monitor notes,
@@ -2969,6 +2934,52 @@ function chgEntries(){
   out.forEach(e=>{ e.h=e.k+"|"+e.id+"|"+e.d+"|"+e.txt.slice(0,80); });
   return out.filter(e=>e.d).sort((a,b)=>(b.d+(b.tm||"")).localeCompare(a.d+(a.tm||"")));
 }
+// --- morning brief (pure renderer; tests cut from here) ---
+const briefStaleHours=()=>
+  ((((BOOT.settings||{}).settings||{}).routine||{}).brief_stale_hours)||26;
+function localDmyHm(ms){
+  const d=new Date(ms); if(isNaN(d)) return "unknown time";
+  const p=n=>String(n).padStart(2,"0");
+  return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function briefHtml(brief, nowMs, staleHours=26){
+  const e=s=>(s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  if(!brief) return {cap:"No daily maintenance run has completed yet. The timer runs daily at the time set in Settings.",
+    body:'<div class="empty">No brief yet.</div>'};
+  if(brief.error) return {cap:"", body:'<div class="brief-error">'+e(brief.error)+'</div>'};
+  const gen=Date.parse(brief.generated_at||"");
+  const when=isNaN(gen)?"unknown time":localDmyHm(gen);
+  const stale=isNaN(gen)||(nowMs-gen)>staleHours*3600*1000;
+  const run=brief.run||{};
+  const cap="Daily maintenance run of "+e(when)+" \u00b7 status <b>"+e(run.status||"unknown")+"</b>"
+    +(run.journal_id?" \u00b7 journal #"+e(run.journal_id):"")
+    +(stale?' \u00b7 <span class="brief-stale">stale: no run in the last '+e(staleHours)+' h</span>':"");
+  const steps=(brief.steps||[]).map(s=>'<span class="brief-step '+e(s.status)+'" title="'
+    +e((s.summary||"")+(s.duration_s!=null?" ("+s.duration_s+"s)":""))+'">'+e(s.label||s.id)+'</span>').join("");
+  const link=(it)=>{
+    const l=it.link||{};
+    if(l.k&&l.id!=null) return '<button type="button" class="brief-link" data-k="'+e(l.k)+'" data-id="'+e(l.id)+'">'+e(it.text)+'</button>';
+    if(l.href&&/^https?:\/\//.test(l.href)) return '<a class="brief-link" href="'+e(l.href)+'" target="_blank" rel="noopener">'+e(it.text)+'</a>';
+    return e(it.text);
+  };
+  const secs=(brief.sections||[]).map(s=>'<div class="brief-sec '+e(s.tone||"")+'"><h4>'+e(s.title)+'</h4>'
+    +(s.summary?'<div class="brief-sum">'+e(s.summary)+'</div>':"")
+    +((s.items||[]).length?'<ul>'+s.items.map(it=>'<li>'+link(it)+'</li>').join("")+'</ul>':"")+'</div>').join("");
+  const ai=brief.ai&&brief.ai.text?'<div class="brief-ai"><h4>\u2726 AI summary'
+    +(brief.ai.model?' <small>'+e(brief.ai.model)+'</small>':"")+'</h4>'
+    +e(brief.ai.text).split(/\n{2,}/).map(p=>'<p>'+p.replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")+'</p>').join("")+'</div>':"";
+  return {cap, body:(steps?'<div class="brief-steps">'+steps+'</div>':"")+ai
+    +(secs?'<div class="brief-grid">'+secs+'</div>':'<div class="empty">Nothing to report.</div>')};
+}
+// --- end morning brief ---
+function renderBrief(){
+  const box=document.getElementById("ov-brief"); if(!box) return;
+  const out=briefHtml(OVERVIEW&&OVERVIEW.brief, Date.now(), briefStaleHours());
+  document.getElementById("ov-brief-cap").innerHTML=out.cap;
+  box.innerHTML=out.body;
+  box.querySelectorAll(".brief-link[data-k]").forEach(el=>el.addEventListener("click",()=>goItem(el.dataset.k,el.dataset.id)));
+}
+
 let chgShowAll=false;
 function renderChanges(){
   const box=document.getElementById("ov-changes"); if(!box) return;
@@ -3003,474 +3014,101 @@ function renderChanges(){
   document.getElementById("chg-back").onclick=()=>{ localStorage.removeItem(CHG_KEY); renderChanges(); };
 }
 
-function barTable(rows, max){
-  if(!rows.length) return '<div class="empty">Nothing to show.</div>';
-  const m=Math.max(1,max);
-  return '<div class="hbars">'+rows.map(r=>'<div class="hb">'
-    +'<div class="hb-t">'+(r.href?'<a class="hb-link" href="'+esc(r.href)+'" target="_blank" rel="noopener"'
-      +(r.title?' title="'+esc(r.title)+'"':'')+'>'+esc(r.l)+' \u2197</a>':'<span>'+esc(r.l)+'</span>')+'<b>'+r.v+'</b></div>'
-    +'<div class="hb-r"><i style="width:'+(100*r.v/m).toFixed(1)+'%;background:'+(r.c||PBI.blue)+';"></i></div>'
-    +(r.sub?'<div class="hb-s">'+esc(r.sub)+'</div>':'')
-    +'</div>').join("")+'</div>';
+// ---- live pulse: one card per section, computed by PortalPulse ----
+// The team payload is the shared audience (no private records); the settings
+// status is kept apart from SETTINGS so a background refresh never clobbers an
+// open Settings form.
+let TEAMDATA = BOOT.team || {};
+let PULSE_STATUS = null;
+let pulseLastFetch = 0;
+function pulseData(){
+  return {tasks:TASKS, workspaces:WORKSPACES, bugs:BUGS, triage:TRIAGE, prs:PRS, raid:RAID,
+    vmlog:VMLOG, team:TEAMDATA, actions:ACTION_UI.jobs,
+    settings:{status:PULSE_STATUS||(SETTINGS&&SETTINGS.status)||null}, brief:(OVERVIEW||{}).brief};
 }
-// Axis-less inline trend line. Colour carries a second dimension (the signal).
-function svgSparkline(vals, color, w, h){
-  w=w||104; h=h||26;
-  if(!vals || vals.length<2) return '<span style="color:var(--muted);">\u2014</span>';
-  const n=vals.length, max=Math.max(1,...vals);
-  const X=i=>1.5+(w-3)*i/(n-1), Y=v=>h-2-(h-6)*v/max;
-  const pts=vals.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(" ");
-  const last=vals[n-1], first=vals[0];
-  const delta=last-first;
-  return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" style="vertical-align:middle;display:block;">'
-    +'<polygon points="'+X(0).toFixed(1)+','+(h-1)+' '+pts+' '+X(n-1).toFixed(1)+','+(h-1)+'"'
-      +' fill="'+color+'" fill-opacity=".15"/>'
-    +'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.6"'
-      +' stroke-linejoin="round" stroke-linecap="round"/>'
-    +'<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(last).toFixed(1)+'" r="2.4" fill="'+color+'"/>'
-    +'<title>'+first+' \u2192 '+last+' open over '+n+' weeks (peak '+max+', '
-      +(delta>0?"+"+delta:delta===0?"flat":delta)+')</title></svg>';
+function pulseShown(now){ return pulseVisible(PortalPulse.cards(pulseData(), now==null?Date.now():now), prefs); }
+function pulseBaseline(){ const b=(OVERVIEW||{}).brief; return (b&&b.pulse&&b.pulse.values)?b.pulse:null; }
+function pulseDelta(base, key, v, better){
+  const d=PortalPulse.delta(base, key, v);
+  if(!d) return "";
+  const cls=better==null?"flat":((better==="down")===(d<0)?"good":"worse");
+  return '<span class="pd '+cls+'" title="Change since the morning brief snapshot ('
+    +esc(localDmyHm(Date.parse(base.taken_at)))+')">'+(d>0?"▲":"▼")+Math.abs(d)+'</span>';
 }
-// Column visual with data labels and a dashed average line.
-function svgBars(items, ref, unit, w, h){
-  w=w||780; h=h||250;
-  const L=34, R=12, T=24, B=44, iw=w-L-R, ih=h-T-B, n=items.length;
-  if(!n) return '<div class="empty">Nothing to show.</div>';
-  const max=Math.max(1, ...items.map(i=>i.v), ref||0)*1.14;
-  const bw=Math.min(74, (iw/n)*0.56);
-  const X=i=>L+iw*(i+0.5)/n, Y=v=>T+ih-ih*v/max;
-  const ticks=[0,.5,1].map(f=>{
-    const v=Math.round(max*f);
-    return '<line x1="'+L+'" y1="'+Y(v)+'" x2="'+(w-R)+'" y2="'+Y(v)+'" stroke="var(--grid)"/>'
-      +'<text x="'+(L-7)+'" y="'+(Y(v)+3.5)+'" text-anchor="end" style="font:10px system-ui;fill:var(--muted);">'+v+'</text>';
-  }).join("");
-  const bars=items.map((it,i)=>{
-    if(!it.v) return '<text x="'+X(i)+'" y="'+(T+ih-7)+'" text-anchor="middle"'
-      +' style="font:12px system-ui;fill:var(--muted);">\u2013</text>';
-    return '<rect class="col" x="'+(X(i)-bw/2).toFixed(1)+'" y="'+Y(it.v).toFixed(1)+'" width="'+bw.toFixed(1)
-      +'" height="'+(T+ih-Y(it.v)).toFixed(1)+'" rx="4" fill="'+(it.c||PBI.blue)+'">'
-      +'<title>'+esc(it.label)+': '+it.v+unit+(it.sub?' ('+esc(it.sub)+')':'')+'</title></rect>'
-      +'<text x="'+X(i)+'" y="'+(Y(it.v)-8).toFixed(1)+'" text-anchor="middle"'
-      +' style="font:800 13px system-ui;fill:var(--text);">'+it.v+'</text>';
-  }).join("");
-  const refline=ref ? '<line x1="'+L+'" y1="'+Y(ref)+'" x2="'+(w-R)+'" y2="'+Y(ref)
-      +'" stroke="'+PBI.red+'" stroke-width="1.4" stroke-dasharray="6 4"/>'
-      +'<text x="'+(w-R)+'" y="'+(Y(ref)-6)+'" text-anchor="end"'
-      +' style="font:800 9px system-ui;fill:'+PBI.red+';letter-spacing:.08em;">AVG '+ref+unit+'</text>' : "";
-  const xlab=items.map((it,i)=>'<text x="'+X(i)+'" y="'+(T+ih+18)+'" text-anchor="middle"'
-      +' style="font:700 11px system-ui;fill:var(--text);">'+esc(it.label)+'</text>'
-    +'<text x="'+X(i)+'" y="'+(T+ih+31)+'" text-anchor="middle"'
-      +' style="font:9.5px system-ui;fill:var(--muted);">'+esc(it.sub||"")+'</text>').join("");
-  return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="display:block;">'
-    +ticks+bars+refline
-    +'<line x1="'+L+'" y1="'+(T+ih)+'" x2="'+(w-R)+'" y2="'+(T+ih)+'" stroke="var(--border)"/>'
-    +xlab+'</svg>';
+function pulseCardHtml(c, base){
+  const toneTxt={ok:"healthy",warn:"needs a look",bad:"needs action"}[c.tone]||"";
+  const stats=c.stats.map(st=>'<div class="ps'+(st.tone?" "+st.tone:"")+'"'+(st.title?' title="'+esc(st.title)+'"':"")+'>'
+    +'<dt>'+esc(st.label)+'</dt><dd>'+esc(st.text!=null?st.text:(st.v==null?"—":st.v))
+    +pulseDelta(base, c.id+"."+st.k, st.v, st.better)+'</dd></div>').join("");
+  const members=c.members?'<div class="pulse-members">'+c.members.map(a=>
+      '<div class="pm"><a href="#member/'+encodeURIComponent(a.key)+'" data-pulse-member="'+esc(a.key)+'">'+esc(a.name)+'</a>'
+      +PortalPulse.memberSummaryHtml(a, Date.now())+'</div>').join("")+'</div>':"";
+  return '<article class="pulse-card tone-'+c.tone+(c.wide?" wide":"")+'" data-card="'+c.id+'">'
+    +'<button type="button" class="pulse-head" data-pulse-go="'+c.section+'" title="Open '+esc(c.label)+'">'
+    +'<span class="pi" aria-hidden="true">'+c.icon+'</span><span class="pl">'+esc(c.label)+'</span>'
+    +'<span class="pt" title="'+esc(toneTxt)+'"><span class="sr-only">'+esc(toneTxt)+'</span></span></button>'
+    +'<div class="pulse-main"><b class="pv">'+esc(c.value)+'</b>'+(c.total!=null?'<span class="ptot">/ '+esc(c.total)+'</span>':"")
+    +pulseDelta(base, c.id, c.value, c.id==="team"||c.id==="workspaces"?null:"down")
+    +'<span class="psub">'+esc(c.sub||"")+'</span></div>'
+    +(c.note?'<div class="pulse-note" title="'+esc(c.noteTitle||"")+'">'+esc(c.note)+'</div>':"")
+    +'<dl class="pulse-stats">'+stats+'</dl>'+members+'</article>';
 }
-
-// ---- derived series -------------------------------------------------------
-function ovBugFlow(){
-  const bugs=bugList();
-  if(!bugs.length) return {labels:[], series:[]};
-  const days=90, today=new Date(new Date().toDateString());
-  // Closed bugs occasionally lack a resolution date; fall back to when they
-  // last entered their current status so the burn-up still balances.
-  const pts=bugs.map(b=>({
-    c:(b.created||"").slice(0,10),
-    r:(b.resolved || (b.open?null:(b.status_since||b.updated)) || "").slice(0,10),
-  })).filter(p=>p.c);
-  const labels=[], open=[], closed=[];
-  for(let i=days-1;i>=0;i--){
-    const d=new Date(today); d.setDate(d.getDate()-i);
-    const iso=isoDay(d);
-    let c=0, o=0;
-    pts.forEach(p=>{
-      if(p.c>iso) return;
-      if(p.r && p.r<=iso) c++; else o++;
-    });
-    labels.push(iso); closed.push(c); open.push(o);
-  }
-  return {labels, series:[
-    {l:"Closed", c:"#16a34a", vals:closed},
-    {l:"Open",   c:"#2563eb", vals:open},
-  ]};
+function renderPulse(){
+  const box=document.getElementById("ov-pulse"); if(!box) return;
+  const base=pulseBaseline(), list=pulseShown();
+  const cap=document.getElementById("ov-pulse-cap");
+  if(cap) cap.innerHTML="Live counts from every section"
+    +(base?" · ▲▼ change since the morning brief ("+esc(localDmyHm(Date.parse(base.taken_at)))+")":" · changes appear after the next daily routine")
+    +' · <a href="#settings" data-pulse-go="settings">customize cards</a>';
+  box.innerHTML=list.length?list.map(c=>pulseCardHtml(c,base)).join("")
+    :'<div class="empty">All cards are hidden. <a href="#settings" data-pulse-go="settings">Choose cards in Settings</a>.</div>';
+  document.querySelectorAll("#sec-overview [data-pulse-go]").forEach(el=>el.onclick=e=>{ e.preventDefault(); selectSection(el.dataset.pulseGo); });
+  box.querySelectorAll("[data-pulse-member]").forEach(el=>el.onclick=e=>{ e.preventDefault(); goItem("member",el.dataset.pulseMember); });
 }
-const MONTH_ABBR=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-// Days from created \u2192 resolved, bucketed by the month the bug CLOSED. Bucketing
-// by close date (not open date) keeps every bucket final \u2014 it can never move.
-function ovCloseTime(months){
-  months=months||6;
-  const byMonth={};
-  bugList().forEach(b=>{
-    if(b.open) return;
-    const c=(b.created||"").slice(0,10);
-    const r=(b.resolved || b.status_since || b.updated || "").slice(0,10);
-    if(!c || !r) return;
-    const d=Math.max(0, Math.round((new Date(r+"T00:00:00")-new Date(c+"T00:00:00"))/86400000));
-    (byMonth[r.slice(0,7)] = byMonth[r.slice(0,7)] || []).push(d);
-  });
-  const now=new Date(), out=[];
-  for(let i=months-1;i>=0;i--){
-    const d=new Date(now.getFullYear(), now.getMonth()-i, 1);
-    const vals=(byMonth[d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")]||[])
-      .slice().sort((a,b)=>a-b);
-    const mean=vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : 0;
-    out.push({label:MONTH_ABBR[d.getMonth()], v:Math.round(mean*10)/10, n:vals.length,
-              sub:vals.length?vals.length+" closed":"",
-              median:vals.length?vals[Math.floor(vals.length/2)]:0});
-  }
-  return out;
+function renderFresh(){
+  const box=document.getElementById("ov-fresh"); if(!box) return;
+  box.innerHTML='<span class="fresh-l">Data age</span>'+PortalPulse.freshness(pulseData(), Date.now()).map(f=>
+    '<button type="button" class="fresh-chip'+(f.stale?" stale":"")+'" data-pulse-go="'+f.section+'" title="'
+    +esc(f.label+(f.at?" last updated "+localDmyHm(f.at):" has no recorded update")+(f.stale?" — older than "+PortalPulse.STALE_HOURS+" h":""))+'">'
+    +esc(f.label)+' <b>'+esc(f.ago)+'</b></button>').join("");
 }
-// Weekly open-bug count per IP \u2014 the shape of each IP's load over time.
-function ovIpTrend(weeks){
-  weeks=weeks||12;
-  const pts=bugList().map(b=>({ip:ipOf(b),
-    c:(b.created||"").slice(0,10),
-    r:(b.resolved || (b.open?null:(b.status_since||b.updated)) || "").slice(0,10)}))
-    .filter(p=>p.c);
-  const today=new Date(new Date().toDateString()), labels=[];
-  for(let i=weeks-1;i>=0;i--){ const d=new Date(today); d.setDate(d.getDate()-i*7); labels.push(isoDay(d)); }
-  const byIp={};
-  pts.forEach(p=>{ byIp[p.ip]=byIp[p.ip]||labels.map(()=>0); });
-  labels.forEach((iso,i)=>pts.forEach(p=>{
-    if(p.c<=iso && !(p.r && p.r<=iso)) byIp[p.ip][i]++;
-  }));
-  return {labels, byIp};
-}
-function ovReviewTasks(){
-  return TASKS.filter(t=>t.category==="code-review" && !["done","cancelled"].includes(t.status));
-}function ovReviewRows(){
-  const cnt={};
-  ovReviewTasks().forEach(t=>{ const p=prs(t); if(!p.length) return;
-    const s=consolidateReviewStatus(p); cnt[s]=(cnt[s]||0)+1; });
-  const colors={pending:"#9B9B9B","in-progress":"#D9B300",commented:"#118DFF",
-    "changes-requested":"#D64550","waiting-for-author":"#E66C37",
-    "waiting-for-re-review":"#744EC2",approved:"#1AAB40",merged:"#197278"};
-  return RV_ORDER.filter(s=>cnt[s]).map(s=>({l:s, v:cnt[s], c:colors[s]}));
-}
-
-// ---- development hygiene ---------------------------------------------------
-// Each rule is "bad out of total"; a rule with no population is skipped rather
-// than scored, so an empty PR queue can't flatter the score.
-const HYG_STALE_PR_DAYS = 7;
-const HYG_REVIEW_SLA_DAYS = 3;
-
-function hygieneRules(){
-  const feats=(PRS.features||[]).filter(f=>!f.complete);
-  const prsAll=[].concat.apply([], feats.map(f=>f.prs||[]));
-  const live=prsAll.filter(p=>!["merged","closed"].includes(p.status));
-  const rvTasks=ovReviewTasks().filter(t=>prs(t).length);
-  const rvWaiting=rvTasks.filter(t=>
-    !["approved","merged","waiting-for-author"].includes(consolidateReviewStatus(prs(t))));
-  const inProgress=TASKS.filter(t=>t.status==="in-progress");
-
-  const rule=(label,bad,total,hint)=>({label, bad, total, hint});
-  return [
-    rule("CI green on open PRs",
-         live.filter(p=>p.status==="ci-fail").length, live.length,
-         "red checks block every reviewer behind you"),
-    rule("Rebased on target",
-         live.filter(p=>p.status==="needs-rebase").length, live.length,
-         "behind or conflicting with the base branch"),
-    rule("Approved PRs landed",
-         live.filter(p=>p.status==="approved").length, live.length,
-         "approved but still not merged"),
-    rule("PRs moving",
-         live.filter(p=>{const d=daysSince((p.updated||"").slice(0,10));
-                         return d!=null && d>=HYG_STALE_PR_DAYS;}).length, live.length,
-         "no activity for "+HYG_STALE_PR_DAYS+"+ days"),
-    rule("Features PLDM-tested",
-         feats.filter(f=>!f.pldm||f.pldm==="not-tested").length, feats.length,
-         "never exercised on Palladium"),
-    rule("Reviews answered in "+HYG_REVIEW_SLA_DAYS+"d",
-         rvWaiting.filter(t=>{const d=daysSince(t.updated); return d!=null && d>HYG_REVIEW_SLA_DAYS;}).length,
-         rvWaiting.length, "waiting on me past the turnaround target"),
-    rule("WIP bound to a workspace",
-         inProgress.filter(t=>!t.workspace).length, inProgress.length,
-         "in-progress with no checkout assigned"),
-  ].filter(r=>r.total>0);
-}
-
-function renderHygiene(){
-  const rules=hygieneRules();
-  const box=document.getElementById("ov-hygiene");
-  if(!rules.length){
-    document.getElementById("ov-hyg-score").innerHTML="";
-    box.innerHTML='<div class="empty">Nothing in flight to measure.</div>';
-    return;
-  }
-  const totBad=rules.reduce((a,r)=>a+r.bad,0), totAll=rules.reduce((a,r)=>a+r.total,0);
-  const score=Math.round(100*(1-totBad/Math.max(1,totAll)));
-  const sc=score>=85?PBI.green:score>=65?PBI.gold:PBI.red;
-  document.getElementById("ov-hyg-score").innerHTML=
-    svgGauge(score,"Pipeline clean",sc,totBad+" of "+totAll+" checks failing");
-
-  box.innerHTML=rules.map(r=>{
-    const pct=Math.round(100*r.bad/r.total);
-    const c=r.bad===0?PBI.green:pct>=34?PBI.red:PBI.gold;
-    return '<div class="hyg" style="--hc:'+c+'">'
-      +'<div class="hyg-h"><span class="hyg-l">'+esc(r.label)+'</span>'
-      +'<span class="hyg-n">'+(r.total-r.bad)+' / '+r.total+'</span></div>'
-      +'<div class="hyg-bar"><i style="width:'+(100-pct)+'%"></i></div>'
-      +'<div class="hyg-s">'+(r.bad?'<b>'+r.bad+'</b> '+esc(r.hint):"all clear")+'</div>'
-      +'</div>';
-  }).join("");
-}
-
-// ---- render ---------------------------------------------------------------
 function renderOverview(){
-  const bugs=bugList(), open=bugs.filter(b=>b.open);
-  const attention=open.filter(bugNeedsAttention);
-  const trend=ovIpTrend(12);
-  const raid=((OVERVIEW&&OVERVIEW.raid)||[]).filter(r=>!r.closed);
-  const raidHot=raid.filter(r=>["red","orange"].includes(r.rag));
-  const rvRows=ovReviewRows();
-  const rvTotal=rvRows.reduce((a,r)=>a+r.v,0);
-  const rvOpen=rvRows.filter(r=>!["merged","approved"].includes(r.l)).reduce((a,r)=>a+r.v,0);
-  const activeTasks=TASKS.filter(t=>!["done","cancelled"].includes(t.status));
-  const prog=(OVERVIEW&&OVERVIEW.program)||{};
-  const slots=(WORKSPACES&&WORKSPACES.slots)||{};
-  const rosterBySlot=new Map(wsRoster().map(r=>[r.slot,r]));
-  const slotNames=[...new Set([...rosterBySlot.keys(),...Object.keys(slots)])];
-  const busy=slotNames.filter(k=>(slots[k]&&slots[k].holder)
-    ||(rosterBySlot.get(k)?.status||{}).mirror).length;
-  const today=isoDay(new Date());
-
-  // --- KPI band ---
-  const po=daysUntil(prog.power_on), a1=daysUntil(prog.a1_delivery);
-  const kpi=o=>'<div class="kpi" style="--k:'+o.c+'">'
-    +(o.spark?'<div class="spark">'+o.spark+'</div>':'')
-    +'<div class="l">'+esc(o.label)+'</div>'
-    +'<div class="n">'+o.n+(o.unit?'<small>'+esc(o.unit)+'</small>':'')+'</div>'
-    +'<div class="s">'+(o.sub||"")+'</div>'
-    +(o.pct==null?'':'<div class="bar"><i style="width:'+Math.max(0,Math.min(100,o.pct)).toFixed(0)+'%"></i></div>')
-    +'</div>';
-  // Program progress: how far into the window that ends at power-on, taking the
-  // same-length run-up before it as the start of the window.
-  const span=(po!=null)?100*(1-Math.max(0,po)/Math.max(1,po+60)):null;
-  const openTrend=Object.values(trend.byIp).reduce((acc,v)=>
-    v.map((x,i)=>x+(acc[i]||0)), []);
-  document.getElementById("ov-kpis").innerHTML=[
-    kpi({c:po!=null&&po<21?PBI.red:(po!=null&&po<45?PBI.orange:PBI.blue), label:"Power-on",
-         n:po==null?"\u2014":po, unit:"days", pct:span,
-         sub:esc(prog.power_on?formatPortalDate(prog.power_on):"date unknown")+" \u00b7 A1 silicon"}),
-    kpi({c:a1!=null&&a1<45?PBI.orange:PBI.navy, label:"A1 big delivery",
-         n:a1==null?"\u2014":a1, unit:"days",
-         sub:esc(prog.a1_delivery?formatPortalDate(prog.a1_delivery):"date unknown")+" \u00b7 end of MS8"}),
-    kpi({c:attention.length?PBI.orange:PBI.green, label:"Open bugs", n:open.length,
-         sub:attention.length+" need attention",
-         pct:open.length?100*attention.length/open.length:0,
-         spark:openTrend.length>1?svgSparkline(openTrend,
-           attention.length?PBI.orange:PBI.green, 150, 44):""}),
-    kpi({c:rvOpen>6?PBI.orange:PBI.teal, label:"Reviews on me", n:rvOpen,
-         sub:rvTotal+" PR group"+(rvTotal===1?"":"s")+" in queue"}),
-    kpi({c:raidHot.length?PBI.red:PBI.violet, label:"RAID open", n:raid.length,
-         sub:raidHot.length+" red / orange",
-         pct:raid.length?100*raidHot.length/raid.length:0}),
-    kpi({c:PBI.purple, label:"Workspaces", n:busy+'<small>/'+slotNames.length+'</small>',
-         sub:activeTasks.length+" active tasks",
-         pct:slotNames.length?100*busy/slotNames.length:0}),
-  ].join("");
-
-  // --- report header + sprint slicer ---
-  const curSprint=(prog.sprints||[]).find(s=>s.start&&s.end&&s.start<=today&&today<=s.end);
-  document.getElementById("ov-asof").innerHTML=
-    "As of <b>"+esc(today)+"</b> \u00b7 "+bugs.length+" bugs mirrored \u00b7 "
-    +(curSprint?"sprint <b>"+esc(curSprint.name)+"</b>":"between sprints")
-    +" \u00b7 "+(SERVED?"live":"static snapshot");
-  document.getElementById("ov-sprints").innerHTML='<span class="sl-l">Sprint</span>'
-    +(prog.sprints||[]).map(s=>{
-      const now=s.start&&s.end&&s.start<=today&&today<=s.end;
-      return '<div class="sprint'+(now?" now":"")+'">'+esc(s.name)
-        +'<span class="w">'+esc(s.window)+'</span></div>';
-    }).join("");
-
-  // --- bug flow ---
-  const flow=ovBugFlow();
-  document.getElementById("ov-bugflow").innerHTML=svgStackedArea(flow.labels, flow.series);
-
-  // --- backlog health gauges ---
-  const gPct=(f)=>open.length?100*open.filter(f).length/open.length:0;
-  const triaged=gPct(b=>(bugTri(b).state||"untriaged")!=="untriaged");
-  const planned=gPct(b=>!(b.flags||[]).some(f=>f==="no-milestone"||f==="no-sprint"));
-  const owned=gPct(b=>!!b.assignee);
-  const gcol=p=>p>=80?PBI.green:p>=50?PBI.gold:PBI.red;
-  document.getElementById("ov-gauges").innerHTML=open.length
-    ? '<div style="display:grid;gap:10px;">'
-      +svgGauge(triaged,"TRIAGED",gcol(triaged),
-         Math.round(triaged*open.length/100)+" of "+open.length+" open bugs have left untriaged")
-      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">'
-      +svgGauge(planned,"PLANNED",gcol(planned),"Has both a milestone and a sprint")
-      +svgGauge(owned,"ASSIGNED",gcol(owned),"Has an assignee in Jira")
-      +'</div></div>'
-    : '<div class="empty">No open bugs.</div>';
-
-  // --- mean time to close ---
-  const ttc=ovCloseTime(6), ttcLive=ttc.filter(m=>m.n);
-  const ttcAll=ttcLive.reduce((a,m)=>a+m.v*m.n,0)/Math.max(1,ttcLive.reduce((a,m)=>a+m.n,0));
-  document.getElementById("ov-ttc").innerHTML=ttcLive.length
-    ? svgBars(ttc.map(m=>({...m, c:m.v>ttcAll?"#f97316":"#2563eb"})), Math.round(ttcAll*10)/10, "d")
-    : '<div class="empty">No bugs closed in the last 6 months.</div>';
-  if(ttcLive.length){
-    const last=ttcLive[ttcLive.length-1], prev=ttcLive[ttcLive.length-2];
-    const dir=!prev ? "" : last.v<prev.v ? " \u2193 faster than "+prev.label
-            : last.v>prev.v ? " \u2191 slower than "+prev.label : " \u2192 flat vs "+prev.label;
-    document.getElementById("ov-ttc-cap").textContent=
-      "Days from created to resolved, by close month. Dashed line = "
-      +Math.round(ttcAll)+"d average." + dir + ". Bars above average are orange.";
-  }
-
-  // --- donuts ---
-  const byIp={}; open.forEach(b=>{ const k=ipOf(b); byIp[k]=(byIp[k]||0)+1; });
-  const ipSegs=Object.entries(byIp).sort((a,b)=>b[1]-a[1])
-    .map((e,i)=>({l:e[0], v:e[1], c:PALETTE[i%PALETTE.length]}));
-  document.getElementById("ov-bugip").innerHTML=svgDonut(ipSegs);
-  document.getElementById("ov-bugip-lg").innerHTML=svgLegend(ipSegs, open.length);
-
-  const byOwner={}; open.forEach(b=>{ const k=b.assignee||"Unassigned"; byOwner[k]=(byOwner[k]||0)+1; });
-  const ownerSegs=Object.entries(byOwner).sort((a,b)=>b[1]-a[1])
-    .map((e,i)=>({l:e[0], v:e[1], c:e[0]==="Unassigned"?"#9ca3af":PALETTE[i%PALETTE.length]}));
-  document.getElementById("ov-bugowner").innerHTML=svgDonut(ownerSegs);
-  document.getElementById("ov-bugowner-lg").innerHTML=svgLegend(ownerSegs, open.length);
-
-  // --- per-IP scoreboard ---
-  const rvByIp={};
-  ovReviewTasks().forEach(t=>{
-    const hay=((t.title||"")+" "+(t.description||"")+" "
-      +prs(t).map(p=>p.repo||"").join(" ")).toLowerCase();
-    const ip=ovIps().find(i=>(i.hints||[]).some(h=>hay.includes(String(h).toLowerCase())));
-    const k=ip?ip.name:"Other"; rvByIp[k]=(rvByIp[k]||0)+1;
-  });
-  const rows=ovIps().map(i=>i.name).concat(["Other"]).map(name=>{
-    const mine=open.filter(b=>ipOf(b)===name);
-    const worst=mine.length?Math.min(...mine.map(b=>{
-      const ix=SIGNALS.indexOf(b.signal); return ix<0?99:ix; })):99;
-    return {name, owner:((ovIps().find(i=>i.name===name)||{}).owners)||"\u2014",
-            n:mine.length, att:mine.filter(bugNeedsAttention).length,
-            worst:worst<SIGNALS.length?SIGNALS[worst]:null,
-            idle:mine.length?Math.max(...mine.map(b=>b.idle_days||0)):null,
-            rv:rvByIp[name]||0};
-  }).filter(r=>r.n||r.rv);
-  document.getElementById("ov-scoreboard").innerHTML=rows.length
-    ? '<table class="sb"><thead><tr><th>IP</th><th class="num">Bugs</th><th class="num">Attn</th>'
-      +'<th class="num">Max idle</th><th class="num">Reviews</th><th>12-week trend</th></tr></thead><tbody>'
-      +rows.map(r=>'<tr><td><b>'+esc(r.name)+'</b><div class="who">'+esc(r.owner)+'</div></td>'
-        +'<td class="num">'+(r.n||"\u2014")+'</td>'
-        +'<td class="num"'+(r.att?' style="color:'+PBI.orange+';"':'')+'>'+(r.att||"\u2014")+'</td>'
-        +'<td class="num">'+(r.idle==null?"\u2014":r.idle+"d")+'</td>'
-        +'<td class="num">'+(r.rv||"\u2014")+'</td>'
-        +'<td style="width:130px;">'+svgSparkline(trend.byIp[r.name],
-            SIGNAL_COLOR[r.worst]||"#9ca3af")+'</td></tr>').join("")
-      +'</tbody></table>'
-      +'<p class="cap" style="margin:8px 0 0;">Line = open bugs per week. '
-      +'Colour = worst signal in that IP right now '
-      +SIGNALS.filter(s=>s!=="closed").reverse().map(s=>SIGNAL_ICON[s]+" "+s).join(" \u00b7 ")+'.</p>'
-    : '<div class="empty">No open bugs or reviews.</div>';
-
-  // --- hygiene flags ---
-  const fc={}, fk={};
-  open.forEach(b=>(b.flags||[]).forEach(f=>{ fc[f]=(fc[f]||0)+1; (fk[f]=fk[f]||[]).push(b.key); }));
-  const flagColor={untriaged:PBI.red, unassigned:PBI.red, overdue:PBI.red,
-    pinged:PBI.orange,
-    "no-milestone":PBI.gold, "no-sprint":PBI.gold, "no-estimate":PBI.gold,
-    aging:PBI.purple, "no-discussion":PBI.grey};
-  const frows=Object.entries(fc).sort((a,b)=>b[1]-a[1]).map(e=>({
-    l:e[0], v:e[1], c:flagColor[e[0]]||"#6b7280",
-    sub:Math.round(100*e[1]/Math.max(1,open.length))+"% of open bugs",
-    href:jiraJql("key in ("+fk[e[0]].join(",")+") ORDER BY priority DESC"),
-    title:"Open these "+e[1]+" bugs in Jira to fix them there — the portal never writes to Jira"}));
-  document.getElementById("ov-flags").innerHTML=barTable(frows, open.length);
-
-  // --- review queue ---
-  document.getElementById("ov-reviews").innerHTML=
-    barTable(rvRows, Math.max.apply(null, rvRows.map(r=>r.v).concat([1])));
-
-  renderHygiene();
+  renderBrief();
+  renderFresh();
+  renderPulse();
   renderChanges();
-
-  // --- RAID ---
-  const raidSorted=raid.slice().sort((a,b)=>
-    ((RAG_RANK[a.rag]==null?9:RAG_RANK[a.rag])-(RAG_RANK[b.rag]==null?9:RAG_RANK[b.rag]))
-    || (b.score-a.score));
-  document.getElementById("ov-raid").innerHTML=raidSorted.length
-    ? '<table class="sb"><thead><tr><th>Row</th><th>Owner</th><th class="num">Score</th>'
-      +'<th class="num">Due</th></tr></thead><tbody>'
-      +raidSorted.slice(0,8).map(r=>'<tr>'
-        +'<td><span class="rag '+esc(r.rag||"gray")+'"></span><b>'+esc(r.id)+'</b>'
-        +'<div class="who" style="white-space:normal;">'+esc(r.title)+'</div></td>'
-        +'<td>'+esc(r.owner||"\u2014")+'</td>'
-        +'<td class="num">'+(r.score||"\u2014")+'</td>'
-        +'<td class="num"'+((r.due&&r.due<today)?' style="color:'+PBI.red+';"':'')+'>'
-        +esc(formatPortalDate(r.due))+'</td></tr>').join("")
-      +'</tbody></table>'
-      +(raidSorted.length>8?'<div class="ro-note" style="margin-top:8px;">+'+(raidSorted.length-8)+' more open rows</div>':'')
-    : '<div class="empty">No open RAID rows.</div>';
-
-  // --- needs you now ---
-  const feed=[];
-  attention.forEach(b=>{
-    const why=[], pings=b.oded_pings||0;
-    if(pings) why.push("Oded pinged \u00d7"+pings+(b.last_ping?" (last "+formatPortalDate(b.last_ping)+")":""));
-    if(["stalled","dormant"].includes(b.signal)) why.push(b.signal+" \u2014 "+b.idle_days+"d idle");
-    if((bugTri(b).state||"untriaged")==="untriaged") why.push("untriaged");
-    if(!b.assignee) why.push("unassigned");
-    feed.push({rank:((b.flags||[]).includes("pinged")||["dormant","stalled"].includes(b.signal))?0:1,
-      kind:"bug", label:b.key,
-      text:b.summary||"", why:why.join(" \u00b7 "),
-      when:(b.idle_days==null?"":b.idle_days+"d idle"), href:b.url, sortv:b.idle_days||0});
-  });
-  // RAID is capped so a long-standing risk backlog can't crowd out live bugs.
-  raidSorted.filter(r=>r.rag==="red"||(r.due&&r.due<today)).slice(0,3).forEach(r=>feed.push({
-    rank:r.rag==="red"?0:2, kind:"raid", label:r.id, text:r.title||"",
-    why:((r.due&&r.due<today)?"overdue since "+formatPortalDate(r.due):"red risk")+" \u00b7 "+(r.owner||"unowned"),
-    when:r.score?"score "+r.score:"", sortv:r.score||0}));
-  ovReviewTasks().forEach(t=>{
-    const p=prs(t); if(!p.length) return;
-    const s=consolidateReviewStatus(p);
-    if(!["pending","in-progress","waiting-for-re-review"].includes(s)) return;
-    const age=t.created?daysSince(t.created):0;
-    feed.push({rank:s==="pending"?3:2, kind:"review", label:t.id,
-      text:(t.title||"").slice(0,110), why:s+" \u00b7 "+p.length+" PR"+(p.length>1?"s":""),
-      when:age?age+"d old":"", sortv:age});
-  });
-  // Phenomena that escaped, regressed or keep recurring without an explanation.
-  phList().filter(p=>phIsOpen(p) && (p.flags||[]).some(f=>PH_ALARM.includes(f))).forEach(p=>{
-    const hit=(p.flags||[]).filter(f=>PH_ALARM.includes(f));
-    feed.push({rank:hit.some(f=>f!=="unexplained-recurring")?0:1, kind:"phenom", label:p.id,
-      text:p.title||"", why:hit.join(" \u00b7 ")+" \u00b7 "+(p.count||0)+" sighting"+(p.count===1?"":"s"),
-      when:p.last_seen?"seen "+formatPortalDate(p.last_seen):"", goph:p.id, sortv:p.count||0});
-  });
-  TASKS.filter(t=>t.status==="blocked").forEach(t=>feed.push({
-    rank:2, kind:"task", label:t.id, text:t.title||"", why:"blocked",
-    when:"", sortv:0}));
-  feed.sort((a,b)=>(a.rank-b.rank)||(b.sortv-a.sortv));
-  const feedColor={bug:PBI.red, raid:PBI.orange, review:PBI.blue, task:PBI.purple, phenom:PBI.teal};
-  document.getElementById("ov-feed").innerHTML=feed.length
-    ? '<div class="feed">'+feed.slice(0,12).map(f=>'<div class="it" style="--fk:'+feedColor[f.kind]+'">'
-        +'<span class="pill">'+f.kind+'</span>'
-        +'<span class="w"><b>'+(f.href?'<a href="'+esc(f.href)+'" target="_blank" rel="noopener">'+esc(f.label)+'</a>'
-          :f.goph?'<a href="#" data-ovph="'+esc(f.goph)+'">'+esc(f.label)+'</a>':esc(f.label))+'</b> '
-        +esc((f.text||"").slice(0,110))
-        +'<div class="why">'+esc(f.why)+'</div></span>'
-        +'<span class="when">'+esc(f.when)+'</span></div>').join("")+'</div>'
-      +(feed.length>12?'<div class="ro-note" style="margin-top:9px;">+'+(feed.length-12)+' more</div>':'')
-    : '<div class="empty">Nothing is screaming for attention.</div>';
-  document.querySelectorAll("#ov-feed [data-ovph]").forEach(a=>a.addEventListener("click",e=>{
-    e.preventDefault(); selectSection("bugs"); goPhenomenon(a.dataset.ovph); }));
-
-  // --- workspaces ---
-  document.getElementById("ov-slots").innerHTML=slotNames.map(name=>{
-    const h=slots[name]&&slots[name].holder;
-    const r=rosterBySlot.get(name)||{slot:name,label:name};
-    const mirror=(r.status||{}).mirror;
-    const who=mirror?"Mirror of "+mirror.source_id
-      :h?(h.type==="task"?(h.task_id+" \u00b7 "+(h.detail||h.tag||"")):(h.label||h.tag||"ad-hoc"))
-      :wsUnknown(r)?"unverified":"free";
-    return '<div class="slot'+(h||mirror?" busy":"")+'"><div class="nm">'
-      +esc(r.label||name)+' · '+esc(r.target||"local")+'</div>'
-      +'<div class="oc" title="'+esc(who)+'">'+esc(who)+'</div></div>';
-  }).join("");
-  applyTableStandards(document.getElementById("sec-overview"));
+  const asof=document.getElementById("ov-asof");
+  if(asof) asof.textContent=(SERVED?"Live":"Snapshot")+" · "+localDmyHm(pulseLastFetch||Date.now())
+    +(SERVED&&prefs.pulsePollMs?" · refreshes every "+(prefs.pulsePollMs/1000)+" s while open":"");
 }
+// Re-reads every saved payload the pulse needs. Pure reads: no Jira/GitHub
+// scans, no workspace probes, no machine contact.
+async function refreshOverviewData(){
+  if(!SERVED) return false;
+  const get=u=>fetch(u,{cache:"no-store"}).then(r=>r.ok?r.json():null).catch(()=>null);
+  const [t,b,o,p,r,v,tr,tm,st]=await Promise.all(["/api/tasks","/api/bugs","/api/overview","/api/prs",
+    "/api/raid","/api/vm-jobs","/api/triage","/api/team","/api/settings"].map(get));
+  if(t){ TASKS=t.tasks||t; if(t.workspaces) WORKSPACES=t.workspaces; }
+  if(b) BUGS=b; if(o) OVERVIEW=o; if(p) PRS=p; if(r) RAID=r; if(v) vmAdoptPayload(v);
+  if(tr&&tr.phenomena) TRIAGE=tr;
+  if(tm&&tm.members) TEAMDATA=tm;
+  if(st&&st.status) PULSE_STATUS=st.status;
+  pulseLastFetch=Date.now();
+  return true;
+}
+let pulseTimer=null, pulseBusy=false;
+async function pulseTick(force){
+  if(!SERVED||activeSection!=="overview"||document.hidden||pulseBusy) return;
+  if(!force&&Date.now()-pulseLastFetch<Math.max(5000,(prefs.pulsePollMs||60000)/2)) return;
+  pulseBusy=true;
+  try{ if(await refreshOverviewData()){ buildSections(); if(activeSection==="overview") renderOverview(); } }
+  finally{ pulseBusy=false; }
+}
+function restartPulsePoll(){
+  if(pulseTimer) clearInterval(pulseTimer);
+  pulseTimer=SERVED&&prefs.pulsePollMs?setInterval(()=>pulseTick(true),prefs.pulsePollMs):null;
+}
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) pulseTick(false); });
 
 // ============================================================================
 // Portal section nav — Overview / Tasks / Workspaces / Bugs / PRs / Team
@@ -3481,10 +3119,10 @@ const SECTIONS=[
   {id:"ws",       label:"Workspaces", icon:"⌂", group:"Workspace", ready:true},
   {id:"bugs",     label:"Bugs",       icon:"⚑", group:"Live signals", ready:true},
   {id:"prs",      label:"PRs",        icon:"↗", group:"Live signals", ready:true},
-  {id:"pldmq",    label:"PLDM",       icon:"◉", group:"Live signals", ready:true},
-  {id:"vm",       label:"VM jobs",    icon:"⌁", group:"Live signals", ready:true},
+  {id:"vm",       label:"Machines",   icon:"⌁", group:"Live signals", ready:true},
   {id:"raid",     label:"RAID",       icon:"◇", group:"Planning", ready:true},
   {id:"team",     label:"Team",       icon:"✧", group:"Planning", ready:true},
+  {id:"settings", label:"Settings",   icon:"⚙", group:"Portal", ready:true},
 ];
 const PORTAL_LAYOUT_KEY="team-portal-layout-v1";
 function readPortalLayout(){
@@ -3510,39 +3148,77 @@ function savePortalLayout(changes){
     console.warn("Unable to save portal layout preferences.",error);
   }
 }
-let activeSection=SECTIONS.some(s=>s.id===portalLayout.activeSection&&s.ready)
-  ? portalLayout.activeSection : "overview";
+// --- browser prefs (pure: readPrefs, navSections) ---
+// Browser preferences (Settings section). Validated on read so a hand-edited
+// or older value can never break the page.
+const PREFS_KEY="team-portal-prefs-v1";
+const PREF_CHOICES={clock:["auto","12","24"], actionPollMs:[1000,1500,3000,5000,10000],
+  vmPollMs:[5000,15000,30000,60000], pulsePollMs:[0,30000,60000,300000]};
+const PREF_DEFAULTS={landing:"last", hidden:[], order:[], clock:"auto", compact:false,
+  actionPollMs:1500, vmPollMs:15000, pulseHidden:[], pulseOrder:[], pulsePollMs:60000};
+function readPrefs(raw, ids, cardIds=[]){
+  const out={...PREF_DEFAULTS, hidden:[], order:[], pulseHidden:[], pulseOrder:[]};
+  let v; try{ v=JSON.parse(raw||"{}"); }catch(_){ return out; }
+  if(!v||typeof v!=="object") return out;
+  if(v.landing==="last"||ids.includes(v.landing)) out.landing=v.landing;
+  if(Array.isArray(v.hidden)) out.hidden=v.hidden.filter(id=>ids.includes(id)&&id!=="settings");
+  if(Array.isArray(v.order)) out.order=[...new Set(v.order.filter(id=>ids.includes(id)))];
+  if(Array.isArray(v.pulseHidden)) out.pulseHidden=[...new Set(v.pulseHidden.filter(id=>cardIds.includes(id)))];
+  if(Array.isArray(v.pulseOrder)) out.pulseOrder=[...new Set(v.pulseOrder.filter(id=>cardIds.includes(id)))];
+  for(const k of ["clock","actionPollMs","vmPollMs","pulsePollMs"]) if(PREF_CHOICES[k].includes(v[k])) out[k]=v[k];
+  if(typeof v.compact==="boolean") out.compact=v.compact;
+  return out;
+}
+// Nav order: saved order first, then any section not yet placed, in default order.
+function navSections(sections, p){
+  const rank=id=>{ const i=p.order.indexOf(id); return i<0 ? p.order.length+sections.findIndex(s=>s.id===id) : i; };
+  return sections.filter(s=>!p.hidden.includes(s.id)).sort((a,b)=>rank(a.id)-rank(b.id));
+}
+// Overview pulse cards: same rule — saved order first, unknown cards keep their default slot.
+function pulseVisible(cards, p, all){
+  const rank=id=>{ const i=p.pulseOrder.indexOf(id); return i<0 ? p.pulseOrder.length+cards.findIndex(c=>c.id===id) : i; };
+  return cards.filter(c=>all||!p.pulseHidden.includes(c.id)).sort((a,b)=>rank(a.id)-rank(b.id));
+}
+// --- end browser prefs ---
+const SECTION_IDS=SECTIONS.map(s=>s.id);
+let prefs=(()=>{ try{ return readPrefs(localStorage.getItem(PREFS_KEY), SECTION_IDS, PortalPulse.CARD_IDS); }
+  catch(_){ return readPrefs(null, SECTION_IDS, PortalPulse.CARD_IDS); } })();
+function savePrefs(changes){
+  prefs=readPrefs(JSON.stringify({...prefs,...changes}), SECTION_IDS, PortalPulse.CARD_IDS);
+  try{ localStorage.setItem(PREFS_KEY,JSON.stringify(prefs)); }
+  catch(error){ console.warn("Unable to save browser preferences.",error); }
+}
+const landingPick=prefs.landing==="last" ? portalLayout.activeSection : prefs.landing;
+let activeSection=SECTIONS.some(s=>s.id===landingPick&&s.ready) ? landingPick : "overview";
 const collapsedOverviewTiles=new Set(portalLayout.collapsedTiles);
 function sectionCount(id){
-  if(id==="overview"){
-    const raid=((OVERVIEW&&OVERVIEW.raid)||[]).filter(r=>!r.closed&&["red","orange"].includes(r.rag));
-    return bugList().filter(b=>bugNeedsAttention(b)).length + raid.length;
-  }
+  if(id==="overview") return pulseShown().filter(c=>c.tone==="bad").length;
   if(id==="work") return TASKS.filter(t=>!["done","cancelled"].includes(t.status)).length;
   if(id==="ws") return wsRoster().filter(s=>wsHolder(s.slot)||(s.status||{}).mirror).length;
   if(id==="bugs") return bugList().filter(b=>bugNeedsAttention(b)).length;
   if(id==="prs") return (PRS.features||[]).filter(f=>(f.blocked||[]).length).length;
-  if(id==="pldmq") return (PLDMQ.jobs||[]).filter(j=>j.active).length;
   if(id==="vm") return (VMLOG.running||[]).length;
   if(id==="raid") return ((RAID.counts||{}).hot)||0;
   return 0;
 }
 function buildSections(){
   const box=document.getElementById("sections");
-  const groups=[...new Set(SECTIONS.map(s=>s.group))];
+  const shown=navSections(SECTIONS, prefs);
+  const groups=[...new Set(shown.map(s=>s.group))];
   box.innerHTML=groups.map(group=>{
-    const items=SECTIONS.filter(s=>s.group===group).map(s=>{
+    const items=shown.filter(s=>s.group===group).map(s=>{
       const n=sectionCount(s.id);
-      const badge = s.ready ? `<span class="badge-count">${n}</span>`
+      const badge = s.id==="settings" ? ""
+                  : s.ready ? `<span class="badge-count">${n}</span>`
                             : `<span class="badge-count">soon</span>`;
       const title = s.id==="bugs" ? "Bugs needing attention (stalled, untriaged, or unassigned)"
                   : s.id==="work" ? "Active tasks"
                   : s.id==="ws" ? "Tracked workspace slots that are currently occupied"
                   : s.id==="prs" ? "My outgoing feature PRs that are blocked (CI, review or rebase)"
-                  : s.id==="pldmq" ? "PLDM hardware jobs still building, queued or running"
                   : s.id==="vm" ? "Jobs delegated to a VM or lab machine that are still running"
                   : s.id==="raid" ? "Open RAID rows at Red or Orange"
-                  : s.id==="overview" ? "Things demanding attention right now (bugs + hot RAID)"
+                  : s.id==="overview" ? "Live pulse cards showing red (needs action); hidden cards are not counted"
+                  : s.id==="settings" ? "Portal settings and browser preferences"
                   : "Team overview, planning and editable member records";
       return `<button class="section-btn${s.id===activeSection?" on":""}" data-section="${s.id}"
         title="${esc(title)}" aria-current="${s.id===activeSection?"page":"false"}"${s.ready?"":" disabled"}>
@@ -3599,6 +3275,7 @@ function selectSection(id){
   const activeIcon=document.getElementById("active-section-icon");
   if(activeTitle) activeTitle.textContent=section.label;
   if(activeIcon) activeIcon.textContent=section.icon;
+  aiSyncButton();
   const refresh=document.getElementById("refresh");
   if(refresh){
     refresh.innerHTML=`<span class="ico">↻</span> Refresh`;
@@ -3612,11 +3289,11 @@ function selectSection(id){
   else if(id==="work"){ render(); }
   else if(id==="ws"){ renderWorkspaces(); }
   else if(id==="prs"){ renderPrs(); }
-  else if(id==="pldmq"){ renderPldmq(); }
   else if(id==="vm"){ renderVmlog(); }
   else if(id==="raid"){ renderRaid(); }
-  else if(id==="overview"){ renderOverview(); }
+  else if(id==="overview"){ renderOverview(); pulseTick(false); }
   else if(id==="team" && window.TeamUI){ window.TeamUI.render(); }
+  else if(id==="settings"){ renderSettings(); }
   const secRoot = document.getElementById("sec-"+id);
   if(secRoot) applyTableStandards(secRoot);
   // Leaving the VM section stops its stopwatch and its poll; renderVmlog()
@@ -3967,6 +3644,24 @@ function prRows(f){
   }).join("");
 }
 
+function prJiraSyncResults(results){
+  return (results||[]).map(row=>'<div class="ro-note" role="status">Last Jira sync result · '+esc(row.key)
+    +' · '+esc(row.state)+(row.target?' → '+esc(row.target):'')
+    +': '+esc(row.message||"")+'</div>').join("");
+}
+
+function prJiraTickets(f){
+  return (f.jira||[]).map(key=>{
+    const confirmed=(f.jira_coverage||[]).includes(key);
+    return '<span><a class="jira-chip" href="'+esc(JIRA_BASE+encodeURIComponent(key))
+      +'" target="_blank" rel="noopener">'+esc(key)+'</a>'
+      +(confirmed?' <span class="muted">Full PR coverage confirmed</span>':'')
+      +(SERVED?'<button type="button" class="ci-btn" data-jira-coverage="'+esc(f.id)
+        +'" data-jira-key="'+esc(key)+'">'
+        +(confirmed?'Revoke coverage':'Confirm full PR coverage')+'</button>':'')+'</span>';
+  }).join("")||'<span class="muted">no ticket</span>';
+}
+
 function prFeatureRow(f){
   const visiblePrs=prVisibleRows(f);
   const c=PR_STATUS_COLOR[f.worst]||PBI.grey;
@@ -4019,10 +3714,7 @@ function prFeatureRow(f){
       +'</div><div class="actions"><button class="primary" data-prsave="'+f.id+'">Save</button>'
       +'<span class="msg" id="pr-edit-msg-'+f.id+'"></span></div></div></details>'
     : '<div class="ro-note">Serve the portal to edit the feature or add notes.</div>';
-  const jiraHtml=(f.jira||[]).length
-    ? f.jira.map(k=>'<a class="jira-chip" href="'+JIRA_BASE+encodeURIComponent(k)+'" target="_blank" rel="noopener">'
-        +esc(k)+'</a>').join("")
-    : '<span class="muted">no ticket</span>';
+  const jiraHtml=prJiraTickets(f);
   const notes=f.notes||[];
   const lastAct=notes.length?notes[0].date:(f.logged||"\u2014");
   const fullDesc=f.description&&f.description!==f.summary
@@ -4030,7 +3722,8 @@ function prFeatureRow(f){
   const summaryHtml='<div class="prf-context">'
     +(f.summary?'<p class="prf-summary">'+mdInline(f.summary)
       +(f.summary_derived?' <span class="muted" title="Derived from the description">(auto)</span>':'')+'</p>':'')
-    +'<div class="prf-context-links">'+jiraHtml+pldm+'</div></div>';
+    +'<div class="prf-context-links">'+jiraHtml+pldm+'</div>'
+    +prJiraSyncResults(f.jira_sync)+'</div>';
   const kvHtml='<div class="kv prf-kv">'
     +'<span><b>Logged:</b> '+esc(f.logged||"\u2014")+'</span>'
     +'<span><b>Last activity:</b> '+esc(lastAct)+'</span>'
@@ -4251,7 +3944,7 @@ document.addEventListener("click",e=>{
     rerunCi(parseInt(t.dataset.ciFail,10),"failed",null,t);
 });
 
-// The scan runs `gh` server-side — no model call, so it is free to hammer.
+// Explicit scans probe GitHub and may update opted-in Jira tickets server-side.
 // ``ids`` limits it to the ticked features; omitted = every tracked feature.
 async function scanPrs(ids){
   const sel=Array.isArray(ids);
@@ -4260,7 +3953,7 @@ async function scanPrs(ids){
   if(!SERVED){ note.textContent="Serve the portal to scan"; return; }
   btn.disabled=true; if(other) other.disabled=true;
   btn.innerHTML='<span class="spin">\u21bb</span> Scanning\u2026';
-  note.textContent="probing GitHub via gh\u2026";
+  note.textContent="probing GitHub and syncing opted-in Jira tickets\u2026";
   try{
     const r=await fetch("/api/pr-scan",sel
       ? {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({feature_ids:ids})}
@@ -4268,13 +3961,15 @@ async function scanPrs(ids){
     const j=await r.json();
     if(!r.ok||j.error) throw new Error(j.error||"scan failed");
     const job=await pollAlign(j.job,"Scanning PRs…");
-    if(!job||job.status==="error") throw new Error((job&&job.message)||"scan failed");
+    if(!job) throw new Error("scan failed");
     const res=job.result||{};
-    PRS=res; renderPrs(); buildSections();
+    if(job.result){ PRS=res; renderPrs(); buildSections(); }
+    if(job.status==="error") throw new Error(job.message||"scan failed");
     const gone=res.purged||[];
     note.innerHTML="probed "+(res.scanned||0)+" PRs"+(sel?" in "+ids.length+" selected feature"+(ids.length===1?"":"s"):"")
       +(gone.length?' \u00b7 <b>retired '+gone.length+'</b>: '
-        +gone.map(f=>esc(f.name)+" ("+f.total+"/"+f.total+")").join(", "):"");
+        +gone.map(f=>esc(f.name)+" ("+f.total+"/"+f.total+")").join(", "):"")
+      +(job.message?' \u00b7 '+esc(job.message):"");
   }catch(e){
     note.textContent="Scan failed: "+e.message;
   }finally{
@@ -4349,6 +4044,42 @@ async function prPost(path, body){
   if(j.prs){ PRS=j.prs; renderPrs(); buildSections(); }
   return j;
 }
+
+function prJiraCoverageDialog(fid, key){
+  if(!SERVED) return;
+  const feature=(PRS.features||[]).find(f=>String(f.id)===String(fid));
+  if(!feature||!(feature.jira||[]).includes(key)) return;
+  const confirmed=!(feature.jira_coverage||[]).includes(key);
+  const revision=feature.revision;
+  prModal('<h3>'+esc(confirmed?'Confirm full PR coverage':'Revoke Jira coverage')+'</h3>'
+    +'<p>'+esc(feature.name)+' · '+esc(key)+'</p>'
+    +(confirmed?'<p>I confirm that this feature’s entire current PR set fully implements '
+      +esc(key)+'. This grants automatic In Review / Done updates on CLI or Portal scans, '
+      +'only if the ticket is assigned to the authenticated Jira user. Changing the PR set '
+      +'invalidates this confirmation.</p>'
+      :'<p>Revoke approval for automatic Jira updates for this ticket and PR set. '
+        +'This does not undo Jira transitions already made.</p>')
+    +'<ul>'+(feature.prs||[]).map(pr=>'<li>'+esc(pr.repo)+' #'+esc(pr.number)+'</li>').join("")+'</ul>'
+    +'<div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>'
+    +'<button class="ws-modal-cancel">Cancel</button><button class="ws-modal-ok primary">'
+    +(confirmed?'Confirm full coverage':'Revoke coverage')+'</button></div>',
+    async (ov,close)=>{
+      const button=ov.querySelector(".ws-modal-ok");
+      button.disabled=true;
+      try{
+        const result=await prPost("/api/feature-jira-coverage",{
+          feature_id:fid, key, confirmed, expected_revision:revision});
+        close(); prNote(result.message||"Jira coverage saved.");
+      }catch(error){
+        ov.querySelector(".ws-modal-msg").textContent=error.message;
+        button.disabled=false;
+      }
+    });
+}
+document.addEventListener("click",event=>{
+  const button=event.target.closest("[data-jira-coverage]");
+  if(button) prJiraCoverageDialog(button.dataset.jiraCoverage,button.dataset.jiraKey);
+});
 
 async function saveFeaturePriority(sel){
   const fid=sel.dataset.fid, v=sel.value;
@@ -4491,99 +4222,8 @@ document.getElementById("pr-track").addEventListener("click",()=>{
 const kpi=o=>'<div class="kpi" style="--k:'+o.c+'"><div class="l">'+esc(o.label)+'</div>'
   +'<div class="n">'+o.n+'</div><div class="s">'+(o.sub||"")+'</div></div>';
 
-/* ===== PLDM job queue section ===== */
-const PQ_STATUS_COLOR={passed:"#1AAB40", failed:"#D64550", running:"#118DFF",
-  queued:"#D9B300", building:"#197278", cancelled:"#9B9B9B", error:"#E66C37",
-  pending:"#9B9B9B"};
-// The stage is the useful progress signal: a job sits in `queued` for hours
-// waiting for an EDK, which is normal and must not read as a stall.
-const PQ_STAGES=["dispatching","building","queued","running","done"];
-
-function pqStageBar(j){
-  const i=Math.max(0,PQ_STAGES.indexOf(j.stage));
-  const c=PQ_STATUS_COLOR[j.status]||PBI.grey;
-  return '<div class="pq-stage" title="'+esc(j.note||"")+'">'
-    +PQ_STAGES.map((s,k)=>'<i class="'+(k<=i?"on":"")+'" style="--pk:'+c+'" title="'+esc(s)+'"></i>').join("")
-    +'<span>'+esc(j.stage)+'</span></div>';
-}
-
-function renderPldmq(){
-  const jobs=PLDMQ.jobs||[], counts=PLDMQ.counts||{};
-  const n=s=>counts[s]||0;
-  const active=jobs.filter(j=>j.active);
-  document.getElementById("pq-portal").href=PLDMQ.portal||"#";
-  document.getElementById("pq-asof").innerHTML=
-    jobs.length+" tracked job"+(jobs.length===1?"":"s")+" \u00b7 "+active.length+" in flight \u00b7 "
-    +(PLDMQ.last_scan?"scanned <b>"+esc(PLDMQ.last_scan)+"</b>":"<b>never scanned</b>")
-    +(PLDMQ.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(PLDMQ.error)+'</span>':"");
-
-  document.getElementById("pq-kpis").innerHTML=[
-    kpi({c:active.length?PBI.blue:PBI.grey, label:"In flight", n:active.length,
-         sub:"of "+jobs.length+" tracked"}),
-    kpi({c:n("building")?PBI.teal:PBI.grey, label:"Building", n:n("building"), sub:"CI build"}),
-    kpi({c:n("queued")?PBI.gold:PBI.grey, label:"Queued", n:n("queued"), sub:"waiting for an EDK"}),
-    kpi({c:n("running")?PBI.blue:PBI.grey, label:"Running", n:n("running"), sub:"on hardware"}),
-    kpi({c:PBI.green, label:"Passed", n:n("passed"), sub:"clean runs"}),
-    kpi({c:(n("failed")+n("error"))?PBI.red:PBI.grey, label:"Failed", n:n("failed")+n("error"),
-         sub:n("error")?n("error")+" never reached HW":"on hardware"}),
-  ].join("");
-
-  document.getElementById("pq-body").innerHTML=jobs.length
-    ? jobs.map(pqRow).join("")
-    : '<tr><td colspan="8"><div class="empty">No PLDM jobs tracked. '
-      +'Submit one from a feature card in PRs, or with <code>pjq.py submit</code>.</div></td></tr>';
-  applyTableStandards(document.getElementById("sec-pldmq"));
-}
-
-function pqRow(j){
-  const c=PQ_STATUS_COLOR[j.status]||PBI.grey;
-  const res=j.result||{};
-  const links=[
-    j.dispatch_url?'<a href="'+esc(j.dispatch_url)+'" target="_blank" rel="noopener" title="CI build run">build</a>':"",
-    j.exec_url?'<a href="'+esc(j.exec_url)+'" target="_blank" rel="noopener" title="Hardware execution run">run</a>':"",
-  ].filter(Boolean).join(" \u00b7 ")||"\u2014";
-  const age=j.age_h>=24?Math.round(j.age_h/24)+"d":j.age_h+"h";
-  let detail="";
-  if(res.summary||(res.lines||[]).length){
-    const n=(res.lines||[]).length;
-    detail='<tr class="pq-detail"><td colspan="8"><details>'
-      +'<summary>'+(res.summary?esc(res.summary):"failure evidence")
-      +' <span>('+n+' log line'+(n===1?"":"s")+')</span></summary>'
-      +((res.failed_steps||[]).length?'<div class="pq-step">failed step: '
-        +esc(res.failed_steps.join(", "))+'</div>':"")
-      +'<pre>'+esc((res.lines||[]).join("\n"))+'</pre></details></td></tr>';
-  }
-  return '<tr class="task"><td title="'+esc(j.note||"")+'"><b>'+esc(j.display_name)+'</b></td>'
-    +'<td>'+esc(j.feature||"\u2014")+'</td>'
-    +'<td>'+esc(j.image_type||"\u2014")+'</td>'
-    +'<td>'+pqStageBar(j)+'</td>'
-    +'<td><span class="st" style="--sk:'+c+'">'+esc(j.status)+'</span></td>'
-    +'<td>'+esc(j.edk||(j.queue_job_id?"queue #"+j.queue_job_id:"\u2014"))+'</td>'
-    +'<td>'+esc(age)+'</td><td>'+links+'</td></tr>'+detail;
-}
-
-// Follows each job through gh server-side; like the PR scan, it costs nothing.
-async function scanPldmq(){
-  const btn=document.getElementById("pq-scan"), note=document.getElementById("pq-scan-note");
-  if(!SERVED){ note.textContent="Serve the portal to scan"; return; }
-  btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Scanning\u2026';
-  note.textContent="following jobs through GitHub\u2026";
-  try{
-    const r=await fetch("/api/pldm-scan",{method:"POST"});
-    const j=await r.json();
-    if(!r.ok||j.error) throw new Error(j.error||"scan failed");
-    PLDMQ=j; renderPldmq(); buildSections();
-    note.textContent="probed "+(j.scanned||0)+" active job(s)";
-  }catch(e){
-    note.textContent="Scan failed: "+e.message;
-  }finally{
-    btn.disabled=false; btn.innerHTML="\u21bb Scan queue";
-  }
-}
-document.getElementById("pq-scan").addEventListener("click",scanPldmq);
-
 // ============================================================================
-// VM delegator log — every job `mctl` dispatched to a VM / lab machine.
+// Machine activity — every job `mctl` dispatched to a VM / lab machine.
 // The remote keeps only the latest log per (workspace, kind), so the history
 // lives in ~/.mctl/joblog.jsonl and the status comes from one ssh probe.
 // ============================================================================
@@ -4660,7 +4300,7 @@ function vmLiveCard(j){
     +(j.last_line?'<span class="vm-tail">'+esc(j.last_line)+'</span>':"")
     +'<button class="vm-log live" data-target="'+esc(j.target)+'" data-tag="'+esc(j.tag)+'"'
     +' data-kind="'+esc(j.kind)+'" data-live="1" data-id="'+esc(j.id)+'"'
-    +' title="Open a live tail of this job\u2019s log over ssh">'
+    +' title="Open a terminal window tailing this job\u2019s log on the machine">'
     +'<span class="spin">\u21bb</span> Tail the live log</button>'
     +'</div><div class="vm-live-r"><b class="vm-el" data-start="'+(j.started_ts||0)+'">'
     +esc(el)+'</b>elapsed</div></div>';
@@ -4744,7 +4384,7 @@ function renderVmlog(){
 // claim that the job is alive, and /api/vm-jobs is a local file read -- it
 // never probes a target -- so polling it while something runs costs nothing.
 let vmTickTimer=null, vmLiveTimer=null;
-const VM_LIVE_POLL_MS=15000;
+const VM_LIVE_POLL_MS=()=>prefs.vmPollMs;
 
 function vmTick(){
   const els=document.querySelectorAll(".vm-el[data-start]");
@@ -4763,7 +4403,8 @@ function vmTimersStop(){
 // section (and with it any selection the user is holding).
 function vmSignature(d){
   return (d&&d.jobs?d.jobs:[]).map(j=>j.id+":"+j.status+":"+j.checked+":"+j.lines
-    +":"+j.stale).join("|")+"#"+((d&&d.last_refresh)||"");
+    +":"+j.stale).join("|")+"#"+((d&&d.last_refresh)||"")
+    +"#"+Object.entries((d&&d.live)||{}).map(([k,v])=>k+":"+v.state).join(",");
 }
 async function vmLivePoll(){
   if(!SERVED||activeSection!=="vm"){ return; }
@@ -4785,7 +4426,7 @@ function vmTimersSync(){
   const live=(VMLOG.running||[]).length>0&&activeSection==="vm";
   if(document.hidden){ vmTimersStop(); return; }
   if(live&&!vmTickTimer) vmTickTimer=setInterval(vmTick,1000);
-  if(live&&!vmLiveTimer) vmLiveTimer=setInterval(vmLivePoll,VM_LIVE_POLL_MS);
+  if(live&&!vmLiveTimer) vmLiveTimer=setInterval(vmLivePoll,VM_LIVE_POLL_MS());
   if(!live) vmTimersStop();
 }
 // A hidden tab need not tick or poll. Coming back recomputes from the absolute
@@ -4810,9 +4451,10 @@ function renderVmMachines(){
   const box=document.getElementById("vm-machines");
   const strip=vmTargetStrip();
   if(!ms.length){
-    box.innerHTML='<div class="vm-idle">No EC2 instance visible. Hit <b>Check VM status</b> to '
+    box.innerHTML='<div class="vm-idle">No EC2 instance visible. Lab-machine targets are shown below when tracked. Hit <b>Check VM status</b> to '
       +'query <code>octl vm list</code> \u2014 it revalidates SSO, so it takes a moment.</div>'+strip;
     vmBindTargetRefresh(box);
+    vmBindTerms(box);
     return;
   }
   const stale=vmStale(VMLOG.machines_age_h);
@@ -4824,6 +4466,7 @@ function renderVmMachines(){
   box.querySelectorAll(".vm-pw").forEach(b=>b.addEventListener("click",()=>
     vmPower(b.dataset.action, b.dataset.id, b)));
   vmBindTargetRefresh(box);
+  vmBindTerms(box);
 }
 // Targets with no EC2 instance behind them (lab desktops, NUCs) get no machine
 // card, but they are still probed and still go stale — so they get their own
@@ -4837,7 +4480,31 @@ function vmTargetStrip(){
     +'<span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
     +(t.checked?esc(t.age_h)+" ago":"never")+'</span>'
     +(t.error?'<span class="vm-t-err">\u26a0</span>':"")
+    +vmLiveBadge(t.name)+vmTermBtn(t.name,true)
     +vmTargetBtn(t.name)+'</span>').join("")+'</div>';
+}
+// A shell on the machine, in its own window: attaches to the persistent tmux
+// session "portal" (so work survives closing the window), bash otherwise.
+function vmTermBtn(name,on){
+  if(!(VMLOG.terminal_targets||[]).includes(name)) return "";
+  return '<button class="vm-term" data-target="'+esc(name)+'"'+(on?"":" disabled")
+    +' title="'+(on?"Open a terminal on "+esc(name)+" (tmux session \u201cportal\u201d)"
+      :esc(name)+" is not running")+'">&gt;_ Terminal</button>';
+}
+// State of the persistent ssh status link (Settings \u203a Machines \u203a live).
+function vmLiveBadge(name){
+  const l=(VMLOG.live||{})[name];
+  if(!l) return "";
+  const age=l.last_block?Math.max(0,Math.round(Date.now()/1000-l.last_block)):null;
+  const title=l.state==="connected"?"Live ssh link \u2014 last update "+age+"s ago"
+    :l.state==="down"?"Live link down: "+(l.error||"")+" \u2014 retrying"
+    :"Connecting the live ssh link\u2026";
+  return '<span class="vm-livebadge '+esc(l.state)+'" title="'+esc(title)+'">'
+    +(l.state==="connected"?"live":l.state)+'</span>';
+}
+function vmBindTerms(box){
+  box.querySelectorAll(".vm-term").forEach(b=>b.addEventListener("click",()=>
+    vmTermOpen(b.dataset.target)));
 }
 // One ↻ per target. Scoping matters because an unreachable host costs a 90 s
 // ssh timeout, so "just the VM" returns in seconds where the fleet takes minutes.
@@ -4872,6 +4539,7 @@ function vmMachine(m){
     +(lease?'<div class="vm-m-sub">'+lease+'</div>':"")
     +probe
     +'</div><div class="vm-m-act">'
+    +(m.target?vmLiveBadge(m.target)+vmTermBtn(m.target, on):"")
     +(m.target?vmTargetBtn(m.target):"")
     +'<button class="vm-pw '+act+'" data-action="'+act+'" data-id="'+esc(m.id)+'"'
     +(busy?" disabled":"")+' title="octl vm '+act+' '+esc(m.id)+'">'
@@ -4932,7 +4600,9 @@ function vmLogLink(j){
   const live=j.status==="running"&&j.owns_slot!==false;
   // Openable when this run's output is still reachable: mirrored here with
   // matching provenance, or still the slot's current log on the target.
-  const canOpen=j.has_log||j.owns_slot!==false;
+  // Runs dispatched since mctl archives each log (runs/<kind>-<stamp>-<pid>.log)
+  // can still be found on the target after a successor took the slot.
+  const canOpen=j.has_log||j.owns_slot!==false||!!j.pid;
   const meta=(j.lines?j.lines+" ln":"")
     +(j.errors?' <b style="color:'+PBI.red+'">'+j.errors+'\u2715</b>':"");
   if(!live&&!canOpen){
@@ -4945,10 +4615,11 @@ function vmLogLink(j){
     return '<span class="muted" title="'+esc(lost)+'">'+(meta||"\u2014")+'</span>';
   }
   // Not yet probed but still the slot's owner: the remote log IS this run's.
-  const what=live?"Tail this log live over ssh"
-    :(j.has_log?"Open this run\u2019s stored log ("+Math.round((j.log_bytes||0)/1024)+" KB"
+  const what=live?"Open a terminal tailing this log live on "+j.target
+    :(j.has_log?"Open this run\u2019s stored log in a terminal pager ("+Math.round((j.log_bytes||0)/1024)+" KB"
         +(j.log_at?", mirrored "+j.log_at:"")+")"
-      :"Read this run\u2019s log from the target \u2014 nothing is mirrored here yet");
+      :(j.owns_slot===false?"Look up this run\u2019s archived log on "+j.target
+        :"Open this run\u2019s log on "+j.target+" in a terminal pager"));
   return '<button class="vm-log'+(live?" live":"")+'" data-target="'+esc(j.target)+'"'
     +' data-tag="'+esc(j.tag)+'" data-kind="'+esc(j.kind)+'" data-live="'+(live?1:0)+'"'
     +' data-id="'+esc(j.id)+'"'
@@ -4957,68 +4628,28 @@ function vmLogLink(j){
     +(meta?'<span class="vm-logmeta">'+meta+'</span>':"");
 }
 
-// --- log panel -----------------------------------------------------------
-// A live tail without a websocket: re-POST /api/vm-tail on a timer. Each poll
-// is one ssh `tail -n`, the same round trip the probe already makes, so this
-// adds no dependency and nothing to clean up but the interval.
-let vmLogCur=null, vmLogTimer=null;
-function vmLogStop(){ if(vmLogTimer){ clearInterval(vmLogTimer); vmLogTimer=null; } }
-function vmLogClose(){
-  vmLogStop(); vmLogCur=null;
-  document.getElementById("vm-logpane").style.display="none";
+// --- log + terminal windows ----------------------------------------------
+// Logs open in a terminal window that runs `tail` on the machine itself
+// (tail -F while the run is live, the last lines of a finished or archived
+// run), streamed over the portal's websocket.
+// Nothing is downloaded or polled; closing the window ends the ssh session.
+function termUrl(params){
+  return "/term?"+new URLSearchParams(params).toString();
 }
-async function vmLogOpen(target,tag,kind,live,id){
-  vmLogStop();
-  vmLogCur={target,tag,kind,live,id:id||""};
-  const pane=document.getElementById("vm-logpane");
-  const follow=document.getElementById("vm-log-follow");
-  pane.style.display="block";
-  document.getElementById("vm-log-title").textContent=tag+" \u00b7 "+kind+" @ "+target;
-  document.getElementById("vm-log-sub").textContent=live?"live \u2014 polling every 5s":"loading\u2026";
-  document.getElementById("vm-log-body").textContent="";
-  document.getElementById("vm-log-followwrap").style.display=live?"":"none";
-  follow.checked=live;
-  await vmLogPoll();
-  if(live&&follow.checked) vmLogTimer=setInterval(vmLogPoll,5000);
-  pane.scrollIntoView({behavior:"smooth",block:"nearest"});
+function termOpen(params,name){
+  if(!SERVED){ alert("Serve the portal to open a terminal"); return null; }
+  const w=window.open(termUrl(params),name||"",
+    "popup=yes,width=1100,height=700");
+  if(!w) alert("The browser blocked the terminal window \u2014 allow pop-ups for this page.");
+  return w;
 }
-async function vmLogPoll(){
-  if(!vmLogCur) return;
-  const {target,tag,kind,live,id}=vmLogCur;
-  const body=document.getElementById("vm-log-body");
-  const sub=document.getElementById("vm-log-sub");
-  if(!SERVED){ sub.textContent="Serve the portal to read logs"; return; }
-  try{
-    const r=await fetch(live?"/api/vm-tail":"/api/vm-log",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({target,tag,kind,id:id||"",lines:400})});
-    const j=await r.json();
-    if(!r.ok||j.error) throw new Error(j.error||"could not read the log");
-    // Only repaint when the text actually moved, so selecting a line inside a
-    // tailing panel is not wiped out five seconds later.
-    if(body.textContent!==j.text){
-      const atEnd=body.scrollTop+body.clientHeight>=body.scrollHeight-40;
-      body.textContent=j.text||"(empty)";
-      if(atEnd||live) body.scrollTop=body.scrollHeight;
-    }
-    sub.textContent=live
-      ? "live \u00b7 "+(j.source||"")+" \u00b7 updated "+formatPortalDate(j.at)
-      : (j.truncated?"last "+Math.round((j.text||"").length/1024)+" KB of ":"")
-        +Math.round((j.bytes||0)/1024)+" KB \u00b7 "+(j.source||"")
-        +(j.provenance?" \u00b7 "+j.provenance:"")
-        +(j.log_pid?" \u00b7 pid "+j.log_pid:"")
-        +(j.mtime?" \u00b7 "+j.mtime:"");
-  }catch(e){
-    sub.textContent="failed: "+e.message;
-    vmLogStop();
-  }
+function vmLogOpen(target,tag,kind,live,id){
+  if(!id) return;
+  termOpen({kind:"log",job:id},"log-"+id);
 }
-document.getElementById("vm-log-close").addEventListener("click",vmLogClose);
-document.getElementById("vm-log-reload").addEventListener("click",vmLogPoll);
-document.getElementById("vm-log-follow").addEventListener("change",e=>{
-  vmLogStop();
-  if(e.target.checked&&vmLogCur&&vmLogCur.live) vmLogTimer=setInterval(vmLogPoll,5000);
-});
+function vmTermOpen(target){
+  termOpen({kind:"shell",target},"term-"+target);
+}
 // One ssh round trip per target plus an `octl vm list`. Dispatched as a
 // background job and polled through the align banner: an unreachable target
 // costs a 90 s ssh timeout, which used to outlive the browser's patience and
@@ -5032,14 +4663,14 @@ async function refreshVmlog(only){
     b.disabled=true; if(b.dataset.target===only) b.innerHTML='<span class="spin">\u21bb</span>';
   });
   note.textContent=only?("asking "+only+" for its job dirs\u2026")
-                       :"asking each target for its job dirs\u2026";
+                       :"asking VM and lab-machine targets for their job dirs\u2026";
   try{
     const r=await fetch("/api/vm-refresh",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(only?{target:only}:{})});
     const j=await r.json();
     if(!r.ok||!j.job) throw new Error(j.error||"refresh failed");
-    const done=await pollAlign(j.job, only?("Probing "+only+"\u2026"):"Probing delegation targets\u2026");
+    const done=await pollAlign(j.job, only?("Probing "+only+"\u2026"):"Probing machine targets\u2026");
     if(done&&done.result){ vmAdoptPayload(done.result); renderVmlog(); buildSections(); }
     note.textContent=(done&&done.message)||"probe finished";
   }catch(e){
@@ -5060,7 +4691,7 @@ async function syncVmLogs(){
   if(!SERVED){ note.textContent="Serve the portal to sync logs"; return; }
   const only=vmTarget||null;
   btn.disabled=true; btn.innerHTML='<span class="spin">\u21bb</span> Syncing\u2026';
-  note.textContent="rsyncing job logs from "+(only||"every target")+"\u2026";
+  note.textContent="rsyncing job logs from "+(only||"every VM and lab-machine target")+"\u2026";
   try{
     const r=await fetch("/api/vm-sync",{method:"POST",
       headers:{"Content-Type":"application/json"},
@@ -5341,6 +4972,11 @@ async function refreshData(){
       if(note) note.textContent="Saved team data refreshed; no external scans";
       return;
     }
+    if(activeSection==="settings"){
+      await loadSettings(); renderSettings();
+      if(note) note.textContent="Settings and timer status reloaded";
+      return;
+    }
     if(SERVED && activeSection==="ws"){
       const response=await fetch("/api/tasks",{cache:"no-store"});
       const data=await response.json();
@@ -5351,7 +4987,8 @@ async function refreshData(){
       if(note) note.textContent="Saved workspace data refreshed; live status not checked";
       return;
     }
-    if(SERVED){
+    if(SERVED&&activeSection==="overview") await refreshOverviewData();
+    else if(SERVED){
       const r=await fetch("/api/tasks",{cache:"no-store"});
       if(r.ok){ const j=await r.json(); TASKS=j.tasks||j; if(j.workspaces) WORKSPACES=j.workspaces; }
       const rb=await fetch("/api/bugs",{cache:"no-store"});
@@ -5395,6 +5032,303 @@ async function refreshData(){
 }
 document.getElementById("refresh").addEventListener("click",refreshData);
 
+// ---- notifications ------------------------------------------------------
+// One poll of /api/events every few seconds: new events become an in-page card
+// (and a desktop notification when the tab is hidden and permission is
+// granted). The poll doubles as the "a tab is open" heartbeat; with no tab the
+// server raises a Windows toast instead. The live ssh link reports a change
+// stamp here too, which re-reads the Machines section without a manual refresh.
+const NOTIFY={seq:null,timer:null,liveChanged:0,max:4};
+const NOTIFY_POLL_MS=5000;
+function notifyCard(ev){
+  let stack=document.getElementById("notify-stack");
+  if(!stack){
+    stack=document.createElement("div"); stack.id="notify-stack";
+    stack.setAttribute("role","status"); stack.setAttribute("aria-live","polite");
+    document.body.appendChild(stack);
+  }
+  const card=document.createElement("div");
+  card.className="nt "+(ev.tone||"");
+  card.innerHTML="<b>"+esc(ev.title)+"</b>"+(ev.body?"<span>"+esc(ev.body)+"</span>":"");
+  card.title="Click to open \u00b7 dismisses in 12 s";
+  card.addEventListener("click",()=>{ if(ev.link) location.hash=ev.link; card.remove(); });
+  stack.appendChild(card);
+  while(stack.children.length>NOTIFY.max) stack.firstChild.remove();
+  setTimeout(()=>card.remove(),12000);
+}
+function notifyDesktop(ev){
+  if(!("Notification" in window)||Notification.permission!=="granted") return false;
+  try{
+    const n=new Notification(ev.title,{body:ev.body||"",tag:"portal-"+ev.seq});
+    n.onclick=()=>{ window.focus(); if(ev.link) location.hash=ev.link; n.close(); };
+    return true;
+  }catch(e){ return false; }
+}
+function notifyShow(ev){
+  if(document.hidden&&notifyDesktop(ev)) return;
+  notifyCard(ev);
+}
+async function notifyPoll(){
+  if(!SERVED) return;
+  try{
+    const r=await fetch("/api/events?since="+(NOTIFY.seq??0),{cache:"no-store"});
+    if(!r.ok) return;
+    const j=await r.json();
+    // First poll only learns the cursor: no replay of events from before load.
+    if(NOTIFY.seq!==null) (j.events||[]).forEach(notifyShow);
+    if((NOTIFY.seq!==null&&(j.events||[]).some(ev=>ev.kind==="ai"))||Date.now()-(NOTIFY.rcAt||0)>60000){
+      NOTIFY.rcAt=Date.now(); rcLoadOpen();
+    }
+    NOTIFY.seq=j.seq||0;
+    const changed=(j.live&&j.live.changed)||0;
+    if(changed>NOTIFY.liveChanged){
+      const first=!NOTIFY.liveChanged;
+      NOTIFY.liveChanged=changed;
+      if(!first&&activeSection==="vm") vmLivePoll();
+    }
+    if(j.ai){ AI_USAGE=j.ai; aiSyncButton(); }
+  }catch(e){ /* the next tick retries */ }
+}
+function notifyStart(){
+  if(NOTIFY.timer) return;
+  notifyPoll();
+  NOTIFY.timer=setInterval(notifyPoll,NOTIFY_POLL_MS);
+}
+let AI_USAGE={};
+
+/* ---- AI drawer: Explain this view / Ask / follow-ups -----------------------
+   Every call is a queued server action (copilot -p); the drawer only posts the
+   request and polls the action + run record. Answers arrive as HTML rendered
+   server-side by markdown-it with raw HTML disabled. */
+const AI_SECTION_IDS=["overview","work","ws","bugs","prs","vm","raid","team"];
+const AI={open:false, thread:[], busy:false, history:[], section:null};
+function aiHeaders(){
+  const h={"Content-Type":"application/json"};
+  if(activeSection==="team"&&window.TeamUI&&window.TeamUI.isPrivate&&window.TeamUI.isPrivate()) h["X-Team-Private"]="1";
+  return h;
+}
+function aiUsageLabel(){
+  const u=AI_USAGE||{};
+  if(u.enabled===false) return "AI is off (Settings → AI)";
+  if(u.cap==null) return "";
+  return `${u.used||0}/${u.cap} runs today${u.premium?` · ${u.premium} premium req.`:""} · ${u.model||""}`;
+}
+function aiFocus(){
+  const sec=document.getElementById("sec-"+activeSection);
+  if(!sec) return "";
+  const bits=[];
+  sec.querySelectorAll(".tab.on,[role=tab][aria-selected=true]").forEach(el=>bits.push("tab: "+el.textContent.trim()));
+  sec.querySelectorAll("input[type=search]").forEach(el=>{ if(el.value) bits.push("search: "+el.value); });
+  return bits.join("; ").slice(0,500);
+}
+function aiEnsureDrawer(){
+  let d=document.getElementById("ai-drawer");
+  if(d) return d;
+  d=document.createElement("aside");
+  d.id="ai-drawer"; d.className="ai-drawer"; d.hidden=true;
+  d.setAttribute("role","dialog"); d.setAttribute("aria-label","AI assistant");
+  d.innerHTML=`<div class="ai-head"><b>✦ AI · <span id="ai-sec"></span></b>
+      <small id="ai-usage"></small>
+      <button type="button" class="ab-close" id="ai-pop" title="Pop out this conversation into a window" aria-label="Pop out into a window">⧉</button>
+      <button type="button" class="ab-close" id="ai-close" aria-label="Close AI panel">&times;</button></div>
+    <div class="ai-actions"><button type="button" class="btn primary" id="ai-explain">Explain this view</button>
+      <button type="button" class="btn" id="ai-new">New conversation</button></div>
+    <div class="ai-thread" id="ai-thread" aria-live="polite"></div>
+    <form class="ai-ask" id="ai-ask"><textarea id="ai-q" rows="3" placeholder="Ask about this view… (Ctrl+Enter to send)"></textarea>
+      <button type="submit" class="btn primary" id="ai-send">Ask</button></form>
+    <details class="ai-history"><summary>Recent in this section</summary><ul id="ai-hist"></ul></details>
+    <p class="ai-foot">Read-only: the assistant sees a snapshot of this view and may read Jira/GitHub if allowed in Settings. It cannot change anything.</p>`;
+  document.body.appendChild(d);
+  d.querySelector("#ai-close").addEventListener("click",aiClose);
+  d.querySelector("#ai-pop").addEventListener("click",()=>{
+    const last=[...AI.thread].reverse().find(r=>r.id);
+    if(!last) return;
+    const priv=aiHeaders()["X-Team-Private"]==="1"?"&private=1":"";
+    if(PortalAIChat.popOut("run="+encodeURIComponent(last.id)+priv,"aithread-"+last.id)) aiClose();
+  });
+  d.querySelector("#ai-explain").addEventListener("click",()=>aiSubmit("explain"));
+  d.querySelector("#ai-new").addEventListener("click",()=>{ AI.thread=[]; aiRenderThread(); });
+  d.querySelector("#ai-ask").addEventListener("submit",e=>{ e.preventDefault(); aiSubmit("ask"); });
+  d.querySelector("#ai-q").addEventListener("keydown",e=>{
+    if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); aiSubmit("ask"); } });
+  d.addEventListener("keydown",e=>{ if(e.key==="Escape") aiClose(); });
+  d.querySelector("#ai-hist").addEventListener("click",e=>{
+    const a=e.target.closest("[data-run]"); if(!a) return;
+    e.preventDefault(); aiLoadRun(a.dataset.run);
+  });
+  return d;
+}
+function aiSyncButton(){
+  const b=document.getElementById("ai-open");
+  if(!b) return;
+  b.hidden=!SERVED||!AI_SECTION_IDS.includes(activeSection);
+  b.disabled=AI_USAGE.enabled===false;
+  b.title=AI_USAGE.enabled===false?"AI is turned off in Settings":"Explain this view or ask a question (AI)";
+  if(AI.open&&AI.section!==activeSection) aiOpen();
+}
+function aiOpen(){
+  const d=aiEnsureDrawer();
+  if(AI.section!==activeSection){ AI.thread=[]; AI.section=activeSection; }
+  AI.open=true; d.hidden=false;
+  const label=(SECTIONS.find(s=>s.id===activeSection)||{}).label||activeSection;
+  d.querySelector("#ai-sec").textContent=label;
+  d.querySelector("#ai-usage").textContent=aiUsageLabel();
+  aiRenderThread(); aiLoadHistory();
+  d.querySelector("#ai-explain").focus();
+}
+function aiClose(){
+  AI.open=false;
+  const d=document.getElementById("ai-drawer"); if(d) d.hidden=true;
+  const b=document.getElementById("ai-open"); if(b&&!b.hidden) b.focus();
+}
+function aiRunHtml(r){
+  const q=r.kind==="explain"?`Explain this view`:r.question;
+  const meta=[r.model, r.premium?`${r.premium} premium`:"", r.truncated?"partial data":"",
+              r.finished?formatPortalDate(r.finished):""].filter(Boolean).join(" · ");
+  const body=r.status==="done"?`<div class="ai-answer">${r.answer_html||esc(r.answer||"")}</div>`
+    :r.status==="error"?`<div class="ai-err">${esc(r.error||"failed")}</div>`
+    :`<div class="ai-wait"><span class="aq-spin" aria-hidden="true"></span> ${esc(r.progress||"thinking…")}</div>`;
+  return `<div class="ai-turn"><div class="ai-q">${esc(q||"")}</div>${body}${meta?`<small class="ai-meta">${esc(meta)}</small>`:""}</div>`;
+}
+function aiRenderThread(){
+  const el=document.getElementById("ai-thread"); if(!el) return;
+  el.innerHTML=AI.thread.length?AI.thread.map(aiRunHtml).join("")
+    :`<p class="muted">Ask a question about this view, or let the AI explain what stands out.</p>`;
+  el.scrollTop=el.scrollHeight;
+  const busy=AI.busy||AI_USAGE.enabled===false;
+  ["ai-explain","ai-send"].forEach(id=>{ const b=document.getElementById(id); if(b) b.disabled=busy; });
+  const pop=document.getElementById("ai-pop");
+  if(pop) pop.disabled=!AI.thread.some(r=>r.id);
+}
+async function aiLoadHistory(){
+  const ul=document.getElementById("ai-hist"); if(!ul) return;
+  try{
+    const r=await fetch("/api/ai/runs?section="+encodeURIComponent(activeSection),{cache:"no-store",headers:aiHeaders()});
+    const j=await r.json();
+    if(j.usage){ AI_USAGE=j.usage; const u=document.getElementById("ai-usage"); if(u) u.textContent=aiUsageLabel(); }
+    ul.innerHTML=(j.runs||[]).filter(x=>!["auto-review","review-turn"].includes(x.kind)).map(x=>
+      `<li><a href="#" data-run="${esc(x.id)}">${esc(x.kind==="explain"?"Explain":x.question||x.kind)}</a> <small>${esc(formatPortalDate(x.started||""))} · ${esc(x.status)}</small></li>`).join("")
+      ||"<li class='muted'>No AI runs yet.</li>";
+  }catch(e){ ul.innerHTML=`<li class="muted">History unavailable</li>`; }
+}
+async function aiShowRun(id){
+  try{
+    const r=await fetch("/api/ai/run/"+encodeURIComponent(id),{cache:"no-store",headers:aiHeaders()});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    if(j.section&&j.section!==activeSection&&AI_SECTION_IDS.includes(j.section)) selectSection(j.section);
+    AI.section=activeSection; aiOpen(); AI.thread=[j]; aiRenderThread();
+  }catch(e){ notifyCard({title:"AI",body:String(e.message||e),tone:"bad"}); }
+}
+async function aiLoadRun(id){
+  try{
+    const r=await fetch("/api/ai/run/"+encodeURIComponent(id),{cache:"no-store",headers:aiHeaders()});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    AI.thread=[j]; aiRenderThread();
+  }catch(e){ notifyCard({title:"AI",body:String(e.message||e),tone:"bad"}); }
+}
+async function aiSubmit(kind){
+  if(AI.busy) return;
+  const q=document.getElementById("ai-q");
+  const question=kind==="ask"?q.value.trim():"";
+  if(kind==="ask"&&!question){ q.focus(); return; }
+  const last=AI.thread[AI.thread.length-1];
+  const body={kind, section:activeSection, question, focus:aiFocus()};
+  if(kind==="ask"&&last&&last.status==="done"&&last.session_id) body.parent=last.id;
+  AI.busy=true;
+  const turn={id:null,kind,question,status:"queued",progress:"queued"};
+  AI.thread.push(turn); aiRenderThread();
+  try{
+    const r=await fetch("/api/ai/run",{method:"POST",headers:aiHeaders(),body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    if(kind==="ask") q.value="";
+    turn.id=j.run_id;
+    await aiWait(j.job,j.run_id,turn);
+  }catch(e){
+    Object.assign(turn,{status:"error",error:String(e.message||e)});
+  }
+  AI.busy=false; aiRenderThread(); aiLoadHistory();
+}
+async function aiWait(jobId,runId,turn){
+  for(;;){
+    await new Promise(res=>setTimeout(res,2000));
+    let job={};
+    try{ job=await (await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"})).json(); }catch(e){}
+    if(job.current){ turn.progress=job.current; aiRenderThread(); }
+    if(["done","error","approval_required"].includes(job.status)||job.error==="unknown job") break;
+  }
+  const r=await fetch("/api/ai/run/"+encodeURIComponent(runId),{cache:"no-store",headers:aiHeaders()});
+  const run=await r.json();
+  Object.assign(turn,r.ok?run:{status:"error",error:run.error||"answer unavailable"});
+}
+// ---- AI review: draft / re-review / interactive ----
+// REVIEW_CHATS maps task id -> its open interactive review (server state).
+async function rcLoadOpen(){
+  if(!SERVED) return;
+  try{
+    const r=await fetch("/api/ai/review-chats?open=1",{cache:"no-store"});
+    if(!r.ok) return;
+    const next={};
+    ((await r.json()).chats||[]).forEach(c=>{ if(!next[c.task_id]) next[c.task_id]=c; });
+    const changed=JSON.stringify(next)!==JSON.stringify(REVIEW_CHATS);
+    REVIEW_CHATS=next;
+    if(changed&&typeof render==="function") render();
+  }catch(e){ /* next refresh retries */ }
+}
+const RC={handle:null,id:null};
+function rcClose(){
+  if(RC.handle) RC.handle.stop();
+  RC.handle=null; RC.id=null;
+  const d=document.getElementById("rc-drawer"); if(d) d.hidden=true;
+}
+function rcOpen(chatId){
+  if(AI.open) aiClose();
+  let d=document.getElementById("rc-drawer");
+  if(!d){
+    d=document.createElement("aside"); d.id="rc-drawer"; d.className="ai-drawer rc-drawer";
+    d.setAttribute("role","dialog"); d.setAttribute("aria-label","Interactive review");
+    d.addEventListener("keydown",e=>{ if(e.key==="Escape") rcClose(); });
+    document.body.appendChild(d);
+  }
+  if(RC.id===chatId&&!d.hidden){ RC.handle.refresh(); return; }
+  if(RC.handle) RC.handle.stop();
+  d.hidden=false; d.innerHTML="";
+  RC.id=chatId;
+  RC.handle=PortalAIChat.mountReview(d,chatId,{onClose:rcClose,onPopped:rcClose,onEnded:()=>setTimeout(rcLoadOpen,1500)});
+}
+async function aiReviewAction(mode,tid,btn){
+  if(mode==="resume"){ rcOpen(btn.dataset.chat); return; }
+  const text={
+    create:`Create an AI review draft for ${tid}?\n\nThe portal picks a free review workspace whose deployed manifest (project, revision) matches the PRs, aligns it to the PR branches, runs /pr-review local (draft only - nothing is posted), registers the draft on the task and releases the workspace.`,
+    rereview:`Re-review ${tid} with AI?\n\nSame workspace handling as a draft; the AI follows the pr-review re-review flow (only what changed since the reviewed head, still-open findings carried forward) and registers a new draft. If nothing changed, the draft stays as is. Nothing is posted.`,
+    interactive:`Start an interactive review of ${tid}?\n\nThe portal occupies a matching review workspace and checks the PRs out, then the AI runs /pr-review local with you in a chat panel. The workspace stays occupied until you end the review (or after 24 h without messages).`}[mode];
+  if(!text||!confirm(text)) return;
+  btn.disabled=true;
+  try{
+    const url=mode==="interactive"?"/api/ai/review-chat":"/api/ai/auto-review";
+    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(mode==="interactive"?{task_id:tid}:{task_id:tid,mode})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    if(mode==="interactive"){
+      await rcLoadOpen(); rcOpen(j.chat_id);
+    }else{
+      notifyCard({title:`${mode==="create"?"Review draft":"Re-review"} ${tid} queued`,body:`Workspace ${j.workspace} (${j.manifest||""}). You'll be notified when it is done.`,tone:"ok"});
+      if(typeof pollAlign==="function") pollAlign(j.job);
+    }
+  }catch(e){
+    notifyCard({title:`AI review of ${tid} not started`,body:String(e.message||e),tone:"bad"});
+  }
+  btn.disabled=false;
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-ai-review]"); if(!b) return;
+  e.preventDefault(); e.stopPropagation();
+  aiReviewAction(b.dataset.aiReview,b.dataset.task,b);
+},true);  // capture: the buttons sit inside clickable task rows
+
 // ---- served-mode detection: enables editing + live data ----
 async function init(){
   try{
@@ -5413,6 +5347,10 @@ async function init(){
       if(rp.ok) PRS=await rp.json();
       const rr=await fetch("/api/raid",{cache:"no-store"});
       if(rr.ok) RAID=await rr.json();
+      notifyStart();
+      const aiBtn=document.getElementById("ai-open");
+      if(aiBtn){ aiBtn.addEventListener("click",()=>AI.open?aiClose():aiOpen()); aiSyncButton(); }
+      rcLoadOpen();
     }
   }catch(e){ /* file:// — stay read-only with embedded data */ }
   document.getElementById("total").textContent=
@@ -5443,10 +5381,13 @@ async function init(){
     const clock=document.getElementById("local-clock");
     if(clock){
       clock.textContent=
-        new Intl.DateTimeFormat(undefined,{hour:"2-digit",minute:"2-digit"}).format(new Date());
+        new Intl.DateTimeFormat(undefined,{hour:"2-digit",minute:"2-digit",
+          ...(prefs.clock==="auto"?{}:{hour12:prefs.clock==="12"})}).format(new Date());
     }
   };
   updateClock();
+  window.__updateClock=updateClock;
+  document.body.classList.toggle("compact-tables",prefs.compact);
   setInterval(updateClock,30000);
   renderOverview();
   renderPrs();
@@ -5455,8 +5396,338 @@ async function init(){
   const ck=document.getElementById("cmdk-open"); if(ck) ck.addEventListener("click",openCmdk);
   if(SERVED){
     refreshActionQueue();
-    setInterval(refreshActionQueue,1500);
+    restartActionPoll();
+    restartPulsePoll();
+    pulseTick(true);
   }
+}
+
+// --- routine days (pure: scheduleDaysLabel; tests cut from here) ---
+const WEEK_DAYS=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+const DAY_PRESETS=[["Every day",WEEK_DAYS],["Sun–Thu",["Sun","Mon","Tue","Wed","Thu"]],
+  ["Mon–Fri",["Mon","Tue","Wed","Thu","Fri"]]];
+function scheduleDaysLabel(days){
+  const set=WEEK_DAYS.filter(d=>(days||[]).includes(d));
+  const preset=DAY_PRESETS.find(([,ds])=>ds.length===set.length&&ds.every(d=>set.includes(d)));
+  if(preset) return preset[0]==="Every day"?"daily":preset[0];
+  return set.length?set.join(", "):"no days";
+}
+// --- end routine days ---
+
+// ---- Settings section ----
+// Portal settings (server, journaled, revision-checked) + browser preferences.
+let actionPollTimer=null;
+function restartActionPoll(){
+  if(!SERVED) return;
+  if(actionPollTimer) clearInterval(actionPollTimer);
+  actionPollTimer=setInterval(refreshActionQueue,prefs.actionPollMs);
+}
+let SETTINGS=BOOT.settings||null;
+let settingsMsg={text:"",tone:""};
+const ROUTINE_STEP_LABELS={reviews:"Reviews",prs:"PRs (no Jira sync)",bugs:"Bugs",
+  workspaces:"Local workspaces",team:"Team activity",ai:"AI summary in the brief"};
+// Generic forms for the flat setting groups. [key, label, hint]; the type
+// comes from the default value (bool / int / list of machine names / text).
+const SETTING_GROUPS=[
+  ["ai","AI assistance",[
+    ["enabled","Allow AI runs","Explain/Ask, the brief paragraph, review drafts and interactive reviews. Off blocks every AI call."],
+    ["model","Model","Copilot CLI --model; \u201cfusion\u201d lets Copilot pick per request."],
+    ["daily_cap","Runs per day","hard cap for Explain/Ask/brief and review drafts; 0 disables"],
+    ["interactive_daily_cap","Interactive review messages per day","separate cap for interactive-review chat turns; 0 disables"],
+    ["timeout_s","Run timeout","seconds, Explain/Ask/brief"],
+    ["review_timeout_s","Review timeout","seconds per review draft run or interactive-review turn"],
+    ["allow_jira_github_reads","Allow Jira / GitHub reads","read-only lookups during AI runs; the only GitHub write is posting an interactive review you confirmed"]]],
+  ["machines","Machines",[
+    ["terminal_targets","Terminal machines","comma-separated targets that get a >_ Terminal button"],
+    ["live_targets","Live-status machines","comma-separated targets kept on a persistent ssh status link"],
+    ["live_interval_s","Live update interval","seconds between probes on the live link"]]],
+  ["notify","Notifications",[
+    ["enabled","Pop-up notifications","master switch"],
+    ["queue","Action queue","an action finished, failed or needs approval"],
+    ["machine_jobs","Machine jobs","a build/test on a machine finished"],
+    ["ai","AI runs","an AI answer, review draft or interactive-review start/submit/end"],
+    ["reachability","Machine reachability","a live-status machine went down or came back"],
+    ["windows_toast","Windows toast when no tab is open","via powershell.exe from WSL"]]]];
+function settingField(group,[key,label,hint],values,dis){
+  const v=values[key], def=((SETTINGS.defaults||{})[group]||{})[key];
+  const id=`sg-${group}-${key}`;
+  if(typeof def==="boolean")
+    return `<label class="set-row"><input type="checkbox" id="${id}" data-g="${group}" data-k="${key}"${v?" checked":""}${dis}>
+      <span>${esc(label)}${hint?`<small>${esc(hint)}</small>`:""}</span></label>`;
+  if(typeof def==="number"){
+    const [lo,hi]=((SETTINGS.group_limits||{})[group]||{})[key]||[0,9999];
+    return `<label class="set-row"><span class="set-lbl">${esc(label)}</span>
+      <input type="number" id="${id}" data-g="${group}" data-k="${key}" min="${lo}" max="${hi}" step="1" value="${esc(v)}" required${dis}>
+      <small>${esc(hint)} (${lo}\u2013${hi})</small></label>`;
+  }
+  const list=Array.isArray(def);
+  return `<label class="set-row"><span class="set-lbl">${esc(label)}</span>
+    <input type="text" id="${id}" data-g="${group}" data-k="${key}"${list?' data-list="1"':""}
+      value="${esc(list?(v||[]).join(", "):v)}"${list?"":" required"}${dis}>
+    <small>${esc(hint)}</small></label>`;
+}
+let groupsMsg={text:"",tone:""};
+function renderGroupSettings(values){
+  const box=document.getElementById("set-groups"); if(!box) return;
+  if(!SETTINGS||!SETTINGS.settings||!SETTINGS.settings.ai){ box.innerHTML='<div class="empty">Loading\u2026</div>'; return; }
+  const dis=SERVED?"":" disabled", src=values||SETTINGS.settings;
+  const perm=("Notification" in window)?Notification.permission:"unsupported";
+  box.innerHTML=`<form id="set-groups-form" class="set-form">
+    <div class="set-groups">${SETTING_GROUPS.map(([g,title,fields])=>`<fieldset class="set-steps"><legend>${esc(title)}</legend>
+      ${fields.map(f=>settingField(g,f,src[g]||{},dis)).join("")}</fieldset>`).join("")}</div>
+    <div class="set-row"><span class="set-lbl">Desktop notifications in this browser</span>
+      <button type="button" class="btn" id="notify-perm"${perm==="granted"||perm==="unsupported"?" disabled":""}>${
+        perm==="granted"?"\u2713 Allowed":perm==="denied"?"Blocked \u2014 allow in the browser\u2019s site settings":perm==="unsupported"?"Not supported":"Allow desktop notifications"}</button>
+      <button type="button" class="btn" id="notify-test">Show a test notification</button>
+      <small>Without permission, notifications appear as cards in the corner of the portal.</small></div>
+    <div class="set-actions">
+      <button type="submit" class="primary"${dis}>Save</button>
+      <button type="button" class="btn" data-groups-defaults${dis}>Fill in defaults</button>
+      <span class="set-msg ${esc(groupsMsg.tone)}" role="status" aria-live="polite">${esc(groupsMsg.text)}</span>
+    </div></form>`;
+  const form=document.getElementById("set-groups-form");
+  form.addEventListener("submit",ev=>{ ev.preventDefault(); saveGroupSettings(form); });
+  form.querySelector("[data-groups-defaults]").addEventListener("click",()=>{
+    groupsMsg={text:"Defaults filled in \u2014 Save to apply.",tone:""};
+    renderGroupSettings(SETTINGS.defaults);
+  });
+  document.getElementById("notify-perm").addEventListener("click",async()=>{
+    try{ await Notification.requestPermission(); }catch(e){ /* older API */ }
+    renderGroupSettings();
+  });
+  document.getElementById("notify-test").addEventListener("click",()=>{
+    const ev={seq:Date.now(),title:"Team Portal notification test",body:"This is how a finished job is announced.",tone:"ok",link:"#settings"};
+    if(!notifyDesktop(ev)) notifyCard(ev);
+  });
+}
+function groupFormValues(form){
+  const out={};
+  form.querySelectorAll("[data-g]").forEach(el=>{
+    const g=el.dataset.g, k=el.dataset.k; out[g]=out[g]||{};
+    out[g][k]=el.type==="checkbox"?el.checked:el.type==="number"?Number(el.value)
+      :el.dataset.list?el.value.split(/[\s,]+/).filter(Boolean):el.value.trim();
+  });
+  return out;
+}
+async function saveGroupSettings(form){
+  if(!form.reportValidity()) return;
+  const btn=form.querySelector("button[type=submit]"); btn.disabled=true;
+  form.querySelector(".set-msg").textContent="Saving\u2026";
+  try{
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({revision:SETTINGS.revision,settings:groupFormValues(form)})});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok){
+      groupsMsg={text:(r.status===409?"Someone else changed settings \u2014 reloaded. ":"")+(data.error||"HTTP "+r.status),tone:"bad"};
+      if(r.status===409) await loadSettings();
+    }else{
+      SETTINGS={settings:data.settings,defaults:data.defaults,revision:data.revision,limits:data.limits,
+        group_limits:data.group_limits,status:data.status};
+      BOOT.settings=SETTINGS;
+      groupsMsg={text:data.changed.length?`Saved ${data.changed.length} change(s)`:"No changes",tone:data.changed.length?"ok":""};
+    }
+  }catch(error){ groupsMsg={text:"Save failed: "+error.message,tone:"bad"}; }
+  renderGroupSettings(); renderRoutineSettings();
+}
+const ROUTINE_NUMBERS=[
+  ["snapshot_keep","Daily DB snapshots kept","days"],
+  ["queue_retention_days","Keep finished queue actions","days"],
+  ["activity_window_hours","Team activity window","hours"],
+  ["brief_stale_hours","Mark the brief stale after","hours"]];
+async function loadSettings(){
+  if(!SERVED) return;
+  try{
+    const r=await fetch("/api/settings",{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    SETTINGS=await r.json();
+  }catch(error){ settingsMsg={text:"Could not load settings: "+error.message,tone:"bad"}; }
+}
+function renderSettings(){
+  renderRoutineSettings(); renderGroupSettings(); renderSettingsStatus(); renderPrefs();
+  if(SERVED&&!(SETTINGS&&SETTINGS.status)){
+    loadSettings().then(()=>{ renderRoutineSettings(); renderGroupSettings(); renderSettingsStatus(); });
+  }
+}
+function renderRoutineSettings(values){
+  const box=document.getElementById("set-routine"); if(!box) return;
+  if(!SETTINGS){ box.innerHTML='<div class="empty">Loading…</div>'; return; }
+  const r=values||SETTINGS.settings.routine, lim=SETTINGS.limits||{}, dis=SERVED?"":" disabled";
+  const chk=(k,label,hint)=>`<label class="set-row"><input type="checkbox" data-r="${k}"${r[k]?" checked":""}${dis}>
+    <span>${esc(label)}${hint?`<small>${esc(hint)}</small>`:""}</span></label>`;
+  box.innerHTML=(SERVED?"":`<div class="ro-note">Read-only. Open the served portal to change portal settings.</div>`)
+    +`<form id="set-routine-form" class="set-form">
+    ${chk("enabled","Run the daily routine","Off disables the systemd timer; you can still run it by hand.")}
+    <label class="set-row"><span class="set-lbl">Run time</span>
+      <input type="time" step="60" data-r="time" value="${esc(r.time)}" required${dis}>
+      <small>local time · the timer may add up to 2 min random delay</small></label>
+    <fieldset class="set-steps set-days"><legend>Run on</legend>
+      ${WEEK_DAYS.map(d=>`<label><input type="checkbox" data-day="${d}"${(r.days||[]).includes(d)?" checked":""}${dis}> ${d}</label>`).join("")}
+      <span class="set-presets">${DAY_PRESETS.map(([l,ds])=>`<button type="button" class="btn" data-days="${ds.join(",")}"${dis}>${esc(l)}</button>`).join("")}</span>
+      <small>Unchecked days (e.g. Fri–Sat) are skipped; check them to run on weekends too.</small></fieldset>
+    ${chk("auto_restart","Restart the portal automatically if unhealthy","only when no action is queued or running")}
+    <fieldset class="set-steps"><legend>Refresh steps</legend>
+      ${Object.entries(ROUTINE_STEP_LABELS).map(([k,l])=>`<label><input type="checkbox" data-step="${k}"${r.steps[k]?" checked":""}${dis}> ${esc(l)}</label>`).join("")}
+      <small>Health, queue, integrity, housekeeping and self-test always run.</small></fieldset>
+    <div class="set-nums">${ROUTINE_NUMBERS.map(([k,l,u])=>{ const [lo,hi]=lim[k]||[1,999];
+      return `<label class="set-row"><span class="set-lbl">${esc(l)}</span>
+        <input type="number" data-r="${k}" min="${lo}" max="${hi}" step="1" value="${esc(r[k])}" required${dis}>
+        <small>${esc(u)} (${lo}–${hi})</small></label>`; }).join("")}</div>
+    <div class="set-actions">
+      <button type="submit" class="primary"${dis}>Save portal settings</button>
+      <button type="button" class="btn" data-set-defaults${dis}>Fill in defaults</button>
+      <span class="set-msg ${esc(settingsMsg.tone)}" role="status" aria-live="polite">${esc(settingsMsg.text)}</span>
+    </div></form>`;
+  const form=document.getElementById("set-routine-form");
+  form.addEventListener("submit",ev=>{ ev.preventDefault(); saveRoutineSettings(form); });
+  form.querySelectorAll("[data-days]").forEach(b=>b.addEventListener("click",()=>{
+    const want=b.dataset.days.split(",");
+    form.querySelectorAll("[data-day]").forEach(el=>{ el.checked=want.includes(el.dataset.day); });
+  }));
+  form.querySelector("[data-set-defaults]").addEventListener("click",()=>{
+    settingsMsg={text:"Defaults filled in — Save to apply.",tone:""};
+    renderRoutineSettings(SETTINGS.defaults.routine);
+  });
+}
+function routineFormValues(form){
+  const out={steps:{},days:[]};
+  form.querySelectorAll("[data-r]").forEach(el=>{
+    out[el.dataset.r]=el.type==="checkbox"?el.checked:el.type==="number"?Number(el.value):el.value;
+  });
+  form.querySelectorAll("[data-step]").forEach(el=>{ out.steps[el.dataset.step]=el.checked; });
+  form.querySelectorAll("[data-day]").forEach(el=>{ if(el.checked) out.days.push(el.dataset.day); });
+  return out;
+}
+async function saveRoutineSettings(form){
+  if(!form.reportValidity()) return;
+  if(!form.querySelector("[data-day]:checked")){
+    settingsMsg={text:"Pick at least one run day, or turn the routine off.",tone:"bad"};
+    form.querySelector(".set-msg").textContent=settingsMsg.text;
+    form.querySelector(".set-msg").className="set-msg bad";
+    return;
+  }
+  const btn=form.querySelector("button[type=submit]"); btn.disabled=true;
+  settingsMsg={text:"Saving…",tone:""};
+  form.querySelector(".set-msg").textContent=settingsMsg.text;
+  try{
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({revision:SETTINGS.revision,settings:{routine:routineFormValues(form)}})});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok){
+      settingsMsg={text:(r.status===409?"Someone else changed settings — reloaded. ":"")+(data.error||"HTTP "+r.status),tone:"bad"};
+      if(r.status===409) await loadSettings();
+    }else{
+      SETTINGS={settings:data.settings,defaults:data.defaults,revision:data.revision,limits:data.limits,
+        group_limits:data.group_limits,status:data.status};
+      BOOT.settings=SETTINGS;
+      settingsMsg={text:data.changed.length?`Saved ${data.changed.length} change(s) · ${data.applied}`:"No changes",tone:data.changed.length?"ok":""};
+      if(typeof renderBrief==="function") renderBrief();
+    }
+  }catch(error){ settingsMsg={text:"Save failed: "+error.message,tone:"bad"}; }
+  renderRoutineSettings(); renderSettingsStatus();
+}
+function renderSettingsStatus(){
+  const box=document.getElementById("set-status"); if(!box) return;
+  if(!SERVED){ box.innerHTML='<div class="empty">Available on the served portal.</div>'; return; }
+  const st=SETTINGS&&SETTINGS.status;
+  if(!st){ box.innerHTML='<div class="empty">Loading…</div>'; return; }
+  const t=st.timer||{}, last=st.last_run, cfg=SETTINGS.settings.routine;
+  const row=(k,v,tone)=>`<div class="set-kv"><span>${esc(k)}</span><b class="${tone||""}">${v}</b></div>`;
+  const when=last&&last.generated_at?localDmyHm(Date.parse(last.generated_at)):"";
+  box.innerHTML=
+    (st.problem?`<div class="brief-error">${esc(st.problem)}</div>`:"")
+    +(t.error?row("Timer",esc(t.error),"bad")
+      :row("Timer",esc(t.active)+" · "+esc(t.enabled),t.active==="active"?"ok":"warn")
+       +row("Next run",esc(t.next||"—"))
+       +row("Last trigger",esc(t.last&&t.last!=="n/a"?t.last:"—")))
+    +row("Schedule",esc(scheduleDaysLabel(cfg.days)+" "+cfg.time)+(st.managed_schedule?"":" <small>(unit default)</small>"))
+    +row("Last brief",last?esc(when+" · "+(last.status||"?"))+(last.journal_id?" · journal #"+esc(last.journal_id):""):"none yet",
+         last&&last.status==="ok"?"ok":last?"warn":"")
+    +row("Linger",esc(st.linger),st.linger==="yes"?"ok":"warn")
+    +(st.linger==="yes"?"":`<p class="cap">With linger off the timer fires only while you are logged in; a missed run catches up at next login. Enable with <code>sudo loginctl enable-linger $USER</code>.</p>`)
+    +`<div class="set-actions"><button type="button" class="btn" id="set-status-refresh">↻ Refresh status</button></div>`;
+  document.getElementById("set-status-refresh").addEventListener("click",async()=>{
+    await loadSettings(); renderSettingsStatus();
+  });
+}
+function renderPrefs(){
+  const box=document.getElementById("set-prefs"); if(!box) return;
+  const order=navSections(SECTIONS,{...prefs,hidden:[]});
+  const cards=pulseVisible(PortalPulse.cards({},Date.now()),prefs,true);
+  const opt=(v,l,cur)=>`<option value="${esc(v)}"${String(v)===String(cur)?" selected":""}>${esc(l)}</option>`;
+  box.innerHTML=`<div class="set-prefs">
+    <div class="set-col">
+      <label class="set-row"><span class="set-lbl">Landing section</span>
+        <select data-pref="landing">${opt("last","Last visited",prefs.landing)}${SECTIONS.map(s=>opt(s.id,s.label,prefs.landing)).join("")}</select></label>
+      <label class="set-row"><span class="set-lbl">Clock</span>
+        <select data-pref="clock">${opt("auto","Browser default",prefs.clock)}${opt("24","24-hour",prefs.clock)}${opt("12","12-hour",prefs.clock)}</select></label>
+      <label class="set-row"><input type="checkbox" data-pref="compact"${prefs.compact?" checked":""}> <span>Compact tables</span></label>
+      <label class="set-row"><span class="set-lbl">Action queue refresh</span>
+        <select data-pref="actionPollMs">${PREF_CHOICES.actionPollMs.map(v=>opt(v,(v/1000)+" s",prefs.actionPollMs)).join("")}</select></label>
+      <label class="set-row"><span class="set-lbl">Machines live refresh</span>
+        <select data-pref="vmPollMs">${PREF_CHOICES.vmPollMs.map(v=>opt(v,(v/1000)+" s",prefs.vmPollMs)).join("")}</select></label>
+      <label class="set-row"><span class="set-lbl">Overview live refresh</span>
+        <select data-pref="pulsePollMs">${PREF_CHOICES.pulsePollMs.map(v=>opt(v,v?(v>=60000?(v/60000)+" min":(v/1000)+" s"):"Off",prefs.pulsePollMs)).join("")}</select></label>
+      <div class="set-actions">
+        <button type="button" class="btn" data-reset-layout>Reset layout (tiles, sidebar)</button>
+        <button type="button" class="btn" data-reset-prefs>Reset preferences</button>
+      </div>
+    </div>
+    <div class="set-col"><span class="set-lbl">Navigation — show, hide and reorder sections</span>
+      <ol class="set-nav">${order.map((s,i)=>`<li><label><input type="checkbox" data-nav-show="${s.id}"${prefs.hidden.includes(s.id)?"":" checked"}${s.id==="settings"?" disabled title=\"Settings is always shown\"":""}>
+        <span aria-hidden="true">${s.icon}</span> ${esc(s.label)}</label>
+        <span class="set-move"><button type="button" class="btn" data-nav-move="${s.id}" data-dir="-1" aria-label="Move ${esc(s.label)} up"${i?"":" disabled"}>↑</button>
+        <button type="button" class="btn" data-nav-move="${s.id}" data-dir="1" aria-label="Move ${esc(s.label)} down"${i<order.length-1?"":" disabled"}>↓</button></span></li>`).join("")}</ol>
+      <small>Hidden sections stay reachable from ⌘K and links.</small></div>
+    <div class="set-col"><span class="set-lbl">Overview live pulse — show, hide and reorder cards</span>
+      <ol class="set-nav">${cards.map((c,i)=>`<li><label><input type="checkbox" data-card-show="${c.id}"${prefs.pulseHidden.includes(c.id)?"":" checked"}>
+        <span aria-hidden="true">${c.icon}</span> ${esc(c.label)}</label>
+        <span class="set-move"><button type="button" class="btn" data-card-move="${c.id}" data-dir="-1" aria-label="Move ${esc(c.label)} card up"${i?"":" disabled"}>↑</button>
+        <button type="button" class="btn" data-card-move="${c.id}" data-dir="1" aria-label="Move ${esc(c.label)} card down"${i<cards.length-1?"":" disabled"}>↓</button></span></li>`).join("")}</ol>
+      <small>The Overview badge counts red cards among the ones shown.</small></div>
+  </div>`;
+  box.querySelectorAll("[data-pref]").forEach(el=>el.addEventListener("change",()=>{
+    const k=el.dataset.pref;
+    const v=el.type==="checkbox"?el.checked:/Ms$/.test(k)?Number(el.value):el.value;
+    savePrefs({[k]:v});
+    if(k==="compact") document.body.classList.toggle("compact-tables",prefs.compact);
+    if(k==="clock"&&window.__updateClock) window.__updateClock();
+    if(k==="actionPollMs") restartActionPoll();
+    if(k==="pulsePollMs") restartPulsePoll();
+  }));
+  box.querySelectorAll("[data-card-show]").forEach(el=>el.addEventListener("change",()=>{
+    const id=el.dataset.cardShow;
+    savePrefs({pulseHidden:el.checked?prefs.pulseHidden.filter(x=>x!==id):[...prefs.pulseHidden,id]});
+    buildSections(); renderPrefs();
+  }));
+  box.querySelectorAll("[data-card-move]").forEach(el=>el.addEventListener("click",()=>{
+    const ids=cards.map(c=>c.id), i=ids.indexOf(el.dataset.cardMove), j=i+Number(el.dataset.dir);
+    if(j<0||j>=ids.length) return;
+    [ids[i],ids[j]]=[ids[j],ids[i]];
+    savePrefs({pulseOrder:ids}); renderPrefs();
+    const again=document.querySelector(`[data-card-move="${el.dataset.cardMove}"][data-dir="${el.dataset.dir}"]`);
+    if(again&&!again.disabled) again.focus();
+  }));
+  box.querySelectorAll("[data-nav-show]").forEach(el=>el.addEventListener("change",()=>{
+    const id=el.dataset.navShow;
+    savePrefs({hidden:el.checked?prefs.hidden.filter(x=>x!==id):[...prefs.hidden,id]});
+    buildSections(); renderPrefs();
+  }));
+  box.querySelectorAll("[data-nav-move]").forEach(el=>el.addEventListener("click",()=>{
+    const ids=order.map(s=>s.id), i=ids.indexOf(el.dataset.navMove), j=i+Number(el.dataset.dir);
+    if(j<0||j>=ids.length) return;
+    [ids[i],ids[j]]=[ids[j],ids[i]];
+    savePrefs({order:ids}); buildSections(); renderPrefs();
+    const again=document.querySelector(`[data-nav-move="${el.dataset.navMove}"][data-dir="${el.dataset.dir}"]`);
+    if(again&&!again.disabled) again.focus();
+  }));
+  box.querySelector("[data-reset-layout]").addEventListener("click",()=>{
+    try{ localStorage.removeItem(PORTAL_LAYOUT_KEY); }catch(_){}
+    location.hash="settings"; location.reload();
+  });
+  box.querySelector("[data-reset-prefs]").addEventListener("click",()=>{
+    try{ localStorage.removeItem(PREFS_KEY); }catch(_){}
+    location.hash="settings"; location.reload();
+  });
 }
 
 // ---- ⌘K command palette + deep-link URL state ----
@@ -5520,6 +5791,8 @@ function applyHash(){
     }
     if(!id){ if(SECTIONS.some(s=>s.id===kind&&s.ready)){ selectSection(kind); return true; } return false; }
     if(["bug","ph","task","pr","raid"].includes(kind)){ goItem(kind,id); return true; }
+    if(kind==="ai"&&SERVED){ aiShowRun(id); return true; }
+    if(kind==="review-chat"&&SERVED&&/^rc-[0-9a-f]{32}$/.test(id)){ rcOpen(id); return true; }
   }finally{ navFromHash=false; }
   return false;
 }
@@ -5612,7 +5885,7 @@ document.addEventListener("keydown",e=>{
 // ---- keyboard: j/k move, Enter/e open, x tick, / search, g+letter section, ? help ----
 const KB_ROWS={work:"#body tr.task", bugs:"#bug-body tr.task", prs:"#pr-body tr.prf-row", raid:"#raid-body tr.raid-row"};
 const KB_SEARCH={work:"q", bugs:"bq", prs:"pr-q"};
-const KB_GO={o:"overview",w:"work",s:"ws",b:"bugs",p:"prs",l:"pldmq",v:"vm",r:"raid"};
+const KB_GO={o:"overview",w:"work",s:"ws",b:"bugs",p:"prs",v:"vm",r:"raid"};
 let kbIdx=-1, kbPending="", kbKey="";
 const kbId=r=>r?(r.dataset.key||r.dataset.fid||r.dataset.id||""):"";
 function kbRows(){

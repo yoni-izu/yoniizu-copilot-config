@@ -84,6 +84,25 @@ class ExtractionTests(unittest.TestCase):
             self.assertIn('id="align-close"', html)
             self.assertIn('<div id="align-body"></div>', html)
 
+    def test_machine_jobs_labels_preserve_vm_status_check_and_running_badge(self):
+        for inline in (False, True):
+            with self.subTest(inline=inline), \
+                    patch.object(portal.wm, "load", return_value={}), \
+                    patch.object(portal, "boot_payload", return_value="{}"):
+                html = portal.render_dashboard_html([], inline=inline)
+            self.assertIn("<h2>Machines</h2>", html)
+            self.assertIn("Check VM status</button>", html)
+            self.assertNotIn("VM delegator log", html)
+
+        pulse = (PORTAL_DIR / "assets" / "pulse.js").read_text()
+        client = (PORTAL_DIR / "assets" / "portal.js").read_text()
+        self.assertIn('label:"Machines"', pulse)
+        self.assertIn('value:(vm.running||[]).length', pulse)
+        self.assertIn('label:"Machines"', client)
+        self.assertIn('return "Refresh machine activity"+(job.target?', client)
+        self.assertIn("Jobs delegated to a VM or lab machine that are still running", client)
+        self.assertIn('if(id==="vm") return (VMLOG.running||[]).length;', client)
+
     def test_team_notes_disclosure_assets_in_served_and_static_html(self):
         with patch.object(portal.wm, "load", return_value={}), \
                 patch.object(portal, "boot_payload", return_value="{}"):
@@ -103,6 +122,22 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn('<input type="text" name="title"', static)
         self.assertRegex(served, r'src="/assets/team\.js\?v=\d+"')
         self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
+
+    def test_overview_pulse_module_loads_before_portal_in_served_and_static_html(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        pulse = served.index('src="/assets/pulse.js?v=')
+        self.assertLess(pulse, served.index('src="/assets/portal.js?v='))
+        self.assertLess(static.index("root.PortalPulse=api"), static.index("function renderPulse("))
+        for ident in ("ov-brief", "ov-fresh", "ov-pulse", "ov-changes"):
+            self.assertIn(f'id="{ident}"', served)
+        order = [served.index(f'id="{ident}"') for ident in ("ov-brief", "ov-fresh", "ov-pulse", "ov-changes")]
+        self.assertEqual(order, sorted(order), "Morning brief must be the first Overview panel")
+        self.assertNotIn('id="ov-kpis"', served)
+        with patch.object(portal, "_read_morning_brief", return_value={"pulse": {"values": {}}}):
+            self.assertEqual(set(portal.overview_payload()), {"brief", "today", "errors"})
 
     def test_tracked_items_and_follow_up_assets_are_included(self):
         with patch.object(portal.wm, "load", return_value={}), \
