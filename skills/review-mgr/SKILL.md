@@ -116,13 +116,14 @@ Check the workspace's repos out to a review task's branches so you can review lo
    For RTL, unknown paths, or uncertain comment content, ask Neo
    (`neo-ask`) or report that the prerequisite is unavailable.
 9. **Auto-invoke `pr-review local`** — starting a review always runs the review, never just aligns the workspace. Hand off to the **`pr-review`** skill in local workspace mode against the just-checked-out branches, passing along the teammate-review summary from step 8. Do **not** stop after the checkout; the checkout exists to be reviewed.
-   - **Fresh vs. re-review is decided automatically** (never ask, never wait for a keyword). For each PR entry, look for a prior baseline in this order: (a) a `reviewed @ <repo>:<sha>` note in the task (recorded by `done`); (b) the head SHA in the most recent file under `~/.copilot-private/skills/pr-review/drafts/` for that PR; (c) the `commit.oid` of your last submitted GitHub review. If **no** baseline exists → **fresh review** (full local diff against the merge-base). If a baseline exists and the current head differs → **re-review** (diff `baseline..new-head`, triage only what changed). If a baseline exists and the head is identical → tell the user there are no new changes since the last review and skip the heavy pass (offer a re-read only if asked).
+   - **Fresh vs. re-review is decided automatically** (never ask, never wait for a keyword). For each PR entry, look for a prior baseline in this order: (a) a `reviewed @ <repo>:<sha>` note in the task (recorded by `done`); (b) that PR's reviewed head in the most recent task report attached to the task (its `--head` registration; older tasks may only have legacy per-PR drafts under `~/.copilot-private/skills/pr-review/drafts/`); (c) the `commit.oid` of your last submitted GitHub review. If **no** baseline exists → **fresh review** (full local diff against the merge-base). If a baseline exists and the current head differs → **re-review** (diff `baseline..new-head`, triage only what changed). If a baseline exists and the head is identical → tell the user there are no new changes since the last review and skip the heavy pass (offer a re-read only if asked).
    - Multi-PR tasks: make the fresh/re-review decision per PR entry independently.
    - This stays drafts-only — `pr-review local` never posts to GitHub without explicit approval (its Hard Rules still apply).
-   - **Persist and attach every produced draft before reporting success.** Pass the
-     task ID and exact per-PR URLs to `pr-review`; require its Step 4
-     `tm.py review-draft` registration for every saved draft. Include the portal
-     draft links in the handoff summary. New passes keep older files/attachments;
+   - **Persist and attach one task report before reporting success.** Pass the
+     task ID and exact per-PR URLs to `pr-review`; require its Step 4 single
+     `tm.py review-draft` registration of the task report with one `--head` per PR
+     reviewed. Never write one file per PR. Include the portal draft link in the
+     handoff summary. New passes keep older files/attachments;
      refinements update the existing attachment. If there are no new changes,
      reuse an existing linked draft rather than generating a duplicate. Missing
      files or attachment failures must be reported, not marked as linked.
@@ -183,9 +184,10 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
 2. **Process one task at a time**, in order. For each task:
    a. **Align the workspace** using the `start` mechanics, including snapshot validation. PR repos go on their author branches; every other repo must match the workspace revision, including per-repo overrides and pins, never automatically `main`. Save only the verified alignment with `wip scan && wip save review-<task-id>`. Never create `pr-NNN` branches or use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
    b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. First gather source-free software reviews and threads as in step 8 above and feed that summary into the draft so it doesn't duplicate what others already raised. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
-   c. **Attach and mark the task.** Require `pr-review` Step 4 to register every
-      draft through `tm.py review-draft` using this task ID, exact PR URL and
-      reviewed head SHA. Verify attachment success for every PR before appending
+   c. **Attach and mark the task.** Require `pr-review` Step 4 to register the
+      one task report through `tm.py review-draft` using this task ID and a
+      `--head <exact PR URL>=<reviewed head SHA>` for every PR. Verify the returned
+      attachment covers every PR before appending
       the note `initial auto review draft done` (with the date) via `tm.py`.
       Report a partial/failed attachment rather than setting the marker.
       Do **not** change `review_status` — this is a preliminary pass, not an
@@ -193,7 +195,7 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
       flow (`start` → `pr-review`) still runs normally.
    d. Move to the next task.
 3. **Return to a clean state.** After the last task, run the `stop` mechanics: return every repo to the workspace revision (skip and report dirty repos; never force).
-4. **Report** a summary: which tasks were drafted, where each draft lives, which tasks/repos were skipped (and why), and confirm the workspace revision restored.
+4. **Report** a summary: which tasks were drafted, where each task report lives, which tasks/repos were skipped (and why), and confirm the workspace revision restored.
 
 Guarantees: drafts only (no GitHub writes), no destructive git, and no review-status transitions — the user still reviews each PR themselves later, now with a head start.
 
@@ -235,7 +237,7 @@ For `blocked` review tasks, check whether the author acted. **Delegate the mecha
    - Classifies each PR: `needs_re_review` (new commits) / `replies_only` /
      `no_activity` / `threads_unchecked` / `merged` / `closed`. RTL or unknown
      thread activity is explicitly unchecked, not evidence of no activity.
-   - With `--update`: transitions PRs classified `needs_re_review` to `review_status: waiting-for-re-review` per-PR (multi-PR tasks: quiet PRs stay put) and moves the task back to `status: todo`.
+   - With `--update`: transitions PRs classified `needs_re_review` to `review_status: waiting-for-re-review` per-PR (multi-PR tasks: quiet PRs stay put) and moves the task back to `status: todo`. PRs classified `closed` are removed from the task; if every PR was closed, the task is set to `cancelled` and its workspace freed.
 2. Read the summary. Your judgment is still required for:
    - **`replies_only`** PRs — decide whether the author's reply is convincing enough to close the thread, or whether you want a re-review.
    - **`needs_re_review`** PRs with `pushback` flags — verify the author isn't blowing off a real concern; the heuristic is deliberately loose.

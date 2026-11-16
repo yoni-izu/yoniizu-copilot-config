@@ -50,7 +50,8 @@ Run as: `python3 ~/.copilot/skills/task-manager/tm.py <subcommand> ...`
 | `assign <id> <workspace> [--force]` | Assign task to a workspace slot | Delegates to `wm.py`. Requires a free, freshly verified clean slot; `--force` cannot displace a hold. Promotes `todo`→`in-progress`; stamps the acquire date. |
 | `release <id> [-n NOTE]` | Free a task's workspace slot **without** changing its status | Releases the slot in `wm.py` but leaves `status` untouched. Use when you stop working in a slot but the task isn't done (e.g. review `stop`, context switch). |
 | `remove <id> --yes` | Permanently delete | Prefer `cancel` unless this is a duplicate/mistake. |
-| `review-draft <id> --pr-url URL --file PATH --head-sha SHA` | Attach a saved review draft | Requires an existing private UTF-8 Markdown file (max 2 MB) under `~/.copilot-private/skills/pr-review/drafts/` and an exact task PR URL. Returns attachment JSON. Same file updates metadata; new file preserves history. Does not change task/review status or post to GitHub. |
+| `review-draft <id> --file PATH --head PR_URL=SHA [--head ...]` | Attach one saved review report to the task | One report per task per pass: repeat `--head` for every PR it covers (exact task PR URL + full reviewed head SHA). Requires an existing private UTF-8 Markdown file (max 2 MB) under `~/.copilot-private/skills/pr-review/drafts/`. Legacy `--pr-url URL --head-sha SHA` still works as a single `--head`. Returns attachment JSON. Same file updates metadata; new file preserves history. Does not change task/review status or post to GitHub. |
+| `review-draft-combine <id>` | Build one task report from legacy per-PR drafts | Writes a new `T-NNN-combined-<ts>.md` from each PR's latest legacy per-PR draft and attaches it (kind `combined`). Originals and their attachments are untouched. |
 
 > **Code-review subcommands** (`scan-reviews`, `add-review`, `list-reviews`, `review-update`, `review-check`, `review-msg`) also live in `tm.py`, but the review queue lifecycle is owned by the **review-mgr** skill. See `~/.copilot/skills/review-mgr/SKILL.md`.
 
@@ -130,8 +131,12 @@ Tasks with `category: "code-review"` also carry a `reviews` array (preferred) or
 
 Only `category: "code-review"` tasks may have `review` / `reviews`; other categories must not.
 
-Each PR may also carry `drafts[]` attachment metadata (`id`, relative `file`,
-`head_sha`, `created_at`, `updated_at`). Only `tm.py review-draft` writes these
+A review task may carry `review_drafts[]`: one entry per review pass, each a
+single report covering the whole task (`id`, relative `file`, `kind`
+`report`/`combined`, `heads[]` of `{pr_url, repo, pr_number, head_sha}`,
+`created_at`, `updated_at`). Older tasks may also have legacy per-PR
+`reviews[].drafts[]` (`id`, `file`, `head_sha`, ...); these stay readable but are
+no longer written. Only `tm.py review-draft`/`review-draft-combine` write
 attachments. `tm.read_review_draft(task_id, draft_id)` resolves a registered
 document for the portal; browser requests cannot specify filesystem paths.
 Files remain private documents, not tracked skill content or database copies.
@@ -139,11 +144,13 @@ The private root honors `COPILOT_PRIVATE_DIR`. Earlier review passes remain
 attached when registered with different filenames. In-place refinements must
 rerun `review-draft` to refresh the saved timestamp. Missing files fail explicitly.
 
-**Closed PRs are dropped, not stubbed.** When a scan (portal **Scan reviews** or CLI
-`review-check`) finds a PR closed **without** merge, that PR entry is removed from the task's
-`reviews` list entirely — there is nothing left to review. A task left with **no** remaining
-PRs is transitioned to `cancelled` (its workspace freed), since a merged PR keeps the record
-but a closed one leaves no work behind.
+**Closed PRs are dropped, not stubbed.** When any PR scan (portal **Scan reviews**, CLI
+`review-check`, or `blocked-scan --update`) finds a PR closed **without** merge, that PR entry
+is removed from the task's `reviews` list entirely — there is nothing left to review. If **all**
+PRs in a review task were closed, the scan sets the task to `cancelled` and frees its workspace
+(shared helper `cancel_if_all_prs_closed`). Scans also sweep in-scope tasks whose remaining PRs
+are only legacy closed stubs (or none) and cancel them without a GitHub fetch. A mix of
+merged + closed PRs ends `done`, not `cancelled`.
 The portal's review scan is selection-scoped: it probes unresolved PRs only for selected active
 code-review tasks. Its bulk-edit owner API applies status, priority, category, complexity and
 estimated-hours changes in one revision-checked transaction; category changes cannot convert

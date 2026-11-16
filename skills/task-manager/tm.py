@@ -101,10 +101,28 @@ def _read_review_draft(path: Path) -> str:
     return content.decode("utf-8")
 
 
-def attach_review_draft(ident: str, pr_url: str, filename: str, head_sha: str) -> dict:
-    """Register a saved draft on exactly one task PR; never change review status."""
-    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head_sha):
-        raise ValueError("head SHA must be a full Git commit hash")
+def _parse_draft_heads(heads) -> list[tuple[str, str]]:
+    pairs = list(heads.items()) if isinstance(heads, dict) else list(heads or [])
+    if not pairs:
+        raise ValueError("at least one reviewed PR head (--head PR_URL=SHA) is required")
+    seen: dict[str, str] = {}
+    for pr_url, sha in pairs:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha or ""):
+            raise ValueError("head SHA must be a full Git commit hash")
+        if seen.get(pr_url, sha.lower()) != sha.lower():
+            raise ValueError(f"conflicting head SHAs for {pr_url}")
+        seen[pr_url] = sha.lower()
+    return list(seen.items())
+
+
+def attach_review_draft(ident: str, filename: str, heads, kind: str = "report") -> dict:
+    """Register one task-level review report covering the PRs in ``heads``.
+
+    ``heads`` maps each reviewed PR URL to the full head SHA reviewed in this
+    pass. Re-registering the same file refines that attachment; a new file is a
+    new pass. Never changes review status.
+    """
+    pairs = _parse_draft_heads(heads)
     path = _review_draft_path(str(Path(filename).expanduser().absolute()))
     _read_review_draft(path)
     relative = str(path.relative_to(review_drafts_root().resolve()))
@@ -113,40 +131,128 @@ def attach_review_draft(ident: str, pr_url: str, filename: str, head_sha: str) -
         task = find_task(data, ident)
         if task is None or task.get("category") != "code-review":
             raise ValueError("a matching code-review task is required")
-        matches = [r for r in pr_entries(task) if r.get("pr_url") == pr_url]
-        if len(matches) != 1:
-            raise ValueError("PR URL must match exactly one PR on the review task")
-        drafts = matches[0].setdefault("drafts", [])
+        entries = []
+        for pr_url, sha in pairs:
+            matches = [r for r in pr_entries(task) if r.get("pr_url") == pr_url]
+            if len(matches) != 1:
+                raise ValueError(f"PR URL must match exactly one PR on the review task: {pr_url}")
+            entries.append({"pr_url": pr_url, "repo": matches[0].get("repo", ""),
+                            "pr_number": matches[0].get("pr_number"), "head_sha": sha})
+        drafts = task.setdefault("review_drafts", [])
         draft = next((d for d in drafts if d["file"] == relative), None)
         if draft is None:
             draft = {"id": uuid.uuid4().hex, "file": relative, "created_at": now}
             drafts.append(draft)
-        draft.update(head_sha=head_sha.lower(), updated_at=now)
+        draft.update(kind=kind, heads=entries, updated_at=now)
         task["updated"] = TODAY
-        result = dict(draft, task_id=task["id"], pr_url=pr_url)
+        result = dict(draft, task_id=task["id"])
     return result
 
 
 def read_review_draft(ident: str, draft_id: str) -> dict:
-    """Resolve an attachment by task/opaque ID, never by a browser-supplied path."""
+    """Resolve an attachment by task/opaque ID, never by a browser-supplied path.
+
+    Task-level reports are preferred; legacy per-PR attachments stay readable.
+    """
     task = next((t for t in load()["tasks"] if t["id"] == ident), None)
     if task is None or task.get("category") != "code-review":
         raise ValueError("unknown review task")
+    for draft in task.get("review_drafts", []):
+        if draft["id"] == draft_id:
+            path = _review_draft_path(draft["file"])
+            return dict(draft, task_id=ident, title=task["title"],
+                        content=_read_review_draft(path))
     for review in pr_entries(task):
         for draft in review.get("drafts", []):
             if draft["id"] == draft_id:
                 path = _review_draft_path(draft["file"])
-                return dict(draft, task_id=ident, title=task["title"],
-                            repo=review["repo"], pr_number=review["pr_number"],
-                            content=_read_review_draft(path))
+                head = {"pr_url": review.get("pr_url"), "repo": review["repo"],
+                        "pr_number": review["pr_number"], "head_sha": draft.get("head_sha", "")}
+                return dict(draft, task_id=ident, title=task["title"], kind="legacy-pr",
+                            heads=[head], content=_read_review_draft(path))
     raise ValueError("unknown review draft")
+
+
+def _demote_headings(markdown: str) -> str:
+    """Nest a document under a PR section: one level deeper, code fences untouched."""
+    out, fence = [], None
+    for line in markdown.split("\n"):
+        marker = re.match(r"\s{0,3}(`{3,}|~{3,})", line)
+        if marker and (fence is None or marker.group(1)[0] == fence[0]
+                       and len(marker.group(1)) >= len(fence)):
+            fence = None if fence else marker.group(1)
+        elif fence is None and re.match(r"#{1,5} ", line):
+            line = "#" + line
+        out.append(line)
+    return "\n".join(out)
+
+
+def combine_legacy_review_drafts(ident: str) -> dict:
+    """Write one combined report from each PR's latest legacy per-PR draft.
+
+    Creates a new Markdown file and registers it as a task-level attachment;
+    the original per-PR files and attachments are left untouched.
+    """
+    task = next((t for t in load()["tasks"] if t["id"] == ident), None)
+    if task is None or task.get("category") != "code-review":
+        raise ValueError("a matching code-review task is required")
+    latest = []
+    for review in pr_entries(task):
+        drafts = sorted(review.get("drafts", []), key=lambda d: d.get("updated_at", ""))
+        if drafts:
+            latest.append((review, drafts[-1]))
+    if not latest:
+        raise ValueError("the task has no per-PR drafts to combine")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    lines = [f"# Review report: {task['id']} - {task.get('title', '')}", "",
+             "Combined from the latest per-PR drafts (originals kept unchanged).", "",
+             "| PR | Head reviewed | Saved | Source draft |", "|---|---|---|---|"]
+    for review, draft in latest:
+        lines.append(f"| [{review['repo']}#{review['pr_number']}]({review.get('pr_url', '')}) "
+                     f"| `{draft.get('head_sha', '')[:12]}` | {draft.get('updated_at', '')[:16]} "
+                     f"| `{draft['file']}` |")
+    for review, draft in latest:
+        body = _read_review_draft(_review_draft_path(draft["file"])).rstrip()
+        body = _demote_headings(body)
+        lines += ["", "---", "", f"## {review['repo']}#{review['pr_number']}", "", body]
+    target = review_drafts_root() / f"{task['id']}-combined-{stamp}.md"
+    if target.exists():
+        raise ValueError(f"{target.name} already exists; retry in a minute")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    heads = [(r["pr_url"], d["head_sha"]) for r, d in latest
+             if r.get("pr_url") and d.get("head_sha")]
+    try:
+        return attach_review_draft(ident, str(target), heads, kind="combined")
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
 def cmd_review_draft(args: argparse.Namespace) -> int:
     try:
-        draft = attach_review_draft(args.id, args.pr_url, args.file, args.head_sha)
+        heads = []
+        for item in args.head or []:
+            url, sep, sha = item.rpartition("=")
+            if not sep or not url:
+                raise ValueError(f"--head must be PR_URL=SHA, got {item!r}")
+            heads.append((url, sha))
+        if args.pr_url or args.head_sha:
+            if not (args.pr_url and args.head_sha):
+                raise ValueError("--pr-url and --head-sha must be given together")
+            heads.append((args.pr_url, args.head_sha))
+        draft = attach_review_draft(args.id, args.file, heads)
     except (ValueError, OSError) as exc:
         print(f"[tm] draft not attached: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(draft, ensure_ascii=False))
+    return 0
+
+
+def cmd_review_draft_combine(args: argparse.Namespace) -> int:
+    try:
+        draft = combine_legacy_review_drafts(args.id)
+    except (ValueError, OSError) as exc:
+        print(f"[tm] drafts not combined: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(draft, ensure_ascii=False))
     return 0
@@ -261,6 +367,26 @@ def remove_pr_entry(t: dict, p: dict) -> None:
         t["reviews"] = [x for x in t["reviews"] if x is not p]
     elif t.get("review") is p:
         t.pop("review", None)
+
+
+def cancel_if_all_prs_closed(t: dict, source: str) -> bool:
+    """Cancel an active review task whose PRs were all closed without merge.
+
+    Drops any lingering closed-without-merge entries first (legacy stubs), then
+    cancels the task and frees its slot if no PR is left. Returns True when the
+    task was cancelled. Shared by every PR scan so they agree on the rule.
+    """
+    if t.get("category") != "code-review" or t.get("status") in ("done", "cancelled"):
+        return False
+    for p in [p for p in pr_entries(t) if p.get("closed") and not p.get("merged")]:
+        remove_pr_entry(t, p)
+    if pr_entries(t):
+        return False
+    t["status"] = "cancelled"
+    t["updated"] = TODAY
+    release_task_slot(t)
+    append_note(t, f"{source}: all PRs closed without merge — cancelled")
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -452,9 +578,13 @@ def cmd_add(args: argparse.Namespace) -> int:
     elif ws_name:
         root = wm.normalize_slot(ws_name)
         holder = wm.get_holder(root)
-        if holder is None:
+        rec = wm.record(root)
+        if not wm.allows(rec, "development"):
+            status = "backlog"
+            skip_reason = f"workspace '{root}' is dedicated to {wm.PURPOSES[rec['purpose']]}"
+            ws_name = None
+        elif holder is None:
             assigned_ws = root
-            notes.append(f"{NOW}: auto-assigned to workspace {root}")
         else:
             status = "backlog"
             skip_reason = f"workspace '{root}' occupied by {wm.holder_summary(holder)}"
@@ -481,7 +611,21 @@ def cmd_add(args: argparse.Namespace) -> int:
         d["tasks"].append(task)
         d["next_id"] += 1
     if assigned_ws:
-        wm.occupy_task(assigned_ws, tid, detail=ws_name)
+        try:
+            ok, message, _ = wm.occupy_task(assigned_ws, tid, detail=ws_name)
+        except ValueError as error:
+            ok, message = False, str(error)
+        with task_store.transaction() as data:
+            created = find_task(data, tid)
+            append_note(created, f"auto-assigned to workspace {assigned_ws}" if ok
+                        else f"workspace assignment failed: {message}")
+            if not ok:
+                created["status"] = "backlog"
+        if not ok:
+            print(f"[tm] workspace assignment failed: {message}", file=sys.stderr)
+            assigned_ws = None
+            skip_reason = message
+            status = "backlog"
 
     summary = f"{tid} | {complexity} | {cost}h | status={status}"
     if assigned_ws:
@@ -1043,6 +1187,10 @@ def cmd_review_check(args: argparse.Namespace) -> int:
         if t.get("status") in ("done", "cancelled"):
             keep.append(t)
             continue
+        if cancel_if_all_prs_closed(t, "review-check"):
+            updates.append(f"{t['id']}: all PRs closed → cancelled")
+            keep.append(t)
+            continue
         prs = pr_entries(t)
         changed = False
         closed_prs = []
@@ -1071,14 +1219,12 @@ def cmd_review_check(args: argparse.Namespace) -> int:
             remove_pr_entry(t, p)
         if changed:
             t["updated"] = TODAY
-            prs = pr_entries(t)
             # Every PR was closed and removed — nothing left to review.
-            if not prs:
-                t["status"] = "cancelled"
-                release_task_slot(t)
-                append_note(t, "all PRs closed without merge — cancelled")
+            if cancel_if_all_prs_closed(t, "review-check"):
+                updates.append(f"{t['id']}: all PRs closed → cancelled")
                 keep.append(t)
                 continue
+            prs = pr_entries(t)
             # Re-derive the task status from all PRs. The task only becomes done
             # once every PR has merged; otherwise it stays tracked (not purged).
             consolidated = consolidate_review_status(prs)
@@ -1181,18 +1327,23 @@ def portal_review_scan(progress=None, task_ids=None) -> dict:
     existing_ids = {t["id"] for t in d["tasks"]}
     if selected_ids is not None and not selected_ids.issubset(existing_ids):
         raise ValueError("one or more selected tasks no longer exist; reload before scanning")
+    # Tasks whose PRs were all closed earlier (stale stubs) are never probed
+    # again, so cancel them up front.
+    cancelled: list[str] = [
+        t["id"] for t in d["tasks"]
+        if (selected_ids is None or t["id"] in selected_ids)
+        and cancel_if_all_prs_closed(t, "review-scan")]
     pairs = [(t, p) for t in d["tasks"]
              if selected_ids is None or t["id"] in selected_ids
              if t.get("category") == "code-review"
              and t.get("status") not in ("done", "cancelled")
              for p in pr_entries(t) if not pr_resolved(p)]
-    if selected_ids is not None and not pairs:
+    if selected_ids is not None and not pairs and not cancelled:
         raise ValueError("selected tasks have no active review PRs to scan")
     total = len(pairs)
     scanned = 0
     changed: list[str] = []
     completed: list[str] = []
-    cancelled: list[str] = []
     removed: list[str] = []
     errors: list[str] = []
     touched: set[str] = set()
@@ -1240,16 +1391,14 @@ def portal_review_scan(progress=None, task_ids=None) -> dict:
     for t in d["tasks"]:
         if t["id"] not in touched:
             continue
-        prs = pr_entries(t)
         t["updated"] = TODAY
         # Every PR was closed and removed — nothing left to review, so the task
         # is cancelled rather than reset to an empty "todo".
+        if cancel_if_all_prs_closed(t, "review-scan"):
+            cancelled.append(t["id"])
+            continue
+        prs = pr_entries(t)
         if not prs:
-            if t.get("status") not in ("done", "cancelled"):
-                t["status"] = "cancelled"
-                release_task_slot(t)
-                append_note(t, "review-scan: all PRs closed without merge — cancelled")
-                cancelled.append(t["id"])
             continue
         consolidated = consolidate_review_status(prs)
         new_status = REVIEW_CONSOLIDATED_TO_TASK[consolidated]
@@ -1708,6 +1857,14 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
             if not t:
                 continue
             for pr_sum in entry["prs"]:
+                if pr_sum["classification"] == "closed":
+                    for p in list(pr_entries(t)):
+                        if p.get("repo") == pr_sum["repo"] and p.get("pr_number") == pr_sum["pr"]:
+                            remove_pr_entry(t, p)
+                            pr_sum["transitioned"] = "removed (closed)"
+                            append_note(t, f"blocked-scan: {p['repo']}#{p['pr_number']} "
+                                           "closed without merge — removed")
+                    continue
                 if pr_sum["classification"] != "needs_re_review":
                     continue
                 for p in pr_entries(t):
@@ -1715,6 +1872,9 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
                         p["review_status"] = "waiting-for-re-review"
                         pr_sum["transitioned"] = "waiting-for-re-review"
                         transitioned.append((t["id"], pr_sum["repo"], pr_sum["pr"]))
+            if cancel_if_all_prs_closed(t, "blocked-scan"):
+                entry["cancelled"] = True
+                continue
             # Derive task status: consolidate all PRs; a bounced-back PR
             # (waiting-for-re-review) moves the ball back to the reviewer.
             prs = pr_entries(t)
@@ -1725,6 +1885,9 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
                     t["status"] = target
                     t["updated"] = TODAY
                     append_note(t, f"blocked-scan: bounced back → {consolidated}")
+                    if target == "done":
+                        t["completed"] = TODAY
+                        release_task_slot(t)
         save(d)
 
     if args.json:
@@ -1777,6 +1940,9 @@ def cmd_blocked_scan(args: argparse.Namespace) -> int:
     _emit("Unable to assess", buckets.get("unknown", []), "❔", show_replies=False)
     _emit("Merged", buckets["merged"], "🔀", show_replies=False)
     _emit("Closed", buckets["closed"], "❌", show_replies=False)
+    cancelled_ids = [e["id"] for e in report if e.get("cancelled")]
+    if cancelled_ids:
+        print(f"\nall PRs closed → cancelled: {', '.join(cancelled_ids)}")
     return 0
 
 
@@ -2109,12 +2275,20 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--jira")
     a.set_defaults(func=cmd_add_review)
 
-    a = sub.add_parser("review-draft", help="attach a private Markdown draft to a task PR")
+    a = sub.add_parser("review-draft",
+                       help="attach one private Markdown review report to a review task")
     a.add_argument("id")
-    a.add_argument("--pr-url", required=True)
     a.add_argument("--file", required=True)
-    a.add_argument("--head-sha", required=True)
+    a.add_argument("--head", action="append", metavar="PR_URL=SHA",
+                   help="a PR covered by this report and its reviewed head; repeat per PR")
+    a.add_argument("--pr-url", help="legacy single-PR form; use with --head-sha")
+    a.add_argument("--head-sha", help="legacy single-PR form; use with --pr-url")
     a.set_defaults(func=cmd_review_draft)
+
+    a = sub.add_parser("review-draft-combine",
+                       help="build one task report from the latest legacy per-PR drafts")
+    a.add_argument("id")
+    a.set_defaults(func=cmd_review_draft_combine)
 
     # list
     a = sub.add_parser("list", help="list tasks")

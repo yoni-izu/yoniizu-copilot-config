@@ -1,4 +1,6 @@
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -31,6 +33,67 @@ class TaskStoreTests(unittest.TestCase):
             {"id": "T-002", "title": "second", "notes": []}]}
         store.LEGACY.write_text(json.dumps(data))
         return data
+
+    def test_auto_assignment_skips_incompatible_dedicated_workspace(self):
+        import tm
+        args = tm.build_parser().parse_args(["add", "new work", "--workspace", "one"])
+        with patch.object(tm.wm, "normalize_slot", return_value="one"), \
+                patch.object(tm.wm, "get_holder", return_value=None), \
+                patch.object(tm.wm, "record", return_value={"purpose": "review"}), \
+                patch.object(tm.wm, "occupy_task") as occupy, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(tm.cmd_add(args), 0)
+        occupy.assert_not_called()
+        self.assertIn("dedicated to Review", output.getvalue())
+        self.assertEqual(store.load()["tasks"][0]["status"], "backlog")
+
+    def test_failed_assignment_does_not_claim_success_in_task_notes_or_summary(self):
+        import tm
+        args = tm.build_parser().parse_args(["add", "new work", "--workspace", "one"])
+        with patch.object(tm.wm, "normalize_slot", return_value="one"), \
+                patch.object(tm.wm, "get_holder", return_value=None), \
+                patch.object(tm.wm, "record", return_value={"purpose": "general"}), \
+                patch.object(tm.wm, "occupy_task", return_value=(False, "dedication changed", None)), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(tm.cmd_add(args), 0)
+        task = store.load()["tasks"][0]
+        self.assertEqual(task["status"], "backlog")
+        self.assertNotIn("ws=one", output.getvalue())
+        self.assertIn("dedication changed", error.getvalue())
+        self.assertTrue(any("assignment failed" in note for note in task["notes"]))
+        self.assertFalse(any("auto-assigned" in note for note in task["notes"]))
+
+    def test_assignment_policy_race_reports_backlog_without_success_note(self):
+        import tm
+        args = tm.build_parser().parse_args(["add", "new work", "--workspace", "one"])
+        with patch.object(tm.wm, "normalize_slot", return_value="one"), \
+                patch.object(tm.wm, "get_holder", return_value=None), \
+                patch.object(tm.wm, "record", return_value={"purpose": "development"}), \
+                patch.object(tm.wm, "occupy_task", side_effect=ValueError("dedication changed")), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(tm.cmd_add(args), 0)
+        task = store.load()["tasks"][0]
+        self.assertEqual(task["status"], "backlog")
+        self.assertNotIn("ws=one", output.getvalue())
+        self.assertIn("dedication changed", error.getvalue())
+        self.assertFalse(any("auto-assigned" in note for note in task["notes"]))
+
+    def test_compatible_assignment_reports_success_only_after_acquiring_workspace(self):
+        import tm
+        args = tm.build_parser().parse_args(["add", "new work", "--workspace", "one"])
+        with patch.object(tm.wm, "normalize_slot", return_value="one"), \
+                patch.object(tm.wm, "get_holder", return_value=None), \
+                patch.object(tm.wm, "record", return_value={"purpose": "development"}), \
+                patch.object(tm.wm, "occupy_task", return_value=(True, "assigned", None)) as occupy, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(tm.cmd_add(args), 0)
+        task = store.load()["tasks"][0]
+        occupy.assert_called_once_with("one", task["id"], detail="one")
+        self.assertEqual(task["status"], "todo")
+        self.assertIn("ws=one", output.getvalue())
+        self.assertTrue(any("auto-assigned" in note for note in task["notes"]))
 
     def test_lossless_idempotent_backed_up_import(self):
         original = self.seed()

@@ -39,7 +39,7 @@ Conduct a high-signal code review of a GitHub PR grounded in three things, in pr
 - **NEVER post reviews, comments, replies, or a verdict to GitHub without explicit user approval.** Draft locally, present for approval, submit only when told.
 - **NEVER delete or overwrite a pending review** — it may hold the user's own draft comments. Always inspect existing pending reviews first.
 - **NEVER auto-submit a verdict.** Recommend approve / comment / request-changes; the user decides and triggers submission.
-- Draft files live under `~/.copilot-private/skills/pr-review/drafts/`. Name them `pr-<N>-<repo>-<YYYYMMDD-HHMM>.md`.
+- Draft files live under `~/.copilot-private/skills/pr-review/drafts/`. **One report per review pass, never one file per PR**: a tracked review task gets a single `T-NNN-<slug>-<YYYYMMDD-HHMM>.md` covering every PR in the task (one section per PR, see [Draft Template](#draft-template)); an untracked single-PR review uses `pr-<N>-<repo>-<YYYYMMDD-HHMM>.md`.
 
 ## Tooling
 
@@ -99,23 +99,27 @@ Apply the memoir's checklists plus independent reasoning. For each candidate fin
 - Pick battles: drop nits that don't hurt readability or maintainability. Distinguish PR-introduced from pre-existing issues; defer the latter to their own PR.
 
 ### Step 4 — Draft locally
-Write a draft under `~/.copilot-private/skills/pr-review/drafts/` using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
+Write **one** report for the whole review task (all its PRs, a section each) under `~/.copilot-private/skills/pr-review/drafts/` using the template below. Include: per-finding file/line anchor, classification, the comment body, and the *why*. Phrase every comment body per [Comment Phrasing](#comment-phrasing). Add a **Dropped/considered** section recording findings you investigated and discarded (with reason) — this preserves reasoning and feeds the memoir later.
 
 **Attach before presenting.** When reviewing a tracked task (including `review-mgr
-start` and `pre-review`), register each saved draft against that task's exact PR URL:
+start` and `pre-review`), register the report once on the task, with one `--head`
+per PR it covers (the exact PR URL and the full head SHA reviewed for that PR):
 
 ```bash
 rtk proxy python3 ~/.copilot/skills/task-manager/tm.py review-draft T-NNN \
-  --pr-url https://github.com/OWNER/REPO/pull/N \
-  --file ~/.copilot-private/skills/pr-review/drafts/pr-N-REPO-TIMESTAMP.md \
-  --head-sha FULL_REVIEWED_HEAD_SHA
+  --file ~/.copilot-private/skills/pr-review/drafts/T-NNN-SLUG-TIMESTAMP.md \
+  --head https://github.com/OWNER/REPO/pull/N=FULL_REVIEWED_HEAD_SHA \
+  --head https://github.com/OWNER/OTHER/pull/M=FULL_REVIEWED_HEAD_SHA
 ```
 
-Use the SHA actually reviewed, not a newly fetched head. One file per PR/pass;
-use a unique filename for a new pass so earlier drafts survive. The command
-returns the attachment `id` and `task_id`; link the result as
-`http://127.0.0.1:8787/review-drafts/<task_id>/<id>` (use the actual portal port
-if non-default). The portal task exposes an **Open review draft** button per PR.
+Use the SHAs actually reviewed, not newly fetched heads. One file per task/pass;
+use a unique filename for a new pass so earlier reports survive. A re-review pass
+that only covers some PRs lists just those `--head`s and says in its summary which
+PRs were unchanged. The command returns the attachment `id` and `task_id`; link
+the result as `http://127.0.0.1:8787/review-drafts/<task_id>/<id>` (use the actual
+portal port if non-default). The portal task exposes one **Open review draft**
+button per task. The legacy `--pr-url/--head-sha` form still works (it attaches a
+single-PR report to the task) but do not use it for multi-PR tasks.
 Check the command succeeded before claiming the task is linked. Report attachment
 failures explicitly; keep the saved file for recovery. Never guess a task when
 several match; ask. For an untracked remote review, save normally and report that
@@ -134,7 +138,7 @@ This is a summary of the *changes*, separate from and preceding the findings —
 **Interactive option:** if the user wants to refine findings one at a time before seeing the consolidated draft, run the [Walkthrough](#walkthrough) first — it lets them adjust, question, polish, reclassify, or reject each finding. It's the natural next step after a local review is drafted.
 
 ### Step 6 — Submit only what's approved
-On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set under `~/.copilot-private/skills/pr-review/drafts/` (e.g. `pr-<N>-submitted-<timestamp>.md`).
+On explicit approval, post the approved comments and (if instructed) the verdict via `gh`/MCP. Back up the submitted set under `~/.copilot-private/skills/pr-review/drafts/` (e.g. `T-NNN-submitted-<timestamp>.md`, one file per task with a section per PR submitted).
 
 ### Step 7 — Update the memoir
 After the review, fold genuinely new, reusable lessons into `~/.copilot-private/skills/pr-review/memoir.md`. **Consolidate intelligently:** group each lesson under the right existing theme, merge true duplicates, and keep entries tight and principle-first (drop review-specific provenance). Do not append a per-review log section.
@@ -187,12 +191,12 @@ For each review repo:
 
 ### Continue with the standard flow
 - Step 2 (existing review state) and Step 6 (submission) still hit **GitHub** — the author's pending drafts, other reviewers' threads, and posted comments live there. Use the `owner`/`repo`/`pr_number` from the store/`gh` to target the right PR.
-- Draft under `~/.copilot-private/skills/pr-review/drafts/` as usual; record the local head SHA reviewed (one per repo in a multi-repo set).
+- Draft one task report under `~/.copilot-private/skills/pr-review/drafts/` as usual; record the local head SHA reviewed per PR (in each PR section and as a `--head` at registration).
 - When done, prefer `review-mgr done <id> <outcome>` so the review task status and the memoir update flow through the review-queue lifecycle. **Record the reviewed head SHA(s) in the task notes** (e.g. `reviewed @ <repo>:<sha>`), so the next re-review can diff `that-sha .. new-head` without re-deriving the baseline. This is the authoritative re-review baseline when no prior draft exists.
 
 ## Re-Review (force-push / rebase)
 When invoked with `re-review` or when the PR changed since the last pass:
-1. **Find the last actually-reviewed SHA** — the head from the *previous review pass*, not the head you just recomputed this session. Resolve it in priority order: (a) the `Head SHA reviewed` line in the most recent prior draft under `~/.copilot-private/skills/pr-review/drafts/`; (b) the `reviewed @ <sha>` recorded in the task-manager task notes (see `review-done`); (c) the `commit.oid` GitHub attaches to your last submitted review (`gh pr view <N> --json reviews` / GraphQL `reviews.nodes.commit.oid`). **Never diff a SHA against itself** — if old and new heads match, retrieve the older one from (a)/(b)/(c) before concluding "no new code".
+1. **Find the last actually-reviewed SHA** — the head from the *previous review pass*, not the head you just recomputed this session. Resolve it in priority order: (a) this PR's head in the most recent prior task report (its `--head` registration, shown in the portal draft metadata, or the PR section's `Head SHA reviewed` line; for older tasks, the legacy per-PR draft) under `~/.copilot-private/skills/pr-review/drafts/`; (b) the `reviewed @ <sha>` recorded in the task-manager task notes (see `review-done`); (c) the `commit.oid` GitHub attaches to your last submitted review (`gh pr view <N> --json reviews` / GraphQL `reviews.nodes.commit.oid`). **Never diff a SHA against itself** — if old and new heads match, retrieve the older one from (a)/(b)/(c) before concluding "no new code".
 2. **Fetch the old SHA even if it was force-pushed away** (`git fetch origin <old-sha>`; rebases orphan it but it stays fetchable by hash). Then `git diff <old-sha>..<new-sha>` (or `gh pr diff`) and triage per file: scrutinize comment-addressing fixes; glance-and-pass unrelated rebase artifacts (path repaths, CI config, base advances). Don't re-review unchanged files.
 3. **Confirm "no new code" by diff, never by head-equality alone.** A rebase changes the head SHA even when your session's recomputed head already matches the PR head; the real question is `old-reviewed-SHA .. current-head`. New files (e.g. a driver split) hide here — list `git diff --name-status <old>..<new>` before claiming nothing changed.
 4. Check for silent changes and JIRA ticket renumbering in commit messages (can signal scope change).
@@ -203,7 +207,7 @@ When invoked with `re-review` or when the PR changed since the last pass:
 An optional interactive pass that refines a drafted review **one finding at a time** before anything is presented for submission. Trigger it when the user says "walkthrough", "walk me through the findings", "go finding by finding", or after a local review is drafted and the user wants to adjust, question, polish, reclassify, or reject findings. It sits between Step 4 (draft) and Step 5 (present) and is the natural next step once a local review is done. It is **purely local refinement of the draft** — it never touches GitHub, and all Hard Rules still hold.
 
 ### Entering the walkthrough
-1. **Locate the draft.** Use the most recent draft(s) under `~/.copilot-private/skills/pr-review/drafts/` for this PR/workspace (`pr-<N>-<repo>-<timestamp>.md`). If no draft exists yet, run Steps 0–4 first, then enter the walkthrough. For a multi-repo set, confirm the order and walk one repo's draft at a time.
+1. **Locate the draft.** Use the most recent task report under `~/.copilot-private/skills/pr-review/drafts/` (`T-NNN-<slug>-<timestamp>.md`; older tasks may still have per-PR `pr-<N>-<repo>-<timestamp>.md` files). If no draft exists yet, run Steps 0–4 first, then enter the walkthrough. For a multi-repo set, confirm the order and walk one PR section at a time within the same report.
 2. **State the lay of the land.** Up front, announce the totals and order, e.g. "12 findings — 3 blockers, 5 suggestions, 3 nits, 1 question. Walking blockers first." Default order is by severity (blockers → suggestions → nits → questions/praise); honor a different order if asked. Carry-forward prior-comment items (from Step 2) are part of the walk.
 
 ### Per-finding loop
@@ -226,8 +230,8 @@ For each finding, present a compact card and then **wait for the user's decision
 
 ### Persist as you go
 **Write each decision back to the draft file immediately — do not batch.** Edit, reclassify, move-to-dropped, or delete in place so a mid-walkthrough interruption loses nothing. Keep the Findings and Dropped/considered sections consistent after every change.
-For a task-linked draft, rerun `tm.py review-draft` with the same file, PR URL
-and reviewed SHA after saving each refinement. It updates the attachment timestamp
+For a task-linked draft, rerun `tm.py review-draft` with the same file and the
+same `--head` list after saving each refinement. It updates the attachment timestamp
 without duplicating it; the portal viewer reads the saved file, not a stale copy.
 
 ### Closing the walkthrough
@@ -248,34 +252,55 @@ How every comment body should read — the reviewer's voice. Applies when drafti
 
 ## Draft Template
 
-```markdown
-# PR #<N> — <title>
-- Repo: <owner/repo>
-- PR: <url>
-- Head SHA reviewed: <sha>
-- Drafted: <timestamp>
+One report per review task (or per untracked review). It starts with a task-level
+summary and index, followed by one section per PR. GitHub submission stays per PR,
+so each PR section has its own verdict, prior comments and findings. A single-PR
+review uses the same layout with one PR section.
 
-## Recommended verdict: <approve | comment | request-changes>
-<one-line justification>
+```markdown
+# Review report: T-NNN — <task title>
+- Drafted: <timestamp>
+- Pass: <first look | re-review of <old-sha>..<new-sha> per PR>
 
 ## Executive summary
-<2-4 sentences: what the PR does and why, in plain language for a reader who hasn't seen the diff>
-- **Scope:** <main areas / modules / repos touched; per-repo gist for multi-repo sets>
+<2-4 sentences: what the change set does and why, in plain language for a reader who hasn't seen the diffs>
+- **Scope:** <main areas / modules / repos touched; how the PRs depend on each other (DEPENDS_ON)>
 - **Notable changes:** <the few changes that matter most — new behavior, interface/ABI changes, risk areas>
-- **Verdict at a glance:** <recommended verdict + the single biggest reason>
+- **Verdict at a glance:** <overall recommendation + the single biggest reason>
 
-## Prior comments (existing threads)
+| PR | Head SHA reviewed | Verdict | Blockers | Findings |
+|---|---|---|---|---|
+| [<repo>#<N>](<url>) | <sha> | <approve / comment / request-changes / unchanged> | <n> | <n> |
+
+## Cross-PR findings
+- <issues that span PRs: interface mismatches, ordering/merge dependencies, duplicated logic> (omit if none)
+
+---
+
+## <repo>#<N> — <PR title>
+- PR: <url>
+- Head SHA reviewed: <sha>
+
+### Recommended verdict: <approve | comment | request-changes>
+<one-line justification>
+
+### Prior comments (existing threads)
 - [<Addressed | Partially | Unaddressed | Won't-fix | Stale>] <file>:<line> — <commenter>: <one-line gist> — <how the author attended to it / what's still missing / follow-up to add>
 
-## Findings
-### [BLOCKER] <file>:<line>
+### Findings
+#### [BLOCKER] <file>:<line>
 <comment body — what to change and why>
 
-### [SUGGESTION] <file>:<line>
+#### [SUGGESTION] <file>:<line>
 ...
 
-### [NIT] / [QUESTION] / [PRAISE] ...
+#### [NIT] / [QUESTION] / [PRAISE] ...
 
-## Dropped / considered
+### Dropped / considered
 - <finding> — <why dropped (e.g. observability exists; BUILD_ASSERT already present; author tested it)>
+
+---
+
+## <next repo>#<M> — <PR title>
+...
 ```
