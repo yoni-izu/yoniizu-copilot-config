@@ -29,8 +29,9 @@ supporting files to the skill directory.
 Portal source is tracked in the configuration repo; private runtime state is
 stored under `~/.copilot-private/team-portal/state/`.
 Shared domain code, databases and `~/.copilot/lib/domain_db.py` stay outside this
-folder with their owners. The systemd user directory contains only the required
-service registration symlink to the unit in `team-portal/deploy/`.
+folder with their owners. The systemd user directory contains only the unit registration
+symlinks to `team-portal/deploy/`, plus the portal-generated
+`portal-maintenance.timer.d/schedule.conf` drop-in (owned by Settings).
 
 Task and review business logic remains in `../task-manager/tm.py`.
 Legacy `tm.py serve` and `tm.py dashboard` are compatibility commands, not

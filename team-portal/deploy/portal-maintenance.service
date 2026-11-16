@@ -1,0 +1,11 @@
+[Unit]
+Description=Team Portal daily maintenance and morning brief (portal-maintainer)
+After=task-dashboard.service
+Wants=task-dashboard.service
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+ExecStart=/usr/bin/env python3 %h/.copilot/team-portal/routine.py daily
+TimeoutStartSec=2h
+Nice=10

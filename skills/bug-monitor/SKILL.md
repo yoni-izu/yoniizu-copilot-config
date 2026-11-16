@@ -146,7 +146,7 @@ alone and never overwritten by a scan:
 
 ### 1. Scan — "what's new?"
 
-**Trigger:** *scan for new bugs*, *any new bugs?*, morning pulse, sync-bot `bug-scan` chore.
+**Trigger:** *scan for new bugs*, *any new bugs?*, morning pulse; also run daily at 08:00 by the portal maintenance timer (`team-portal/routine.py`).
 
 1. Run `bm.py scan`. It prints new / changed / closed / left-scope deltas.
 2. Report the delta, not the whole list. For each **new** bug give: key, summary, priority, reporter,
@@ -274,7 +274,7 @@ The portal's **↻ Scan Jira** button (Bugs section toolbar) POSTs `/api/bug-sca
 `bm.portal_scan()` — `do_scan` + `save` + a fresh payload — server-side. It is the same code path as
 `bm.py scan`, so it costs **zero tokens**; it only needs Jira credentials and a served portal. Use it
 whenever the mirror looks stale instead of spending a model turn on it. The CLI remains the right
-choice for scoped scans (`--jql`, `--activity all`) and for the sync-bot `bug-scan` chore.
+choice for scoped scans (`--jql`, `--activity all`) and for ad-hoc terminal runs.
 
 ## Cadence
 
@@ -284,4 +284,4 @@ choice for scoped scans (`--jql`, `--activity all`) and for the sync-bot `bug-sc
 | **Weekly** | `bm.py pulse` — the stalled/dormant sweep, before the team weekly. `bm.py dups` when regression bugs have been filing. |
 | **Per milestone** | Review open families: is each still one issue, still open, still owned. Close families whose root cause shipped. |
 
-Registered with `sync-bot` as the `bug-scan` (daily·focused) and `bug-pulse` (weekly·wide) chores.
+The daily scan runs automatically through the portal's 08:00 maintenance timer (`POST /api/bug-scan`, see `team-portal/references/operations.md`); run `bm.py pulse` manually before the team weekly.

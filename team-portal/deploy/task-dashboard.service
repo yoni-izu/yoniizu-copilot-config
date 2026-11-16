@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
+Environment="PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 ExecStart=/usr/bin/env python3 %h/.copilot/team-portal/portal.py serve --port 8787
 Restart=on-failure
 RestartSec=3
