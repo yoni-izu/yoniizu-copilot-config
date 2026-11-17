@@ -3483,6 +3483,7 @@ function pldmBadge(f){
 
 function renderPrs(){
   const feats=PRS.features||[], counts=PRS.counts||{};
+  ciTriageLoad(false);
   if(!PR_COLLAPSE_INIT){
     feats.forEach(f=>PR_COLLAPSED.add(String(f.id)));
     PR_COLLAPSE_INIT=true;
@@ -3756,6 +3757,70 @@ function prJiraTickets(f){
   }).join("")||'<span class="muted">no ticket</span>';
 }
 
+// ---- AI CI triage (pr-failure-analyzer): per feature, on click only ----
+let CI_TRIAGES={}, CI_TRIAGE_AT=0;
+async function ciTriageLoad(force){
+  if(!SERVED||(!force&&Date.now()-CI_TRIAGE_AT<30000)) return;
+  CI_TRIAGE_AT=Date.now();
+  try{
+    const r=await fetch("/api/ai/ci-triages",{cache:"no-store"});
+    if(!r.ok) return;
+    const next=(await r.json()).triages||{};
+    if(JSON.stringify(next)!==JSON.stringify(CI_TRIAGES)){ CI_TRIAGES=next; renderPrs(); }
+  }catch(e){}
+}
+function ciTriageHtml(f,failCi){
+  if(!SERVED||AI_USAGE.enabled===false||!failCi) return "";
+  const t=CI_TRIAGES[String(f.id)];
+  const busy=t&&(t.status==="queued"||t.status==="running");
+  const done=t&&t.status==="done";
+  const badge=t&&(busy||t.verdict)
+    ? '<button class="ci-triage-badge v-'+esc(busy?"busy":t.verdict)+(t.stale?" stale":"")+'" data-ci-triage-open="'+esc(t.run_id)+'" title="'
+      +esc(busy?"AI triage in progress \u2014 open":(t.summary||t.verdict)+(t.stale?" (CI changed since \u2014 re-triage)":""))+'">\u2726 '
+      +esc(busy?"triaging\u2026":t.verdict)+'</button>' : "";
+  const btn=busy?"":'<button class="ci-btn ai" data-ci-triage="'+f.id+'"'+(done?' data-force="1"':'')
+    +' title="Ask AI (pr-failure-analyzer) why the '+failCi+' failing PR(s) are red. Read-only; adds a verdict note.">'
+    +'\u2726 '+(done?"Re-triage":"Triage CI")+' ('+failCi+')</button>';
+  return '<span class="ci-triage">'+badge+btn+'</span>';
+}
+async function ciTriage(fid,force,btn){
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch("/api/ai/ci-triage",{method:"POST",headers:aiHeaders(),
+      body:JSON.stringify({feature_id:fid,force:!!force})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    ciTriageLoad(true);
+    if(j.cached&&!j.job){
+      const run=await (await fetch("/api/ai/run/"+encodeURIComponent(j.run_id),{cache:"no-store",headers:aiHeaders()})).json();
+      if(run.status!=="queued"&&run.status!=="running"){ aiShowRun(j.run_id); return; }
+    }
+    AI.section=activeSection; aiOpen();
+    const turn={id:j.run_id,kind:"ci-triage",question:"Triage CI",status:"queued",progress:"queued"};
+    AI.thread=[turn]; AI.busy=true; aiRenderThread();
+    if(j.job) await aiWait(j.job,j.run_id,turn);
+    else await aiWaitRun(j.run_id,turn);
+    AI.busy=false; aiRenderThread(); ciTriageLoad(true);
+  }catch(e){
+    AI.busy=false;
+    notifyCard({title:"AI CI triage",body:String(e.message||e),tone:"bad"});
+  }finally{ if(btn) btn.disabled=false; }
+}
+async function aiWaitRun(runId,turn){
+  for(;;){
+    await new Promise(res=>setTimeout(res,2500));
+    let run={};
+    try{ run=await (await fetch("/api/ai/run/"+encodeURIComponent(runId),{cache:"no-store",headers:aiHeaders()})).json(); }catch(e){}
+    if(run.status&&run.status!=="queued"&&run.status!=="running"){ Object.assign(turn,run); return; }
+    turn.progress=run.status||"waiting\u2026"; aiRenderThread();
+  }
+}
+document.addEventListener("click",e=>{
+  const open=e.target.closest("[data-ci-triage-open]");
+  if(open){ e.preventDefault(); aiShowRun(open.dataset.ciTriageOpen); return; }
+  const t=e.target.closest("[data-ci-triage]");
+  if(t){ e.preventDefault(); ciTriage(parseInt(t.dataset.ciTriage,10),t.dataset.force==="1",t); }
+});
 function prFeatureRow(f){
   const visiblePrs=prVisibleRows(f);
   const c=PR_STATUS_COLOR[f.worst]||PBI.grey;
@@ -3825,6 +3890,7 @@ function prFeatureRow(f){
     +(f.pldm_details?'<span><b>PLDM:</b> '+mdInline(f.pldm_details)+'</span>':'')
     +'</div>';
   const prsHtml='<div class="prf-sec prf-prs"><div class="prf-toolbar"><h4>Pull requests <span class="prf-count">'+visiblePrs.length+'</span></h4>'
+    +ciTriageHtml(f,failCi)
     +(SERVED?'<details class="prf-actions-menu"><summary>Actions</summary>'
       +'<div class="prf-actions">'+ciAll+ciFail+addBtn+pldmBtn+dropBtn+'</div></details>':'')
     +'</div><div class="ci-note" id="ci-note-'+f.id+'" role="status" aria-live="polite"></div>'

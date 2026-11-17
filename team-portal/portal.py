@@ -81,6 +81,14 @@ try:
 except ImportError:
     pm = None
 
+# pr-failure-analyzer owns CI-failure knowledge and the sightings store
+# (~/tasks/pr_failures.db); the portal records triage verdicts through it.
+sys.path.insert(0, os.path.expanduser("~/.copilot/skills/pr-failure-analyzer"))
+try:
+    import pfa  # noqa: E402
+except ImportError:      # skill not installed -> triage runs, no sightings
+    pfa = None
+
 # team-planner owns the RAID log (database canonical); the portal uses the rd.py owner API only.
 sys.path.insert(0, os.path.expanduser("~/.copilot/skills/team-planner"))
 try:
@@ -2250,8 +2258,16 @@ def ai_render(markdown: str) -> str:
             .use(tasklists_plugin).render(markdown or ""))
 
 
+def _strip_machine_line(text: str) -> str:
+    return "\n".join(line for line in (text or "").splitlines()
+                     if not line.strip().startswith(("PORTAL-TRIAGE:", ai.REVIEW_MARK))).rstrip()
+
+
 def ai_public(run: dict) -> dict:
     out = {k: v for k, v in run.items() if k not in {"prompt", "context"}}
+    if run.get("kind") in {"ci-triage", "online-review"} or run.get("profile") == "ci-triage":
+        out["answer"] = _strip_machine_line(run.get("answer") or "")
+        run = out
     out["answer_html"] = ai_render(run.get("answer") or "") if run.get("answer") else ""
     return out
 
@@ -2285,6 +2301,8 @@ def start_ai_run(body: dict, private: bool) -> dict:
             raise ValueError("wait for the previous answer first")
         if kind != "ask":
             raise ValueError("follow-ups must be questions")
+        if parent.get("kind") == "ci-triage" or parent.get("profile") == "ci-triage":
+            section = "prs"
     context = body.get("context")
     if kind == "brief":
         if not isinstance(context, (dict, list)):
@@ -2296,6 +2314,8 @@ def start_ai_run(body: dict, private: bool) -> dict:
                      private=bool(private and section == "team"),
                      parent=parent["id"] if parent else None,
                      resume=parent["session_id"] if parent else None)
+    if parent and parent.get("profile") == "ci-triage":
+        run.update(profile="ci-triage", feature_id=parent.get("feature_id"))
     if context is not None:
         run["context"] = context
     AI_STORE.save(run)
@@ -2334,6 +2354,11 @@ def run_ai_job(job: dict) -> None:
         if run["kind"] == "brief":
             text, cut = ai.compact(run.pop("context", {}), 20_000)
             prompt = ai.brief_prompt(text, read_at, cut)
+        elif run["kind"] == "ci-triage":
+            feature = run.get("context") or {}
+            repos = sorted({f"{p.get('owner')}/{p.get('repo')}" for p in feature.get("prs") or []})
+            prompt = ai.ci_triage_prompt(feature, _pfa_recent(repos), read_at)
+            text, cut = prompt, False
         elif run.get("resume"):
             text, cut = "", False
             prompt = ai.followup_prompt(run["question"])
@@ -2347,15 +2372,21 @@ def run_ai_job(job: dict) -> None:
                                     run["question"], run["focus"]))
         run.update(context_bytes=len(text), truncated=cut)
         AI_STORE.save(run)
-        argv = ai.build_argv(prompt, model=cfg["model"], profile="read",
+        argv = ai.build_argv(prompt, model=cfg["model"], profile=run.get("profile") or "read",
                              allow_reads=cfg["allow_jira_github_reads"],
                              resume=run.get("resume"))
-        result = ai.run_copilot(argv, cwd=str(Path.home()), timeout=cfg["timeout_s"],
-                                on_line=_ai_progress(job))
+        timeout = max(cfg["timeout_s"], 600) if run["kind"] == "ci-triage" else cfg["timeout_s"]
+        with ai_cancellable(job) as cancel:
+            result = ai.run_copilot(argv, cwd=str(Path.home()), timeout=timeout,
+                                    on_line=_ai_progress(job), cancel=cancel)
         _ai_finish(run, result)
+        if run["kind"] == "ci-triage" and not run["error"]:
+            _ci_triage_record(run)
+        shown = _strip_machine_line(run["answer"]) if run.get("profile") == "ci-triage" else run["answer"]
         with ALIGN_LOCK:
             job.update(status="error" if run["error"] else "done", current=None,
-                       message=run["error"] or (run["answer"].strip().splitlines() or [""])[0][:200])
+                       message=run["error"] or (run.get("verdict_summary")
+                                                or (shown.strip().splitlines() or [""])[0])[:200])
     except Exception as error:                                   # noqa: BLE001
         run.update(status="error", error=str(error), finished=ai.now_iso())
         AI_STORE.save(run)
@@ -2374,6 +2405,138 @@ def _ai_finish(run: dict, result: dict) -> None:
                status="error" if result.get("error") else "done")
     AI_STORE.save(run)
     AI_STORE.add_premium(run["premium"])
+
+
+# ------------------------------------------------------- PR CI triage ----
+def _pfa_recent(repos: list[str]) -> list[dict]:
+    if pfa is None:
+        return []
+    try:
+        return pfa.recent(repos)[:15]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def ci_triage_key(feature: dict) -> str:
+    """Identity of a feature's current failure: its failing run URLs (or, before
+    runs are known, the failing PRs and check names). A new push/run changes it."""
+    runs, fallback = set(), set()
+    for pr in feature.get("prs") or []:
+        if pr.get("status") != "ci-fail":
+            continue
+        runs.update(pr.get("failed_runs") or [])
+        fallback.add(f"{pr.get('repo')}#{pr.get('number')}:"
+                     + ",".join(sorted(pr.get("failed_checks") or [])))
+    return "|".join(sorted(runs or fallback))
+
+
+def _ci_triage_runs() -> list[dict]:
+    runs = [r for r in AI_STORE.recent(300) if r.get("kind") == "ci-triage"]
+    return sorted(runs, key=lambda r: r.get("created") or "", reverse=True)
+
+
+def ci_triage_index() -> dict:
+    """feature_id -> latest triage summary, flagged stale when the failure moved."""
+    features = {f.get("id"): f for f in pr_payload().get("features") or []}
+    out: dict = {}
+    for run in _ci_triage_runs():
+        fid = run.get("feature_id")
+        if fid in out or fid not in features:
+            continue
+        out[fid] = {"run_id": run["id"], "status": run.get("status"),
+                    "verdict": run.get("verdict"), "summary": run.get("verdict_summary"),
+                    "finished": run.get("finished"),
+                    "stale": run.get("ci_key") != ci_triage_key(features[fid])}
+    return {str(k): v for k, v in out.items()}
+
+
+def start_ci_triage(feature_id, force: bool = False) -> dict:
+    """Queue (or reuse) the AI triage of one feature set's red CI."""
+    cfg = portal_settings.load()["ai"]
+    if not cfg["enabled"]:
+        raise ValueError("AI is turned off in Settings")
+    if not cfg.get("allow_jira_github_reads"):
+        raise ValueError("CI triage reads GitHub logs: allow Jira/GitHub reads in Settings \u203a AI")
+    if type(feature_id) is not int:
+        raise ValueError("feature_id must be an integer")
+    feature = next((f for f in pr_payload().get("features") or []
+                    if f.get("id") == feature_id), None)
+    if feature is None:
+        raise ValueError("unknown feature")
+    failing = [p for p in feature.get("prs") or [] if p.get("status") == "ci-fail"]
+    if not failing:
+        raise ValueError("no PR of this feature is failing CI")
+    key = ci_triage_key(feature)
+    latest = next((r for r in _ci_triage_runs() if r.get("feature_id") == feature_id), None)
+    if latest and latest.get("status") in {"queued", "running"}:
+        return {"run_id": latest["id"], "job": None, "cached": True}
+    if latest and latest.get("status") == "done" and latest.get("ci_key") == key and not force:
+        return {"run_id": latest["id"], "job": None, "cached": True}
+    keep = ("owner", "repo", "number", "title", "url", "status", "checks_fail",
+            "checks_pass", "failed_checks", "failed_runs", "branch", "head", "base")
+    context = {"id": feature_id, "name": feature.get("name"), "jira": feature.get("jira"),
+               "prs": [{k: p.get(k) for k in keep if p.get(k) is not None}
+                       for p in feature.get("prs") or []]}
+    AI_STORE.reserve(cfg["daily_cap"])
+    name = feature.get("name") or f"feature {feature_id}"
+    run = ai.new_run("ci-triage", section="prs", question=f"Triage CI \u00b7 {name}",
+                     focus="", private=False, feature_id=feature_id, ci_key=key,
+                     profile="ci-triage", context=context)
+    AI_STORE.save(run)
+    title = f"AI CI triage \u00b7 {name}"[:120]
+    job_id = enqueue_action({"kind": "ai", "run_id": run["id"], "title": title,
+                             "slot": title, "current": "queued", "message": "",
+                             "repos": [], "total": 0, "link": f"ai/{run['id']}"})
+    return {"run_id": run["id"], "job": job_id, "cached": False}
+
+
+def _ci_triage_record(run: dict) -> None:
+    """After a triage: keep its verdict, record sightings, add the feature note.
+    Never fails the run - bookkeeping errors are kept on the record."""
+    parsed = pfa.parse_verdict(run.get("answer") or "") if pfa else None
+    if not parsed:
+        run["note_error"] = "no PORTAL-TRIAGE verdict line in the answer"
+        AI_STORE.save(run)
+        return
+    run.update(verdict=parsed["verdict"], verdict_summary=parsed.get("summary") or "")
+    context = run.get("context") or {}
+    failing = [p for p in context.get("prs") or [] if p.get("status") == "ci-fail"]
+
+    def pr_of(item: dict) -> dict:
+        repo = (item.get("repo") or "").rsplit("/", 1)[-1]
+        return next((p for p in failing if p.get("number") == item.get("pr")
+                     and (not repo or p.get("repo") == repo)), {})
+
+    errors = []
+    if pfa is not None:
+        items = parsed.get("items") or [
+            {"repo": p.get("repo"), "pr": p.get("number"),
+             "check": ",".join(p.get("failed_checks") or []), "run_url": "",
+             "signature": parsed.get("summary") or "", "verdict": parsed["verdict"]}
+            for p in failing]
+        for item in items:
+            pr = pr_of(item)
+            repo = (f"{pr['owner']}/{pr['repo']}" if pr.get("owner") and pr.get("repo")
+                    else item.get("repo") or "")
+            try:
+                pfa.record(repo=repo, verdict=item.get("verdict") or parsed["verdict"],
+                           pr=item.get("pr"), feature_id=context.get("id"),
+                           run_url=item.get("run_url") or (pr.get("failed_runs") or [""])[0],
+                           check_name=item.get("check") or "",
+                           signature=item.get("signature") or parsed.get("summary") or "",
+                           summary=parsed.get("summary") or "", source="portal")
+            except Exception as error:                           # noqa: BLE001
+                errors.append(f"sighting: {error}")
+    if pm is not None and context.get("id") is not None:
+        try:
+            ok, msg = pm.add_note(context["id"], f"AI CI triage: {parsed['verdict']} \u2014 "
+                                  f"{parsed.get('summary') or ''}".strip(), label="ai-triage")
+            if not ok:
+                errors.append(f"note: {msg}")
+        except Exception as error:                               # noqa: BLE001
+            errors.append(f"note: {error}")
+    run["note_error"] = "; ".join(errors)
+    AI_STORE.save(run)
 
 
 # ------------------------------------------------------------ auto-review ----
@@ -3531,6 +3694,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     runs = [r for r in runs if r.get("section") != "team"]
                 return self._send(200, json.dumps({"runs": runs, "usage": ai_usage_payload()},
                                                   ensure_ascii=False))
+            if route == "/api/ai/ci-triages":
+                return self._send(200, json.dumps({"triages": ci_triage_index()},
+                                                  ensure_ascii=False))
             if route.startswith("/api/ai/run/"):
                 run = AI_STORE.get(route.rsplit("/", 1)[-1])
                 if run is None:
@@ -3816,13 +3982,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # change is journaled. Schedule edits rewrite the timer drop-in.
             chat_route = re.fullmatch(r"/api/ai/review-chat(?:/(rc-[0-9a-f]{32})/(turn|preview|submit|end|retry))?",
                                       self.path)
-            if self.path in ("/api/ai/run", "/api/ai/auto-review") or chat_route:
+            if self.path in ("/api/ai/run", "/api/ai/auto-review", "/api/ai/ci-triage") or chat_route:
                 origin = self.headers.get("Origin")
                 if origin and origin != f"http://{self.headers.get('Host')}":
                     return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
                 try:
                     if self.path == "/api/ai/run":
                         result = start_ai_run(payload, self.headers.get("X-Team-Private") == "1")
+                    elif self.path == "/api/ai/ci-triage":
+                        result = start_ci_triage(payload.get("feature_id"),
+                                                 payload.get("force") is True)
                     elif chat_route and chat_route.group(1):
                         result = review_chat_action(chat_route.group(1), chat_route.group(2),
                                                     payload)

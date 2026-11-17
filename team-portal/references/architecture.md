@@ -12,6 +12,7 @@ NFS or share them between machines without a supported database service.
 | Bug monitoring and phenomena | `bug-monitor/bm.py`, `bugdb.py`, `bug-triage/ph.py` | `~/tasks/bugs.db` |
 | Workspace roster/occupancy | `workspace-manager/wm.py` | `~/tasks/workspaces.db` |
 | Outgoing features/PR observations | `pr-monitor/pm.py` | `~/tasks/prs.db` |
+| CI-failure sightings and pitfalls (pr-failure-analyzer) | `pr-failure-analyzer/pfa.py` | `~/tasks/pr_failures.db` |
 | RAID | `team-planner/rd.py` | `~/tasks/raid.db` |
 | Local PLDM tracking (not surfaced in the portal; the job queue lives in the company PLDM portal) | `pldm-job-queue/pjq.py` | `~/tasks/pldm.db` |
 | Delegation observations/history | `vm-delegate/vd.py` | `~/tasks/delegation.db` |

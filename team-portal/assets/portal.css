@@ -661,6 +661,15 @@
   .pr-row-tools { display:inline-flex; gap:4px; align-items:center; margin-left:6px; vertical-align:middle; }
   .pr-row-tools:empty { display:none; }
   .pr-tbl .ci-btn { font-size:10px; padding:3px 6px; }
+  .ci-triage { display:inline-flex; gap:6px; align-items:center; margin-left:auto; }
+  .ci-triage-badge { font:inherit; font-size:10px; font-weight:800; padding:2px 8px; cursor:pointer;
+    border-radius:var(--r-pill); border:1px solid currentColor; background:transparent; color:var(--info); }
+  .ci-triage-badge:hover { background:var(--accent-soft); }
+  .ci-triage-badge:focus-visible { outline:2px solid var(--info); outline-offset:2px; }
+  .ci-triage-badge.v-fw-code, .ci-triage-badge.v-fw-wiring { color:var(--danger); }
+  .ci-triage-badge.v-flake, .ci-triage-badge.v-runner-env, .ci-triage-badge.v-ci-tool,
+  .ci-triage-badge.v-platform, .ci-triage-badge.v-foreign-artifact { color:var(--warn); }
+  .ci-triage-badge.stale { opacity:.6; border-style:dashed; }
   .pr-tbl .why { display:inline-block; margin-top:3px; }
   .pr-tbl .empty { text-align:center; padding:20px; }
   .pr-tbl tr:hover td { background:var(--accent-soft); }

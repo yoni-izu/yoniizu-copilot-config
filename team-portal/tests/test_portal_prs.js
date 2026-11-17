@@ -9,7 +9,7 @@ function harness(served = true) {
   const listeners = {};
   const menus = [];
   const context = vm.createContext({
-    SERVED: served, PE_URL: "http://localhost:8080", JIRA_BASE: "https://jira.example/",
+    SERVED: served, AI_USAGE: {enabled: true}, PE_URL: "http://localhost:8080", JIRA_BASE: "https://jira.example/",
     PBI: {grey: "#999", red: "#f00", gold: "#fa0", green: "#0f0"},
     PR_STATUS_COLOR: {"ci-fail": "#f00", merged: "#0f0"},
     PRI_ORDER: ["critical", "high", "medium", "low"],
@@ -329,4 +329,25 @@ test("action menu closes on outside click, action selection and Escape with focu
   listeners.keydown({key: "Escape"});
   assert.equal(menu.open, false);
   assert.equal(focused, true);
+});
+
+test("AI CI triage: button on failing features, verdict badge, forced re-triage, hidden when off", () => {
+  const {context} = harness();
+  let html = context.prFeatureRow(feature());
+  assert.match(html, /data-ci-triage="8"[^>]*>\u2726 Triage CI \(1\)/);
+  assert.doesNotMatch(html, /data-force/);
+  vm.runInContext('CI_TRIAGES={"8":{run_id:"ai-1",status:"done",verdict:"flake",summary:"runner <oom>",stale:true}}', context);
+  html = context.prFeatureRow(feature());
+  assert.match(html, /class="ci-triage-badge v-flake stale" data-ci-triage-open="ai-1"/);
+  assert.match(html, /runner &lt;oom&gt;/);
+  assert.match(html, /data-ci-triage="8" data-force="1"[^>]*>\u2726 Re-triage/);
+  vm.runInContext('CI_TRIAGES={"8":{run_id:"ai-2",status:"running"}}', context);
+  html = context.prFeatureRow(feature());
+  assert.match(html, /v-busy/);
+  assert.doesNotMatch(html, /data-ci-triage="8"/);
+  const green = feature([{repo: "example/repo", number: 12, title: "x", url: "u", status: "ci-pass"}]);
+  assert.doesNotMatch(context.prFeatureRow(green), /ci-triage/);
+  context.AI_USAGE = {enabled: false};
+  assert.doesNotMatch(context.prFeatureRow(feature()), /data-ci-triage/);
+  assert.doesNotMatch(harness(false).context.prFeatureRow(feature()), /data-ci-triage/);
 });

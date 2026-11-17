@@ -675,3 +675,158 @@ class ReviewChatRouteTests(RouteTests):
 
     def test_private_runs_are_gated(self):
         pass  # covered by RouteTests
+
+
+SID1 = "6fbb31a4-0302-4fa8-929d-5f4968a5f716"
+TRIAGE_LINE = ('PORTAL-TRIAGE: {"verdict":"fw-code","summary":"undeclared FOO_REG in mng",'
+               '"owner":"mng","items":[{"repo":"ip.mng.sw.fw","pr":7,"check":"build",'
+               '"signature":"error: FOO_REG undeclared","verdict":"fw-code"}]}')
+
+
+def _feature(fid=3, runs=("https://github.com/o/ip.mng.sw.fw/actions/runs/11",)):
+    return {"id": fid, "name": "Feat", "worst": "ci-fail", "total": 2, "merged": 0, "prs": [
+        {"owner": "o", "repo": "ip.mng.sw.fw", "number": 7, "title": "t", "status": "ci-fail",
+         "url": "https://github.com/o/ip.mng.sw.fw/pull/7", "failed_checks": ["build"],
+         "failed_runs": list(runs), "checks_fail": 1, "checks_pass": 3},
+        {"owner": "o", "repo": "ip.infra.sw.fw", "number": 9, "title": "u", "status": "ci-pass",
+         "url": "https://github.com/o/ip.infra.sw.fw/pull/9"}]}
+
+
+class CiTriageTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg["allow_jira_github_reads"] = True
+        self.features = [_feature()]
+        self.notes = []
+        os_db = self.root / "pfa.db"
+        for target, name, value in (
+            (portal, "pr_payload", lambda: {"features": self.features}),
+            (portal.pm, "add_note", lambda fid, text, label="": self.notes.append((fid, text, label))
+             or (True, "ok")),
+            (portal.pfa, "DB_PATH", os_db),
+        ):
+            p = patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_job(self, job, result):
+        seen = {}
+
+        def fake(argv, **kw):
+            seen["argv"], seen["timeout"] = argv, kw["timeout"]
+            return result
+        job = dict(job, status="running")
+        with patch.object(portal.ai, "run_copilot", fake), \
+                patch.object(portal.ai, "copilot_bin", lambda: "/bin/copilot"):
+            portal.run_ai_job(job)
+        return job, seen
+
+    def test_refusals(self):
+        with self.assertRaisesRegex(ValueError, "integer"):
+            portal.start_ci_triage("3")
+        with self.assertRaisesRegex(ValueError, "unknown feature"):
+            portal.start_ci_triage(99)
+        self.features[0]["prs"][0]["status"] = "ci-pass"
+        with self.assertRaisesRegex(ValueError, "no PR"):
+            portal.start_ci_triage(3)
+        self.features[0]["prs"][0]["status"] = "ci-fail"
+        self.cfg["allow_jira_github_reads"] = False
+        with self.assertRaisesRegex(ValueError, "allow Jira/GitHub reads"):
+            portal.start_ci_triage(3)
+        self.cfg["enabled"] = False
+        with self.assertRaisesRegex(ValueError, "turned off"):
+            portal.start_ci_triage(3)
+        self.assertEqual(self.queued, [])
+
+    def test_run_records_verdict_sighting_and_note(self):
+        out = portal.start_ci_triage(3)
+        self.assertFalse(out["cached"])
+        job, seen = self.run_job(self.queued[-1], {"answer": "Root cause: X.\n" + TRIAGE_LINE,
+                                                   "session_id": SID1, "model": "m"})
+        argv = seen["argv"]
+        self.assertIn("pr-failure-analyzer", argv[2])
+        self.assertIn("actions/runs/11", argv[2])
+        self.assertNotIn("--no-custom-instructions", argv)
+        self.assertIn("shell", argv[argv.index("--deny-tool") + 1:])
+        self.assertEqual(seen["timeout"], 600)
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["message"], "undeclared FOO_REG in mng")
+        run = self.store.get(out["run_id"])
+        self.assertEqual((run["verdict"], run["note_error"]), ("fw-code", ""))
+        self.assertEqual(self.notes, [(3, "AI CI triage: fw-code \u2014 undeclared FOO_REG in mng",
+                                       "ai-triage")])
+        rows = portal.pfa.recent(["o/ip.mng.sw.fw"])
+        self.assertEqual((rows[0]["pr"], rows[0]["verdict"], rows[0]["source"]),
+                         (7, "fw-code", "portal"))
+        self.assertTrue(rows[0]["run_url"].endswith("/runs/11"))
+        public = portal.ai_public(run)
+        self.assertNotIn("PORTAL-TRIAGE", public["answer"] + public["answer_html"])
+        self.assertNotIn("context", public)
+
+    def test_cache_stale_force_and_running_reuse(self):
+        first = portal.start_ci_triage(3)
+        self.assertTrue(portal.start_ci_triage(3)["cached"])   # still queued -> reused
+        self.run_job(self.queued[-1], {"answer": TRIAGE_LINE, "session_id": "s"})
+        again = portal.start_ci_triage(3)
+        self.assertEqual((again["run_id"], again["cached"]), (first["run_id"], True))
+        idx = portal.ci_triage_index()["3"]
+        self.assertEqual((idx["verdict"], idx["stale"]), ("fw-code", False))
+        forced = portal.start_ci_triage(3, force=True)
+        self.assertFalse(forced["cached"])
+        self.run_job(self.queued[-1], {"answer": TRIAGE_LINE, "session_id": "s"})
+        self.features[0] = _feature(runs=("https://github.com/o/ip.mng.sw.fw/actions/runs/12",))
+        self.assertTrue(portal.ci_triage_index()["3"]["stale"])
+        fresh = portal.start_ci_triage(3)
+        self.assertFalse(fresh["cached"])
+        self.assertEqual(len(self.queued), 3)
+
+    def test_missing_verdict_line_and_note_failure_never_fail_run(self):
+        out = portal.start_ci_triage(3)
+        job, _ = self.run_job(self.queued[-1], {"answer": "no line", "session_id": "s"})
+        self.assertEqual(job["status"], "done")
+        self.assertIn("no PORTAL-TRIAGE", self.store.get(out["run_id"])["note_error"])
+        portal.start_ci_triage(3, force=True)
+        with patch.object(portal.pm, "add_note", lambda *a, **k: (False, "locked")):
+            self.run_job(self.queued[-1], {"answer": TRIAGE_LINE, "session_id": "s"})
+        run = self.store.get(self.queued[-1]["run_id"])
+        self.assertEqual((run["status"], run["note_error"]), ("done", "note: locked"))
+
+    def test_followup_keeps_read_only_triage_profile(self):
+        out = portal.start_ci_triage(3)
+        self.run_job(self.queued[-1], {"answer": TRIAGE_LINE, "session_id": SID1})
+        child = portal.start_ai_run({"kind": "ask", "section": "vm", "question": "why?",
+                                     "parent": out["run_id"]}, False)
+        run = self.store.get(child["run_id"])
+        self.assertEqual((run["profile"], run["section"], run["resume"]), ("ci-triage", "prs", SID1))
+        _, seen = self.run_job(self.queued[-1], {"answer": "because", "session_id": SID1})
+        self.assertIn("shell", seen["argv"])
+        self.assertNotIn("--no-custom-instructions", seen["argv"])
+        self.assertEqual(len(portal.pfa.recent()), 1)   # follow-ups add no sightings
+
+
+class CiTriageRouteTests(CiTriageTests, RouteTests):
+    def post(self, path, payload, origin=None):
+        h = object.__new__(self.handler_class)
+        body = json.dumps(payload).encode()
+        h.path = path
+        h.headers = {"Content-Length": str(len(body)), "Host": "127.0.0.1:8787"}
+        if origin:
+            h.headers["Origin"] = origin
+        h.rfile = io.BytesIO(body)
+        h._send = lambda code, text, *a: (code, json.loads(text))
+        return h.do_POST()
+
+    def test_routes(self):
+        status, body = self.post("/api/ai/ci-triage", {"feature_id": 3})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.queued[-1]["kind"], "ai")
+        self.assertEqual(self.post("/api/ai/ci-triage", {"feature_id": 3},
+                                   "http://evil")[0], 403)
+        self.assertEqual(self.post("/api/ai/ci-triage", {"feature_id": "x"})[0], 400)
+        tri = self.get("/api/ai/ci-triages")["body"]["triages"]
+        self.assertEqual(tri["3"]["run_id"], body["run_id"])
+        self.assertEqual(tri["3"]["status"], "queued")
+
+    test_private_runs_are_gated = None
+
+
