@@ -433,6 +433,8 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
         require_use(slot, "review")
     elif action == "mirror" and options.get("mirror") is not None:
         require_use(slot, "mirror")
+    if action in {"free", "sync"} and rec.get("purpose") == "review":
+        options["disposable"] = True
     request = {"id": rec["id"], "path": rec["path"], "rev": rec["rev"], "action": action}
     request.update(options)
     portal_sync = options.get("portal_sync")

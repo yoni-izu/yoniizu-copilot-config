@@ -243,6 +243,21 @@ def repo_worker(payload):
                 stash = {"path": path, "branch": branch, "head": head, "oid": saved}
                 if git("status", "--porcelain", "--untracked-files=all"):
                     raise RuntimeError("working tree remains dirty after stashing; check submodules")
+        elif action == "discard-update":
+            # Review-dedicated workspaces are disposable: drop local work, reset the target.
+            if dirty:
+                git("reset", "--hard", "--quiet")
+                git("clean", "-fd", "--quiet")
+                if git("status", "--porcelain", "--untracked-files=all"):
+                    raise RuntimeError("working tree remains dirty after discarding; check submodules")
+            git("fetch", "origin")
+            if git("rev-parse", "--verify", "refs/remotes/origin/" + target + "^{commit}", optional=True):
+                git("checkout", "--force", "-B", target, "--track", "origin/" + target)
+            else:
+                git("fetch", "origin", target)
+                git("checkout", "--force", "--detach", "FETCH_HEAD")
+            branch = git("symbolic-ref", "--quiet", "--short", "HEAD", optional=True)
+            head = git("rev-parse", "HEAD")
         elif action != "status":
             if action == "force-update":
                 if dirty:
@@ -546,6 +561,9 @@ def execute(request):
                                      or not re.fullmatch(r"[0-9a-f]{64}", approved)):
             raise ValueError("invalid workspace approval snapshot")
         portal_approval = value
+    disposable = "disposable" in request
+    if disposable and (request["disposable"] is not True or action not in {"free", "sync"}):
+        raise ValueError("disposable requires true and a free or sync action")
     raw = request["path"]
     if not (raw.startswith("/") or raw.startswith("~/")):
         raise ValueError("workspace path must be absolute or home-relative")
@@ -596,15 +614,18 @@ def execute(request):
                         if portal_approval["approved"] is not None:
                             raise ValueError("Force sync is only available for free independent workspaces")
                         portal_approval = None
+                    if disposable and mirror:
+                        raise ValueError("a mirror cannot be discarded as a review workspace")
+                    failures = [r for r in result["repos"] if r.get("error")]
+                    if disposable and failures:
+                        raise ValueError("; ".join(f"{r['path']}: {r['error']}" for r in failures))
                     forced = False
-                    if portal_approval is not None:
-                        failures = [r for r in result["repos"] if r.get("error")]
+                    # Off-baseline branches with nothing to lose return without confirmation.
+                    if portal_approval is not None and not disposable and not result["safe"]:
                         if failures:
                             raise ValueError("; ".join(f"{r['path']}: {r['error']}" for r in failures))
                         token = return_token(wid, path, revision, result, mirror)
-                        if approved and approved != token and result["clean"]:
-                            raise ValueError("workspace changed after approval; retry the return")
-                        if not result["clean"] and approved != token:
+                        if approved != token:
                             approval = {
                                 "token": token,
                                 "revision": revision,
@@ -613,7 +634,7 @@ def execute(request):
                                           for r in result["repos"] if not r["clean"]],
                                 "blockers": return_blockers(result),
                             }
-                        elif not result["clean"]:
+                        else:
                             forced = True
                     if approval is None:
                         approved_manifests = None
@@ -623,9 +644,10 @@ def execute(request):
                                 raise ValueError("; ".join(blockers))
                             changing_checkout = True
                             approved_manifests = prepare_forced_return(path, revision, result, stashes)
-                        elif not result["safe"]:
+                        elif not result["safe"] and not disposable:
                             raise ValueError("; ".join(result["reasons"]))
-                        if action == "sync" and not mirror and not result["clean"] and not forced:
+                        if (action == "sync" and not mirror and not result["clean"] and not forced
+                                and portal_approval is None and not disposable):
                             raise ValueError("; ".join(result["reasons"]))
                         if action == "align" and not result["clean"]:
                             raise ValueError("; ".join(result["reasons"]))
@@ -658,7 +680,8 @@ def execute(request):
                                             matched.add(prkey)
                             # Return first; octl must never rebase a development branch.
                             baseline_rows = repo_batch(root, repos if forced else manifest_repos(root, revision),
-                                                       "force-update" if forced else "update",
+                                                       "force-update" if forced else
+                                                       "discard-update" if disposable else "update",
                                                        "return", "Returning repositories to manifest revision" + where)
                             failures = [f"{r['path']}: {r['error']}" for r in baseline_rows if r.get("error")]
                             if failures:

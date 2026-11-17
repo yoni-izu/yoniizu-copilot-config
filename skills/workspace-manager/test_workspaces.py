@@ -395,6 +395,22 @@ class RegistryTests(unittest.TestCase):
         self.assertNotIn("approval_required", wm.status_read(wm.record("one")["id"]))
         self.assertEqual(wm.action_log("one")[-1]["outcome"], "approval-required")
 
+    def test_workspace_request_marks_only_review_purpose_returns_disposable(self):
+        response = subprocess.CompletedProcess([], 0, json.dumps({
+            "ok": True, "status": {"clean": True, "path": str(self.local)}, "log": []}), "")
+
+        def sent(action, **options):
+            with patch.object(subprocess, "run", return_value=response) as run:
+                wm.workspace_request("one", action, **options)
+            return json.loads(run.call_args.args[0][-1])
+
+        self.assertNotIn("disposable", sent("free", portal_free={"approved": None}))
+        ok, message = wm.set_slot_fields("one", {"purpose": "review"})
+        self.assertTrue(ok, message)
+        self.assertIs(sent("free", portal_free={"approved": None})["disposable"], True)
+        self.assertIs(sent("sync")["disposable"], True)
+        self.assertNotIn("disposable", sent("status"))
+
     def test_workspace_request_records_saved_stash_recovery_details(self):
         stash = {"path": "/repo", "branch": "dev/test", "oid": "b" * 40}
         response = subprocess.CompletedProcess([], 0, json.dumps({
@@ -666,6 +682,61 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
         self.assertEqual(self.git(self.repo, "rev-parse", "refs/heads/dev/local"), head)
 
+    def test_portal_return_of_pushed_review_branch_needs_no_approval(self):
+        for action, option in (("free", "portal_free"), ("sync", "portal_sync")):
+            self.git(self.repo, "checkout", "main")
+            if action == "free":
+                self.dev()
+            else:
+                self.git(self.repo, "checkout", "dev/test")
+            result = self.execute(action, **{option: {"approved": None}})
+            self.assertTrue(result["ok"], result)
+            self.assertNotIn("approval_required", result)
+            self.assertTrue(result["status"]["clean"])
+            self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
+        self.assertEqual(self.git(self.repo, "stash", "list"), "")
+
+    def test_stale_approval_on_a_safe_workspace_returns_instead_of_failing(self):
+        self.dev()
+        result = self.portal_free("b" * 64)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("approval_required", result)
+        self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
+
+    def test_disposable_return_discards_local_work_without_approval(self):
+        (self.repo / "file").write_text("local main commit\n")
+        self.git(self.repo, "commit", "-am", "local main commit")
+        self.git(self.repo, "checkout", "-b", "dev/review", "origin/main")
+        (self.repo / "file").write_text("local pr commit\n")
+        self.git(self.repo, "commit", "-am", "local pr commit")
+        (self.repo / "file").write_text("staged\n")
+        self.git(self.repo, "add", "file")
+        (self.repo / "untracked").write_text("scratch\n")
+        result = self.execute("free", portal_free={"approved": None}, disposable=True)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("approval_required", result)
+        self.assertTrue(result["status"]["clean"], result)
+        self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"),
+                         self.git(self.repo, "rev-parse", "origin/main"))
+        self.assertEqual((self.repo / "file").read_text(), "baseline\n")
+        self.assertFalse((self.repo / "untracked").exists())
+        self.assertEqual(self.git(self.repo, "stash", "list"), "")
+        self.assertTrue((self.home / "octl-calls").exists())
+
+    def test_disposable_cli_sync_discards_without_portal_option(self):
+        self.dev()
+        (self.repo / "untracked").write_text("scratch\n")
+        result = self.execute("sync", disposable=True)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["status"]["clean"])
+        self.assertFalse((self.repo / "untracked").exists())
+
+    def test_disposable_option_is_strict(self):
+        for action, value in (("status", True), ("align", True), ("free", "yes"), ("free", False)):
+            with self.assertRaises(ValueError):
+                self.execute(action, disposable=value)
+
     def test_portal_free_reprompts_when_worktree_changes_after_approval(self):
         (self.repo / "first").write_text("one")
         first = self.portal_free()
@@ -821,8 +892,8 @@ class RuntimeTests(unittest.TestCase):
         self.git(self.repo, "commit", "-m", "remove artifact")
         self.git(self.repo, "push", "-u", "origin", "dev/ignored")
         (self.repo / "artifact").write_text("keep ignored file\n")
-        first = self.portal_free()
-        result = self.portal_free(first["approval_required"]["token"])
+        result = self.portal_free()
+        self.assertNotIn("approval_required", result)
         self.assertFalse(result["ok"])
         self.assertIn("would be overwritten", result["error"])
         self.assertEqual((self.repo / "artifact").read_text(), "keep ignored file\n")

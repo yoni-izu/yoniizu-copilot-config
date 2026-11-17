@@ -57,6 +57,34 @@ Review lifecycle: `todo` → `in-progress` → `blocked` (comments/changes-reque
 
 ## Workflows
 
+### Dedicated review workspaces are disposable
+
+When the user has explicitly designated a workspace for reviews only, switching
+between review tasks may destructively discard local changes and local-only
+commits. Do not stash, back up, or save branch-state snapshots before switching;
+preserving the previous checkout is not a requirement. Fetch live PR metadata
+and refs, then align each PR repo to the current task's latest author branch and
+head SHA, including force-pushed heads. Verify every HEAD against the live PR
+head; if it changed during alignment, refresh and verify again before reviewing.
+Keep non-PR repos on the workspace revision, honoring overrides and pins.
+
+This exception applies to `start`, resume, `--manual`, `pre-review`, `stop`, and
+`done`, and takes precedence over the safe-checkout and snapshot steps below.
+Workspaces registered with `purpose: review` enforce it mechanically: their
+Free/Sync (portal Return or `tm.py release`) discards local work without a
+confirmation prompt.
+Use the supported `wip` destructive alignment operations with `--yes` from the
+WIP root; never raw multi-repo Git loops. Existing snapshots are not authority
+for current PR heads. Preserve review reports, attachments, notes and reviewed
+head evidence outside the checkout; they are not disposable branch state.
+
+Before switching, verify the review-only designation and resolve any conflicting
+workspace holder through the owning API. Occupancy checks, RTL restrictions and
+PR-base/workspace-revision mismatch warnings still apply. Do not infer review-only
+designation merely because a review task is assigned. In all other workspaces,
+retain safe checkout, skip/report dirty repos, and obtain explicit approval for
+any destructive operation.
+
 ### `scan` — discover PRs that need my review
 
 Find new review requests and let the user tick which to add.
@@ -90,15 +118,15 @@ Check the workspace's repos out to a review task's branches so you can review lo
 
 1. Read the store; pick target review tasks (matching task id, author, repo, or PR — or default: all non-merged with status `todo`/`in-progress`).
 2. For each PR entry, find the target repo path inside the workspace.
-3. **Branch checkout (safe):**
+3. **Branch checkout (safe unless explicitly review-dedicated):**
    - **Fast path (token savings):** if a `review-<task-id>` snapshot already exists from a prior `start`, first verify that its non-review repos match the workspace revision (including per-repo overrides and pinned tags/SHAs). Repair stale snapshots that recorded unrelated repos on `main`; do not blindly restore them. Restore a valid snapshot via the [wip-workspace](../wip-workspace/SKILL.md) CLI: `cd <wip_root> && wip load review-<task-id> && wip all checkout`, then perform step 3b before skipping to step 5.
    - **First time (no snapshot):** `git fetch origin <branch>` then `git checkout <branch>`.
    - If the remote ref is missing (renamed/force-pushed), fall back to `git fetch origin pull/<pr>/head:<branch>` then `git checkout <branch>`.
    - **Never** create local `pr-NNN` branches — always use the real `reviews[].branch` name.
-   - **Never** use destructive resets. If a repo has local changes and checkout is blocked, leave it and report it.
+   - Outside dedicated review workspaces, **never** use destructive resets. If a repo has local changes and checkout is blocked, leave it and report it. Dedicated review workspaces use the disposable-workspace rule above.
 3b. **Resolve and verify PR upstream tracking** using [PR upstream and VS Code review detection](#pr-upstream-and-vs-code-review-detection). This is mandatory after every checkout or snapshot restore, including `--manual` and `pre-review`; a matching branch name and HEAD alone do not establish PR recognition.
-4. Keep all other repos on the **workspace revision**, resolved from its manifest/metadata, honoring per-repo overrides and pinned tags/SHAs. Never substitute `main` just because it is the repository default branch. Use `wip` for multi-repo operations; skip dirty repos and report them.
-4b. **Snapshot the alignment (token savings).** Verify PR repos are on their PR branches and every other repo matches the workspace revision. Then record and save it: `cd <wip_root> && wip scan && wip save review-<task-id>` (see [wip-workspace](../wip-workspace/SKILL.md)). `done` removes the snapshot.
+4. Keep all other repos on the **workspace revision**, resolved from its manifest/metadata, honoring per-repo overrides and pinned tags/SHAs. Never substitute `main` just because it is the repository default branch. Use `wip` for multi-repo operations; skip dirty repos and report them outside dedicated review workspaces.
+4b. **Snapshot the alignment (non-dedicated workspaces only).** Verify PR repos are on their PR branches and every other repo matches the workspace revision. Then record and save it: `cd <wip_root> && wip scan && wip save review-<task-id>` (see [wip-workspace](../wip-workspace/SKILL.md)). `done` removes the snapshot. Dedicated review workspaces require no branch-state snapshot.
 5. **Record workspace occupancy.** Detect the workspace you are aligning (the `~/projects/<project>/<ws>` slot the repos live in). Before occupying it, check it is not already held by a *different* holder — a task **or** an ad-hoc hold (`tm.py workspaces`, backed by the [workspace-manager](../workspace-manager/SKILL.md) store). If free, claim it with `tm.py assign <id> <ws>` — this records the slot in `wm.py` and promotes `todo`→`in-progress`. If it is already held, don't clobber it: report the conflict and let the user decide (`--force` displaces the holder).
 6. Update the task: each selected PR entry `review_status: in-progress` if `pending`; append a note. Use `tm.py review-update <id> in-progress` or edit the store. (`assign` in step 5 already handled the task `status`.)
 7. Report: which repos switched to review branches, their resolved tracking upstreams and PR-detection result (or explicitly unverified), which use the workspace revision (name it), which were skipped (and why), and which workspace slot is now occupied.
@@ -152,6 +180,8 @@ though the GitHub icon is visible. Rechecking out through the extension is not r
    `git -C <path> fetch <head-remote> refs/heads/<headRefName>:refs/remotes/<head-remote>/<headRefName>`.
    Compare the fetched tip and local HEAD with `headRefOid`; report stale/diverged
    checkouts rather than pulling, resetting, or moving HEAD merely to repair detection.
+   In a dedicated review workspace, first align to the latest verified PR head
+   under the disposable-workspace rule, then verify tracking and detection.
    Fetching `pull/<N>/head` into a local branch alone does **not** create proper upstream
    tracking. If the head branch/repository was deleted, renamed, or is inaccessible,
    re-read metadata and report the limitation; do not invent a tracking ref or set the
@@ -182,7 +212,7 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
 
 1. **Select the new tasks.** Read the store; pick every active review task (status `todo`/`in-progress`, not done/cancelled) whose notes do **not** already contain the `initial auto review draft done` marker. These are the never-looked-at tasks. If none qualify, report "no new review tasks to pre-review" and stop. List the selected tasks (ids + PR counts) before starting.
 2. **Process one task at a time**, in order. For each task:
-   a. **Align the workspace** using the `start` mechanics, including snapshot validation. PR repos go on their author branches; every other repo must match the workspace revision, including per-repo overrides and pins, never automatically `main`. Save only the verified alignment with `wip scan && wip save review-<task-id>`. Never create `pr-NNN` branches or use destructive resets. If a repo is dirty / checkout is blocked, **skip that task**, report it, and move on — do not force.
+   a. **Align the workspace** using the `start` mechanics. Dedicated review workspaces discard prior branch state as needed, fetch and verify the latest task PR heads, and require no snapshots. Elsewhere, validate any snapshot and save only the verified alignment with `wip scan && wip save review-<task-id>`; if a repo is dirty / checkout is blocked, **skip that task**, report it, and move on without forcing. PR repos go on their author branches; every other repo must match the workspace revision, including overrides and pins, never automatically `main`. Never create `pr-NNN` branches.
    b. **Auto-draft** by running **`pr-review local`** against the checked-out branches. First gather source-free software reviews and threads as in step 8 above and feed that summary into the draft so it doesn't duplicate what others already raised. This produces local draft findings only; **do not submit, comment, or approve** anything on GitHub.
    c. **Attach and mark the task.** Require `pr-review` Step 4 to register the
       one task report through `tm.py review-draft` using this task ID and a
@@ -194,20 +224,20 @@ Trigger phrases: "review new PRs", "pre-review", "auto-draft the new reviews".
       actual review; leave the task's status untouched so the user's own review
       flow (`start` → `pr-review`) still runs normally.
    d. Move to the next task.
-3. **Return to a clean state.** After the last task, run the `stop` mechanics: return every repo to the workspace revision (skip and report dirty repos; never force).
+3. **Return to a clean state.** After the last task, run the `stop` mechanics: return every repo to the workspace revision under the dedicated/non-dedicated safety policy.
 4. **Report** a summary: which tasks were drafted, where each task report lives, which tasks/repos were skipped (and why), and confirm the workspace revision restored.
 
-Guarantees: drafts only (no GitHub writes), no destructive git, and no review-status transitions — the user still reviews each PR themselves later, now with a head start.
+Guarantees: drafts only (no GitHub writes), destructive alignment only in explicitly dedicated review workspaces, and no review-status transitions — the user still reviews each PR themselves later, now with a head start.
 
 ### `stop`
 
-Return every repo to the workspace revision via the [wip-workspace](../wip-workspace/SKILL.md) CLI. Use `wip all return` only after confirming its upstream map matches the workspace revision, including per-repo overrides and pins; otherwise align the correct revision map with `wip`. Skip (don't force) dirty repos and report them. Don't change task status unless asked. **Release the workspace slot** you were occupying: `tm.py release <id>` (frees the slot in `wm.py`, leaves `status` untouched).
+Return every repo to the workspace revision via the [wip-workspace](../wip-workspace/SKILL.md) CLI. Use `wip all return` only after confirming its upstream map matches the workspace revision, including per-repo overrides and pins; otherwise align the correct revision map with `wip`. Dedicated review workspaces may discard local branch state without saving; elsewhere skip (don't force) dirty repos and report them. Don't change task status unless asked. **Release the workspace slot** you were occupying: `tm.py release <id>` (frees the slot in `wm.py`, leaves `status` untouched).
 
 ### `done <task-id> [outcome]` — close out a review pass
 
 Combined `stop` + status update.
 
-1. Return all repos to the workspace revision using the `stop` mechanics (skip dirty ones; never force). Remove the task's snapshot now that the review is closing: `rm -f ~/.wip/saved/review-<task-id>.wip`.
+1. Return all repos to the workspace revision using the `stop` mechanics and its dedicated/non-dedicated safety policy. If a task snapshot exists, remove it now that the review is closing: `rm -f ~/.wip/saved/review-<task-id>.wip`.
 2. Set `review_status` on the relevant PR entries to the outcome (`commented`, `changes-requested`, `approved`, …). If unspecified, keep current.
 3. Derive task status:
    - **All** PR entries `merged` → task `done`, clear `workspace`, set `completed`.
@@ -259,11 +289,11 @@ PR when its actual file diff is needed — never for the sweep or an RTL PR.
 1. **`tm.py` is the only writer to the store.** Use it for every mechanical mutation. Use owner CLI/API calls even for judgment-based metadata. Git workflow steps and the separate review memoir are not task-store edits.
 2. **Never post to GitHub without explicit user approval** — that gate belongs to `pr-review`; `review-mgr` only queues and tracks.
 3. **Curate, don't auto-add.** `scan` always goes through the tick step.
-4. **Never destructive git.** No resets; skip and report dirty repos.
+4. **Dedicated review workspaces are disposable.** Apply the rule above: latest task PR heads take priority over local branch state, with no stash, backup or snapshot required. Outside explicitly dedicated review workspaces, no destructive resets; skip and report dirty repos.
 5. **Done gating:** a review task is `done` only when every PR is **merged**. Approval alone keeps the task `in-progress` (awaiting merge). Submitting comments/changes-requested → `blocked`.
 6. **No purge — track until merged:** the task-manager keeps a review task until every PR merges; fully-merged tasks persist as a `done`/`merged` record (surfaced in the dashboard code-review section) rather than being deleted. `review-update` / `review-check` re-derive status without purging.
 7. **One PR per repo per task.** A multi-PR review task must never contain two PRs targeting the same repo. `review-start` can only check out one branch per repo — a second PR in the same repo is unreachable locally, causes confusion about which code is under review, and forces the reviewer to context-switch branches mid-review. When adding PRs (via `scan` or `add-review`), split any same-repo collisions into separate tasks. When inheriting a task that already violates this, split it before `start`.
 8. **Repo allowlists** live in [references/hsi-repos.txt](./references/hsi-repos.txt) (HSI IPs: D2D/PCIe/SE) and [references/fw-repos.txt](./references/fw-repos.txt) (broader FW team); keep them current as repos are added/retired.
 9. **`pre-review` is drafts-only.** The batch auto-draft pass produces local `pr-review` drafts and never writes to GitHub or transitions review status. It marks each processed task with the `initial auto review draft done` note so subsequent runs skip it; that note is the sole "already looked at" signal.
 10. **Consider teammate reviews.** For non-RTL PRs, read existing reviews and inline threads before drafting on any `start`/resume/`pre-review` pass. For RTL, ask Neo (`neo-ask`) to assess them; never fetch their bodies or diff hunks to WSL. This is read-only; never post in response to a teammate's review without explicit approval.
-11. **`start --manual` is no-AI, no-credit.** Manual mode does the workspace alignment and occupancy (`start` steps 1–7) only, then stops — it never fetches teammate reviews (step 8) or hands off to `pr-review` (step 9). PR repos go on their author branches; everything else stays on the workspace revision. Same safety guarantees apply: safe checkout only, never destructive git, skip and report dirty repos, don't clobber an occupied slot.
+11. **`start --manual` is no-AI, no-credit.** Manual mode does the workspace alignment and occupancy (`start` steps 1–7) only, then stops — it never fetches teammate reviews (step 8) or hands off to `pr-review` (step 9). PR repos go on their latest author branch heads; everything else stays on the workspace revision. Apply the dedicated/non-dedicated safety policy and don't clobber an occupied slot.

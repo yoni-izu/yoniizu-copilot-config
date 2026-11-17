@@ -79,8 +79,12 @@ to the same physical checkout on several hosts.
   clear only after success. Failures keep the reservation and are visible.
   `release(..., reset=False)` is internal to the portal worker after it has
   completed that physical operation, not a shortcut for callers.
-- **Portal return approval** adds an explicit, snapshot-bound confirmation when
-  the fresh check finds a dirty or non-baseline checkout. On approval, staged,
+- **Portal return approval** adds an explicit, snapshot-bound confirmation only
+  when work could be lost: uncommitted changes, local-only/unverifiable commits
+  or repository errors. A checkout that is merely on another pushed branch
+  (e.g. a review PR branch) with nothing local returns without confirmation;
+  a stale approval token on such a checkout proceeds instead of failing. On
+  approval, staged,
   unstaged and untracked changes are stashed; named branches and their commits
   remain intact. Ignored files are not stashed and Git refuses to overwrite
   them. Target-branch local-only/unverifiable commits, unsafe detached commits,
@@ -88,6 +92,14 @@ to the same physical checkout on several hosts.
   blockers. Stash IDs and original branches are logged, even on partial
   failure; the holder/mirror clears only after verification. Normal CLI Free
   retains its existing guarded behavior and does not silently force a return.
+- **Review-purpose workspaces are disposable on return.** For `purpose: review`,
+  `workspace_request` adds `disposable: true` to every Free/Sync (portal and
+  CLI, local and via `mctl`). The runtime then never asks for confirmation: it
+  hard-resets and cleans (`git reset --hard` + `git clean -fd`; ignored files
+  kept) and force-resets the manifest target branch to origin, discarding
+  uncommitted changes and local-only commits without a stash. Repository errors
+  and mirrors still fail. Occupying a review workspace still requires a clean
+  baseline.
 - **Untrack** (`wm.untrack(slot, force=False)`) removes only the roster entry.
   Normally held workspaces and mirrors are refused. An explicit boolean
   `force=True` bypasses only those two checks, preserving holds, saved readings,

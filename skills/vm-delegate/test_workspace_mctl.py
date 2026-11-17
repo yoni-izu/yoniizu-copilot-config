@@ -123,6 +123,9 @@ cmd_workspace free /remote/slot WS-R-stable 2
             "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":true}}'",
             "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":\"bad\"}}'",
             "sync /slot WS-R-stable main '{\"portal_sync\":{\"approved\":null,\"extra\":1}}'",
+            "free /slot WS-R-stable main '{\"disposable\":1}'",
+            "free /slot WS-R-stable main '{\"disposable\":false}'",
+            "align /slot WS-R-stable main '{\"prs\":[],\"disposable\":true}'",
         ]:
             with self.subTest(args=args):
                 result = self.shell("""
@@ -221,6 +224,16 @@ cmd_workspace """ + shlex.join(["free", "/remote/slot ' ; $(touch BAD)",
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["portal_free"], options["portal_free"])
         self.assertFalse((Path.cwd() / "BAD").exists())
+
+    def test_disposable_review_return_is_transported(self):
+        self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
+        for action, options in (("free", {"portal_free": {"approved": None}, "disposable": True}),
+                                ("sync", {"disposable": True})):
+            result = self.shell("""
+rlogin_workspace() { python3 "$2" "$1"; }
+cmd_workspace """ + shlex.join([action, "/remote/slot", "WS-R-stable", "main", json.dumps(options)]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIs(json.loads(result.stdout)["disposable"], True)
 
     def test_portal_sync_approval_is_transported(self):
         self.runtime_fixture("import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n")
