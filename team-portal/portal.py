@@ -44,6 +44,7 @@ _SKILLS = str(PORTAL_ROOT.parent / "skills")
 sys.path.insert(0, os.path.join(_SKILLS, "task-manager"))
 sys.path.insert(0, os.path.join(_SKILLS, "workspace-manager"))
 import tm  # noqa: E402
+import rtl_pr_guard  # noqa: E402  (tm.py puts rtl-vm-policy on sys.path)
 
 import wm  # noqa: E402
 import team_api  # noqa: E402
@@ -1176,6 +1177,9 @@ def action_resources(job: dict) -> set[str]:
         # workspace actions with their own claims (claiming the workspace
         # here would deadlock them).
         return {"auto-review:" + job["ws_id"]}
+    if kind == "online-review":
+        # No workspace: only one online pass per task at a time.
+        return {"online-review:" + job["task_id"]}
     if kind == "review-chat":
         # One message at a time per chat; opening also serialises with any
         # auto-review on the same workspace.
@@ -1243,10 +1247,15 @@ def _execute_action(job: dict, store_lock=None) -> None:
     if kind == "vm-refresh":
         VM_REFRESH_LOCK.acquire()
         return run_vm_refresh(job)
+    if kind == "vm-cancel":
+        with VM_REFRESH_LOCK:
+            return run_vm_cancel(job)
     if kind == "ai":
         return run_ai_job(job)
     if kind == "auto-review":
         return run_auto_review(job)
+    if kind == "online-review":
+        return run_online_review(job)
     if kind == "review-chat":
         return run_review_chat_job(job)
     if kind == "pldm":
@@ -2680,7 +2689,7 @@ def _review_busy(tid: str) -> str:
     """Why another AI review of ``tid`` cannot start now ('' when it can)."""
     with ALIGN_LOCK:
         for other in ALIGN_JOBS.values():
-            if (other.get("kind") == "auto-review" and other.get("task_id") == tid
+            if (other.get("kind") in {"auto-review", "online-review"} and other.get("task_id") == tid
                     and other.get("status") in {"queued", "running"}):
                 return f"an AI review draft of {tid} is already queued"
     if AI_STORE.chats(tid, open_only=True):
@@ -2838,6 +2847,214 @@ def run_auto_review(job: dict) -> None:
                 start_workspace_job("free", slot, {})
             except Exception:                                    # noqa: BLE001
                 pass
+
+
+# --------------------------------------------------------- online review ----
+# /pr-review remote mode over all of a task's PRs as ONE feature set, without
+# a workspace. The portal verifies non-RTL + pins the heads, the AI writes one
+# report into the drafts directory (its only writable place), and the portal
+# - not the AI - registers it through the task owner's API.
+REVIEW_MARK_RE = re.compile(r"^\s*" + re.escape(ai.REVIEW_MARK) + r"\s*(\{.*\})\s*$")
+PR_URL_RE = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)$")
+
+
+def _pr_ident(url: str) -> tuple[str, str, int]:
+    m = PR_URL_RE.match(url or "")
+    if not m:
+        raise ValueError(f"not a GitHub PR URL: {url}")
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def _latest_draft(task: dict) -> dict | None:
+    drafts = sorted(task.get("review_drafts") or [],
+                    key=lambda d: d.get("updated_at") or d.get("created_at") or "")
+    if not drafts:
+        return None
+    last = drafts[-1]
+    return {"file": last.get("file"),
+            "heads": {h.get("pr_url"): h.get("head_sha") for h in last.get("heads") or []
+                      if h.get("pr_url") and h.get("head_sha")}}
+
+
+def start_online_review(tid: str, mode: str = "create") -> dict:
+    cfg = portal_settings.load()["ai"]
+    if not cfg["enabled"]:
+        raise ValueError("AI is turned off in Settings")
+    if not cfg["allow_jira_github_reads"]:
+        raise ValueError("online review reads the PRs from GitHub: enable "
+                         "'Jira/GitHub reads' in Settings > AI first")
+    if mode not in ai.REVIEW_MODES:
+        raise ValueError("mode must be create or rereview")
+    task = _review_task(tid)
+    if mode == "create" and has_review_draft(task):
+        raise ValueError(f"{tid} already has a review draft; use Re-review")
+    if mode == "rereview" and not has_review_draft(task):
+        raise ValueError(f"{tid} has no review draft yet; use Create review draft")
+    for r in _open_reviews(task):
+        owner, repo, _ = _pr_ident(r["pr_url"])
+        if rtl_pr_guard.is_rtl_repo(repo):
+            raise ValueError(f"{owner}/{repo} is an RTL repository: online review is "
+                             "refused (RTL is reviewed only through the VM agent)")
+    busy = _review_busy(tid)
+    if busy:
+        raise ValueError(busy)
+    AI_STORE.reserve(cfg["daily_cap"])
+    label = "Online review" if mode == "create" else "Online re-review"
+    run = ai.new_run("online-review", section="work", task_id=tid, mode=mode,
+                     profile="review-online",
+                     question=f"{label} {tid}: {task.get('title', '')}")
+    AI_STORE.save(run)
+    title = f"{label} {tid}"
+    job_id = enqueue_action({"kind": "online-review", "task_id": tid, "run_id": run["id"],
+                             "mode": mode, "title": title, "slot": title, "current": "queued",
+                             "message": "", "repos": [], "steps": [], "total": 3,
+                             "link": f"task/{tid}"})
+    return {"run_id": run["id"], "job": job_id, "mode": mode, "online": True}
+
+
+def _pr_head(url: str) -> str:
+    out = subprocess.run(["gh", "pr", "view", url, "--json", "headRefOid", "-q",
+                          ".headRefOid"], capture_output=True, text=True, timeout=60,
+                         check=False)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _draft_files(drafts: Path) -> dict:
+    return {p.name: p.stat().st_mtime_ns for p in drafts.glob("*.md") if p.is_file()}
+
+
+def _online_report(answer: str, tid: str, drafts: Path, before: dict) -> tuple[Path | None, list]:
+    """The report the AI wrote or rewrote in this run (validated) and its proposed
+    sibling PR URLs. Files untouched since ``before`` (a _draft_files snapshot)
+    are never picked up."""
+    claim: dict = {}
+    for line in reversed((answer or "").splitlines()):
+        m = REVIEW_MARK_RE.match(line)
+        if m:
+            try:
+                claim = json.loads(m.group(1))
+            except ValueError:
+                claim = {}
+            break
+    siblings = [u for u in claim.get("siblings") or [] if isinstance(u, str)
+                and PR_URL_RE.match(u)][:20] if isinstance(claim, dict) else []
+    root = drafts.resolve()
+
+    def fresh(path: Path) -> bool:
+        return (path.is_file() and path.suffix == ".md" and path.name.startswith(tid + "-")
+                and path.resolve().parent == root
+                and before.get(path.name) != path.stat().st_mtime_ns)
+
+    name = claim.get("report") if isinstance(claim, dict) else None
+    if isinstance(name, str) and name:
+        path = (root / name).resolve() if not os.path.isabs(name) else Path(name).resolve()
+        if fresh(path):
+            return path, siblings
+    found = sorted((p for p in root.glob(f"{tid}-*.md") if fresh(p)),
+                   key=lambda p: p.stat().st_mtime)
+    return (found[-1] if found else None), siblings
+
+
+def run_online_review(job: dict) -> None:
+    run = AI_STORE.get(job.get("run_id", "")) or {}
+    if not run:
+        raise ValueError("online-review run record is missing")
+    cfg = portal_settings.load()["ai"]
+    tid, mode = job["task_id"], job.get("mode") or "create"
+
+    def step(label: str, state: str = "running", detail: str = "") -> None:
+        with ALIGN_LOCK:
+            steps = job.setdefault("steps", [])
+            if steps and steps[-1]["state"] == "running":
+                steps[-1]["state"] = "done"
+            if state == "running":
+                steps.append({"key": label, "label": label, "state": state,
+                              "started": wm.stamp(), "errors": [], "detail": detail})
+            elif steps:
+                steps[-1].update(state=state, detail=detail or steps[-1].get("detail", ""))
+            job["current"] = label if state == "running" else None
+
+    def finish(outcome: str, error: str = "") -> None:
+        if error:
+            run.update(status="error", error=error, finished=ai.now_iso())
+        AI_STORE.save(run)
+        step("", "error" if error else "done", error or outcome)
+        with ALIGN_LOCK:
+            job.update(status="error" if error else "done", current=None,
+                       message=error or outcome)
+
+    run.update(status="running", started=ai.now_iso())
+    AI_STORE.save(run)
+    try:
+        task = _task(tid)
+        if task is None:
+            return finish("", f"{tid} no longer exists")
+        reviews = _open_reviews(task)
+        if not reviews:
+            return finish("", f"{tid} has no open PRs left")
+        step("Checking the PRs are not RTL and pinning their heads")
+        prs = []
+        for r in reviews:
+            owner, repo, num = _pr_ident(r["pr_url"])
+            kind, reason, head, base, _ = rtl_pr_guard.classify_pr_details(owner, repo, num)
+            if kind != "software":
+                return finish("", f"online review refused: {r['pr_url']} is {kind} "
+                                  f"({reason}); RTL/unclassified PRs need the VM agent")
+            prs.append({"url": r["pr_url"], "repo": f"{owner}/{repo}", "head": head,
+                        "base": r.get("base") or "", "branch": r.get("branch") or "",
+                        "author": r.get("author") or ""})
+        baseline = _latest_draft(task) if mode == "rereview" else None
+        if baseline and all(baseline["heads"].get(p["url"], "").lower() == p["head"].lower()
+                            for p in prs):
+            run.update(status="done", finished=ai.now_iso(), answer=(
+                f"No PR of {tid} has new commits since the last draft; nothing to re-review."))
+            return finish(f"no new commits since the last review of {tid}; draft unchanged")
+        drafts = tm.review_drafts_root()
+        drafts.mkdir(parents=True, exist_ok=True)
+        skills = Path.home() / ".copilot" / "skills"
+        reads = tuple(str(d) for d in (skills, drafts.parent) if d.is_dir())
+        before = _draft_files(drafts)
+        step(f"AI reviewing {len(prs)} PR(s) as one feature set")
+        argv = ai.build_argv(ai.online_review_prompt(task, prs, str(drafts), mode, baseline),
+                             model=cfg["model"], profile="review-online",
+                             allow_reads=cfg["allow_jira_github_reads"],
+                             write_dir=str(drafts), read_dirs=reads)
+        with ai_cancellable(job) as cancel:
+            result = ai.run_copilot(argv, cwd=str(drafts), timeout=cfg["review_timeout_s"],
+                                    on_line=_ai_progress(job), cancel=cancel)
+        _ai_finish(run, result)
+        if run["error"]:
+            return finish("", run["error"])
+        answer = run.get("answer") or ""
+        report, siblings = _online_report(answer, tid, drafts, before)
+        if report is None:
+            if mode == "rereview" and ai.NO_CHANGE_MARK in answer:
+                return finish(f"no relevant changes since the last review of {tid}; "
+                              "draft unchanged")
+            return finish("", "the AI finished but wrote no report into the drafts directory")
+        step("Registering the draft on the task")
+        draft = tm.attach_review_draft(tid, str(report), {p["url"]: p["head"] for p in prs})
+        on_task = {r.get("pr_url") for r in task.get("reviews") or []}
+        proposed = [u for u in dict.fromkeys(siblings) if u not in on_task]
+        moved = [p["url"] for p in prs if (h := _pr_head(p["url"])) and h.lower() != p["head"].lower()]
+        run.update(drafts=1, draft_id=draft.get("id"), report=report.name,
+                   proposed_prs=proposed, moved_prs=moved)
+        what = "AI online review draft" if mode == "create" else "AI online re-review draft"
+        note = f"{what} done ({report.name}, {len(prs)} PR(s) as one feature set, portal {run['id']})"
+        if proposed:
+            note += ("; related PRs not on this task (DEPENDS_ON/feature siblings) - "
+                     "consider adding them: " + ", ".join(proposed))
+        if moved:
+            note += "; PR head moved during the review, re-review recommended: " + ", ".join(moved)
+        tm_note(tid, note)
+        outcome = f"draft registered on {tid} ({report.name})"
+        if proposed:
+            outcome += f"; {len(proposed)} related PR(s) not on the task proposed in a note"
+        if moved:
+            outcome += f"; {len(moved)} PR(s) moved during the review"
+        finish(outcome)
+    except Exception as error:                                   # noqa: BLE001
+        finish("", str(error))
 
 
 # ---------------------------------------------------------- review chat ----
@@ -3181,7 +3398,9 @@ def live_payload() -> dict:
 ACTION_TITLES = {"pr-scan": "Scan PRs", "review-scan": "Scan reviews", "align": "Align workspace",
                  "pldm": "Submit PLDM test", "vm-refresh": "Refresh machine activity",
                  "ai": "AI", "auto-review": "AI review draft",
-                 "review-chat": "Interactive review"}
+                 "online-review": "AI online review",
+                 "review-chat": "Interactive review",
+                 "vm-cancel": "Cancel machine job"}
 
 
 def action_title(job: dict) -> str:
@@ -3207,7 +3426,8 @@ def notify_action(job: dict) -> None:
             and job.get("op") in {"turn", "preview"}):
         return
     label = action_title(job)
-    kind = "ai" if job.get("kind") in {"ai", "auto-review", "review-chat"} else "queue"
+    kind = "ai" if job.get("kind") in {"ai", "auto-review", "online-review",
+                                       "review-chat"} else "queue"
     text = {"done": "finished", "error": "failed",
             "approval_required": "needs approval"}[status]
     EVENTS.publish(kind, f"{label} {text}", (job.get("message") or "")[:300],
@@ -4001,6 +4221,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                             raise ValueError("task_id must be a task id")
                         if chat_route:
                             result = start_review_chat(tid)
+                        elif payload.get("online") is True:
+                            result = start_online_review(tid, payload.get("mode") or "create")
                         else:
                             result = start_auto_review(tid, payload.get("mode") or "create")
                 except LookupError as e:

@@ -816,17 +816,78 @@ Markdown rendered server-side with raw HTML disabled.
   posts its own sections as context (`kind: brief`), waits for the job and stores the
   text in the brief. A cap/disabled answer is a step warning, never a failed run.
 
+### AI CI triage (PRs section)
+
+A feature whose PRs include `ci-fail` rows shows **✦ Triage CI (n)** in its PR
+toolbar (served, AI enabled; never automatic). `POST /api/ai/ci-triage
+{feature_id:int, force?:bool}` (same-origin) queues one `ai` action of kind
+`ci-triage` that runs the **pr-failure-analyzer** skill on the feature's PRs (failing
+checks, run URLs, siblings) plus recent sightings for those repos.
+
+- **Profile `ci-triage`**: shell and write denied (the RTK hook blocks `gh` in
+  unattended runs, and shell rules cannot narrow `gh run` to `view`); logs, jobs,
+  diffs and checks come from the read-only `github-mcp-server` tools. Custom
+  instructions load so the skill is reachable. Follow-up questions in the drawer
+  keep this profile. Uses the shared daily cap.
+- **Cache**: a run is keyed by the feature's sorted failing run URLs. While one is
+  queued/running, or done for the same key, the POST returns it (`cached: true`);
+  `force` (the **Re-triage** button) runs again. Requires Settings › AI to allow
+  Jira/GitHub reads (400 otherwise); runs get at least 600 s. `GET /api/ai/ci-triages` maps
+  feature id → latest `{run_id, status, verdict, summary, stale}`; `stale` means the
+  failing runs changed since. The toolbar shows a `✦ <verdict>` badge that opens the
+  run in the drawer (dashed when stale).
+- **After a run**: the answer's final `PORTAL-TRIAGE: {json}` line (hidden from the
+  displayed answer) gives the verdict. The portal records one sighting per item
+  through `pfa.record(source="portal")` and adds the PR Monitor feature note
+  `AI CI triage: <verdict> — <summary>` (label `ai-triage`) via `pm.add_note`.
+  A missing line or a failed note/sighting is kept as `note_error` and never fails
+  the run.
+
 ### AI review (draft / re-review / interactive)
 
-An open code-review task with open PRs shows the AI review buttons in its expanded
-detail, and compact versions in the review row (served portal, AI enabled):
+An open code-review task with open PRs shows the AI review buttons **only in its
+expanded detail** (Pull Requests heading; served portal, AI enabled):
 
 - **✦ Create review draft** only while the task has no review draft, and **↻ Re-review**
   only once it has one;
+- **🌐 Online review** (**🌐 Online re-review** once a draft exists);
 - **✦ Interactive review**, which becomes **✦ Resume interactive review** while a chat
   for the task is open.
 
-At most one AI review (queued draft run or open chat) per task.
+The collapsed row carries no buttons, only a non-clickable marker: **✦ AI review open**
+while an interactive chat is open, else **✦ AI review running** while an `auto-review` or
+`online-review` action for the task is queued/running (read from the action queue; rows
+re-render when that set changes).
+
+At most one AI review (queued draft run, online run or open chat) per task.
+
+**Online review** (`POST /api/ai/auto-review {task_id, mode, online: true}`) needs no
+workspace and so runs even while every review workspace is busy. It requires AI enabled
+and Settings > AI "Jira/GitHub reads". At click time a PR whose repo name is RTL
+(`rtl_pr_guard.is_rtl_repo`) is refused. The queued `online-review` action (resource
+`online-review:<task>`):
+
+1. classifies every open PR with `rtl_pr_guard.classify_pr_details` and refuses unless
+   all are `software` (RTL and unknown alike), pinning each verified head SHA;
+2. re-review only: when every PR head equals the latest task draft's reviewed head it
+   finishes "draft unchanged" without running AI;
+3. runs Copilot with the **review-online profile**: `/pr-review` remote mode, shell
+   denied, GitHub MCP + Atlassian reads only, cwd = the drafts directory, which is the
+   only writable place (`write(<drafts>/**)`; the cwd is implicitly writable, so it must
+   be the drafts dir). `--add-dir` opens `~/.copilot/skills` and the private pr-review
+   directory (memoir) read-only. The prompt reviews all PRs as **one feature set**:
+   DEPENDS_ON graph and merge order, cross-PR API/consumer and Kconfig/DTS/CMake
+   consistency, then each PR; one report `T-NNN-<slug>-<stamp>.md` with a Feature
+   overview section first. Timeout `review_timeout_s`; daily cap applies;
+4. the AI ends with `PORTAL-REVIEW: {"report", "siblings"}` (hidden from displayed
+   answers). The **portal** registers the report via `tm.attach_review_draft` with the
+   pinned heads — only a `T-NNN-*.md` file directly in the drafts directory that was
+   created or rewritten during this run (snapshot comparison; falls back to the newest
+   such file); a re-review answering `PORTAL-RESULT: no-change` registers nothing;
+5. adds a task note naming the report; sibling PRs the AI found that are not on the task
+   are **proposed** in that note and kept as `proposed_prs` on the run (task-manager has
+   no add-PR-to-task API, so nothing is added); PRs whose head moved during the review are
+   flagged (`moved_prs`) with a re-review recommendation. Nothing is ever posted.
 
 **Draft runs** (`POST /api/ai/auto-review {task_id, mode: create|rereview}`) queue an
 `auto-review` action (title "AI review draft"):

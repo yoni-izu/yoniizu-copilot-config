@@ -1444,6 +1444,9 @@ tr.kb-cur > td:first-child { box-shadow:inset 2px 0 0 var(--accent), inset 0 1px
 .ai-rv-group .ai-rv { font-size:.8rem; }
 .ai-rv-row { display:inline-flex; gap:4px; margin-left:8px; vertical-align:middle; }
 .ai-rv-row .ai-rv { font-size:.72rem; padding:var(--ctl-pad-sm); }
+.ai-rv-mark { display:inline-block; margin-left:8px; padding:1px 7px; border-radius:999px; font-size:.72rem;
+  vertical-align:middle; border:1px solid var(--border); color:var(--muted); white-space:nowrap; }
+.ai-rv-mark.running { border-style:dashed; color:var(--accent); border-color:var(--accent); }
 /* Interactive review / detached AI panel. */
 .rc-drawer { width:min(640px,100vw); }
 .rc-panel { display:flex; flex-direction:column; gap:10px; min-height:0; }

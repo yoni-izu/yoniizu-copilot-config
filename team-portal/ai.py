@@ -430,6 +430,68 @@ def review_prompt(task: dict, slot_dir: str, revision: str, mode: str = "create"
             "the report path and, per PR, its verdict suggestion and number of findings.")
 
 
+def online_review_prompt(task: dict, prs: list[dict], drafts_dir: str,
+                         mode: str = "create", baseline: dict | None = None) -> str:
+    """Remote-mode /pr-review of every PR of ``task`` as ONE feature set.
+
+    ``prs`` carries the portal-verified head per PR; ``baseline`` is the
+    latest registered draft ({"file", "heads": {url: sha}}) for a re-review.
+    """
+    if mode not in REVIEW_MODES:
+        raise ValueError("unknown review mode")
+    lines = "\n".join(
+        f"- {p['url']} ({p.get('repo', '')}, base {p.get('base') or '?'}, branch "
+        f"{p.get('branch') or '?'}, author {p.get('author') or '?'}) head {p['head']}"
+        for p in prs)
+    head = "/pr-review" + (" re-review" if mode == "rereview" else "") + " draft-only"
+    rereview = ""
+    if mode == "rereview":
+        base = (baseline or {}).get("heads") or {}
+        rereview = (
+            "This is a RE-REVIEW. Previous draft: "
+            f"{(baseline or {}).get('file') or '(see the task notes)'} in {drafts_dir}. "
+            "Previously reviewed heads:\n" +
+            "\n".join(f"- {u} {s}" for u, s in base.items()) +
+            "\nFollow the pr-review re-review flow: compare each PR from its reviewed "
+            "head to the head above (list_commits / get_commit), triage only what "
+            "changed, and carry still-open findings forward. If no PR changed, write "
+            f"nothing and end with the exact line `{NO_CHANGE_MARK}`.\n")
+    return (
+        f"{head}\n\n"
+        f"Unattended portal ONLINE review of task {task['id']} ({task.get('title', '')}). "
+        "Use pr-review REMOTE mode: there is no workspace and no shell. Read everything "
+        "through the read-only github-mcp-server tools - pull_request_read (get, "
+        "get_diff, get_files, get_review_comments, get_reviews, get_status), "
+        "get_file_contents (pass the PR head SHA as ref for context beyond the hunks), "
+        "list_commits, get_commit, search_code. Where the skill says `gh ...`, use "
+        "these tools instead.\n"
+        f"The PRs (the portal verified none is RTL; if you still meet RTL/HDL "
+        "content, stop and report it without quoting it):\n" + lines + "\n\n" +
+        rereview +
+        "Review them as ONE FEATURE SET, not as unrelated PRs:\n"
+        "1. Read every PR body for DEPENDS_ON / related-PR lines and build the "
+        "dependency graph and merge order.\n"
+        "2. Check cross-PR consistency: every API/header/struct/enum change against "
+        "its consumers in the sibling PRs (and in the base branch via "
+        "get_file_contents); Kconfig/DTS/CMake/manifest wiring; matching symbol "
+        "names; nothing left half-migrated; a consistent merge order.\n"
+        "3. Then the usual per-PR review (prior comments disposition, findings with "
+        "file:line anchors, severity, phrasing per the skill).\n"
+        "Write ONE Markdown report into the current directory "
+        f"({drafts_dir}) named {task['id']}-<slug>-<YYYYMMDD-HHMM>.md: a "
+        "'Feature overview' section first (scope, dependency graph and merge order, "
+        "cross-PR findings, overall verdict suggestion), then one section per PR "
+        "(prior comments table, findings, verdict suggestion), then 'Dropped / "
+        "considered'. Do not write anywhere else and do not run tm.py: the portal "
+        "registers the report on the task. Never post, comment, approve, request "
+        "changes or push.\n"
+        "Finish with a short summary (report file name; per PR its verdict suggestion "
+        "and number of findings; the feature-level verdict), then as the very last "
+        "line, exactly one machine-readable line:\n"
+        f'{REVIEW_MARK} {{"report": "<file name>", "siblings": ["<PR URLs named in '
+        'DEPENDS_ON or clearly part of the feature but NOT in the list above>"]}')
+
+
 CHAT_RULES = (
     "Portal interactive-review rules: the user talks to you through a web chat, one "
     "message per turn, so finish every answer with a clear question or next step. "

@@ -1408,6 +1408,30 @@ test("open code-review tasks offer draft / re-review / interactive AI review by 
   assert.doesNotMatch(draftHarness().detailRow({...task,status:"done"},8),/data-ai-review/);
 });
 
+test("AI review buttons live only in the expanded view; the row shows a state marker", () => {
+  const task={id:"T-009",category:"code-review",status:"in-progress",reviews:[
+    {repo:"one",pr_number:1,pr_url:"https://github.com/example/one/pull/1"}]};
+  const served=draftHarness();
+  vm.runInContext(block("function cellFor(", "function selOpts("), served);
+  const title=served.cellFor(task,"title");
+  assert.doesNotMatch(title,/data-ai-review/);
+  assert.doesNotMatch(title,/ai-rv-mark/);
+  const fresh=served.detailRow(task,8);
+  assert.match(fresh,/data-ai-review="online"[^>]*>🌐 Online review</);
+  const drafted=served.detailRow({...task,review_drafts:[{id:"d",file:"x.md",heads:[]}]},8);
+  assert.match(drafted,/data-ai-review="online"[^>]*>🌐 Online re-review</);
+  served.ACTION_UI.jobs=[{kind:"online-review",task_id:"T-009",status:"running"},
+    {kind:"auto-review",task_id:"T-010",status:"done"}];
+  assert.match(served.cellFor(task,"title"),/class="ai-rv-mark running"[^>]*>✦ AI review running</);
+  assert.doesNotMatch(served.cellFor({...task,id:"T-010"},"title"),/ai-rv-mark/);
+  vm.runInContext('REVIEW_CHATS={"T-009":{id:"rc-1"}}',served);
+  const open=served.cellFor(task,"title");
+  assert.match(open,/✦ AI review open/);
+  assert.doesNotMatch(open,/<button[^>]*data-ai-review/);
+  served.AI_USAGE={enabled:false};
+  assert.doesNotMatch(served.cellFor(task,"title"),/ai-rv-mark/);
+});
+
 test("morning brief shows the AI paragraph escaped, above the sections", () => {
   const context=vm.createContext({Date});
   vm.runInContext(block("// --- morning brief (pure renderer", "// --- end morning brief ---"), context);

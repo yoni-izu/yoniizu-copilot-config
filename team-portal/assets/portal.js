@@ -859,7 +859,7 @@ function cellFor(t,key){
     case "id": return `<td class="id">${esc(t.id)}</td>`;
     case "title": return `<td class="title-cell"><div class="title-line">`+
       `<button class="task-toggle" aria-expanded="false" title="Expand task details">\u25b8</button>`+
-      `<span class="title-text">${esc(t.title)}</span>${aiReviewButtons(t,true)}</div></td>`;
+      `<span class="title-text">${esc(t.title)}</span>${aiReviewMarker(t)}</div></td>`;
     case "category": return `<td><span class="cat">${esc(t.category)}</span></td>`;
     case "priority": return `<td><span class="badge p-${esc(t.priority)}">${esc(t.priority)}</span></td>`;
     case "status": return `<td><span class="badge s-${esc(t.status)}">${esc(t.status)}</span></td>`;
@@ -1004,6 +1004,18 @@ function taskHasOpenReview(t){
 }
 
 let REVIEW_CHATS={};
+// Task ids with an AI review draft job (workspace or online) queued/running.
+function runningReviewTasks(){
+  return new Set((ACTION_UI.jobs||[]).filter(j=>["auto-review","online-review"].includes(j.kind)
+    &&["queued","running"].includes(j.status)&&j.task_id).map(j=>j.task_id));
+}
+// Collapsed rows only show state; the buttons live in the expanded view.
+function aiReviewMarker(t){
+  if(!SERVED||AI_USAGE.enabled===false) return "";
+  if(REVIEW_CHATS[t.id]) return ` <span class="ai-rv-mark" title="An interactive AI review is open - expand the task to resume it">✦ AI review open</span>`;
+  if(runningReviewTasks().has(t.id)) return ` <span class="ai-rv-mark running" title="An AI review draft is being written - see Actions">✦ AI review running</span>`;
+  return "";
+}
 function taskHasDraft(t){
   return (t.review_drafts||[]).length>0||prs(t).some(r=>(r.drafts||[]).length>0);
 }
@@ -1016,6 +1028,7 @@ function aiReviewButtons(t,compact){
     :[taskHasDraft(t)
         ?b("rereview","↻ Re-review","↻ Re-review","A draft exists: AI follows the pr-review re-review flow (only what changed since the reviewed head) in a matching review workspace, registers the new draft and releases the workspace. Nothing is posted.")
         :b("create","✦ Create review draft","✦ Draft","Occupy a free review workspace matching the PRs' manifest, let AI write a draft with /pr-review local, register it and release the workspace. Nothing is posted."),
+      b("online",taskHasDraft(t)?"🌐 Online re-review":"🌐 Online review","🌐 Online","No workspace: AI reads the PRs from GitHub (pr-review remote mode) and reviews them as ONE feature set - DEPENDS_ON graph, cross-PR consistency, then each PR. Writes and registers one draft"+(taskHasDraft(t)?" (re-review of what changed since the last draft)":"")+". Nothing is posted; RTL PRs are refused."),
       b("interactive","✦ Interactive review","✦ Interactive","Check the PRs out in a review workspace and review them together with AI in a chat panel: walk the findings, discuss the code, reach verdicts, then submit after a confirmed preview.")];
   return compact?`<span class="ai-rv-row">${list.join("")}</span>`:` <span class="ai-rv-group">${list.join("")}</span>`;
 }
@@ -5493,20 +5506,29 @@ function rcOpen(chatId){
 }
 async function aiReviewAction(mode,tid,btn){
   if(mode==="resume"){ rcOpen(btn.dataset.chat); return; }
+  const task=(typeof TASKS!=="undefined"?TASKS:[]).find(x=>x.id===tid);
+  const hasDraft=!!(task&&taskHasDraft(task));
   const text={
     create:`Create an AI review draft for ${tid}?\n\nThe portal picks a free review workspace whose deployed manifest (project, revision) matches the PRs, aligns it to the PR branches, runs /pr-review local (draft only - nothing is posted), registers the draft on the task and releases the workspace.`,
     rereview:`Re-review ${tid} with AI?\n\nSame workspace handling as a draft; the AI follows the pr-review re-review flow (only what changed since the reviewed head, still-open findings carried forward) and registers a new draft. If nothing changed, the draft stays as is. Nothing is posted.`,
+    online:`${hasDraft?"Online re-review":"Online review"} of ${tid}?\n\nNo workspace is used: the AI reads the PRs from GitHub (read-only) and reviews them as one feature set - the DEPENDS_ON graph and cross-PR consistency first, then each PR${hasDraft?", only what changed since the last draft":""}. It writes one report, which the portal registers on the task. Related PRs missing from the task are proposed in a task note. RTL PRs are refused. Nothing is posted.`,
     interactive:`Start an interactive review of ${tid}?\n\nThe portal occupies a matching review workspace and checks the PRs out, then the AI runs /pr-review local with you in a chat panel. The workspace stays occupied until you end the review (or after 24 h without messages).`}[mode];
   if(!text||!confirm(text)) return;
   btn.disabled=true;
   try{
     const url=mode==="interactive"?"/api/ai/review-chat":"/api/ai/auto-review";
     const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(mode==="interactive"?{task_id:tid}:{task_id:tid,mode})});
+      body:JSON.stringify(mode==="interactive"?{task_id:tid}
+        :mode==="online"?{task_id:tid,mode:hasDraft?"rereview":"create",online:true}
+        :{task_id:tid,mode})});
     const j=await r.json();
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
     if(mode==="interactive"){
       await rcLoadOpen(); rcOpen(j.chat_id);
+    }else if(mode==="online"){
+      notifyCard({title:`Online ${hasDraft?"re-review":"review"} ${tid} queued`,body:"No workspace needed. You'll be notified when the draft is registered.",tone:"ok"});
+      if(typeof pollAlign==="function") pollAlign(j.job);
+      if(typeof refreshActionQueue==="function") refreshActionQueue();
     }else{
       notifyCard({title:`${mode==="create"?"Review draft":"Re-review"} ${tid} queued`,body:`Workspace ${j.workspace} (${j.manifest||""}). You'll be notified when it is done.`,tone:"ok"});
       if(typeof pollAlign==="function") pollAlign(j.job);

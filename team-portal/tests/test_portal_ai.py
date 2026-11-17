@@ -830,3 +830,194 @@ class CiTriageRouteTests(CiTriageTests, RouteTests):
     test_private_runs_are_gated = None
 
 
+URL2 = "https://github.com/example/other/pull/2"
+SIB = "https://github.com/example/third/pull/7"
+HEAD1, HEAD2 = "1" * 40, "2" * 40
+
+
+class OnlineReviewTests(ReviewBase):
+    def setUp(self):
+        super().setUp()
+        self.cfg["allow_jira_github_reads"] = True
+        self.drafts = self.root / "private" / "skills" / "pr-review" / "drafts"
+        with portal.tm.task_store.transaction() as data:
+            data["tasks"][0]["reviews"].append({"pr_url": URL2, "repo": "other", "pr_number": 2})
+        self.kinds = {}
+        self.heads = {1: HEAD1, 2: HEAD2}
+        self.now_heads = {}
+        self.notes = []
+        for target, name, value in (
+            (portal.tm, "review_drafts_root", lambda: self.drafts),
+            (portal.rtl_pr_guard, "classify_pr_details",
+             lambda o, r, n: (self.kinds.get(n, "software"), "why", self.heads[n], "b" * 40, [])),
+            (portal, "_pr_head", lambda url: self.now_heads.get(url, "")),
+            (portal.ai, "copilot_bin", lambda: "copilot"),
+        ):
+            p = patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_online(self, writer=None, answer=None, mode="create", result_error=""):
+        portal.start_online_review("T-001", mode)
+        job = dict(self.queued[-1], status="running")
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(argv=argv, **kw)
+            name = writer(Path(kw["cwd"])) if writer else None
+            text = answer if answer is not None else (
+                "summary\nPORTAL-REVIEW: " + json.dumps({"report": name, "siblings": [SIB, URL]}))
+            return {"answer": text, "error": result_error}
+        with patch.object(portal.ai, "run_copilot", fake_run):
+            portal.run_online_review(job)
+        return job, self.store.get(job["run_id"]), seen
+
+    @staticmethod
+    def write_report(cwd: Path, name="T-001-feature-20250101-1200.md"):
+        (cwd / name).write_text("# Feature overview\n")
+        return name
+
+    def task(self):
+        return portal._task("T-001")
+
+    def test_start_validates_and_needs_no_workspace(self):
+        with patch.object(portal.wm, "is_free", lambda slot: False):
+            out = portal.start_online_review("T-001")
+        job = self.queued[-1]
+        self.assertEqual((job["kind"], out["online"]), ("online-review", True))
+        self.assertNotIn("ws_slot", job)
+        self.assertEqual(portal.action_resources(job), {"online-review:T-001"})
+        portal.ALIGN_JOBS["j1"] = dict(job, status="running")
+        with self.assertRaisesRegex(ValueError, "already queued"):
+            portal.start_online_review("T-001")
+        with self.assertRaisesRegex(ValueError, "already queued"):
+            portal.start_auto_review("T-001")
+
+    def test_start_refusals(self):
+        with self.assertRaisesRegex(ValueError, "no review draft yet"):
+            portal.start_online_review("T-001", "rereview")
+        self.cfg["allow_jira_github_reads"] = False
+        with self.assertRaisesRegex(ValueError, "Jira/GitHub reads"):
+            portal.start_online_review("T-001")
+        self.cfg["allow_jira_github_reads"] = True
+        with portal.tm.task_store.transaction() as data:
+            data["tasks"][0]["reviews"].append(
+                {"pr_url": "https://github.com/o/ip.d2d.hw.rtl/pull/3", "repo": "ip.d2d.hw.rtl"})
+        with self.assertRaisesRegex(ValueError, "RTL repository"):
+            portal.start_online_review("T-001")
+        self.assertEqual(self.queued, [])
+
+    def test_feature_set_run_registers_one_draft_and_proposes_siblings(self):
+        job, run, seen = self.run_online(self.write_report)
+        self.assertEqual(job["status"], "done", job["message"])
+        argv = seen["argv"]
+        self.assertEqual(seen["cwd"], str(self.drafts))
+        self.assertEqual(seen["timeout"], self.cfg["review_timeout_s"])
+        self.assertIn(f"write({self.drafts}/**)", argv)
+        self.assertEqual(argv[argv.index("--deny-tool")+1:argv.index("--deny-tool")+2], ["shell"])
+        self.assertNotIn("write", [argv[i + 1] for i, a in enumerate(argv) if a == "--allow-tool"])
+        self.assertIn("--add-dir", argv)
+        prompt = argv[argv.index("-p") + 1]
+        for text in (URL, URL2, HEAD1, HEAD2, "ONE FEATURE SET", "DEPENDS_ON", "REMOTE mode"):
+            self.assertIn(text, prompt)
+        drafts = self.task()["review_drafts"]
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual({h["pr_url"]: h["head_sha"] for h in drafts[0]["heads"]},
+                         {URL: HEAD1, URL2: HEAD2})
+        self.assertEqual(run["proposed_prs"], [SIB])
+        note = self.task()["notes"][-1]["text"] if isinstance(self.task()["notes"][-1], dict) \
+            else str(self.task()["notes"][-1])
+        self.assertIn(SIB, note)
+        self.assertIn("1 related PR", job["message"])
+        public = portal.ai_public(run)
+        self.assertNotIn("PORTAL-REVIEW", public["answer"])
+
+    def test_report_outside_drafts_or_stale_is_not_registered(self):
+        outside = self.root / "T-001-x.md"
+        outside.write_text("x")
+        job, run, _ = self.run_online(
+            answer="PORTAL-REVIEW: " + json.dumps({"report": str(outside)}))
+        self.assertEqual(job["status"], "error")
+        self.assertIn("wrote no report", job["message"])
+        self.assertFalse(self.task().get("review_drafts"))
+
+    def test_foreign_task_prefix_is_ignored_and_fallback_finds_report(self):
+        def two(cwd):
+            self.write_report(cwd, "T-999-other.md")
+            return self.write_report(cwd)
+        job, _, _ = self.run_online(two, answer="no machine line")
+        self.assertEqual(job["status"], "done", job["message"])
+        self.assertTrue(self.task()["review_drafts"][0]["file"].startswith("T-001-feature"))
+
+    def test_rtl_classification_refuses_before_ai(self):
+        self.kinds[2] = "unknown"
+        called = []
+        job, run, seen = self.run_online(lambda cwd: called.append(1))
+        self.assertEqual(job["status"], "error")
+        self.assertIn("refused", job["message"])
+        self.assertEqual((called, seen), ([], {}))
+
+    def test_rereview_short_circuits_when_no_head_moved(self):
+        self.drafts.mkdir(parents=True)
+        (self.drafts / "T-001-old.md").write_text("old")
+        portal.tm.attach_review_draft("T-001", str(self.drafts / "T-001-old.md"),
+                                      {URL: HEAD1, URL2: HEAD2})
+        job, run, seen = self.run_online(self.write_report, mode="rereview")
+        self.assertEqual(seen, {})
+        self.assertIn("draft unchanged", job["message"])
+        self.heads[2] = "3" * 40
+        job, run, seen = self.run_online(self.write_report, mode="rereview")
+        prompt = seen["argv"][seen["argv"].index("-p") + 1]
+        self.assertIn("RE-REVIEW", prompt)
+        self.assertIn("T-001-old.md", prompt)
+        self.assertEqual(job["status"], "done", job["message"])
+        self.assertEqual(len(self.task()["review_drafts"]), 2)
+
+    def test_rereview_no_change_mark_and_moved_head(self):
+        self.drafts.mkdir(parents=True)
+        (self.drafts / "T-001-old.md").write_text("old")
+        portal.tm.attach_review_draft("T-001", str(self.drafts / "T-001-old.md"), {URL: "0" * 40})
+        job, _, _ = self.run_online(answer=f"nothing\n{ai.NO_CHANGE_MARK}", mode="rereview")
+        self.assertEqual(job["status"], "done")
+        self.assertIn("draft unchanged", job["message"])
+        self.now_heads[URL] = "f" * 40
+        job, run, _ = self.run_online(self.write_report, mode="rereview")
+        self.assertEqual(run["moved_prs"], [URL])
+        self.assertIn("moved during the review", job["message"])
+
+    def test_ai_error_fails_the_job(self):
+        job, run, _ = self.run_online(result_error="timed out")
+        self.assertEqual((job["status"], run["status"]), ("error", "error"))
+
+
+class OnlineReviewRouteTests(OnlineReviewTests, RouteTests):
+    post = CiTriageRouteTests.post
+    test_private_runs_are_gated = None
+
+    def test_route_dispatches_online_flag(self):
+        status, body = self.post("/api/ai/auto-review", {"task_id": "T-001", "online": True})
+        self.assertEqual(status, 200, body)
+        self.assertEqual((self.queued[-1]["kind"], body["online"]), ("online-review", True))
+        status, body = self.post("/api/ai/auto-review",
+                                 {"task_id": "T-001", "online": True, "mode": "rereview"})
+        self.assertEqual(status, 400)
+
+
+class OnlineArgvTests(unittest.TestCase):
+    def test_github_read_tools_are_enabled_only_with_reads(self):
+        argv = ai.build_argv("p", model="m", profile="review-online", allow_reads=True, binary="c")
+        added = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-github-mcp-tool"]
+        self.assertIn("pull_request_read", added)
+        self.assertIn("get_job_logs", added)
+        self.assertFalse(any("write" in t or "create" in t or "comment" in t for t in added))
+        argv = ai.build_argv("p", model="m", profile="review-online", allow_reads=False, binary="c")
+        self.assertNotIn("--add-github-mcp-tool", argv)
+
+    def test_bad_directories_are_rejected(self):
+        for bad in ("relative/dir", "/a/../b", "/a;rm"):
+            with self.assertRaises(ai.AIError):
+                ai.build_argv("p", model="m", profile="review-online", allow_reads=True,
+                              binary="c", write_dir=bad)
+        with self.assertRaises(ai.AIError):
+            ai.build_argv("p", model="m", profile="review-online", allow_reads=True,
+                          binary="c", read_dirs=("rel",))
