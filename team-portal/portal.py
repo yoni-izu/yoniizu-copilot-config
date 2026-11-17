@@ -1070,6 +1070,8 @@ def apply_workspace_edit(slot: str, payload: dict, *, validated: bool = False) -
 # reported, never reset.
 
 import threading as _threading  # noqa: E402
+import contextlib as _contextlib  # noqa: E402
+import copy as _copy  # noqa: E402
 
 ALIGN_JOBS: dict[str, dict] = {}
 ALIGN_LOCK = _threading.Lock()
@@ -1080,6 +1082,70 @@ def enqueue_action(job: dict) -> str:
     if ACTION_QUEUE is None:
         raise RuntimeError("Portal action queue is not available")
     return ACTION_QUEUE.enqueue(job)
+
+
+# Running actions that can be stopped safely: job id -> cancel event. Only
+# pure-AI work registers (its copilot process is killed); workspace, PR, PLDM
+# and auto-review runs are never interrupted mid-flight.
+AI_CANCEL: dict[str, _threading.Event] = {}
+AI_CANCEL_LOCK = _threading.Lock()
+
+
+@_contextlib.contextmanager
+def ai_cancellable(job: dict):
+    """Make ``job`` interruptible while the block runs; yields its cancel event."""
+    event = _threading.Event()
+    ident = job.get("id")
+    if ident:
+        with AI_CANCEL_LOCK:
+            AI_CANCEL[ident] = event
+    try:
+        yield event
+    finally:
+        if ident:
+            with AI_CANCEL_LOCK:
+                if AI_CANCEL.get(ident) is event:
+                    AI_CANCEL.pop(ident, None)
+
+
+def interrupt_action(job: dict) -> bool:
+    """ActionQueue hook: signal a running action to stop, if it is interruptible."""
+    with AI_CANCEL_LOCK:
+        event = AI_CANCEL.get(job.get("id") or "")
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def cancel_action(ident: str) -> dict:
+    """Cancel a queued/approval/running action and settle its owner records."""
+    if ACTION_QUEUE is None:
+        raise RuntimeError("Portal action queue is not available")
+    outcome = ACTION_QUEUE.cancel(ident)
+    with ALIGN_LOCK:
+        job = _copy.deepcopy(ALIGN_JOBS.get(ident) or {})
+    if outcome == "cancelled":
+        _settle_cancelled(job)
+    job.pop("request", None)
+    return {"status": outcome, "job": job}
+
+
+def _settle_cancelled(job: dict) -> None:
+    """A job cancelled before it ran: close the owner records it was holding open."""
+    kind = job.get("kind")
+    if kind in {"ai", "auto-review", "online-review", "review-chat"} and job.get("run_id"):
+        run = AI_STORE.get(job["run_id"])
+        if run and run.get("status") in {"queued", "running"}:
+            again = "; send the message again" if kind == "review-chat" else ""
+            run.update(status="error", error="cancelled before it started" + again,
+                       finished=ai.now_iso())
+            AI_STORE.save(run)
+    if kind == "review-chat" and job.get("op") == "open":
+        chat = AI_STORE.get_chat(job.get("chat_id") or "")
+        if chat and chat.get("status") == "starting":
+            _chat_update(chat["id"], status=CHAT_INTERRUPTED,
+                         interrupted="start cancelled before it ran")
 
 
 def action_resources(job: dict) -> set[str]:
@@ -1093,6 +1159,8 @@ def action_resources(job: dict) -> set[str]:
     if kind == "vm-refresh":
         # The delegation owner and VM_REFRESH_LOCK still serialize fleet probes.
         return {"domain:delegation", "vm:*"}
+    if kind == "vm-cancel":
+        return {"domain:delegation", "vm:" + job["target"]}
     if kind == "ai":
         return {"ai:" + job["run_id"]}
     if kind == "auto-review":
@@ -2495,7 +2563,7 @@ def _wait_action(job_id: str, timeout: int = AUTO_REVIEW_WAIT) -> dict:
     while time.monotonic() < end:
         with ALIGN_LOCK:
             sub = dict(ALIGN_JOBS.get(job_id) or {})
-        if sub.get("status") in {"done", "error", "approval_required"}:
+        if sub.get("status") in {"done", "error", "cancelled", "approval_required"}:
             return sub
         time.sleep(2)
     raise TimeoutError(f"action {job_id} did not finish in {timeout}s")
@@ -2846,8 +2914,12 @@ def run_review_chat_job(job: dict) -> None:
         progress("AI is working")
         argv = ai.build_argv(prompt, model=cfg["model"], profile=profile,
                              allow_reads=cfg["allow_jira_github_reads"], resume=resume)
-        result = ai.run_copilot(argv, cwd=chat["ws_path"], timeout=cfg["review_timeout_s"],
-                                on_line=_ai_progress(job))
+        # Opening, chatting and previewing only talk to the model; a submit
+        # posts to GitHub and must not be cut off half-way.
+        with (ai_cancellable(job) if op != "submit"
+              else _contextlib.nullcontext(None)) as cancel:
+            result = ai.run_copilot(argv, cwd=chat["ws_path"], timeout=cfg["review_timeout_s"],
+                                    on_line=_ai_progress(job), cancel=cancel)
         _ai_finish(run, result)
     except Exception as error:                                   # noqa: BLE001
         run.update(status="error", error=str(error), finished=ai.now_iso())
@@ -2963,6 +3035,8 @@ def notify_action(job: dict) -> None:
     status = job.get("status")
     if status not in {"done", "error", "approval_required"}:
         return
+    if job.get("cancel_requested") and status == "error":
+        return  # the user stopped it; the queue records it as cancelled
     if status == "done" and job.get("kind") == "vm-refresh":
         return
     # Chat replies show up in the open panel; only failures pop up.
@@ -2985,6 +3059,34 @@ def execute_and_notify(job: dict, store_lock=None) -> None:
         notify_action({**job, "status": "error", "message": str(error)})
         raise
     notify_action(job)
+
+
+def start_vm_cancel_job(job_id: str) -> str:
+    """Queue stopping one running delegated machine job (through vm-delegate)."""
+    rows = {j.get("id"): j for j in vd.jobs()}
+    rec = rows.get(job_id)
+    if rec is None:
+        raise LookupError("unknown machine job")
+    if rec.get("status") != "running":
+        raise ValueError(f"machine job is not running (status: {rec.get('status')})")
+    target = rec.get("target") or "vm"
+    what = f"{rec.get('kind') or 'job'} {rec.get('ws_label') or rec.get('tag') or ''}".strip()
+    slot = f"Cancel {what} \u00b7 {target}"
+    return enqueue_action({"kind": "vm-cancel", "slot": slot, "title": slot,
+                           "vm_job": job_id, "target": target,
+                           "current": None, "total": 1, "message": "", "repos": []})
+
+
+def run_vm_cancel(job: dict) -> None:
+    """Stop a running delegated job via vd.portal_cancel (mctl cancel + re-probe)."""
+    with ALIGN_LOCK:
+        job["current"] = f"stopping job on {job['target']}"
+    res = vd.portal_cancel(job["vm_job"])
+    result = {k: res.get(k) for k in ("cancel", "acted", "error") if res.get(k)}
+    with ALIGN_LOCK:
+        job.update(current=None, result=result,
+                   status="error" if res.get("error") else "done",
+                   message=res.get("error") or res.get("acted") or "cancel requested")
 
 
 def start_vm_refresh_job(target: str | None = None) -> str:
@@ -3139,12 +3241,29 @@ def start_workspace_job(action: str, slot: str | None = None,
         elif approval_job is not None:
             raise ValueError("workspace approval requires force=true")
         payload = {"action": action, "force": force, "approved": approved}
-    return enqueue_action({
+    job_id = enqueue_action({
         "kind": "workspace-action", "action": action,
         "slot": slots[0] if slot else f"{scope} workspaces", "current": None,
         "total": len(slots), "message": "", "repos": [], "steps": [],
         "request": {"slots": slots, "payload": payload or {}},
     })
+    if slot and action in {"free", "sync"}:
+        with ALIGN_LOCK:
+            pending = [ident for ident, other in ALIGN_JOBS.items()
+                       if ident != job_id and other.get("kind") == "workspace-action"
+                       and other.get("action") == action and other.get("slot") == slots[0]
+                       and other.get("status") == "approval_required"]
+        for ident in pending:
+            message = (f"Confirmation used by {job_id}" if ident == approval_job
+                       else f"Superseded by {job_id}")
+            if ACTION_QUEUE is not None:
+                ACTION_QUEUE.settle(ident, message)
+            else:
+                with ALIGN_LOCK:
+                    if ALIGN_JOBS[ident].get("status") == "approval_required":
+                        ALIGN_JOBS[ident].update(status="done", message=message,
+                                                 approval=None, current=None)
+    return job_id
 
 
 def run_workspace_job(job: dict, store_lock=None) -> None:
@@ -3657,9 +3776,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "align_job": jid}))
 
-            # Daily maintenance: drop finished ("done") queue history older than
-            # the retention window. Pending, running, failed and approval
-            # results are kept. Same-origin only; no browser control calls it.
+            # Cancel one queued action, pending approval or interruptible
+            # (pure-AI) running action. Same-origin only.
+            cancel_route = re.fullmatch(r"/api/actions/(action-[0-9a-f]{32})/cancel", self.path)
+            if cancel_route:
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                try:
+                    result = cancel_action(cancel_route.group(1))
+                except LookupError:
+                    return self._send(404, json.dumps({"error": "unknown action"}))
+                except ValueError as e:
+                    return self._send(409, json.dumps({"error": str(e)}))
+                except RuntimeError as e:
+                    return self._send(503, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, **result}, ensure_ascii=False))
+
+            # Daily maintenance: drop finished ("done"/"cancelled") queue history
+            # older than the retention window. Pending, running, failed and
+            # approval results are kept. Same-origin only; no browser control calls it.
             if self.path == "/api/maintenance/queue-retention":
                 origin = self.headers.get("Origin")
                 if origin and origin != f"http://{self.headers.get('Host')}":
@@ -3827,6 +3963,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 try:
                     jid = start_vm_refresh_job(only)
                 except Exception as e:
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, "job": jid}))
+
+            # Stop one running delegated machine job. Queued so it serialises with
+            # probes of that target; vm-delegate's mctl cancel re-checks the pid
+            # on the machine, so a job that ended meanwhile is never hit.
+            if self.path == "/api/vm-cancel":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                ident = payload.get("id")
+                if set(payload) != {"id"} or not isinstance(ident, str) or not ident:
+                    return self._send(400, json.dumps({"error": "id of a machine job is required"}))
+                try:
+                    jid = start_vm_cancel_job(ident)
+                except LookupError as e:
+                    return self._send(404, json.dumps({"error": str(e)}))
+                except ValueError as e:
+                    return self._send(409, json.dumps({"error": str(e)}))
+                except Exception as e:                       # noqa: BLE001
                     return self._send(500, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"ok": True, "job": jid}))
 
@@ -4084,7 +4242,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     ACTION_QUEUE = ActionQueue(
         STATE_DIR / "action-queue.db",
         lambda job: execute_and_notify(job, lock), ALIGN_JOBS, ALIGN_LOCK,
-        resources=action_resources, max_workers=4)
+        resources=action_resources, interrupt=interrupt_action, max_workers=4)
     ACTION_QUEUE.start()
     PID_FILE.write_text(str(os.getpid()))
 

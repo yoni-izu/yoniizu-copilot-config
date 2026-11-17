@@ -95,7 +95,7 @@ portal's HTTP API so the action queue, scan locks and owner validation apply.
 | bugs | `POST /api/bug-scan` (Jira read) |
 | workspaces | `POST /api/ws-refresh` (local, read-only status) |
 | team | Per-member `activity-scan`, then activity summary over the configured window (default 24 h) |
-| housekeeping | Portal DB snapshots to `state/backups/daily/YYYY-MM-DD/` (keep N, default 14; other backups untouched), `POST /api/maintenance/queue-retention {"days":N}` (default 90; deletes only `done` actions), journal `VACUUM`, static export |
+| housekeeping | Portal DB snapshots to `state/backups/daily/YYYY-MM-DD/` (keep N, default 14; other backups untouched), `POST /api/maintenance/queue-retention {"days":N}` (default 90; deletes only `done` and `cancelled` actions), journal `VACUUM`, static export |
 | selftest | Portal Python and JS test suites |
 
 Steps are isolated; the run writes `state/morning-brief.json` (Overview
@@ -138,6 +138,12 @@ Tests use temporary queue databases and mock all owner/external operations:
 rtk proxy python3 -m unittest discover \
   -s ~/.copilot/team-portal/tests -p 'test_action_queue.py'
 ```
+
+Cancelling (**Actions** → select → **Cancel**/**Stop**) is the supported way
+to drop queued work; never delete queue rows. Only AI copilot calls can be
+stopped while running; for anything else wait for completion, then undo through
+the owner. A cancelled machine job (`mctl cancel`) may leave docker containers
+on the target; inspect with the vm-delegate skill before re-dispatching.
 
 An `approval_required` workspace return is a completed preflight, not a
 successful free. Reopen it from **Actions** to review and confirm; it does not

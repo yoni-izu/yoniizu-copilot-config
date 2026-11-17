@@ -267,7 +267,22 @@ data without starting external scans.
 URLs and `GET /api/align/<id>` remain supported. The queue response includes
 `max_workers`; scheduled waiting jobs expose `blocked_by` action IDs and a
 `waiting_reason` (resource conflict or execution capacity). Job states are `queued`,
-`running`, `done` and `error`; clients must keep polling while queued or running.
+`running`, `done`, `error`, `approval_required` and `cancelled`; clients must keep
+polling while queued or running.
+
+**Cancel.** The selected action's detail offers **Cancel** (queued, or awaiting
+approval) or **Stop** (running AI work), always behind a confirm, posting
+`POST /api/actions/<id>/cancel` (same-origin; 404 unknown, 409 already finished
+or not interruptible, 200 `{status, job}` with status `cancelled` or
+`cancelling`). A queued/approval job never starts; its owner record is closed
+(AI run marked "cancelled before it started", a review chat that never opened
+becomes `interrupted`). A running job is only interruptible at a copilot call
+(`ai`, `online-review`, and `review-chat` turns/previews/opens — never a
+`submit`, which posts to GitHub): the process is killed, the job carries
+`cancel_requested`, shows *cancelling*, then finishes `cancelled` without a
+failure notification. Every other running kind (scans, workspace actions,
+alignment, PLDM, auto-review, machine refresh) returns 409 because stopping it
+mid-way could leave external state half-applied. AI budget is not refunded.
 Pending jobs survive server restarts in the private portal queue database.
 Interrupted running jobs become explicit errors, never automatic retries.
 Check the external state before submitting an interrupted action again.
@@ -359,12 +374,20 @@ Roster payloads include `id`, `target`, `location`, `status` and registered
 `targets`. Re-read data after job completion; accepting a job is not success.
 
 For **Return & free**, **Set free**, and **Release mirror**, a fresh check in
-the queued job identifies non-clean repositories before any checkout change.
-The job finishes as `approval_required` and shows their branches, manifest
+the queued job identifies repositories whose work could be lost (uncommitted
+changes, local-only/unverifiable commits, errors) before any checkout change.
+Repositories that are only on another pushed branch return without asking.
+Review-purpose workspaces never ask: their local work is discarded (see the
+workspace-manager skill). Otherwise the job finishes as `approval_required` and
+shows their branches, manifest
 revisions, reasons, and any safety blockers. Cancel leaves the checkout and
 hold unchanged. Explicit confirmation submits a new job linked to that
 approval; a changed checkout is checked again and requires fresh confirmation.
-The approval remains available in Actions after a page reload or portal restart.
+The approval remains available in Actions after a page reload or portal restart
+until it is used or superseded: submitting any newer Free/Sync for the same
+workspace closes older `approval_required` jobs for that action as `done`
+("Confirmation used by …" / "Superseded by …"), so stale confirmation buttons
+cannot replay an old snapshot.
 
 An approved return stashes staged, unstaged, and untracked files, preserves
 existing named branches and their commits, and returns to each manifest
@@ -695,6 +718,13 @@ The short **Machines** section name covers both VM and lab-machine targets. The
 navigation badge continues to count confirmed running delegated jobs; the separate
 **Check VM status** control remains an EC2-only `octl vm list` check.
 
+- **Stop** on a confirmed-running row that still owns its slot (`build`/`test`/`run`)
+  posts `POST /api/vm-cancel {id}`, which queues a `vm-cancel` action (claims
+  `domain:delegation` + `vm:<target>`). It runs `vd.portal_cancel` → `mctl cancel`
+  through the delegate mechanism: the remote process group gets TERM then KILL,
+  the log gains `__MCTL_DONE__ rc=130` + `__MCTL_CANCELLED__`, the target is
+  re-probed and the row shows `cancelled`. A newer run in the slot (pid mismatch)
+  is refused. Containers the job started may outlive it.
 - **Refresh status** (`POST /api/vm-refresh`) is a **background job**, polled through
   `/api/align/<id>` like the PR scan, and it streams one row per target into the align banner.
   It is not inline for a reason: one unreachable target costs a 90 s ssh timeout and `octl vm

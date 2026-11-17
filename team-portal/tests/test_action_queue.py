@@ -38,7 +38,7 @@ class QueueTests(unittest.TestCase):
             with sqlite3.connect(self.path) as conn:
                 finished = conn.execute(
                     "SELECT count(*) FROM actions WHERE state IN "
-                    "('done','error','approval_required')").fetchone()[0]
+                    "('done','error','cancelled','approval_required')").fetchone()[0]
             if finished == count:
                 return
             time.sleep(.01)
@@ -349,7 +349,8 @@ class QueueTests(unittest.TestCase):
         queue = self.queue(lambda job: None, jobs)
         old, new = "2026-01-01T00:00:00.000+00:00", "2026-11-10T00:00:00.000+00:00"
         rows = [("old-done", "done", old), ("new-done", "done", new),
-                ("old-error", "error", old), ("old-approval", "approval_required", old)]
+                ("old-error", "error", old), ("old-approval", "approval_required", old),
+                ("old-cancelled", "cancelled", old), ("new-cancelled", "cancelled", new)]
         with sqlite3.connect(self.path) as conn:
             for seq, (ident, state, finished) in enumerate(rows, 1000):
                 job = {"id": ident, "status": state, "finished": finished, "kind": "pr-scan"}
@@ -358,14 +359,135 @@ class QueueTests(unittest.TestCase):
                 jobs[ident] = job
         from datetime import datetime, timezone
         result = queue.prune(90, now=datetime(2026, 11, 12, tzinfo=timezone.utc))
-        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["removed"], 2)
         with sqlite3.connect(self.path) as conn:
             left = {r[0] for r in conn.execute("SELECT id FROM actions")}
-        self.assertEqual(left, {"new-done", "old-error", "old-approval"})
+        self.assertEqual(left, {"new-done", "old-error", "old-approval", "new-cancelled"})
         self.assertNotIn("old-done", jobs)
         self.assertIn("old-error", jobs)
         with self.assertRaises(ValueError):
             queue.prune(0)
+
+    def test_cancel_queued_action_is_never_dispatched_and_survives_restart(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        called = []
+        def execute(job):
+            called.append(job["number"])
+            if job["number"] == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test release timed out")
+            job["status"] = "done"
+        queue = self.queue(execute)
+        queue.enqueue({"kind": "test", "number": 1})
+        queue.start()
+        self.assertTrue(entered.wait(2))
+        second = queue.enqueue({"kind": "test", "number": 2})
+        third = queue.enqueue({"kind": "test", "number": 3})
+        self.assertEqual(queue.cancel(second), "cancelled")
+        reading = next(j for j in queue.snapshot()["actions"] if j["id"] == second)
+        self.assertEqual(reading["status"], "cancelled")
+        self.assertIn("before it started", reading["message"])
+        self.assertTrue(reading["finished"])
+        third_reading = next(j for j in queue.snapshot()["actions"] if j["id"] == third)
+        self.assertEqual(third_reading["queue_position"], 1)
+        with self.assertRaisesRegex(ValueError, "already cancelled"):
+            queue.cancel(second)
+        release.set()
+        self.wait_done(queue, 3)
+        self.assertEqual(called, [1, 3])
+        queue.stop()
+        queue.join()
+        recovered = self.queue(lambda job: self.fail("cancelled action was replayed"))
+        self.assertEqual(recovered.jobs[second]["status"], "cancelled")
+
+    def test_cancel_unknown_finished_and_approval_actions(self):
+        def execute(job):
+            if job["number"] == 1:
+                job.update(status="approval_required", approval={"token": "a" * 64})
+            else:
+                job["status"] = "done"
+        queue = self.queue(execute)
+        first = queue.enqueue({"kind": "workspace-action", "number": 1})
+        second = queue.enqueue({"kind": "test", "number": 2})
+        queue.start()
+        self.wait_done(queue, 2)
+        with self.assertRaises(LookupError):
+            queue.cancel("action-missing")
+        with self.assertRaisesRegex(ValueError, "already done"):
+            queue.cancel(second)
+        self.assertEqual(queue.cancel(first), "cancelled")
+        self.assertIsNone(queue.jobs[first]["approval"])
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("SELECT state FROM actions WHERE id=?",
+                                          (first,)).fetchone()[0], "cancelled")
+
+    def test_running_cancel_needs_the_interrupt_hook(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def execute(job):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test release timed out")
+            job["status"] = "done"
+        queue = self.queue(execute)
+        ident = queue.enqueue({"kind": "test"})
+        queue.start()
+        self.assertTrue(entered.wait(2))
+        with self.assertRaisesRegex(ValueError, "cannot be interrupted"):
+            queue.cancel(ident)
+        release.set()
+        self.wait_done(queue, 1)
+        self.assertEqual(queue.jobs[ident]["status"], "done")
+
+    def test_running_cancel_interrupts_and_finishes_cancelled(self):
+        entered, stop = threading.Event(), threading.Event()
+        self.addCleanup(stop.set)
+        interrupted = []
+        def interrupt(job):
+            if job["kind"] != "ai":
+                return False
+            interrupted.append(job["id"])
+            stop.set()
+            return True
+        def execute(job):
+            entered.set()
+            if job["kind"] == "ai":
+                stop.wait(5)
+                job.update(status="error", message="copilot killed")
+            else:
+                job["status"] = "done"
+        queue = self.queue(execute, interrupt=interrupt)
+        ident = queue.enqueue({"kind": "ai"})
+        queue.start()
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(queue.cancel(ident), "cancelling")
+        self.assertEqual(queue.cancel(ident), "cancelling")
+        self.wait_done(queue, 1)
+        self.assertEqual(interrupted, [ident])
+        job = queue.jobs[ident]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIn("copilot killed", job["message"])
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("SELECT state FROM actions WHERE id=?",
+                                          (ident,)).fetchone()[0], "cancelled")
+
+    def test_running_cancel_that_loses_the_race_keeps_the_success(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def execute(job):
+            entered.set()
+            release.wait(5)
+            job["status"] = "done"
+        queue = self.queue(execute, interrupt=lambda job: True)
+        ident = queue.enqueue({"kind": "ai"})
+        queue.start()
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(queue.cancel(ident), "cancelling")
+        release.set()
+        self.wait_done(queue, 1)
+        self.assertEqual(queue.jobs[ident]["status"], "done")
 
     def test_fifo_single_worker_and_waiting_positions(self):
         entered, release = threading.Event(), threading.Event()
@@ -527,6 +649,53 @@ class IntegrationTests(unittest.TestCase):
         thread.assert_not_called()
         self.assertEqual([j["kind"] for j in captured], [
             "pr-scan", "review-scan", "vm-refresh", "align", "workspace-action", "pldm"])
+
+    def test_used_and_superseded_workspace_approvals_are_settled(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        jobs, lock = {}, threading.Lock()
+
+        def execute(job):
+            with lock:
+                if job["request"]["payload"].get("force"):
+                    job.update(status="done", message="free complete")
+                else:
+                    job.update(status="approval_required",
+                               approval={"token": "a" * 64, "blockers": []})
+
+        queue = ActionQueue(Path(tmp.name) / "actions.db", execute, jobs, lock)
+        queue.start()
+        self.addCleanup(queue.join)
+        self.addCleanup(queue.stop)
+
+        def wait(ident, status):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with lock:
+                    if jobs[ident]["status"] == status:
+                        return
+                time.sleep(.01)
+            self.fail(f"{ident} never reached {status}: {jobs[ident]}")
+
+        with patch.object(portal, "ACTION_QUEUE", queue), patch.object(portal, "ALIGN_JOBS", jobs), \
+                patch.object(portal, "ALIGN_LOCK", lock), \
+                patch.object(portal.wm, "record", return_value={"slot": "one"}):
+            older = portal.start_workspace_job("free", "one")
+            wait(older, "approval_required")
+            newer = portal.start_workspace_job("free", "one")
+            wait(newer, "approval_required")
+            self.assertEqual(jobs[older]["status"], "done")
+            self.assertIn("Superseded", jobs[older]["message"])
+            with self.assertRaisesRegex(ValueError, "no longer available"):
+                portal.start_workspace_job("free", "one", {"force": True, "approval_job": older})
+            forced = portal.start_workspace_job("free", "one", {"force": True, "approval_job": newer})
+            wait(forced, "done")
+        self.assertEqual(jobs[newer]["status"], "done")
+        self.assertIsNone(jobs[newer]["approval"])
+        self.assertIn(f"Confirmation used by {forced}", jobs[newer]["message"])
+        with sqlite3.connect(Path(tmp.name) / "actions.db") as conn:
+            state = conn.execute("SELECT state FROM actions WHERE id=?", (newer,)).fetchone()[0]
+        self.assertEqual(state, "done")
 
     def test_scan_lock_taken_at_execution_not_enqueue(self):
         job = {"kind": "pr-scan", "request": {"only": [1]}}

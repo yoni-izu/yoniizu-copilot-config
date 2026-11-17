@@ -346,7 +346,27 @@ function wsStepRow(st){
   return `<div class="ab-row ab-step ab-step-${esc(st.state)}"><span class="ab-${tone}">${WS_STEP_ICONS[st.state]||"\u00b7"}</span> `
     +`${esc(st.label)}${count}${live}${errs}</div>`;
 }
-const ACTION_UI={jobs:[],selected:null,dismissed:false,refreshing:false,open:false};
+const ACTION_UI={jobs:[],selected:null,dismissed:false,refreshing:false,open:false,cleared:new Set()};
+// "Clear finished" only hides rows in this browser; the queue store is untouched.
+const AQ_CLEARED_KEY="portal.actionQueue.cleared";
+const AQ_ACTIVE=["queued","running","approval_required"];
+try{ ACTION_UI.cleared=new Set(JSON.parse(localStorage.getItem(AQ_CLEARED_KEY)||"[]")); }catch(_){}
+function saveClearedActions(){
+  try{ localStorage.setItem(AQ_CLEARED_KEY,JSON.stringify([...ACTION_UI.cleared])); }catch(_){}
+}
+function visibleActions(actions){
+  return actions.filter(job=>AQ_ACTIVE.includes(job.status)||!ACTION_UI.cleared.has(job.id));
+}
+function clearFinishedActions(){
+  ACTION_UI.jobs.filter(job=>!AQ_ACTIVE.includes(job.status)).forEach(job=>ACTION_UI.cleared.add(job.id));
+  saveClearedActions();
+  renderActionQueue({actions:ACTION_UI.jobs});
+}
+function restoreClearedActions(){
+  ACTION_UI.cleared.clear();
+  saveClearedActions();
+  renderActionQueue({actions:ACTION_UI.jobs});
+}
 // The queue lives in a drop-down under the Actions card; nothing opens it but
 // the user. The card itself carries the running summary.
 function setActionsOpen(open){
@@ -372,15 +392,46 @@ function actionCardSummary(actions){
   if(approval.length) return {tone:"warn",busy:false,text:`${approval.length} need approval`};
   return {tone:"idle",busy:false,text:"Idle"};
 }
+// Running work is only stoppable where the server has an interrupt point:
+// the copilot call of an AI job (review-chat submits post to GitHub, so never).
+const AQ_INTERRUPTIBLE=new Set(["ai","online-review","review-chat"]);
+function actionCancellable(job){
+  if(["queued","approval_required"].includes(job.status)) return true;
+  return job.status==="running"&&!job.cancel_requested
+    &&AQ_INTERRUPTIBLE.has(job.kind)&&job.op!=="submit";
+}
+function actionStateText(job){
+  if(job.status==="queued") return "Waiting #"+job.queue_position;
+  if(job.status==="approval_required") return "Approval required";
+  if(job.status==="running"&&job.cancel_requested) return "cancelling";
+  return job.status;
+}
+async function cancelAction(id){
+  const job=ACTION_UI.jobs.find(j=>j.id===id);
+  const what=job?actionLabel(job):"this action";
+  const ask=job?.status==="running"
+    ?`Stop "${what}" now? Its work so far is discarded.`
+    :`Cancel "${what}"? It will not run.`;
+  if(!confirm(ask)) return;
+  const r=await fetch("/api/actions/"+encodeURIComponent(id)+"/cancel",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:"{}"});
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.error||`cancel failed (${r.status})`);
+  await refreshActionQueue();
+}
 function actionLabel(job){
   if(job.kind==="vm-refresh")
     return "Refresh machine activity"+(job.target?" · "+job.target:"");
+  if(job.kind==="vm-cancel") return job.slot||"Cancel machine job";
   const labels={"pr-scan":"Scan PRs","review-scan":"Scan reviews",
     align:"Align workspace",pldm:"Submit PLDM test"};
   return (job.kind==="workspace-action"?job.action:labels[job.kind]||job.kind)+" · "+(job.slot||"");
 }
 function renderActionQueue(data){
+  const reviewKey=()=>typeof runningReviewTasks==="function"?[...runningReviewTasks()].sort().join():"";
+  const reviewsBefore=reviewKey();
   ACTION_UI.jobs=data.actions;
+  if(reviewKey()!==reviewsBefore&&typeof render==="function"&&typeof TASKS!=="undefined") render();
   const panel=document.getElementById("action-queue");
   if(!panel) return;
   const active=data.actions.filter(job=>["queued","running"].includes(job.status));
@@ -393,16 +444,33 @@ function renderActionQueue(data){
     document.getElementById("aq-summary").textContent=sum.text;
     document.getElementById("aq-spin").style.visibility=sum.busy?"visible":"hidden";
   }
-  if(!ACTION_UI.selected||!data.actions.some(job=>job.id===ACTION_UI.selected))
-    ACTION_UI.selected=(active[0]||data.actions[0])?.id||null;
+  // Forget cleared ids the store has already pruned; skip on an empty read.
+  if(data.actions.length&&[...ACTION_UI.cleared].some(id=>!data.actions.some(job=>job.id===id))){
+    ACTION_UI.cleared=new Set([...ACTION_UI.cleared].filter(id=>data.actions.some(job=>job.id===id)));
+    saveClearedActions();
+  }
+  const shown=visibleActions(data.actions);
+  const hiddenCount=data.actions.length-shown.length;
+  const finishedShown=shown.filter(job=>!AQ_ACTIVE.includes(job.status)).length;
+  if(!ACTION_UI.selected||!shown.some(job=>job.id===ACTION_UI.selected))
+    ACTION_UI.selected=(active[0]||shown[0])?.id||null;
   const focused=document.activeElement?.closest?.("[data-action-id]")?.dataset.actionId;
-  panel.innerHTML=`<div class="ab-queue-count" role="status">${active.filter(job=>job.status==="running").length} running · ${active.filter(job=>job.status==="queued").length} waiting</div>`
-    +data.actions.map(job=>`<button type="button" class="ab-queue-item${job.id===ACTION_UI.selected?" selected":""}"
+  const tools=(finishedShown?`<button type="button" class="ab-link" data-aq-clear title="Hide finished and failed actions from this view">Clear finished</button>`:"")
+    +(hiddenCount?`<button type="button" class="ab-link" data-aq-restore>Show ${hiddenCount} cleared</button>`:"");
+  panel.innerHTML=`<div class="ab-queue-count"><span role="status">${active.filter(job=>job.status==="running").length} running · ${active.filter(job=>job.status==="queued").length} waiting</span>${tools}</div>`
+    +(shown.length?"":`<div class="ab-queue-empty">No actions in view.</div>`)
+    +shown.map(job=>`<button type="button" class="ab-queue-item${job.id===ACTION_UI.selected?" selected":""}"
       data-action-id="${esc(job.id)}" aria-pressed="${job.id===ACTION_UI.selected}">
-      <span>${esc(actionLabel(job))}</span><b class="${job.status==="error"?"ab-bad":""}">${esc(job.status==="queued"?"Waiting #"+job.queue_position:job.status==="approval_required"?"Approval required":job.status)}</b></button>`).join("");
+      <span>${esc(actionLabel(job))}</span><b class="${job.status==="error"?"ab-bad":job.status==="cancelled"?"ab-muted":""}">${esc(actionStateText(job))}</b></button>`).join("");
   if(focused) [...panel.querySelectorAll("[data-action-id]")].find(button=>button.dataset.actionId===focused)?.focus();
-  const selected=data.actions.find(job=>job.id===ACTION_UI.selected);
+  const selected=shown.find(job=>job.id===ACTION_UI.selected);
   if(selected&&!ACTION_UI.dismissed) renderAlign(selected);
+  else if(!selected){
+    const spin=document.getElementById("align-spin"), title=document.getElementById("align-title"), body=document.getElementById("align-body");
+    if(spin) spin.style.display="none";
+    if(title) title.textContent="Action queue";
+    if(body) body.innerHTML="";
+  }
 }
 async function refreshActionQueue(){
   if(ACTION_UI.refreshing) return;
@@ -438,10 +506,31 @@ async function refreshActionResult(job){
     PRS=job.result; renderPrs();
   }else if(job.kind==="vm-refresh"&&job.result){
     vmAdoptPayload(job.result); renderVmlog();
+  }else if(job.kind==="vm-cancel"){
+    const response=await fetch("/api/vm-jobs",{cache:"no-store"});
+    if(response.ok){ vmAdoptPayload(await response.json()); renderVmlog(); }
   }
   buildSections();
 }
 function renderAlign(job){
+  const body=document.getElementById("align-body");
+  if(job.status==="cancelled"){
+    const spin=document.getElementById("align-spin"), title=document.getElementById("align-title");
+    if(!body) return;
+    spin.style.display="none";
+    title.innerHTML=`<span class="ab-muted">Cancelled · ${esc(actionLabel(job))}</span>`;
+    body.innerHTML=job.message?`<div class="ab-msg">${esc(job.message)}</div>`:"";
+    return;
+  }
+  renderAlignDetail(job);
+  if(!body) return;
+  if(job.status==="running"&&job.cancel_requested)
+    document.getElementById("align-title").textContent=`Cancelling · ${actionLabel(job)}`;
+  else if(actionCancellable(job))
+    body.insertAdjacentHTML("beforeend",`<div class="ab-cancel"><button type="button" class="btn"
+      data-aq-cancel="${esc(job.id)}">${job.status==="running"?"Stop":"Cancel"}</button></div>`);
+}
+function renderAlignDetail(job){
   const banner=document.getElementById("align-banner");
   const spin=document.getElementById("align-spin");
   const title=document.getElementById("align-title");
@@ -539,6 +628,11 @@ async function pollAlign(jobId,label){
 document.addEventListener("click",e=>{
   const approvalId=e.target?.closest?.("[data-workspace-approval]")?.dataset.workspaceApproval;
   if(approvalId) wsReviewApproval(approvalId).catch(error=>alert(error.message));
+  const cancelId=e.target?.closest?.("[data-aq-cancel]")?.dataset.aqCancel;
+  if(cancelId){ cancelAction(cancelId).catch(error=>alert(error.message)); return; }
+  // Re-rendering detaches the clicked button, so stop before the outside-click check.
+  if(e.target?.closest?.("[data-aq-clear]")){ clearFinishedActions(); return; }
+  if(e.target?.closest?.("[data-aq-restore]")){ restoreClearedActions(); return; }
   const actionId=e.target?.closest?.("[data-action-id]")?.dataset.actionId;
   if(actionId){
     ACTION_UI.selected=actionId;
@@ -3887,6 +3981,7 @@ async function pollPldm(jobId,id){
         +(j.current?' \u00b7 '+esc(j.current):"")
       : (j.status==="done"?'<b class="ok">Queued.</b> '+esc(j.message||"")
           +(j.run_url?' \u00b7 <a href="'+esc(j.run_url)+'" target="_blank" rel="noopener">Actions run</a>':"")
+        : j.status==="cancelled"?'<b>Cancelled.</b> '+esc(j.message||"")
         : '<b class="bad">Failed.</b> '+esc(j.message||""));
     box.innerHTML='<div class="pldm-prog">'+head+'</div>'+log
       +(pending?"":'<div class="pldm-act">'
@@ -4228,12 +4323,13 @@ const kpi=o=>'<div class="kpi" style="--k:'+o.c+'"><div class="l">'+esc(o.label)
 // lives in ~/.mctl/joblog.jsonl and the status comes from one ssh probe.
 // ============================================================================
 const VM_STATUS_COLOR={running:PBI.blue, passed:PBI.green, failed:PBI.red, died:PBI.orange,
-                       superseded:PBI.grey, gone:PBI.grey, unknown:PBI.grey};
+                       cancelled:PBI.orange, superseded:PBI.grey, gone:PBI.grey, unknown:PBI.grey};
 const VM_STATUS_TITLE={
   running:"still executing on the target",
   passed:"finished with rc=0",
   failed:"finished with a non-zero rc",
   died:"the process vanished without writing a completion marker",
+  cancelled:"stopped from the portal (mctl cancel)",
   superseded:"a newer run overwrote this log on the target",
   gone:"no log left on the target (cleaned, or it never started)",
   unknown:"not confirmed by the target \u2014 never probed, or the last reading "
@@ -4359,7 +4455,8 @@ function renderVmlog(){
          sub:"of "+all.length+" delegated"}),
     kpi({c:PBI.green, label:"Passed", n:n("passed"), sub:"rc=0"}),
     kpi({c:n("failed")?PBI.red:PBI.grey, label:"Failed", n:n("failed"), sub:"non-zero rc"}),
-    kpi({c:n("died")?PBI.orange:PBI.grey, label:"Died", n:n("died"), sub:"no completion marker"}),
+    kpi({c:n("died")?PBI.orange:PBI.grey, label:"Died", n:n("died"),
+         sub:"no completion marker"+(n("cancelled")?" \u00b7 "+n("cancelled")+" cancelled":"")}),
     kpi({c:PBI.grey, label:"Targets", n:tgts.length,
          sub:(VMLOG.targets||[]).length+" registered"}),
   ].join("");
@@ -4441,6 +4538,8 @@ function vmBindLogs(){
   document.querySelectorAll(".vm-log").forEach(b=>b.addEventListener("click",()=>
     vmLogOpen(b.dataset.target, b.dataset.tag, b.dataset.kind, b.dataset.live==="1",
               b.dataset.id||"")));
+  document.querySelectorAll(".vm-cancel").forEach(b=>b.addEventListener("click",()=>
+    vmCancel(b.dataset.id,b.dataset.label)));
 }
 // A reading older than an hour is history, not status. Saying so is the whole
 // point: a day-old "stopped" that looked live is why the VM seemed unusable.
@@ -4589,7 +4688,35 @@ function vmRow(j){
     +'<td title="'+esc(title)+'">'
       +'<span class="vm-st '+esc(j.status)+'" style="--sk:'+c+'">'+esc(j.status)+esc(rc)+'</span>'
       +'<span class="vm-verline">'+vmVerified(j)+'</span>'+tail+'</td>'
-    +'<td class="vm-logcell">'+vmLogLink(j)+'</td></tr>';
+    +'<td class="vm-logcell">'+vmLogLink(j)+vmCancelButton(j)+'</td></tr>';
+}
+// Only a run that still owns its workspace slot can be stopped: mctl kills the
+// pid recorded in that slot and refuses when a newer run has taken it over.
+function vmCancelButton(j){
+  if(j.status!=="running"||j.owns_slot===false||!j.pid||!["build","test","run"].includes(j.kind))
+    return "";
+  return '<button class="vm-cancel" data-id="'+esc(j.id)+'" data-label="'
+    +esc(j.kind+" "+(j.ws_label||j.tag)+" on "+j.target)+'"'
+    +' title="Stop this job on '+esc(j.target)+' (queued as a portal action)">\u25a0 stop</button>';
+}
+async function vmCancel(id,label){
+  const note=document.getElementById("vm-refresh-note");
+  if(!SERVED){ note.textContent="Serve the portal to stop a job"; return; }
+  if(!confirm("Stop "+label+"? The process group is terminated on the machine; "
+    +"containers it started may need manual cleanup.")) return;
+  note.textContent="stopping "+label+"\u2026";
+  try{
+    const r=await fetch("/api/vm-cancel",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+    const j=await r.json();
+    if(!r.ok||!j.job) throw new Error(j.error||"cancel failed");
+    const done=await pollAlign(j.job,"Stopping "+label+"\u2026");
+    const rv=await fetch("/api/vm-jobs",{cache:"no-store"});
+    if(rv.ok){ vmAdoptPayload(await rv.json()); renderVmlog(); buildSections(); }
+    note.textContent=(done&&done.message)||"cancel finished";
+  }catch(e){
+    note.textContent="Stop failed: "+e.message;
+  }
 }
 // The Log cell. The remote keeps ONE log per (workspace, kind), so "a log
 // exists" never implies "this run's log exists": `has_log` is now server-side
@@ -5257,7 +5384,7 @@ async function aiWait(jobId,runId,turn){
     let job={};
     try{ job=await (await fetch("/api/align/"+encodeURIComponent(jobId),{cache:"no-store"})).json(); }catch(e){}
     if(job.current){ turn.progress=job.current; aiRenderThread(); }
-    if(["done","error","approval_required"].includes(job.status)||job.error==="unknown job") break;
+    if(["done","error","cancelled","approval_required"].includes(job.status)||job.error==="unknown job") break;
   }
   const r=await fetch("/api/ai/run/"+encodeURIComponent(runId),{cache:"no-store",headers:aiHeaders()});
   const run=await r.json();

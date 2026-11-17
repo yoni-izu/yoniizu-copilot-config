@@ -247,6 +247,7 @@ test("scan action banner never shows green success for archived Jira failures", 
   const elements = {};
   context.document.getElementById = id => elements[id] ||= {style: {}};
   context.alignRepoRow = () => "";
+  context.actionCancellable = () => false;
   vm.runInContext(source.slice(source.indexOf("function renderAlign("),
     source.indexOf("async function pollAlign(")), context);
   context.renderAlign({kind: "pr-scan", status: "error", repos: [],

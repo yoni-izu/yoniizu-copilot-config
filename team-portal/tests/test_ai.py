@@ -6,7 +6,9 @@ import stat
 import sys
 import tempfile
 import time
+import threading
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ai  # noqa: E402
@@ -214,6 +216,24 @@ class RunnerTests(unittest.TestCase):
         out = ai.run_copilot([self.fake("sleep 30 &\nsleep 30\n")], cwd=None, timeout=1)
         self.assertLess(time.monotonic() - start, 15)
         self.assertIn("timed out", out["error"])
+
+    def test_cancel_kills_group_and_reports_cancelled(self):
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        start = time.monotonic()
+        out = ai.run_copilot([self.fake("sleep 30 &\nsleep 30\n")], cwd=None, timeout=60,
+                             cancel=cancel)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual(out["error"], ai.CANCELLED_ERROR)
+
+    def test_cancel_set_before_start_never_spawns(self):
+        cancel = threading.Event()
+        cancel.set()
+        with unittest.mock.patch.object(ai.subprocess, "Popen",
+                                        side_effect=AssertionError("spawned")):
+            out = ai.run_copilot(["/bin/false"], cwd=None, timeout=5, cancel=cancel)
+        self.assertEqual(out["error"], ai.CANCELLED_ERROR)
+        self.assertEqual(out["answer"], "")
 
     def test_no_answer(self):
         out = ai.run_copilot([self.fake("exit 0\n")], cwd=None, timeout=20,

@@ -30,6 +30,7 @@ class ActionQueue:
     def __init__(self, path: Path, execute: Callable[[dict], None],
                  jobs: dict[str, dict], lock: LockType, *,
                  resources: Callable[[dict], set[str]] | None = None,
+                 interrupt: Callable[[dict], bool] | None = None,
                  max_workers: int = 3):
         if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
@@ -42,6 +43,7 @@ class ActionQueue:
         self._failure: str | None = None
         self._thread: threading.Thread | None = None
         self._resources = resources
+        self._interrupt = interrupt
         self.max_workers = max_workers
         self._running: dict[str, frozenset[str]] = {}
         self._workers: set[threading.Thread] = set()
@@ -90,6 +92,57 @@ class ActionQueue:
             self._condition.notify_all()
             return job["id"]
 
+    def settle(self, ident: str, message: str) -> bool:
+        """Close an unused approval request so its stale confirmation cannot be replayed."""
+        with self._condition:
+            with self.lock:
+                job = self.jobs.get(ident)
+                if not job or job.get("status") != "approval_required":
+                    return False
+                job.update(status="done", message=message, approval=None, current=None)
+            with self._connect() as conn, self.lock:
+                self._write(conn, job)
+        return True
+
+    def cancel(self, ident: str) -> str:
+        """Cancel one action; returns ``"cancelled"`` or ``"cancelling"``.
+
+        Queued work and pending approvals are cancelled immediately and never
+        dispatched (the check runs under the scheduling lock, so it cannot race
+        a dispatch). Running work is cancelled only when the ``interrupt`` hook
+        accepts it; the worker then finishes as ``cancelled``. Raises
+        ``LookupError`` for an unknown id and ``ValueError`` when the action is
+        finished or cannot be interrupted safely.
+        """
+        with self._condition:
+            with self.lock:
+                job = self.jobs.get(ident)
+                if not job:
+                    raise LookupError("unknown action")
+                status = job.get("status")
+            if ident in self._running or status == "running":
+                if job.get("cancel_requested"):
+                    return "cancelling"
+                if not (self._interrupt and self._interrupt(job)):
+                    raise ValueError("this running action cannot be interrupted safely; "
+                                     "wait for it to finish")
+                with self.lock:
+                    job.update(cancel_requested=stamp(), current="Cancelling\u2026")
+                return "cancelling"
+            if status not in {"queued", "approval_required"}:
+                raise ValueError(f"action is already {status}")
+            with self.lock:
+                job.pop("blocked_by", None)
+                job.pop("waiting_reason", None)
+                job.update(status="cancelled", finished=stamp(), current=None,
+                           approval=None,
+                           message=("Cancelled before it started" if status == "queued"
+                                    else "Cancelled instead of approving"))
+            with self._connect() as conn, self.lock:
+                self._write(conn, job)
+            self._condition.notify_all()
+        return "cancelled"
+
     def snapshot(self) -> dict:
         with self._condition, self._connect() as conn:
             ids = [row[0] for row in conn.execute(
@@ -116,7 +169,7 @@ class ActionQueue:
             return result
 
     def prune(self, days: int, now: datetime | None = None) -> dict:
-        """Delete successful ("done") actions finished more than ``days`` ago.
+        """Delete done or cancelled actions finished more than ``days`` ago.
 
         Queued/running work, failures and pending approvals are never removed,
         so recovery evidence survives. Compacts the store afterwards.
@@ -127,7 +180,7 @@ class ActionQueue:
             timespec="milliseconds")
         with self._condition:
             with self._connect() as conn:
-                rows = conn.execute("SELECT id, job FROM actions WHERE state='done'").fetchall()
+                rows = conn.execute("SELECT id, job FROM actions WHERE state IN ('done','cancelled')").fetchall()
                 expired = [ident for ident, raw in rows
                            if (json.loads(raw).get("finished") or "9999") < cutoff]
                 conn.executemany("DELETE FROM actions WHERE id=?", [(i,) for i in expired])
@@ -246,12 +299,17 @@ class ActionQueue:
     def _run(self, job: dict) -> None:
         try:
             self.execute(job)
-            if job["status"] not in {"done", "error", "approval_required"}:
+            if job["status"] not in {"done", "error", "cancelled", "approval_required"}:
                 raise RuntimeError("Action worker returned without a terminal result")
         except Exception as error:
             logging.exception("Portal action %s failed", job["id"])
             with self.lock:
                 job.update(status="error", message=str(error), current=None)
+        with self.lock:
+            if job.get("cancel_requested") and job["status"] == "error":
+                job.update(status="cancelled", current=None,
+                           message="Cancelled while running"
+                           + (f" ({job['message']})" if job.get("message") else ""))
         with self._condition:
             try:
                 with self._connect() as conn, self.lock:

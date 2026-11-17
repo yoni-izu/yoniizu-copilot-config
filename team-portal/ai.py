@@ -494,10 +494,16 @@ def parse_events(lines) -> dict:
     return out
 
 
+CANCELLED_ERROR = "cancelled by user"
+
+
 def run_copilot(argv: list[str], *, cwd: str | None, timeout: int,
                 on_line: Callable[[dict], None] | None = None,
-                env: dict | None = None) -> dict:
-    """Run one CLI call; kill the whole process group on timeout."""
+                env: dict | None = None,
+                cancel: threading.Event | None = None) -> dict:
+    """Run one CLI call; kill the whole process group on timeout or ``cancel``."""
+    if cancel is not None and cancel.is_set():
+        return dict(parse_events([]), error=CANCELLED_ERROR, rc=None)
     if env is None:
         # The CLI is a node script; systemd's PATH has no nvm, so put the
         # binary's own directory (where its node lives) first.
@@ -511,6 +517,15 @@ def run_copilot(argv: list[str], *, cwd: str | None, timeout: int,
     errs: list[str] = []
     timer = threading.Timer(timeout, lambda: _kill(proc))
     timer.start()
+    done = threading.Event()
+    if cancel is not None:
+        def watch() -> None:
+            while not done.wait(0.5):
+                if cancel.is_set():
+                    proc._portal_cancelled = True              # type: ignore[attr-defined]
+                    _kill(proc)
+                    return
+        threading.Thread(target=watch, name="copilot-cancel", daemon=True).start()
     drain = threading.Thread(target=lambda: errs.extend(proc.stderr), daemon=True)
     drain.start()
     try:
@@ -524,12 +539,15 @@ def run_copilot(argv: list[str], *, cwd: str | None, timeout: int,
                     pass
         rc = proc.wait()
     finally:
+        done.set()
         timer.cancel()
         drain.join(2)
         for pipe in (proc.stdout, proc.stderr):
             pipe.close()
     result = parse_events(lines)
-    if getattr(proc, "_portal_killed", False):
+    if getattr(proc, "_portal_cancelled", False):
+        result["error"] = CANCELLED_ERROR
+    elif getattr(proc, "_portal_killed", False):
         result["error"] = f"timed out after {timeout}s"
     elif rc != 0 and not result["error"]:
         tail = "".join(errs).strip().splitlines()

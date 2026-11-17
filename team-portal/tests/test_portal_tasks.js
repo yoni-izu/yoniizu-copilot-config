@@ -67,7 +67,7 @@ function draftHarness(served=true) {
     esc: value=>String(value).replaceAll("&","&amp;").replaceAll("<","&lt;")
       .replaceAll('"',"&quot;"),
     editorHtml: ()=>"",
-    AI_USAGE: {},
+    AI_USAGE: {}, ACTION_UI: {jobs:[]},
   });
   installDateHelpers(context);
   vm.runInContext(block("function daysSince(", "// ---- workspace alignment")+
@@ -213,6 +213,16 @@ test("VM open-only shows running jobs without changing the saved job list", () =
   assert.equal(jobs.length, 3);
   assert.match(source, /makeOpenOnly\("vm-openonly"\)/);
   assert.match(source, /id="vm-count"/);
+});
+
+test("machine rows offer stop only for a running job that still owns its slot", () => {
+  const context = vm.createContext({esc: s => String(s)});
+  vm.runInContext(block("function vmCancelButton(", "async function vmCancel("), context);
+  const row = {id: "j1", status: "running", pid: 7, kind: "build", tag: "ws", ws_label: "one/fw", target: "lab1"};
+  assert.match(context.vmCancelButton(row), /class="vm-cancel" data-id="j1" data-label="build one\/fw on lab1"/);
+  for (const off of [{status: "passed"}, {owns_slot: false}, {pid: null}, {kind: "mirror"}])
+    assert.equal(context.vmCancelButton({...row, ...off}), "", JSON.stringify(off));
+  assert.match(source, /cancelled:"stopped from the portal/);
 });
 
 test("RAID Open only hides closed rows and retains them when cleared", () => {
@@ -444,7 +454,7 @@ test("workspace error banner collapses repeated per-repo failures", () => {
 
 test("workspace action banner shows live steps, counts, detail and failures", () => {
   const els = {"align-banner": {style: {}}, "align-spin": {style: {}},
-    "align-title": {textContent: ""}, "align-body": {innerHTML: ""}};
+    "align-title": {textContent: ""}, "align-body": {innerHTML: "", insertAdjacentHTML(pos, html) { this.innerHTML += html; }}};
   const context = vm.createContext({document: {getElementById: id => els[id]},
     esc: s => String(s).replace(/</g, "&lt;"), ALIGN_ICONS: {}});
   vm.runInContext(block("function wsErrorSummary(", "function wsUnknown(")
@@ -465,7 +475,7 @@ test("workspace action banner shows live steps, counts, detail and failures", ()
 
 test("workspace action banner exposes pending approval and saved stash recovery", () => {
   const els = {"align-banner": {style: {}}, "align-spin": {style: {}},
-    "align-title": {textContent: ""}, "align-body": {innerHTML: ""}};
+    "align-title": {textContent: ""}, "align-body": {innerHTML: "", insertAdjacentHTML(pos, html) { this.innerHTML += html; }}};
   const context = vm.createContext({document: {getElementById: id => els[id]},
     esc: s => String(s).replace(/</g, "&lt;"), ALIGN_ICONS: {}});
   vm.runInContext(block("function wsErrorSummary(", "function wsUnknown(")
@@ -484,10 +494,10 @@ test("workspace action banner exposes pending approval and saved stash recovery"
   assert.match(els["align-body"].innerHTML,/abc123/);
 });
 
-function bannerHarness(jobs=[]) {
+function bannerHarness(jobs=[], storage={}) {
   const elements = {
     "align-banner": {style: {}}, "align-spin": {style: {}},
-    "align-title": {textContent: ""}, "align-body": {innerHTML: "", hidden: false},
+    "align-title": {textContent: ""}, "align-body": {innerHTML: "", hidden: false, insertAdjacentHTML(pos, html) { this.innerHTML += html; }},
     "action-queue": {innerHTML: "", hidden: false},
     "action-queue-open": {textContent: "", hidden: true, dataset: {}, title: "",
       attributes: {}, setAttribute(name, value) { this.attributes[name] = value; }},
@@ -502,13 +512,15 @@ function bannerHarness(jobs=[]) {
     esc: s => String(s), encodeURIComponent,
     fetch: async () => ({ok: true, json: async () => jobs[requests++]}),
     setTimeout: callback => callback(),
+    localStorage: {getItem: k => (k in storage ? storage[k] : null),
+      setItem: (k, v) => { storage[k] = String(v); }},
   });
   vm.runInContext(block("// ---- workspace alignment", "function feature("), context);
   const target = id => Object.assign(elements[id] || {}, {id,
     closest: sel => (sel === "#" + id ? elements[id] : null)});
   return {context, elements, click: id => click({target: target(id)}),
     toggle() { click({target: Object.assign(elements["align-toggle"], {id: "align-toggle"})}); },
-    requests: () => requests};
+    requests: () => requests, raw: event => click(event)};
 }
 
 test("operation banner toggles details with accessible state and keeps header visible", () => {
@@ -578,6 +590,43 @@ test("actions card summarises one running action, several, waiting and approvals
   assert.equal(sum([{status:"approval_required",kind:"pr-scan"}]).tone,"warn");
 });
 
+test("cancel offers only where the server can stop the work and posts it", async () => {
+  const {context,elements}=bannerHarness();
+  const can=job=>context.actionCancellable(job);
+  assert.equal(can({status:"queued",kind:"pr-scan"}),true);
+  assert.equal(can({status:"approval_required",kind:"workspace-action"}),true);
+  assert.equal(can({status:"running",kind:"ai"}),true);
+  assert.equal(can({status:"running",kind:"review-chat",op:"turn"}),true);
+  assert.equal(can({status:"running",kind:"review-chat",op:"submit"}),false);
+  assert.equal(can({status:"running",kind:"pr-scan"}),false);
+  assert.equal(can({status:"running",kind:"ai",cancel_requested:"t"}),false);
+  assert.equal(can({status:"done",kind:"ai"}),false);
+  const queued={id:"q",kind:"pr-scan",slot:"PRs",status:"queued",queue_position:1};
+  context.renderAlign(queued);
+  assert.match(elements["align-body"].innerHTML,/data-aq-cancel="q">Cancel</);
+  context.renderAlign({id:"r",kind:"ai",slot:"AI",status:"running",repos:[]});
+  assert.match(elements["align-body"].innerHTML,/data-aq-cancel="r">Stop</);
+  context.renderAlign({id:"s",kind:"ai",slot:"AI",status:"running",repos:[],cancel_requested:"t"});
+  assert.doesNotMatch(elements["align-body"].innerHTML,/data-aq-cancel/);
+  assert.match(elements["align-title"].textContent,/^Cancelling/);
+  context.renderAlign({id:"c",kind:"pr-scan",slot:"PRs",status:"cancelled",message:"Cancelled before it started"});
+  assert.match(elements["align-title"].innerHTML,/Cancelled · Scan PRs/);
+  assert.match(elements["align-body"].innerHTML,/before it started/);
+  assert.equal(context.actionStateText({status:"running",cancel_requested:"t"}),"cancelling");
+  context.renderActionQueue({actions:[{...queued,status:"cancelled"}]});
+  assert.match(elements["action-queue"].innerHTML,/ab-muted">cancelled/);
+  const posts=[];
+  context.confirm=()=>true;
+  context.fetch=async (url,opts)=>{ if(opts?.method==="POST") posts.push(url);
+    return {ok:true,json:async()=>(opts?{status:"cancelled"}:{actions:[]})}; };
+  vm.runInContext('ACTION_UI.jobs=[{id:"q",kind:"pr-scan",slot:"PRs",status:"queued"}]',context);
+  await context.cancelAction("q");
+  assert.deepEqual(posts,["/api/actions/q/cancel"]);
+  context.confirm=()=>false;
+  await context.cancelAction("q");
+  assert.equal(posts.length,1);
+});
+
 test("queue popup keeps polling waiting jobs instead of treating queued as completion", async () => {
   const queued={id:"one",kind:"pr-scan",slot:"PRs",status:"queued",queue_position:2,repos:[]};
   const running={...queued,status:"running"};
@@ -614,6 +663,53 @@ test("queue popup lists positions and errors, selects jobs, and retains collapse
   assert.equal(elements["align-banner"].style.display,"none");
   assert.equal(vm.runInContext("ACTION_UI.open",context),false);
   assert.match(template,/id="action-queue-open"/);
+});
+
+test("clear finished hides done/failed rows in this browser only and can be restored", () => {
+  const storage={};
+  const {context,elements}=bannerHarness([], storage);
+  const running={id:"run",kind:"pr-scan",slot:"PRs",status:"running",repos:[]};
+  const approval={id:"ap",kind:"workspace-action",action:"sync",slot:"one",status:"approval_required",steps:[]};
+  const done={id:"done",kind:"pr-scan",slot:"PRs",status:"done",repos:[]};
+  const failed={id:"bad",kind:"review-scan",slot:"R",status:"error",repos:[]};
+  const actions=[running,approval,done,failed];
+  context.renderActionQueue({actions});
+  assert.match(elements["action-queue"].innerHTML,/data-aq-clear/);
+  assert.doesNotMatch(elements["action-queue"].innerHTML,/data-aq-restore/);
+  vm.runInContext('ACTION_UI.selected="done"',context);
+  context.clearFinishedActions();
+  const html=elements["action-queue"].innerHTML;
+  assert.match(html,/data-action-id="run"/);
+  assert.match(html,/data-action-id="ap"/);
+  assert.doesNotMatch(html,/data-action-id="done"/);
+  assert.doesNotMatch(html,/data-action-id="bad"/);
+  assert.match(html,/Show 2 cleared/);
+  assert.doesNotMatch(html,/data-aq-clear/);
+  assert.equal(vm.runInContext("ACTION_UI.selected",context),"run");
+  assert.equal(vm.runInContext("ACTION_UI.jobs.length",context),4);
+  assert.deepEqual(JSON.parse(storage["portal.actionQueue.cleared"]).sort(),["bad","done"]);
+  // persisted across reloads; ids pruned by the store are forgotten
+  const reload=bannerHarness([], storage);
+  reload.context.renderActionQueue({actions:[running,done]});
+  assert.doesNotMatch(reload.elements["action-queue"].innerHTML,/data-action-id="done"/);
+  assert.deepEqual(JSON.parse(storage["portal.actionQueue.cleared"]),["done"]);
+  reload.context.restoreClearedActions();
+  assert.match(reload.elements["action-queue"].innerHTML,/data-action-id="done"/);
+  assert.equal(storage["portal.actionQueue.cleared"],"[]");
+});
+
+test("clearing every action leaves an empty view and does not close the popup", () => {
+  const {context,elements,click,raw}=bannerHarness();
+  const done={id:"done",kind:"pr-scan",slot:"PRs",status:"done",repos:[]};
+  click("action-queue-open");
+  context.renderActionQueue({actions:[done]});
+  // a detached button: closest() finds itself but no #aq-anchor ancestor
+  const button={closest:sel=>sel==="[data-aq-clear]"?button:null};
+  raw({target:button});
+  assert.match(elements["action-queue"].innerHTML,/No actions in view/);
+  assert.match(elements["action-queue"].innerHTML,/Show 1 cleared/);
+  assert.equal(elements["align-title"].textContent,"Action queue");
+  assert.equal(vm.runInContext("ACTION_UI.open",context),true);
 });
 
 test("queue popup shows concurrent jobs and explains resource or capacity waits", () => {
