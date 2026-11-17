@@ -15,7 +15,19 @@
   "enabledPlugins": {
     "github@ai-toolkit": true,
     "fw-soc@ai-toolkit": true,
-    "sw-arch@ai-toolkit": true
+    "sw-arch@ai-toolkit": true,
+    "mattpocock-skills@ai-toolkit": true,
+    "review-swarm@ai-toolkit": true,
+    "brainstorming@ai-toolkit": true,
+    "atlassian-mcp@ai-toolkit": true,
+    "atlassian-search-company-knowledge@ai-toolkit": true,
+    "jira-elementlabs@ai-toolkit": true,
+    "openai-pdf@ai-toolkit": true,
+    "openai-screenshot@ai-toolkit": true,
+    "agents-md-management@ai-toolkit": true,
+    "ms-teams-notifications@ai-toolkit": true,
+    "hwarch-specs@ai-toolkit": true,
+    "swarch-specs@ai-toolkit": true
   },
   "model": "auto",
   "autoTier": "balance"
