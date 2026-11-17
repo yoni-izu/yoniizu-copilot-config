@@ -291,7 +291,14 @@ mctl jobs           # every job ever delegated, from the local log
 mctl jobs-probe     # EVERY job dir, including last lines: source-free targets only
 mctl jobs-sync      # EVERY job log: source-free targets only
 mctl jobs-tail <tag> [kind] [n]   # ONE verified source-free software log
+mctl cancel <tag> <kind> <pid>    # stop a running job (TERM, then KILL its process group)
 ```
+
+`mctl cancel` refuses (`MISMATCH`/`NOLOG`, rc 2) unless the slot's live pid is
+the one given, so it never kills a newer run. A stopped job's log gains
+`__MCTL_DONE__ rc=130` plus `__MCTL_CANCELLED__`, and probes report it as
+`CANCELLED` (resolved status `cancelled`). Docker containers it started may
+survive; check them before re-dispatching.
 
 `jobs-probe` emits `tag kind STATE rc pid log_mtime lines errors cmd last_line`,
 which is what the resolver consumes:
@@ -301,6 +308,7 @@ python3 ~/.copilot/skills/vm-delegate/vd.py list       # history + resolved stat
 python3 ~/.copilot/skills/vm-delegate/vd.py targets    # per-target freshness + last error
 python3 ~/.copilot/skills/vm-delegate/vd.py refresh [target]  # probe + mirror logs
 python3 ~/.copilot/skills/vm-delegate/vd.py sync    [target]  # mirror job logs only
+python3 ~/.copilot/skills/vm-delegate/vd.py cancel <job-id>   # mctl cancel + re-probe
 python3 ~/.copilot/skills/vm-delegate/vd.py log  <target> <tag> [kind]  # stored log
 python3 ~/.copilot/skills/vm-delegate/vd.py tail <target> <tag> [kind]  # live log
 python3 ~/.copilot/skills/vm-delegate/vd.py payload    # JSON for the portal

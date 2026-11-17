@@ -32,6 +32,7 @@ fleet refresh waits for every dead lab desktop.
     vd.py sync    [target]     mirror logs only
     vd.py log|tail <target> <tag> [kind]
     vd.py vms | start <id> | stop <id>
+    vd.py cancel <job-id>      stop a running job via `mctl cancel`
 
 A status is a READING, not a fact. It is only true as of `checked`, the moment
 the target last confirmed it, so a failed probe must never advance that stamp
@@ -91,7 +92,7 @@ ERROR_BACKOFF = 600         # ... but a target that just failed is left alone
 # Terminal = the outcome is final and no further probe can change it.
 # `unknown` is deliberately NOT terminal: a demoted job must stay re-resolvable
 # the moment the target answers again.
-TERMINAL = {"passed", "failed", "died", "superseded", "gone"}
+TERMINAL = {"passed", "failed", "died", "cancelled", "superseded", "gone"}
 
 
 # --------------------------------------------------------------------------
@@ -210,6 +211,8 @@ def _status_of(state: str, rc) -> str:
         return "passed" if str(rc) == "0" else "failed"
     if state == "DIED":
         return "died"
+    if state == "CANCELLED":
+        return "cancelled"
     return "gone"
 
 
@@ -1192,6 +1195,79 @@ def portal_power(action: str, instance_id: str) -> dict:
     return out
 
 
+CANCEL_TIMEOUT = 60         # TERM, up to ~10 s grace, KILL, plus the ssh hop
+_CANCEL_RESULTS = {"CANCELLED", "FINISHED", "DIED", "MISMATCH", "NOLOG"}
+
+
+def cancel(job_id: str) -> dict:
+    """Stop one running delegated job through ``mctl cancel``.
+
+    Only the newest dispatch of its slot, believed running, with a known pid is
+    cancellable; mctl re-checks on the target that the pid still owns the slot,
+    so a job that finished or was replaced meanwhile is never hit. The target is
+    re-probed afterwards so the recorded status is a fresh reading.
+    Returns ``{"result": CANCELLED|FINISHED|DIED|MISMATCH|NOLOG, ...}`` or
+    ``{"error": ...}``.
+    """
+    job = _job_by_id(job_id or "")
+    if not job:
+        return {"error": "unknown job"}
+    target = job.get("target") or "vm"
+    tag, kind = job.get("tag", ""), job.get("kind", "") or "build"
+    if not (_safe_id(target) and _safe_id(tag) and kind in ("build", "test", "run")):
+        return {"error": "job has an unsafe target/tag/kind"}
+    st = (_read_state().get("jobs") or {}).get(job["id"]) or {}
+    if st.get("status") != "running":
+        return {"error": f"job is not running (status: {st.get('status') or 'unknown'})"}
+    if not owns_slot(job):
+        return {"error": "a later run owns this slot; refusing to cancel it"}
+    pid = st.get("pid") if st.get("pid") is not None else job.get("pid")
+    if not str(pid or "").isdigit() or int(pid) <= 0:
+        return {"error": "job has no recorded pid to cancel"}
+    if not MCTL.exists():
+        return {"error": "mctl not installed"}
+    env, _agent_err = agent_env()
+    try:
+        p = subprocess.run([str(MCTL), "-t", target, "cancel", tag, kind, str(int(pid))],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=CANCEL_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return {"error": f"'{target}' did not confirm the cancel within {CANCEL_TIMEOUT}s"}
+    except OSError as e:
+        return {"error": str(e)}
+    result = ""
+    for line in p.stdout.splitlines():
+        if line.startswith("__MCTL_CANCEL__ "):
+            result = line.split(None, 1)[1].strip()
+            break
+    if result.split(" ", 1)[0] not in _CANCEL_RESULTS:
+        err = (p.stderr or "").strip().splitlines()
+        return {"error": err[-1] if err else f"mctl cancel failed (rc={p.returncode})"}
+    refreshed = refresh(target)
+    out = {"result": result, "job_id": job["id"], "target": target,
+           "tag": tag, "kind": kind, "pid": int(pid)}
+    if (refreshed.get("errors") or {}).get(target):
+        out["refresh_error"] = refreshed["errors"][target]
+    return out
+
+
+def portal_cancel(job_id: str) -> dict:
+    """Cancel a running job, then return the full refreshed payload."""
+    res = cancel(job_id)
+    if res.get("error"):
+        return res
+    out = payload()
+    out["cancel"] = res
+    word = res["result"].split(" ", 1)[0]
+    out["acted"] = {"CANCELLED": f"cancelled {res['kind']} {res['tag']}",
+                    "FINISHED": "job had already finished",
+                    "DIED": "job was no longer running"}.get(
+                        word, f"not cancelled: {res['result']}")
+    if word not in ("CANCELLED", "FINISHED", "DIED"):
+        out["error"] = f"not cancelled: {res['result']}"
+    return out
+
+
 def portal_log(target: str, tag: str, kind: str, job_id: str = "") -> dict:
     """Open a job's log — its own, never a later run's in the same workspace."""
     kind = kind or "build"
@@ -1354,6 +1430,16 @@ def main(argv: list[str]) -> int:
             return 1
         print(f"[vd] {cmd} requested for {argv[2]}")
         return 0
+    if cmd == "cancel":
+        if len(argv) < 3:
+            print("usage: vd.py cancel <job-id>", file=sys.stderr)
+            return 2
+        res = cancel(argv[2])
+        if res.get("error"):
+            print(f"[vd] {res['error']}", file=sys.stderr)
+            return 1
+        print(f"[vd] {res['kind']} {res['tag']} on {res['target']}: {res['result']}")
+        return 0 if res["result"].split(" ", 1)[0] in ("CANCELLED", "FINISHED", "DIED") else 1
     if cmd == "payload":
         print(json.dumps(payload(), indent=2, ensure_ascii=False))
         return 0
