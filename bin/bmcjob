@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# bmcjob — run commands on a lab BMC DETACHED, so they survive VPN/SSH drops.
+#
+# Mirrors mctl's model: the work runs under `setsid nohup` on the BMC with a
+# pid/log/rc triplet under /tmp/pilot-jobs/<tag>/. No persistent SSH session is
+# needed — poll later from a fresh connection with `status`.
+#
+#   bmcjob run <tag> '<cmd>'    start detached, return immediately
+#   bmcjob status <tag> [-n N]  RUNNING/DONE + exit code + last N log lines
+#   bmcjob log <tag> [-n N]     just the log tail
+#   bmcjob wait <tag> [-T secs] poll until DONE (default 600s), then print status
+#   bmcjob list                 all jobs and their states
+#   bmcjob clean <tag>|--all    remove job dirs
+#
+# Host: -H <ip|name>, else $BMC_HOST, else the private lab-bmc-host setting.
+# Password: ~/.pilot/bmc.pw (all lab BMCs share one credential), via $SSHPASS.
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/cli-local-config.sh" || exit 1
+
+BMC_HOST_DEFAULT=$(cli_local_default lab-bmc-host "") || exit 1
+PWFILE="${BMC_PW_FILE:-$HOME/.pilot/bmc.pw}"
+JOBROOT="/tmp/pilot-jobs"
+TAIL_N=25
+WAIT_T=600
+
+host="${BMC_HOST:-$BMC_HOST_DEFAULT}"
+SSH_TIMEOUT=60
+args=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	-H) host="$2"; shift 2 ;;
+	-n) TAIL_N="$2"; shift 2 ;;
+	-T) WAIT_T="$2"; shift 2 ;;
+	*) args+=("$1"); shift ;;
+	esac
+done
+set -- "${args[@]:-}"
+
+die() { echo "bmcjob: $*" >&2; exit 1; }
+
+[[ -n "$host" ]] || die "set BMC_HOST, -H, or configure lab-bmc-host"
+[[ -r "$PWFILE" ]] || die "no password file at $PWFILE (all BMCs share one credential)"
+command -v sshpass >/dev/null || die "sshpass not installed"
+export SSHPASS="$(cat "$PWFILE")"
+
+# Short ConnectTimeout + ServerAlive so a dead VPN fails fast instead of hanging.
+bmc_ssh() {
+	timeout "$SSH_TIMEOUT" sshpass -e ssh -n \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o LogLevel=ERROR -o ConnectTimeout=10 \
+		-o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+		"root@$host" "$@"
+}
+
+bmc_put() { # stdin -> remote file
+	timeout 60 sshpass -e ssh \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o LogLevel=ERROR -o ConnectTimeout=10 \
+		"root@$host" "cat > $1"
+}
+
+ck_tag() {
+	[[ -n "${1:-}" ]] || die "missing <tag>"
+	[[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "tag must be [A-Za-z0-9._-]+"
+}
+
+sub="${1:-}"; shift || true
+
+case "$sub" in
+run)
+	tag="${1:-}"; ck_tag "$tag"; shift || true
+	cmd="${1:-}"
+	[[ -n "$cmd" ]] || die "missing '<cmd>'"
+	d="$JOBROOT/$tag"
+	bmc_ssh "mkdir -p $d && rm -f $d/rc $d/pid $d/log" >/dev/null || die "cannot create $d on $host"
+	printf '%s\n' "$cmd" | bmc_put "$d/cmd.sh" || die "failed to stage cmd.sh"
+	# setsid+nohup detaches from the ssh session; rc is written after the body exits.
+	bmc_ssh "cd $d && date -u +%Y-%m-%dT%H:%M:%SZ > started && \
+		setsid nohup sh -c 'sh $d/cmd.sh > $d/log 2>&1; echo \$? > $d/rc' \
+		>/dev/null 2>&1 </dev/null & echo \$! > $d/pid; cat $d/pid" >/dev/null
+	echo "detached tag=$tag host=$host log=$d/log"
+	echo "poll: bmcjob status $tag"
+	;;
+status)
+	tag="${1:-}"; ck_tag "$tag"
+	d="$JOBROOT/$tag"
+	bmc_ssh "d=$d; \
+		if [ ! -d \$d ]; then echo STATE=NOJOB; exit 0; fi; \
+		if [ -f \$d/rc ]; then echo STATE=DONE rc=\$(cat \$d/rc); \
+		else echo STATE=RUNNING; fi; \
+		echo started=\$(cat \$d/started 2>/dev/null); \
+		echo bytes=\$(wc -c < \$d/log 2>/dev/null); \
+		echo '--- log tail ---'; tail -n $TAIL_N \$d/log 2>/dev/null"
+	;;
+log)
+	tag="${1:-}"; ck_tag "$tag"
+	bmc_ssh "tail -n $TAIL_N $JOBROOT/$tag/log 2>/dev/null"
+	;;
+wait)
+	tag="${1:-}"; ck_tag "$tag"
+	d="$JOBROOT/$tag"
+	SSH_TIMEOUT=$((WAIT_T + 30))  # must outlive the server-side poll loop
+	# Poll on the BMC, not locally: one SSH round-trip instead of many.
+	bmc_ssh "d=$d; i=0; while [ \$i -lt $WAIT_T ]; do \
+			[ -f \$d/rc ] && break; sleep 2; i=\$((i+2)); done; \
+		if [ -f \$d/rc ]; then echo STATE=DONE rc=\$(cat \$d/rc); \
+		else echo STATE=TIMEOUT after ${WAIT_T}s; fi; \
+		echo '--- log tail ---'; tail -n $TAIL_N \$d/log 2>/dev/null"
+	;;
+list)
+	bmc_ssh "for d in $JOBROOT/*/; do [ -d \"\$d\" ] || continue; \
+			t=\$(basename \$d); \
+			if [ -f \$d/rc ]; then s=\"DONE rc=\$(cat \$d/rc)\"; else s=RUNNING; fi; \
+			printf '%-28s %-12s %s bytes  %s\n' \"\$t\" \"\$s\" \
+				\"\$(wc -c < \$d/log 2>/dev/null)\" \"\$(cat \$d/started 2>/dev/null)\"; \
+		done 2>/dev/null"
+	;;
+clean)
+	tgt="${1:-}"
+	if [[ "$tgt" == "--all" ]]; then
+		bmc_ssh "rm -rf $JOBROOT" && echo "cleaned all jobs on $host"
+	else
+		ck_tag "$tgt"; bmc_ssh "rm -rf $JOBROOT/$tgt" && echo "cleaned $tgt"
+	fi
+	;;
+*)
+	sed -n '2,22p' "$0" | sed 's/^# \?//'
+	exit 1
+	;;
+esac

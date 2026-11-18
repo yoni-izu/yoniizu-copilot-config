@@ -21,6 +21,14 @@ JSON/Markdown exports or domain tables. Use the owning CLI/API. Jira, GitHub,
 PLDM and machine tooling retain external authority; documents and raw evidence
 remain files. See the maintainer's domain architecture for the ownership map.
 
+## Custom CLI ownership
+
+Keep custom CLI source, associated tests and installation wiring tracked in
+this repository, either in `bin/` or the owning skill. Install commands as
+links to those sources where possible. Keep credentials, personal records,
+machine-specific configuration and runtime state outside the repository. Do
+not add `neo-ask` unless its ownership is clarified. See `bin/README.md`.
+
 ## RTL questions go to Neo, and only Neo
 
 Every RTL/HDL question, whether behaviour, signal, register implementation,

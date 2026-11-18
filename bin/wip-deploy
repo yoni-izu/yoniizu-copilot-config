@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# wip-deploy — install the `wip` CLI onto a remote machine.
+#
+# Copies ~/bin/wip (+ its bash completion) to the remote host, makes it
+# executable, and idempotently wires ~/bin onto the login PATH and loads the
+# completion in the remote ~/.bashrc. Safe to re-run.
+#
+# Usage:
+#   wip-deploy <host> [--no-bashrc] [--force]
+#   wip-deploy <host>
+#   wip-deploy user@host
+#   wip-deploy "$(mctl -t vm dest)"   # deploy to the Main EC2 VM ([user@]ip)
+#
+#   <host>        anything ssh can reach (hostname or user@host)
+#   --no-bashrc   copy the binary only; don't touch the remote ~/.bashrc
+#   --force       redeploy even if the remote already has an up-to-date `wip`
+#
+set -euo pipefail
+
+SRC_BIN="$HOME/bin/wip"
+SRC_COMP="$HOME/bin/completions/wip.bash"
+
+HOST=""
+WIRE_BASHRC=1
+FORCE=0
+for arg in "$@"; do
+	case "$arg" in
+		--no-bashrc) WIRE_BASHRC=0 ;;
+		--force)     FORCE=1 ;;
+		--*)         echo "Unknown flag: $arg" >&2; exit 2 ;;
+		*)           HOST="$arg" ;;
+	esac
+done
+
+[[ -n "$HOST" ]] || { echo "usage: wip-deploy <host> [--no-bashrc] [--force]" >&2; exit 2; }
+[[ -f "$SRC_BIN" ]] || { echo "ERROR: $SRC_BIN not found locally" >&2; exit 2; }
+
+echo "[$HOST] deploying wip CLI..."
+
+# Skip if the remote already has the same version (unless --force).
+if [[ $FORCE -eq 0 ]]; then
+	local_sum=$(sha256sum "$SRC_BIN" | cut -d' ' -f1)
+	remote_sum=$(ssh "$HOST" 'sha256sum ~/bin/wip 2>/dev/null | cut -d" " -f1' || true)
+	if [[ -n "$remote_sum" && "$remote_sum" == "$local_sum" ]]; then
+		echo "[$HOST] already up to date (use --force to redeploy)."
+		exit 0
+	fi
+fi
+
+# Ensure remote dirs, copy binary + completion, set exec bit.
+ssh "$HOST" 'mkdir -p ~/bin/completions'
+scp -q "$SRC_BIN" "$HOST:~/bin/wip"
+ssh "$HOST" 'chmod 755 ~/bin/wip'
+if [[ -f "$SRC_COMP" ]]; then
+	scp -q "$SRC_COMP" "$HOST:~/bin/completions/wip.bash"
+fi
+
+# Idempotently put ~/bin on PATH + load completion in the remote ~/.bashrc.
+if [[ $WIRE_BASHRC -eq 1 ]]; then
+	ssh "$HOST" 'bash -s' <<'REMOTE'
+touch ~/.bashrc
+grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+line='[ -f ~/bin/completions/wip.bash ] && source ~/bin/completions/wip.bash'
+grep -qxF "$line" ~/.bashrc || echo "$line" >> ~/.bashrc
+REMOTE
+fi
+
+# Verify it runs under a login shell (PATH resolved).
+if ssh "$HOST" 'bash -lc "command -v wip >/dev/null && wip help >/dev/null"'; then
+	echo "[$HOST] wip deployed and on PATH."
+else
+	echo "[$HOST] wip copied to ~/bin/wip, but not resolvable on login PATH." >&2
+	echo "         Invoke it as ~/bin/wip, or add ~/bin to PATH manually." >&2
+	exit 1
+fi

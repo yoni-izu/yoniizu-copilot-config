@@ -1,22 +1,44 @@
-# Local CLIs (version controlled)
+# Local CLIs
 
-Home for the standalone command-line tools that back several skills. They live
-here so they are version controlled, even though `~/.copilot/bin` is not their
-natural home. They are exposed on `PATH` from `~/bin` (or `$PREFIX`) via
-`install.sh`.
+Custom CLI sources belong in this repository. `bin/` contains the standalone
+commands; domain-owned implementations can also live with their skills.
+Personal records, credentials, machine-specific defaults, and runtime state
+must remain outside the repository. `neo-ask` is excluded while its ownership
+is unclear.
 
-| Tool    | Purpose                                                                 |
-|---------|-------------------------------------------------------------------------|
-| `wip`   | Multi-repo / workspace git operations (see the `wip-workspace` skill).  |
-| `vmctl` | Delegate FW workspace work to the EC2 VM mirror (see `vm-delegate`).     |
+| Tool | Purpose |
+|------|---------|
+| `wip`, `wip-deploy` | Multi-repo workspace operations and remote installation |
+| `mctl`, `vmctl`, `setup_machine.sh` | Machine delegation and compatibility helpers |
+| `lsctl`, `bmcjob` | Local lab console and BMC job clients |
+| `fw-deploy` | Launcher for `skills/fw-deploy/scripts/fw_deploy.py` |
+
+The local `bmcjob` client is different from the BMC-side script in
+`skills/machine-pilot/scripts/bmcjob`; both are retained.
 
 ## Install
 
 ```bash
-~/.copilot/bin/install.sh          # symlink wip + vmctl into ~/bin (default)
+~/.copilot/bin/install.sh
 PREFIX=~/.local/bin ~/.copilot/bin/install.sh
-~/.copilot/bin/install.sh --copy   # copy instead of symlink (e.g. a remote VM)
+~/.copilot/bin/install.sh --copy
 ```
 
-Symlink is the default: after `git pull` the installed commands update with no
-re-install. Use `--copy` on machines where the repo is not checked out (the VM).
+The installer links commands and the `wip` completion by default. It checks all
+destinations first and refuses to overwrite different files or links; move or
+back up existing installations explicitly before running it. `--copy` copies
+the files instead. Commands that use skills or other repository files still
+require those dependencies on the target machine.
+
+Machine-specific defaults, when needed, are single-line files under
+`~/.copilot-private/cli/`:
+
+| File | Used by | Fallback when absent |
+|------|---------|----------------------|
+| `default-remote-user` | `mctl`, `setup_machine.sh` | Local login name |
+| `lab-bmc-host` | `lsctl`, local `bmcjob` | No host; set an explicit override |
+| `lsctl-password-file` | `lsctl` | `~/.pilot/bmc.pw` |
+
+Existing command-line and environment overrides take precedence. These files
+contain configuration only, not passwords; credentials stay in their existing
+private stores.

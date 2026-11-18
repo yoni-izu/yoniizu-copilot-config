@@ -1,50 +1,67 @@
 #!/usr/bin/env bash
-# Install the version-controlled CLIs (wip, vmctl) into a local bin directory.
-#
-# These scripts live in ~/.copilot/bin (version controlled here even though it is
-# not their natural home) and are exposed on PATH by symlinking — so a `git pull`
-# of this repo instantly updates the installed commands with no re-install.
-#
-# Usage:
-#   ./install.sh                 # symlink into ~/bin (default)
-#   PREFIX=~/.local/bin ./install.sh
-#   ./install.sh --copy          # copy instead of symlink (e.g. for a remote VM)
-#
+# Install the repository's local CLIs into $PREFIX (default: ~/bin).
+# Usage: ./install.sh [--link|--copy]
 set -euo pipefail
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/bin}"
-MODE=symlink
-TOOLS=(wip vmctl)
+MODE=link
+FILES=(
+	"bin/wip:wip"
+	"bin/mctl:mctl"
+	"bin/vmctl:vmctl"
+	"bin/wip-deploy:wip-deploy"
+	"bin/setup_machine.sh:setup_machine.sh"
+	"bin/lsctl:lsctl"
+	"bin/bmcjob:bmcjob"
+	"bin/fw-deploy:fw-deploy"
+	"bin/cli-local-config.sh:cli-local-config.sh"
+	"bin/completions/wip.bash:completions/wip.bash"
+)
 
-for a in "$@"; do
-  case "$a" in
-    --copy)   MODE=copy ;;
-    --link)   MODE=symlink ;;
-    -h|--help)
-      sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *) echo "install.sh: unknown option '$a'" >&2; exit 2 ;;
-  esac
+for arg in "$@"; do
+	case "$arg" in
+		--copy) MODE=copy ;;
+		--link) MODE=link ;;
+		-h|--help) sed -n '2,3p' "${BASH_SOURCE[0]}"; exit 0 ;;
+		*) echo "install.sh: unknown option '$arg'" >&2; exit 2 ;;
+	esac
 done
 
-mkdir -p "$PREFIX"
+for entry in "${FILES[@]}"; do
+	src="$REPO_DIR/${entry%%:*}"
+	dst="$PREFIX/${entry#*:}"
+	[[ -f "$src" ]] || { echo "install.sh: missing source $src" >&2; exit 1; }
+	if [[ -e "$dst" || -L "$dst" ]]; then
+		if [[ "$MODE" == link && -L "$dst" && "$(readlink -f "$dst")" == "$src" ]]; then
+			continue
+		fi
+		if [[ "$MODE" == copy && ! -L "$dst" && -f "$dst" ]] && cmp -s "$src" "$dst"; then
+			continue
+		fi
+		echo "install.sh: refusing to overwrite $dst" >&2
+		exit 1
+	fi
+done
 
-for t in "${TOOLS[@]}"; do
-  src="$SRC_DIR/$t"
-  dst="$PREFIX/$t"
-  [[ -f "$src" ]] || { echo "install.sh: missing source $src" >&2; exit 1; }
-  chmod +x "$src"
-  if [[ "$MODE" == copy ]]; then
-    install -m 0755 "$src" "$dst"
-    echo "copied   $t -> $dst"
-  else
-    ln -sfn "$src" "$dst"
-    echo "linked   $t -> $dst"
-  fi
+for entry in "${FILES[@]}"; do
+	src="$REPO_DIR/${entry%%:*}"
+	dst="$PREFIX/${entry#*:}"
+	if [[ -e "$dst" || -L "$dst" ]]; then
+		echo "unchanged $dst"
+		continue
+	fi
+	mkdir -p "$(dirname "$dst")"
+	if [[ "$MODE" == copy ]]; then
+		cp -p "$src" "$dst"
+		echo "copied $dst"
+	else
+		ln -s "$src" "$dst"
+		echo "linked $dst"
+	fi
 done
 
 case ":$PATH:" in
-  *":$PREFIX:"*) ;;
-  *) echo "note: $PREFIX is not on your PATH — add it to your shell rc." >&2 ;;
+	*":$PREFIX:"*) ;;
+	*) echo "note: $PREFIX is not on your PATH" >&2 ;;
 esac

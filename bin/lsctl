@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# lsctl - parallel OAM console harness for PCIe link-stability runs.
+#
+# Opens one persistent logged obmc-console session per OAM on the ELS BMC
+# (ports 2200+N), driven by a per-OAM command file so that commands can be
+# injected from separate shells/invocations. Everything is UART-only: no PCIe
+# transport is involved, which is mandatory while the PCIe link is the thing
+# under investigation.
+#
+#   lsctl start  RUN            open sessions, log to $BASE/RUN/oamN.log
+#   lsctl bcast  RUN 'CMD'      send CMD to every OAM
+#   lsctl send   RUN N 'CMD'    send CMD to one OAM
+#   lsctl mark   RUN 'TEXT'     write a timestamped marker into every log
+#   lsctl status RUN            show per-OAM session liveness + log sizes
+#   lsctl stop   RUN            close all sessions
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/cli-local-config.sh" || exit 1
+
+BMC=${BMC:-$(cli_local_default lab-bmc-host "")} || exit 1
+BASE=${BASE:-$HOME/pilot-evidence/linkstab}
+PWF=${PWF:-$(cli_local_default lsctl-password-file "$HOME/.pilot/bmc.pw")} || exit 1
+OAMS=${OAMS:-0 1 2 3 4 5 6 7}
+
+d_of() { echo "$BASE/$1"; }
+
+start() {
+	local run=$1 d n pid
+	[[ -n $BMC ]] || { echo "set BMC or configure lab-bmc-host" >&2; exit 1; }
+	d=$(d_of "$run")
+	mkdir -p "$d/ctl"
+	[[ -r $PWF ]] || { echo "missing password file $PWF" >&2; exit 1; }
+	export SSHPASS
+	SSHPASS=$(cat "$PWF")
+	for n in $OAMS; do
+		: > "$d/ctl/cmd$n"
+		(
+			tail -n +1 -f "$d/ctl/cmd$n" |
+				sshpass -e ssh -tt \
+					-o StrictHostKeyChecking=no \
+					-o UserKnownHostsFile=/dev/null \
+					-o LogLevel=ERROR \
+					-o ServerAliveInterval=30 \
+					-p $((2200 + n)) "root@$BMC"
+		) >> "$d/oam$n.log" 2>&1 &
+		pid=$!
+		echo "$pid" > "$d/ctl/pid$n"
+	done
+	echo "started oam[${OAMS// /,}] -> $d"
+}
+
+send() {
+	local d
+	d=$(d_of "$1")
+	printf '%s\r' "$3" >> "$d/ctl/cmd$2"
+}
+
+bcast() {
+	local run=$1 cmd=$2 n
+	for n in $OAMS; do send "$run" "$n" "$cmd"; done
+}
+
+mark() {
+	local run=$1 text=$2 n stamp
+	stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	for n in $OAMS; do
+		printf '\n===== MARK %s %s =====\n' "$stamp" "$text" >> "$(d_of "$run")/oam$n.log"
+	done
+	echo "mark $stamp $text"
+}
+
+status() {
+	local d n pid state
+	d=$(d_of "$1")
+	for n in $OAMS; do
+		pid=$(cat "$d/ctl/pid$n" 2>/dev/null)
+		state=dead
+		[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && state=live
+		printf 'oam%s pid=%-7s %-4s %s bytes\n' \
+			"$n" "${pid:--}" "$state" "$(stat -c %s "$d/oam$n.log" 2>/dev/null || echo 0)"
+	done
+}
+
+stop() {
+	local d n pid
+	d=$(d_of "$1")
+	for n in $OAMS; do
+		pid=$(cat "$d/ctl/pid$n" 2>/dev/null) || continue
+		[[ -n $pid ]] || continue
+		# kill the pipeline children (tail, sshpass/ssh) then the subshell
+		kill $(pgrep -P "$pid" 2>/dev/null) "$pid" 2>/dev/null
+	done
+	echo "stopped"
+}
+
+case ${1:-} in
+start) start "$2" ;;
+send) send "$2" "$3" "$4" ;;
+bcast) bcast "$2" "$3" ;;
+mark) mark "$2" "$3" ;;
+status) status "$2" ;;
+stop) stop "$2" ;;
+*)
+	sed -n '2,16p' "$0" >&2
+	exit 2
+	;;
+esac
