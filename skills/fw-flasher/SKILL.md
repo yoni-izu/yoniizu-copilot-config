@@ -147,6 +147,31 @@ Preconditions and hazards (details in
   boots. `bmccli flash update` selects the device for you (`-d <device|all>`) —
   prefer it.
 
+## Scripted flashing: `fw-flash` (used by the Team Portal)
+
+`scripts/fw_flash.py` (launcher `~/bin/fw-flash`) wraps the steps above for an
+mctl target with a registered BMC:
+
+```bash
+fw-flash discover --target srv22 [--json]       # read-only: methods + OAM state/build
+fw-flash run --target srv22 --method bmc --image IMG --sha256 SHA --oam 1 --oam 3 \
+    [--reset-verify] [--force] [--events FILE] [--job-id ID]
+```
+
+- Methods: `bmc` (`bmccli flash update`, queued — progress comes from
+  `journalctl -u orchestrator`, which is streamed into the log as `[journal]`),
+  `pcie` / `spi-ftdi` (`fw_ctl` on the host; needs fw_ctl + passwordless sudo),
+  `spi-bmc` (`fwloader` on the `soc-nv-flash` MTD, one part, verified by dump SHA).
+- Gates: image SHA-256 must match `--sha256`; every OAM READY unless `--force`;
+  staged image re-hashed on the BMC. Read-back is mandatory (`flash version -f`);
+  an OAM is `verified` only with write evidence AND every FPT build equal to the
+  image build. `--reset-verify` resets and checks the booted build.
+- Exit: 0 all verified, 2 written but not verified, 1 error, 130 cancelled.
+  SIGTERM is honoured only before the write phase; during write/verify/boot it is
+  refused (logged as `cancel REFUSED`).
+- `--events` writes JSONL (phase / oam / image / result) that the portal's
+  `/flash` window folds into progress. Tests: `python3 -m unittest tests.test_fw_flash`.
+
 ## Step 4 — VERIFY it (mandatory; a flash isn't done until this passes)
 
 Run **all** that apply; see [references/verification.md](./references/verification.md)
