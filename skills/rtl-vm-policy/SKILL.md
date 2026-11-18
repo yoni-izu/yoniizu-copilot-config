@@ -52,11 +52,16 @@ lines before output reaches WSL.
    ground in RTL, stays unverified in your answer. Quote the mirror commit
    when it matters (A1 is frozen; A2 is `main` and moves).
 5. **No fallback.** If `neo-ask` fails, report the prerequisite and stop. The
-   usual causes are a stopped VM (`mctl -t vm start`), a logged-out Copilot
+   usual causes are a VM that could not be auto-started (`neo-ask` wakes it;
+   check `mctl -t vm lease`), a logged-out Copilot
    CLI on the VM (`ssh -t <vm> 'copilot login --device-code'`), or stale
    mirrors. Do not improvise local, GitHub or VM-worktree reads.
 
 ## Neo deployment on the VM (for maintenance)
+
+Installed and verified by `mctl provision vm` (recipes `neo` and `rtl` in
+`~/.copilot/skills/vm-delegate/provision/`); a new Main VM needs only that plus
+`copilot login` on it. Re-run with `--only neo,rtl --force` to rebuild.
 
 | Item | Value |
 | --- | --- |

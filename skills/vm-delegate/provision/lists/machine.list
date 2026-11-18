@@ -1,0 +1,11 @@
+# Default provisioning list for kind=remote targets (lab desktops / servers).
+# One recipe (recipes/<name>.sh) per line, run in order; `include <list>` pulls
+# in another list. Lab machines share one NFS home, so provisioning one usually
+# covers them all. Used by `mctl provision` when no --list is given.
+# (State dirs are created on demand by mirror/dispatch/wip-deploy; the
+# optional `dirs` recipe is available via --only dirs.)
+creds
+git
+wip
+copilot
+btop

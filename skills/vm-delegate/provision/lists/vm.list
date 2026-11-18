@@ -1,0 +1,7 @@
+# Default provisioning list for kind=vm targets (personal EC2 VMs).
+# Order matters: later recipes rely on earlier ones (neo needs git+creds+copilot,
+# rtl needs neo). Used by `mctl provision` when no --list is given.
+include machine.list
+octl_update
+neo
+rtl

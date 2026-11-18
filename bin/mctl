@@ -1,0 +1,2210 @@
+#!/usr/bin/env bash
+#
+# mctl — delegate FW workspace work to a mirror workspace on ANY machine.
+#
+# (Formerly `vmctl`, which only ever spoke to the EC2 VM. `mctl` keeps every
+#  VM capability — including lifecycle: start / stop — but now targets any
+#  reachable machine: a personal EC2 VM *or* a shared lab desktop.)
+#
+# A "target" is a named machine in ~/.mctl/targets:
+#   • kind=vm     — a personal EC2 instance. Its IP is auto-discovered from
+#                   `octl vm list` (never hardcoded); it can be started/stopped.
+#   • kind=remote — any ssh-reachable host (lab desktop, build box, …) given by
+#                   user@host. No lifecycle control — it is assumed to be up.
+#
+# The mirror keeps the workspace at the SAME PATH RELATIVE TO $HOME as local.
+# On the VM the home is identical, so the absolute path is identical too (the
+# original vmctl behaviour). On a lab machine with a different login/home, the
+# path is remapped home-relative — e.g. local  ~/projects/iridium/one/fw
+# becomes  <remote-home>/projects/iridium/one/fw. Many lab machines share one
+# NFS home, so a single `mctl mirror` is visible on all of them; you can then
+# build on whichever box is free.
+#
+# Work is delegated by:
+#   1. pushing local dev branches to origin,
+#   2. aligning the remote mirror workspace to those exact branches,
+#   3. running builds/tests DETACHED (survive SSH hangups),
+#   4. pulling logs/binaries back so results look local.
+#
+# Every long-running remote job uses setsid+nohup and writes a PID + log file
+# under <remote-home>/.mctl/jobs/<tag>/, so status/pull work from a fresh SSH
+# connection with no persistent session required.
+#
+# Usage:
+#   mctl targets                       List configured targets
+#   mctl target add <name> <user@host> Register a remote (kind=remote) machine
+#   mctl dest                          Print the target's ssh destination ([user@]host)
+#   mctl target add <name> --vm [user] [instance-id]
+#                                      Register a VM target bound to an instance
+#   mctl vm list                       Your EC2 instances and their targets
+#   mctl vm main [<id> [--user LOGIN]] Show / switch the Main VM (target 'vm');
+#                                      the previous one stays as target vm-<id6>
+#   mctl target rm  <name>             Remove a target
+#   mctl target add <name> <user@host> --bmc <[user@]bmc-host>
+#   mctl target bmc <name> <[user@]host|->
+#                                      Set / clear the machine's BMC (remote only;
+#                                      user defaults to root)
+#   mctl [-t name] bmc [cmd...]        ssh to the target's BMC (password from
+#                                      ~/.pilot/bmc.pw via sshpass -e, else prompt)
+#   mctl use <name>                    Set the default target
+#   mctl provision [name] [--list L] [--only a,b] [--skip a,b] [--dry-run] [--force]
+#                                      Install prerequisites from recipe lists
+#                                      (default list: vm.list for VMs, machine.list
+#                                      otherwise; recipes already in place are skipped)
+#   mctl provision [name] --status     Last result per recipe on the target
+#   mctl setup [name] [opts]           Same as `provision` (kept for muscle memory)
+#   mctl setup-machine [name]          Legacy: only copy GH/SSH/AWS creds (setup_machine.sh)
+#
+#   mctl -t <name> <cmd …>             Run <cmd> against a specific target
+#   (target precedence: -t/--target ▸ $MCTL_TARGET ▸ ~/.mctl/default ▸ vm)
+#
+#   mctl ip                            Resolve & cache a VM target's IP
+#   mctl start [name]                  Start a VM target        (kind=vm only)
+#   mctl stop  [name]                  Stop  a VM target        (kind=vm only)
+#   mctl wake  [name]                  Ensure a VM target is up (auto-start + wait for ssh)
+#   mctl lease [status [--refresh]]    Last start, predicted stop and lease policy
+#   mctl lease renew [--if-below DUR]  Renew the lease (only when less than DUR left)
+#   mctl vm start|stop <instance-id> [-w]  Power an instance by id (records the start)
+#
+#   VM auto-start: active commands (sh, mirror, build, test, run, pull-*, release,
+#   wip, term, setup, provision, workspace <non-status>) start a stopped / lease-
+#   expired VM target and wait for ssh; build/test/run also renew a short lease.
+#   Passive commands never wake a VM: `jobs` reads only the local log, and
+#   jobs-probe/watch/sync/tail, ip, dest, *-status, cancel are what the portal
+#   polls - waking on them would keep an idle VM up (and billed) forever, and a
+#   stopped VM has no running jobs to report. `mctl wake` starts it explicitly.
+#   mctl sh   '<cmd>' [ws]             Run a command in the remote ws root
+#   mctl mirror [ws] [--sync] [--allow-manifest-drift]
+#                                      Align remote mirror ws to local branches
+#   mctl build [ws] [args] [--no-parallel] [--allow-manifest-drift] [-f]
+#                                      Detached workspace/project build
+#   mctl build-status  [ws]            Poll the remote build
+#   mctl test  '<args>' [ws] [-f]      Detached `octl ws test <args>`
+#   mctl test-status   [ws]            Poll the remote test run
+#   mctl run   '<script>' [ws] [-f]   Run a detached multi-step shell script
+#   mctl run-status [ws]              Poll the remote script
+#   mctl pull-build    [ws]            rsync logs + binaries back (as if local)
+#   mctl pull-logs     [ws]            rsync logs only (for analysis)
+#   mctl jobs                          List every job ever delegated (local log)
+#   mctl jobs-probe                    Machine-readable status of ALL job dirs
+#   mctl jobs-sync                     Mirror every remote job log into ~/.mctl/jobs
+#   mctl jobs-tail <tag> [kind] [n]    Last n lines of one live remote job log
+#   mctl jobs-watch [secs]             Stream jobs-probe blocks over one ssh link
+#   mctl cancel <tag> <kind> <pid>     Stop a running job (only if pid still owns it)
+#   mctl term [remote-cmd]             Interactive ssh -tt (portal terminal)
+#   mctl release       [ws]            Return remote repos to baseline + sync
+#   mctl workspace <action> <remote-path> <id> <rev> [options-json]
+#                                      Guarded independent remote slot lifecycle
+#   mctl wip <action> [ws|--wip]       Proxy any wip_/ws_ action to the target
+#   mctl status        [ws]            Alias of build-status
+#
+# Env overrides:
+#   MCTL_TARGET   Default target name (overridden by -t/--target).
+#   VM_IP         For a kind=vm target: skip discovery, use this IP.
+#   MCTL_SSH_OPTS Extra ssh options (default sets ConnectTimeout + no host check).
+#   MCTL_PROVISION_DIR Recipes/lists root (default ~/.copilot/skills/vm-delegate/provision).
+#   MCTL_PUSH_PREFIX Branch prefix allowed to force-with-lease push (default dev/$USER/).
+#   MCTL_VM_LEASE    Lease given on every start/renew (default 30m, max 72h).
+#   MCTL_RENEW_BELOW Renew before build/test/run when less is left (default 30m).
+#   MCTL_KEEPALIVE_BELOW Portal keepalive renews a VM with running jobs below this (10m).
+#   MCTL_AUTOSTART   0 = never auto-start a stopped VM (default 1).
+#
+set -euo pipefail
+
+source "$(dirname "$(readlink -f "$0")")/cli-local-config.sh"
+
+MCTL_DIR="$HOME/.mctl"
+TARGETS_FILE="$MCTL_DIR/targets"
+DEFAULT_FILE="$MCTL_DIR/default"
+mkdir -p "$MCTL_DIR"
+
+# BatchMode=yes    → never block on a password/host prompt; fail fast instead.
+# ServerAlive*     → drop a half-dead tunnel after ~4×15s rather than hang.
+SSH_OPTS=${MCTL_SSH_OPTS:-${VM_SSH_OPTS:-"-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4"}}
+
+# Upper bound (seconds) on any single interactive-less remote control command
+# so a stuck git fetch or a wedged tunnel aborts instead of hanging forever.
+STEP_TIMEOUT=${MCTL_STEP_TIMEOUT:-${VM_STEP_TIMEOUT:-600}}
+
+# Non-interactive git — the classic "mirror hangs" cause is git blocking on a
+# credential/host-key prompt with no tty. Force it to fail instead, both for the
+# local push and for the fetches the remote runs. Embedded verbatim in scripts.
+# VM lease policy (octl --lease syntax). A VM is started with $VM_LEASE; before
+# a build/test/run the lease is renewed when less than $RENEW_BELOW is left;
+# the portal's keepalive renews while a job runs when less than
+# $KEEPALIVE_BELOW is left. Active commands auto-start a stopped VM.
+VM_LEASE=${MCTL_VM_LEASE:-30m}
+RENEW_BELOW=${MCTL_RENEW_BELOW:-30m}
+KEEPALIVE_BELOW=${MCTL_KEEPALIVE_BELOW:-10m}
+AUTOSTART=${MCTL_AUTOSTART:-1}
+WAKE_TIMEOUT=${MCTL_WAKE_TIMEOUT:-600}
+POWER_DIR="$MCTL_DIR/power"
+# Provisioning recipes + lists (tracked in the vm-delegate skill).
+PROVISION_DIR=${MCTL_PROVISION_DIR:-$HOME/.copilot/skills/vm-delegate/provision}
+
+GIT_SSH_BATCH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+GIT_BATCH="export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='$GIT_SSH_BATCH';"
+
+# A remote op failing with any of these means the machine is missing GH/SSH/AWS
+# credentials — `setup_machine.sh` (run from the VM) provisions them, after which
+# the op is retried once. See rlogin_cred / provision_target below.
+CRED_FAIL_RE='Could not authenticate using GH|SSH_AUTH_SOCK not-specified|gh auth login|Permission denied \(publickey|could not read Username|Authentication failed|Could not read from remote repository|fatal: could not read'
+
+# ── pretty output ───────────────────────────────────────────────────────────
+if [[ ( -t 1 || -t 2 ) && -z "${NO_COLOR:-}" ]]; then
+  _RST=$'\033[0m'; _B=$'\033[1m'; _D=$'\033[2m'
+  _RED=$'\033[31m'; _GRN=$'\033[32m'; _YLW=$'\033[33m'; _CYN=$'\033[36m'
+else
+  _RST= _B= _D= _RED= _GRN= _YLW= _CYN=
+fi
+
+log()  { echo "${_CYN}▸${_RST} $*" >&2; }
+ok()   { echo "${_GRN}✔${_RST} $*" >&2; }
+warn() { echo "${_YLW}▲${_RST} $*" >&2; }
+die()  { echo "${_RED}✖${_RST} ${_B}mctl:${_RST} $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Target registry — ~/.mctl/targets, whitespace-separated columns:
+#     name    kind(vm|remote)    user(- = local login)    host(- = auto)
+# Lines starting with '#' and blank lines are ignored. Seed on first use with
+# the personal EC2 VM (kept for backward-compat with the old vmctl default).
+# ---------------------------------------------------------------------------
+_seed_targets() {
+  [[ -s "$TARGETS_FILE" ]] && return
+  cat > "$TARGETS_FILE" <<EOF
+# mctl targets — columns: name  kind(vm|remote)  user(- =local)  host(- =auto)  [bmc(- =none)]
+# kind=vm     : host = EC2 instance id (bind with 'mctl vm main <id>'); IP
+#               auto-discovered from 'octl vm list'; supports start/stop.
+# kind=remote : plain ssh host (user@host); assumed always up.
+vm      vm      -       -
+EOF
+}
+
+# Currently selected target (globals set by select_target).
+T_NAME= T_KIND= T_USER= T_HOST= T_BMC=
+
+_target_line() {  # $1=name → prints "name kind user host" or nothing
+  awk -v n="$1" '($1==n){print; exit}' "$TARGETS_FILE" 2>/dev/null
+}
+_target_by_host() {  # $1=host → the registered target whose host column matches
+  awk -v h="$1" '($4==h){print; exit}' "$TARGETS_FILE" 2>/dev/null
+}
+
+select_target() {   # $1=explicit name | host | user@host (may be empty)
+  _seed_targets
+  local name=${1:-}
+  [[ -z "$name" ]] && name=${MCTL_TARGET:-}
+  [[ -z "$name" && -s "$DEFAULT_FILE" ]] && name=$(cat "$DEFAULT_FILE")
+  [[ -z "$name" ]] && name=vm
+  # Resolve by registered name, then by registered host, then synthesize an
+  # ad-hoc remote target from a bare hostname or user@host.
+  local line; line=$(_target_line "$name")
+  [[ -z "$line" ]] && line=$(_target_by_host "$name")
+  if [[ -z "$line" ]]; then
+    if [[ "$name" == vm ]]; then
+      line="vm vm - -"                                   # backward compat
+    elif [[ "$name" == *@* ]]; then
+      line="$name remote ${name%%@*} ${name#*@}"          # user@host
+    elif [[ "$name" == *[.-]* ]]; then
+      line="$name remote ${MCTL_DEFAULT_USER:-$(cli_local_default default-remote-user "$(id -un)")} $name"  # bare host
+    else
+      die "unknown target '$name' — add it with: mctl target add $name <user@host>"
+    fi
+  fi
+  read -r T_NAME T_KIND T_USER T_HOST T_BMC _ <<<"$line"
+  [[ -n "$T_BMC" ]] || T_BMC=-
+}
+
+cmd_targets() {
+  _seed_targets
+  local def=""; [[ -s "$DEFAULT_FILE" ]] && def=$(cat "$DEFAULT_FILE")
+  printf "%-14s %-8s %-20s %-22s %s\n" NAME KIND USER HOST BMC
+  awk 'NF && $1!~/^#/' "$TARGETS_FILE" | while read -r n k u h b _; do
+    local mark=" "; [[ "$n" == "$def" ]] && mark="*"
+    printf "%s%-13s %-8s %-20s %-22s %s\n" "$mark" "$n" "$k" "$u" "$h" "${b:--}"
+  done
+  [[ -n "$def" ]] && echo "${_D}(* = default target)${_RST}" >&2
+  return 0
+}
+
+cmd_target() {
+  local action=${1:?"usage: mctl target <add|bmc|rm> …"}; shift || true
+  _seed_targets
+  case "$action" in
+    add)
+      local name=${1:?"usage: mctl target add <name> <user@host> [--bmc host] | --vm [user] [instance-id]"}; shift || true
+      local kind user host bmc=-
+      local -a rest=()
+      while [[ $# -gt 0 ]]; do
+        if [[ "$1" == --bmc ]]; then bmc=${2:?"--bmc needs a host"}; shift 2
+        else rest+=("$1"); shift; fi
+      done
+      set -- "${rest[@]}"
+      if [[ "${1:-}" == "--vm" ]]; then
+        [[ "$bmc" == - ]] || die "a VM target has no BMC"
+        kind=vm; user=${2:--}; host=${3:--}
+        [[ "$host" == - || "$host" =~ ^i-[0-9a-f]{8,17}$ ]] || die "not an instance id: $host"
+      else
+        local dest=${1:?"usage: mctl target add <name> <user@host>"}
+        kind=remote
+        if [[ "$dest" == *@* ]]; then user=${dest%%@*}; host=${dest#*@}
+        else user="-"; host="$dest"; fi
+      fi
+      # Replace any existing line for this name, then append.
+      grep -vE "^[[:space:]]*$name[[:space:]]" "$TARGETS_FILE" > "$TARGETS_FILE.tmp" 2>/dev/null || true
+      mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+      [[ "$bmc" == - ]] || _valid_bmc "$bmc"
+      if [[ "$bmc" == - ]]; then
+        printf "%s\t%s\t%s\t%s\n" "$name" "$kind" "$user" "$host" >> "$TARGETS_FILE"
+      else
+        printf "%s\t%s\t%s\t%s\t%s\n" "$name" "$kind" "$user" "$host" "$bmc" >> "$TARGETS_FILE"
+      fi
+      ok "target '$name' registered (kind=$kind user=$user host=$host${bmc:+ bmc=$bmc})"
+      ;;
+    bmc)
+      local name=${1:?"usage: mctl target bmc <name> <[user@]host|->"} bmc=${2:?"usage: mctl target bmc <name> <[user@]host|->"}
+      local line; line=$(_target_line "$name")
+      [[ -n "$line" ]] || die "unknown target '$name' (see: mctl targets)"
+      local n k u h; read -r n k u h _ <<<"$line"
+      [[ "$k" == remote || "$bmc" == - ]] || die "target '$name' is a VM; VMs have no BMC"
+      [[ "$bmc" == - ]] || _valid_bmc "$bmc"
+      awk -v n="$name" -v b="$bmc" 'BEGIN{OFS="\t"} (NF && $1==n){ if(b=="-") print $1,$2,$3,$4; else print $1,$2,$3,$4,b; next } {print}' \
+        "$TARGETS_FILE" > "$TARGETS_FILE.tmp" && mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+      [[ "$bmc" == - ]] && ok "target '$name': BMC cleared" || ok "target '$name': BMC → $bmc"
+      ;;
+    rm|remove|del)
+      local name=${1:?"usage: mctl target rm <name>"}
+      grep -vE "^[[:space:]]*$name[[:space:]]" "$TARGETS_FILE" > "$TARGETS_FILE.tmp" || true
+      mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+      [[ -s "$DEFAULT_FILE" && "$(cat "$DEFAULT_FILE")" == "$name" ]] && rm -f "$DEFAULT_FILE"
+      ok "target '$name' removed"
+      ;;
+    *) die "unknown 'target' action: $action (add|rm|bmc)";;
+  esac
+}
+
+_valid_bmc() {  # [user@]host — no options, spaces or shell metacharacters
+  [[ "$1" =~ ^([A-Za-z_][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] \
+    || die "not a valid BMC [user@]host: $1"
+}
+
+cmd_use() {
+  local name=${1:?"usage: mctl use <name>"}
+  _seed_targets
+  [[ -n "$(_target_line "$name")" || "$name" == vm ]] \
+    || die "unknown target '$name' (see: mctl targets)"
+  echo "$name" > "$DEFAULT_FILE"
+  ok "default target → $name"
+}
+
+# ---------------------------------------------------------------------------
+# VM IP discovery (kind=vm). Never hardcoded — resolved from `octl vm list`,
+# cached per-target in ~/.mctl/<name>.ip; the cache is self-validating (reused
+# only while TCP/22 is open, so a new/torn-down VM auto-invalidates).
+# A kind=vm target is bound to an EC2 instance id in its host column; only a
+# legacy unbound target ("-") falls back to "the single running VM".
+# ---------------------------------------------------------------------------
+_vm_bound_id() { [[ "$T_HOST" == i-* ]] && echo "$T_HOST" || true; }
+
+# Every instance as TSV: id state private_ip owner_tag description lease_expires_at.
+_octl_vm_rows() {
+  local raw; raw=$(octl vm list --output json --silent 2>/dev/null) || return 1
+  python3 -c '
+import json, sys
+raw = sys.stdin.read()
+start = raw.find("{")
+if start < 0:
+    sys.exit(1)
+data, _ = json.JSONDecoder().raw_decode(raw[start:])
+for inst in data.get("aws") or []:
+    tags = {}
+    for t in inst.get("tags") or []:
+        if isinstance(t, str) and "=" in t:
+            k, v = t.split("=", 1)
+            tags[k] = v
+    print("\t".join([inst.get("instance_id") or "-", (inst.get("state") or "unknown").lower(),
+                     inst.get("private_ip") or "-", tags.get("owner") or "-",
+                     (tags.get("description") or "-").replace("\t", " "),
+                     tags.get("lease_expires_at") or "-"]))
+' <<<"$raw"
+}
+
+_discover_ip() {
+  local rows id; rows=$(_octl_vm_rows) || return 1
+  id=$(_vm_bound_id)
+  if [[ -n "$id" ]]; then
+    awk -F'\t' -v id="$id" '($1==id && $2=="running" && $3!="-"){print $3; exit}' <<<"$rows"
+    return
+  fi
+  local running; running=$(awk -F'\t' '($2=="running" && $3!="-")' <<<"$rows")
+  if (( $(grep -c . <<<"$running" || true) > 1 )); then
+    warn "several VMs are running and '$T_NAME' is not bound to one — bind it with: mctl vm main <instance-id>"
+    return 1
+  fi
+  cut -f3 <<<"$running" | head -1
+}
+
+vm_ip() {
+  [[ "$T_KIND" == vm ]] || die "'$T_NAME' is not a VM target — IP discovery is VM-only"
+  [[ -n "${VM_IP:-}" ]] && { echo "$VM_IP"; return; }
+  [[ -n "${RESOLVED_IP:-}" ]] && { echo "$RESOLVED_IP"; return; }
+  local cache="$MCTL_DIR/$T_NAME.ip" ip=""
+  if [[ -s "$cache" ]]; then
+    ip=$(cat "$cache")
+    if timeout 2 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null; then
+      RESOLVED_IP=$ip; echo "$ip"; return
+    fi
+    log "cached VM IP $ip unreachable — rediscovering"
+  fi
+  ip=$(_discover_ip)
+  [[ -n "$ip" ]] || die "could not resolve a running VM IP for '$T_NAME'${T_HOST:+ ($T_HOST)} from 'octl vm list' — is it started? (mctl -t $T_NAME start, or set VM_IP=...)"
+  echo "$ip" > "$cache"; RESOLVED_IP=$ip; echo "$ip"
+}
+
+# ssh destination for the selected target: an IP (vm) or user@host (remote).
+sshdest() {
+  if [[ "$T_KIND" == vm ]]; then
+    local ip; ip=$(vm_ip)
+    [[ -n "$T_USER" && "$T_USER" != "-" ]] && echo "$T_USER@$ip" || echo "$ip"
+  else
+    [[ -n "$T_HOST" && "$T_HOST" != "-" ]] || die "target '$T_NAME' has no host"
+    [[ -n "$T_USER" && "$T_USER" != "-" ]] && echo "$T_USER@$T_HOST" || echo "$T_HOST"
+  fi
+}
+
+# ssh with agent forwarding (needed for git-over-ssh on the remote), bounded so
+# a wedged remote command can never hang the caller indefinitely.
+rsh() { timeout -k 10 "${STEP_TIMEOUT}" ssh -A $SSH_OPTS "$(sshdest)" "$@"; }
+# Run a script inside a login shell (so octl / wip are on PATH). Fed over stdin
+# to avoid ALL quoting pitfalls on the remote.
+rlogin() { rsh "bash -l -s" <<<"$*"; }
+
+# Send a portable runtime as data to a fixed remote script, not as evaluated code.
+rlogin_workspace() {
+  local request=$1 runtime=$2 quoted
+  quoted=$(python3 -c 'import shlex,sys; print(shlex.quote(sys.argv[1]))' "$request") || return
+  rsh "bash -l -c 'umask 077
+runtime_dir=\$(mktemp -d) || exit 1
+cleanup() { rm -f -- \"\$runtime_dir/workspace_runtime.py\"; rmdir -- \"\$runtime_dir\"; }
+trap cleanup EXIT
+cat > \"\$runtime_dir/workspace_runtime.py\" || exit 1
+python3 \"\$runtime_dir/workspace_runtime.py\" \"\$1\"
+' _ $quoted" < "$runtime"
+}
+
+# provision_target — copy GH/SSH/AWS creds onto the selected (remote) target via
+# setup_machine.sh (which runs the copies from the VM). No-op for the VM itself.
+provision_target() {
+  [[ "$T_KIND" == remote ]] || { warn "provision skipped: '$T_NAME' is kind=$T_KIND (VM is the cred source)"; return 0; }
+  local host=$T_HOST; [[ -n "$host" && "$host" != "-" ]] || die "target '$T_NAME' has no host to provision"
+  local user=$T_USER; [[ -n "$user" && "$user" != "-" ]] || user=$USER
+  log "provisioning credentials on '$T_NAME' ($host)"
+  "$HOME/bin/setup_machine.sh" "$host" "$user" || die "setup_machine.sh failed for '$T_NAME'"
+}
+
+# rlogin variant that captures output and, on a credential failure, auto-runs
+# setup_machine.sh then retries ONCE. Used by the git/octl-touching commands
+# (mirror align, release, wip, sh) so a fresh machine self-heals.
+rlogin_cred() {
+  local script=$*
+  local out rc=0
+  out=$(rsh "bash -l -s" <<<"$script" 2>&1) || rc=$?
+  if [[ $rc -ne 0 && "$T_KIND" == remote && -z "${_MCTL_PROVISIONED:-}" ]] \
+     && grep -qiE "$CRED_FAIL_RE" <<<"$out"; then
+    warn "credential failure on '$T_NAME' — provisioning, then retrying once"
+    provision_target
+    _MCTL_PROVISIONED=1 rlogin_cred "$script"
+    return
+  fi
+  printf '%s\n' "$out"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Remote home + path mapping. The mirror lives at the SAME path relative to
+# $HOME. On a VM the home is identical → identity mapping (old behaviour). On a
+# differing-home lab machine, remap home-relative and cache the remote $HOME.
+# ---------------------------------------------------------------------------
+remote_home() {
+  if [[ "$T_KIND" == vm && ( -z "$T_USER" || "$T_USER" == "-" ) ]]; then
+    echo "$HOME"; return          # identical home — no round trip needed
+  fi
+  local cache="$MCTL_DIR/$T_NAME.home"
+  if [[ -s "$cache" ]]; then cat "$cache"; return; fi
+  local rh; rh=$(rsh 'echo $HOME' 2>/dev/null | tr -d '\r' | tail -1)
+  [[ -n "$rh" ]] || die "could not resolve remote \$HOME on '$T_NAME'"
+  echo "$rh" > "$cache"; echo "$rh"
+}
+
+map_remote() {   # local absolute path → remote absolute path (home-relative)
+  local p=$1 rh; rh=$(remote_home)
+  case "$p" in
+    "$HOME")   echo "$rh" ;;
+    "$HOME"/*) echo "$rh/${p#"$HOME"/}" ;;
+    *)         echo "$p" ;;    # outside home → assume identical (e.g. NFS root)
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Workspace resolution — local ws is found by walking up for .repo; the remote
+# ws is the home-relative image of it.
+# ---------------------------------------------------------------------------
+find_ws() {
+  local d=${1:-$PWD}
+  d=$(cd "$d" && pwd)
+  while [[ "$d" != "/" ]]; do
+    [[ -d "$d/.repo" ]] && { echo "$d"; return; }
+    d=$(dirname "$d")
+  done
+  die "no octl workspace (.repo) found from ${1:-$PWD}"
+}
+
+is_workspace_arg() {
+  [[ "$1" == "." && -d "$PWD/.repo" ]] || [[ -d "$1/.repo" ]]
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+# Send the portable runtime itself, not a dependency on a remote installation.
+# Ordinary rlogin deliberately never provisions/retries a mutating request.
+cmd_workspace() {
+  [[ $# -ge 4 && $# -le 5 ]] \
+    || die "usage: mctl workspace <status|sync|free|mirror|align> <remote-path> <id> <rev> [options-json]"
+  # Roster paths may be home-relative ("~/..."); resolve against the target's $HOME.
+  if [[ "$2" == "~" || "$2" == "~/"* ]]; then
+    local rh; rh=$(remote_home) || return $?
+    set -- "$1" "$rh${2#\~}" "${@:3}"
+  fi
+  local request
+  request=$(python3 - "$@" <<'PY'
+import json
+import re
+import sys
+
+action, path, identity, rev, *mirror = sys.argv[1:]
+if action not in {"status", "sync", "free", "mirror", "align"}:
+    raise SystemExit("unsupported workspace action: " + action)
+if not path.startswith("/") or not identity.startswith("WS-R-"):
+    raise SystemExit("workspace requires an absolute remote path and WS-R identity")
+if not rev:
+    raise SystemExit("workspace requires a manifest baseline revision")
+request = {"action": action, "path": path, "id": identity, "rev": rev}
+if action == "mirror":
+    if not mirror:
+        raise SystemExit("mirror action requires an object or null")
+    value = json.loads(mirror[0])
+    if value is not None and not isinstance(value, dict):
+        raise SystemExit("mirror must be an object or null")
+    request["mirror"] = value
+elif mirror:
+    options = json.loads(mirror[0])
+    if not isinstance(options, dict) or set(options) - {"prs", "portal_free", "portal_sync", "disposable"}:
+        raise SystemExit("unsupported workspace options")
+    if "disposable" in options and (options["disposable"] is not True or action not in {"free", "sync"}):
+        raise SystemExit("disposable requires true and a free or sync action")
+    if "prs" in options and not isinstance(options["prs"], list):
+        raise SystemExit("workspace prs must be a list")
+    for option, required_action in (("portal_free", "free"), ("portal_sync", "sync")):
+        if option not in options:
+            continue
+        value = options[option]
+        if action != required_action or not isinstance(value, dict) or set(value) != {"approved"}:
+            raise SystemExit(f"{option} requires a {required_action} action and an approved snapshot")
+        approved = value["approved"]
+        if approved is not None and (not isinstance(approved, str)
+                                     or not re.fullmatch(r"[0-9a-f]{64}", approved)):
+            raise SystemExit("invalid workspace approval snapshot")
+    request.update(options)
+print(json.dumps(request))
+PY
+  ) || return $?
+  local activity
+  activity=$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); print("review" if r["action"]=="align" else "mirror" if r["action"]=="mirror" and r.get("mirror") is not None else "")' "$request") || return $?
+  if [[ -n "$activity" ]]; then
+    workspace_policy_guard "$2" "$T_NAME" "$activity" || return $?
+  fi
+  rlogin_workspace "$request" "$HOME/.copilot/skills/workspace-manager/workspace_runtime.py"
+}
+
+workspace_checked() {
+  local output rc=0
+  output=$(cmd_workspace "$@") || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return "$rc"
+  fi
+  if ! python3 -c 'import json,sys; r=json.loads(sys.argv[1]); sys.exit(0 if r.get("ok") is True else 1)' "$output"; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  printf '%s\n' "$output"
+}
+
+workspace_field() {
+  python3 -c 'import json,sys; r=json.loads(sys.argv[1]); print(r[sys.argv[2]])' "$1" "$2"
+}
+
+workspace_identity() {
+  python3 "$HOME/.copilot/skills/workspace-manager/wm.py" identity "$@"
+}
+
+workspace_policy_check() {
+  local resolved='{}'
+  if [[ -n "$2" ]]; then
+    resolved=$(workspace_policy_resolve "$1" "$2") || return $?
+  fi
+  python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$2" "$3" "$resolved" "${4:-}" <<'PY'
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+path, target, activity = sys.argv[2:5]
+resolved = json.loads(sys.argv[5])
+root = resolved.get("path", path).rstrip("/")
+records = []
+canonical = dict(resolved.get("records", []))
+for wid, candidate in resolved.get("records", []):
+    candidate = candidate.rstrip("/")
+    if (root == candidate or root.startswith(candidate + "/")
+            or (sys.argv[6] == "tree" and candidate.startswith(root + "/"))):
+        records.append(wm.record(wid))
+if not records:
+    records = [wm.identity(path, target)]
+for rec in records:
+    wm.require_use(rec["slot"], activity)
+    if rec["path"] != canonical.get(rec["id"], resolved.get("path", rec["path"])):
+        raise ValueError(f"workspace '{rec['slot']}' has a path alias; refresh its status "
+                         "to reconcile the physical path before dispatch")
+    print(wm._state_path(rec["id"], ".operation.lock"))
+PY
+}
+
+workspace_policy_resolve() {
+  local records script
+  records=$(python3 - "$HOME/.copilot/skills/workspace-manager" "$2" <<'PY'
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+print(json.dumps([[r["id"], r["path"]] for r in wm.tracked().values()
+                  if r.get("target") == sys.argv[2]]))
+PY
+  ) || return $?
+  script='import json,sys; from pathlib import Path
+resolve=lambda p: str(Path(p).expanduser().resolve())
+print(json.dumps({"path":resolve(sys.argv[1]),"records":[[wid,resolve(p)] for wid,p in json.loads(sys.argv[2])]}))'
+  rlogin "python3 -c $(shell_quote "$script") $(shell_quote "$1") $(shell_quote "$records")"
+}
+
+# Keep dedication fixed until dispatch is recorded. Detached job history then
+# prevents repurposing until its outcome has been verified.
+workspace_policy_guard() {
+  local lock_paths lock_path fd wid
+  lock_paths=$(workspace_policy_check "$@") || return $?
+  while IFS= read -r lock_path; do
+    wid=$(basename "$lock_path" .operation.lock)
+    if [[ "${WM_LOCKED_WORKSPACE:-}" == "$wid" || "${MCTL_POLICY_IDS:-}" == *"|$wid|"* ]]; then
+      continue
+    fi
+    mkdir -p -- "$(dirname "$lock_path")" || return $?
+    exec {fd}>"$lock_path" || return $?
+    flock -n "$fd" || { echo "workspace operation already running: $1" >&2; return 1; }
+    MCTL_POLICY_IDS="${MCTL_POLICY_IDS:-}|$wid|"
+  done <<< "$lock_paths"
+  workspace_policy_check "$@" >/dev/null || return $?
+}
+
+workspace_policy_guard_tree() {
+  workspace_policy_guard "$1" "$T_NAME" wip tree
+}
+
+workspace_register_remote() {
+  python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$T_NAME" "$2" <<'PY'
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+path, target, revision = sys.argv[2:]
+with wm.store_lock():
+    existing = any(
+        (rec.get("target") or "") == target
+        and (path == rec["path"] or path.startswith(rec["path"].rstrip("/") + "/"))
+        for rec in wm.tracked(wm.load()).values()
+    )
+    if not existing:
+        ok, message, _ = wm.track(path, target=target, rev=revision)
+        if not ok:
+            raise SystemExit(message)
+    print(json.dumps(wm.identity(path, target)))
+PY
+}
+
+workspace_reconcile_identity() {
+  python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$T_NAME" <<'PY'
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+record = wm.identity(sys.argv[2], sys.argv[3])
+wm.workspace_request(record["slot"], "status")
+print(json.dumps(wm.record(record["slot"])))
+PY
+}
+
+workspace_remote_path() {
+  # Register the machine's physical slot, not a home-relative symlink alias.
+  rlogin "python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]).expanduser().resolve(strict=True); assert p.is_dir(), \"workspace is not a directory\"; print(p)' $(shell_quote "$1")"
+}
+
+# Status may report a preexisting marker under a different ID. Adopt that ID
+# locally before any write, then read it again with its authoritative revision.
+workspace_remote_identity() {
+  local path=$1 record id rev output actual
+  path=$(workspace_remote_path "$path") || return $?
+  if [[ -n "${2:-}" ]]; then
+    record=$(workspace_register_remote "$path" "$2") || return $?
+  else
+    record=$(workspace_identity "$path" --target "$T_NAME") || return $?
+  fi
+  id=$(workspace_field "$record" id) || return $?
+  rev=$(workspace_field "$record" rev) || return $?
+  output=$(cmd_workspace status "$path" "$id" "$rev") || return $?
+  actual=$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); s=r.get("status") or {}; print(s.get("id") or r.get("workspace_id") or "")' "$output") || return $?
+  if [[ -n "$actual" && "$actual" != "$id" ]]; then
+    record=$(workspace_reconcile_identity "$path") || return $?
+    id=$(workspace_field "$record" id) || return $?
+    [[ "$id" == "$actual" ]] || { warn "remote identity changed during reconciliation"; return 1; }
+    path=$(workspace_field "$record" path) || return $?
+    rev=$(workspace_field "$record" rev) || return $?
+    output=$(cmd_workspace status "$path" "$id" "$rev") || return $?
+  fi
+  python3 -c '
+import json,sys
+r=json.loads(sys.argv[1])
+if r.get("ok") is not True:
+    print(sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+s=r["status"]
+if s.get("id") != sys.argv[2]:
+    raise SystemExit("remote status omitted or changed workspace identity")
+s["rev"]=sys.argv[3]
+print(json.dumps(s))
+' "$output" "$id" "$rev"
+}
+
+workspace_mirror_json() {
+  python3 - "$1" "$2" "$3" <<'PY'
+from datetime import datetime, timezone
+import json
+import socket
+import sys
+print(json.dumps(dict(source_id=sys.argv[1], source_path=sys.argv[2],
+                     source_host=socket.gethostname(), state=sys.argv[3],
+                     updated=datetime.now(timezone.utc).isoformat())))
+PY
+}
+
+workspace_mirror_state() {
+  local remote_path=$1 source_id=$2 source_path=$3 state=$4
+  python3 "$HOME/.copilot/skills/workspace-manager/wm.py" mirror-state \
+    "$T_NAME" "$remote_path" --source-id "$source_id" \
+    --source-path "$source_path" --state "$state"
+}
+
+workspace_set_mirror() {
+  local path=$1 id=$2 source_id=$3 source_path=$4 state=$5 rev=$6 mirror
+  mirror=$(workspace_mirror_json "$source_id" "$source_path" "$state") || return $?
+  workspace_checked mirror "$path" "$id" "$rev" "$mirror" >/dev/null
+}
+
+workspace_sync_slot() {
+  local path=$1 id=$2 rev=$3
+  workspace_checked sync "$path" "$id" "$rev" >/dev/null
+}
+
+workspace_slot_unoccupied() {
+  python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$T_NAME" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+record = wm.identity(sys.argv[2], sys.argv[3])
+if wm.get_holder(record["slot"]):
+    raise SystemExit("remote workspace is occupied; free its reservation before mirroring")
+PY
+}
+
+workspace_mirror_guard() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+mirror = status.get("mirror")
+if not status.get("exists") or not status.get("safe"):
+    raise SystemExit("remote workspace is missing or unsafe; mirror refused")
+if mirror and mirror.get("source_id") != sys.argv[2]:
+    raise SystemExit("remote mirror belongs to another source; mirror refused")
+if not mirror and not status.get("clean"):
+    raise SystemExit("independent remote workspace is not at baseline; mirror refused")
+PY
+}
+
+# Called only in a command subshell. Record outcome without command text, args,
+# credentials, or remote output, and preserve the original command's exit code.
+workspace_log_start() {
+  local ws=$1 action=$2 remote_path
+  remote_path=$(map_remote "$ws") || return $?
+  remote_path=$(workspace_remote_path "$remote_path") || return $?
+  case "$action" in
+    build|test|run|sh|wip)
+      workspace_policy_guard "$remote_path" "$T_NAME" "$action" || return $? ;;
+  esac
+  trap "workspace_log_finish \$? $(shell_quote "$ws") $(shell_quote "$remote_path") $(shell_quote "$action")" EXIT
+}
+
+workspace_log_finish() {
+  local rc=$1 ws=$2 remote_path=$3 action=$4
+  trap - EXIT
+  python3 - "$HOME/.copilot/skills/workspace-manager" \
+    "$ws" "$remote_path" "$T_NAME" "$action" "$rc" <<'PY' \
+    || warn "could not append workspace action history"
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+local = wm.identity(sys.argv[2])
+remote = wm.identity(sys.argv[3], sys.argv[4])
+outcome = "ok" if sys.argv[6] == "0" else "error"
+for slot in dict.fromkeys((local["slot"], remote["slot"])):
+    wm.log_action(slot, "mctl-" + sys.argv[5], outcome, "target=" + sys.argv[4])
+PY
+  exit "$rc"
+}
+
+workspace_manifest_dir() {
+  printf '%s/.repo/manifests' "$1"
+}
+
+manifest_pins() {
+  local manifest_dir=$1
+  ( cd "$manifest_dir" \
+    && find . -type f -path '*/fw_external/*.tar.gz' -print0 \
+      | sort -z \
+      | xargs -0 -r sha256sum )
+}
+
+check_manifest_drift() {
+  local ws=$1 rws=$2 allow=${3:-0}
+  local local_manifest remote_manifest local_rev remote_rev local_pins remote_pins
+  local_manifest=$(workspace_manifest_dir "$ws")
+  remote_manifest=$(workspace_manifest_dir "$rws")
+  [[ -d "$local_manifest" ]] || die "local manifest directory missing: $local_manifest"
+  local_rev=$(git -C "$local_manifest" rev-parse HEAD) \
+    || die "cannot read local manifest revision: $local_manifest"
+  local remote_manifest_q; remote_manifest_q=$(shell_quote "$remote_manifest")
+  remote_rev=$(rlogin "git -C $remote_manifest_q rev-parse HEAD") \
+    || die "cannot read remote manifest revision on '$T_NAME': $remote_manifest"
+  if [[ "$local_rev" != "$remote_rev" ]]; then
+    warn "manifest revisions differ on '$T_NAME' (local $local_rev, remote $remote_rev)"
+  fi
+  local_pins=$(manifest_pins "$local_manifest") \
+    || die "cannot read local fw_external pins from $local_manifest"
+  remote_pins=$(rlogin "cd $(shell_quote "$remote_manifest") && find . -type f -path '*/fw_external/*.tar.gz' -print0 | sort -z | xargs -0 -r sha256sum") \
+    || die "cannot read remote fw_external pins from $remote_manifest"
+  if [[ "$local_rev" != "$remote_rev" && "$local_pins" == "$remote_pins" ]]; then
+    log "fw_external pin inventories are identical despite the manifest revision difference"
+  fi
+  if [[ "$local_pins" != "$remote_pins" ]]; then
+    warn "fw_external pins differ between local and '$T_NAME':"
+    diff -u <(printf '%s\n' "$local_pins") <(printf '%s\n' "$remote_pins") || true
+    [[ $allow -eq 1 ]] || die "manifest pin drift refused; pass --allow-manifest-drift to override"
+  fi
+}
+
+ws_tag() { echo "$1" | sed "s#^$HOME/##; s#/#_#g"; }   # projects_iridium_one_fw
+local_jobdir()  { echo "$MCTL_DIR/jobs/$T_NAME/$1"; }  # pulled logs (per target)
+remote_jobdir() { echo "$(remote_home)/.mctl/jobs/$1"; }
+
+# ---------------------------------------------------------------------------
+# Delegation history — the remote keeps only the LATEST log per (tag,kind), so
+# every dispatch is also appended here as one JSON line. This is the only record
+# that survives the next run; the portal's "VM jobs" tab renders it.
+# ---------------------------------------------------------------------------
+JOBLOG="$MCTL_DIR/joblog.jsonl"
+
+joblog_add() {   # $1=kind $2=local_ws $3=tag $4=cmd $5=pid $6=remote_jobdir
+  python3 - "$JOBLOG" "$T_NAME" "$(sshdest)" "$1" "$2" "$3" "$4" "$5" "$6" "$(_vm_bound_id)" <<'PY' 2>/dev/null || true
+import json, sys, time
+path, target, dest, kind, ws, tag, cmd, pid, jd, inst = sys.argv[1:11]
+rec = {"id": "%d-%s" % (int(time.time() * 1000), kind), "target": target,
+       "dest": dest, "kind": kind, "ws": ws, "tag": tag, "cmd": cmd,
+       # The EC2 instance behind a VM target: `vm` follows Main, so the name
+       # alone does not say which machine ran a historic job.
+       **({"instance": inst} if inst else {}),
+       "pid": int(pid) if pid.isdigit() else None, "jobdir": jd,
+       "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "state": "running"}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY
+}
+
+# One SSH round trip, every job dir on the target, machine-readable. Columns:
+#   tag  kind  STATE  rc  pid  log_mtime_epoch  lines  errors  cmd  last_line
+# Remote status of every job dir, one TSV row per job (see jobs-probe).
+PROBE_SCRIPT='jr=$HOME/.mctl/jobs
+for d in "$jr"/*/; do
+  [ -d "$d" ] || continue
+  tag=$(basename "$d")
+  for k in build test run; do
+    log="$d$k.log"; pf="$d$k.pid"
+    [ -f "$log" ] || continue
+    rc=""; pid=$(cat "$pf" 2>/dev/null || true)
+    if grep -q __MCTL_CANCELLED__ "$log"; then
+      st=CANCELLED; rc=$(grep -o "rc=[0-9]*" "$log" | tail -1 | cut -d= -f2)
+    elif grep -q __MCTL_DONE__ "$log"; then
+      st=DONE; rc=$(grep -o "rc=[0-9]*" "$log" | tail -1 | cut -d= -f2)
+    elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      st=RUNNING
+    else
+      st=DIED
+    fi
+    # NOTE: this whole script is single-quoted — no apostrophes below this line.
+    # Remove ANSI escapes before counting so decorated log fields still match.
+    errs=$(sed -r "s/\x1b\[[0-9;]*m//g" "$log" 2>/dev/null \
+      | awk "{
+          line=tolower(\$0)
+          if ((line ~ /error:|error failed|: failed|fail / ||
+               (line ~ /common\.star/ && line ~ /load/ && line ~ /error/)) &&
+              !(line ~ /error failed removing stage container/ ||
+                (line ~ /common\.star/ && line ~ /load/ && line ~ /error/))) errors++
+        }
+        END { print errors + 0 }") || true
+    [ -n "$errs" ] || errs=0
+    last=$(grep -v -e __MCTL_DONE__ -e __MCTL_CANCELLED__ "$log" 2>/dev/null | tail -1 \
+           | sed "s/\x1b\[[0-9;]*[A-Za-z]//g" | tr -d "\r\t" | cut -c1-160 | (iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat))
+    cmd=$(head -1 "$d$k.cmd" 2>/dev/null | tr -d "\r\t" | cut -c1-200 | (iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat))
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$tag" "$k" "$st" "$rc" "$pid" \
+      "$(stat -c %Y "$log" 2>/dev/null)" "$(wc -l < "$log" 2>/dev/null)" \
+      "$errs" "$cmd" "$last"
+  done
+done'
+
+cmd_jobs_probe() {
+  rlogin "$PROBE_SCRIPT" 2>/dev/null
+}
+
+# Persistent status link: ONE long-lived ssh session that re-runs the probe
+# every <interval> seconds and ends each block with a __MCTL_PROBE_END__ marker.
+# No STEP_TIMEOUT (it is meant to live); ServerAlive* drops a dead link. Never
+# starts a stopped VM: vm_ip only discovers.
+cmd_jobs_watch() {
+  local every=${1:-15}
+  [[ "$every" =~ ^[0-9]+$ ]] && (( every >= 2 )) || die "jobs-watch interval must be >= 2 seconds"
+  local dest; dest=$(sshdest) || return
+  exec ssh -A $SSH_OPTS "$dest" "bash -l -s" <<<"while :; do
+$PROBE_SCRIPT
+echo __MCTL_PROBE_END__ \$(date +%s)
+sleep $every
+done"
+}
+
+# Interactive terminal (used by the portal's browser terminal): ssh -tt with the
+# usual options; an optional remote command replaces the login shell.
+# ssh to the selected target's BMC (lab trays). The shared lab BMC password is
+# read from ~/.pilot/bmc.pw into SSHPASS (never argv); without it ssh prompts.
+cmd_bmc() {
+  [[ "$T_KIND" == remote ]] || die "target '$T_NAME' is a VM; VMs have no BMC"
+  [[ -n "$T_BMC" && "$T_BMC" != - ]] \
+    || die "target '$T_NAME' has no BMC — set one with: mctl target bmc $T_NAME <host>"
+  local dest=$T_BMC; [[ "$dest" == *@* ]] || dest="root@$dest"
+  local -a opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+                 -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+  # A forced pty only for interactive use: BMC sshd (dropbear) rejects -tt for a
+  # one-shot command whose stdin is not a terminal (exit 255).
+  local tty=-T; [[ $# -eq 0 || -t 0 ]] && tty=-tt
+  local pw=${MCTL_BMC_PW:-$HOME/.pilot/bmc.pw}
+  if [[ -r "$pw" ]] && command -v sshpass >/dev/null; then
+    SSHPASS=$(cat "$pw"); export SSHPASS
+    exec sshpass -e ssh "$tty" "${opts[@]}" "$dest" "$@"
+  fi
+  exec ssh "$tty" "${opts[@]}" "$dest" "$@"
+}
+
+cmd_term() {
+  local dest; dest=$(sshdest) || return
+  exec ssh -tt -A $SSH_OPTS "$dest" "$@"
+}
+
+cmd_jobs() {
+  [[ -s "$JOBLOG" ]] || { echo "no delegated jobs recorded yet ($JOBLOG)"; return; }
+  python3 - "$JOBLOG" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    print(f"{r.get('started','?'):19}  {r.get('target','?'):8}  {r.get('kind','?'):6}"
+          f"  {r.get('ws','?')}\n{'':21}{r.get('cmd','')}")
+PY
+}
+
+# Mirror every job log on the target into $MCTL_DIR/jobs/<target>/<tag>/. The
+# remote keeps only the latest log per (tag,kind) and overwrites it on the next
+# run, so without this a log is gone the moment the slot is reused.
+cmd_jobs_sync() {
+  local dest; dest=$(sshdest)
+  local rjr; rjr="$(remote_home)/.mctl/jobs"
+  local into="$MCTL_DIR/jobs/$T_NAME"
+  mkdir -p "$into"
+  log "syncing job logs from '$T_NAME' into $into"
+  # --backup keeps the previous copy as <name>.log~ when the remote slot was
+  # reused, so a reused tag does not silently destroy the older local log.
+  _rsync_from --prune-empty-dirs --backup --suffix='~' \
+    --include='*/' --include='*.log' --include='*.cmd' --include='*.pid' --exclude='*' \
+    "$dest:$rjr/" "$into/" 2>/dev/null || { warn "no job logs pulled from '$T_NAME'"; return 0; }
+  ok "job logs synced ($(find "$into" -name '*.log' 2>/dev/null | wc -l) local)"
+}
+
+# Last N lines of one live job log. Used by the portal's tail panel, so it must
+# stay quiet and cheap: one ssh, no login shell, no decoration.
+cmd_jobs_tail() {   # $1=tag $2=kind $3=lines
+  local tag=${1:?tag required} kind=${2:-build} n=${3:-200}
+  rsh "tail -n $n \$HOME/.mctl/jobs/$tag/$kind.log 2>/dev/null \
+       | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr -d '\r'" 2>/dev/null || true
+}
+
+# Stop one running detached job. The caller passes the pid it observed, so a
+# job that finished (or was replaced by a newer run) in between is never hit.
+# TERMs the whole process group, escalates to KILL after ~10 s, then stamps
+# the log so probes report CANCELLED. Prints one `__MCTL_CANCEL__ <RESULT>`:
+# CANCELLED | FINISHED | DIED | MISMATCH | NOLOG. Containers started by the
+# job's docker client may outlive it.
+CANCEL_SCRIPT='tag=$1; kind=$2; want=$3; by=$4
+d=$HOME/.mctl/jobs/$tag; log=$d/$kind.log; pf=$d/$kind.pid
+[ -f "$log" ] || { echo "__MCTL_CANCEL__ NOLOG"; exit 0; }
+if grep -q -e __MCTL_DONE__ -e __MCTL_CANCELLED__ "$log"; then echo "__MCTL_CANCEL__ FINISHED"; exit 0; fi
+pid=$(cat "$pf" 2>/dev/null || true)
+[ "$pid" = "$want" ] || { echo "__MCTL_CANCEL__ MISMATCH pid=$pid"; exit 0; }
+kill -0 "$pid" 2>/dev/null || { echo "__MCTL_CANCEL__ DIED"; exit 0; }
+kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+i=0
+while kill -0 "$pid" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
+kill -0 "$pid" 2>/dev/null && { kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null; sleep 0.5; }
+grep -q __MCTL_DONE__ "$log" || echo "__MCTL_DONE__ rc=130" >> "$log"
+echo "__MCTL_CANCELLED__ by=$by at=$(date -Is)" >> "$log"
+echo "__MCTL_CANCEL__ CANCELLED"'
+
+cmd_cancel() {   # $1=tag $2=kind $3=pid
+  local tag=${1:?"usage: mctl cancel <tag> <build|test|run> <pid>"} kind=${2:-} pid=${3:-}
+  [[ "$tag" =~ ^[A-Za-z0-9._-]+$ && "$tag" != .* ]] || die "invalid job tag: $tag"
+  [[ "$kind" =~ ^(build|test|run)$ ]] || die "invalid job kind: $kind (build|test|run)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "invalid pid: $pid"
+  local by; by=$(id -un 2>/dev/null || echo unknown); by=${by//[^A-Za-z0-9._-]/}
+  local out
+  out=$(rsh "bash -s -- $tag $kind $pid ${by:-unknown}" <<<"$CANCEL_SCRIPT") \
+    || die "cancel failed on '$T_NAME' (ssh error)"
+  local res; res=$(sed -n 's/^__MCTL_CANCEL__ //p' <<<"$out" | head -1)
+  [[ -n "$res" ]] || die "cancel on '$T_NAME' returned no result"
+  echo "__MCTL_CANCEL__ $res"
+  case "${res%% *}" in
+    CANCELLED) ok "$kind job $tag (pid $pid) cancelled on '$T_NAME'" ;;
+    FINISHED)  log "$kind job $tag already finished; nothing to cancel" ;;
+    DIED)      log "$kind job $tag is no longer running; nothing to cancel" ;;
+    *)         log "$kind job $tag not cancelled: $res"; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# start / stop — VM lifecycle (kind=vm only).
+# ---------------------------------------------------------------------------
+# Power memory: ~/.mctl/power/<instance-id> (key=value: started, expires,
+# lease, by, updated, state) is written by every start / renew / observation,
+# so the predicted stop (= lease expiry) is known without asking octl, and
+# ~/.mctl/power.log (JSONL) keeps the history the portal shows.
+# ---------------------------------------------------------------------------
+_dur_s() {  # 30m | 2h | 1h30m | 90s | 600 → seconds
+  local d=$1 t=0 n u
+  [[ "$d" =~ ^[0-9]+$ ]] && { echo "$d"; return; }
+  while [[ "$d" =~ ^([0-9]+)([smhd])(.*)$ ]]; do
+    n=${BASH_REMATCH[1]} u=${BASH_REMATCH[2]} d=${BASH_REMATCH[3]}
+    case "$u" in s) t=$((t + n)) ;; m) t=$((t + n * 60)) ;; h) t=$((t + n * 3600)) ;; d) t=$((t + n * 86400)) ;; esac
+  done
+  [[ -z "$d" && $t -gt 0 ]] || die "bad duration: $1 (e.g. 30m, 2h, 1h30m)"
+  echo "$t"
+}
+_hm() { local s=$1 neg=""; (( s < 0 )) && { neg=-; s=$(( -s )); }
+  (( s >= 3600 )) && printf '%s%dh%02dm' "$neg" $((s / 3600)) $((s % 3600 / 60)) || printf '%s%dm' "$neg" $((s / 60)); }
+_power_file() { echo "$POWER_DIR/$1"; }
+_power_get() {  # id key
+  local f; f=$(_power_file "$1"); [[ -f "$f" ]] || return 0
+  sed -n "s/^$2=//p" "$f" | tail -1
+}
+_power_set() {  # id key=value…
+  local id=$1 f kv k; shift; mkdir -p "$POWER_DIR"; f=$(_power_file "$id")
+  touch "$f"
+  for kv in "$@"; do
+    k=${kv%%=*}
+    grep -v "^$k=" "$f" > "$f.tmp" || true
+    echo "$kv" >> "$f.tmp"; mv "$f.tmp" "$f"
+  done
+  grep -v '^updated=' "$f" > "$f.tmp" || true; echo "updated=$(date +%s)" >> "$f.tmp"; mv "$f.tmp" "$f"
+}
+_power_event() {  # event id expires [note]
+  printf '{"ts":%s,"event":"%s","instance":"%s","target":"%s","expires":%s,"note":"%s"}\n' \
+    "$(date +%s)" "$1" "$2" "${T_NAME:-}" "${3:-0}" "${4:-}" >> "$MCTL_DIR/power.log"
+}
+# Instance row from octl: "state<TAB>ip<TAB>expires-epoch" (expires 0 if untagged).
+_octl_row() {
+  local rows; rows=$(_octl_vm_rows) || return 1
+  awk -F'\t' -v id="$1" '$1==id{print $2"\t"$3"\t"$6; exit}' <<<"$rows" | {
+    IFS=$'\t' read -r st ip lease || exit 1
+    local exp=0; [[ -n "$lease" && "$lease" != - ]] && exp=$(date -u -d "$lease" +%s 2>/dev/null || echo 0)
+    printf '%s\t%s\t%s\n' "$st" "$ip" "$exp"
+  }
+}
+# Remember what octl just told us, so the next prediction needs no octl call.
+_power_observe() {  # id state expires
+  local id=$1 st=$2 exp=$3
+  if [[ "$st" == running ]]; then
+    [[ -n "$(_power_get "$id" started)" && "$(_power_get "$id" state)" == running ]] \
+      || _power_set "$id" "started=$(date +%s)" "by=observed"
+    (( exp > 0 )) && _power_set "$id" "expires=$exp"
+  else
+    [[ "$(_power_get "$id" state)" == running ]] && _power_event stopped-observed "$id" "$(_power_get "$id" expires)"
+    # A stopped VM's tag still names its last lease end: keep it only if past.
+    (( exp > 0 && exp <= $(date +%s) )) && _power_set "$id" "expires=$exp"
+  fi
+  _power_set "$id" "state=$st"
+}
+
+_vm_require_bound() {
+  [[ "$T_KIND" == vm ]] || die "$1 is VM-only ('$T_NAME' is kind=$T_KIND)"
+  local id; id=$(_vm_bound_id)
+  [[ -n "$id" ]] || die "VM target '$T_NAME' is not bound to an instance — bind it with: mctl vm main <instance-id>"
+  echo "$id"
+}
+# Every name bound to <id> (or an unbound VM target) loses its IP cache.
+_forget_ip_of() { awk -v h="$1" '($2=="vm" && ($4==h || $4=="-")){print $1}' "$TARGETS_FILE" 2>/dev/null \
+  | while read -r n; do rm -f "$MCTL_DIR/$n.ip"; done; }
+
+# Start <id> with a lease and record it. $2=by (manual|auto), $3=wait(0|1).
+_instance_start() {
+  local id=$1 by=$2 wait=${3:-1} lease_s; lease_s=$(_dur_s "$VM_LEASE")
+  local w=(); (( wait )) && w=(-w)
+  log "starting $id (lease $VM_LEASE, $by)"
+  octl vm start "$id" --lease "$VM_LEASE" "${w[@]}" || return 1
+  local now; now=$(date +%s)
+  _power_set "$id" "started=$now" "expires=$((now + lease_s))" "lease=$lease_s" "by=$by" "state=running"
+  _power_event "$([[ $by == auto ]] && echo auto-start || echo start)" "$id" "$((now + lease_s))"
+  _forget_ip_of "$id"; RESOLVED_IP=""
+}
+_instance_stop() {
+  local id=$1 wait=${2:-0} w=(); (( wait )) && w=(-w)
+  octl vm stop "$id" "${w[@]}" || return 1
+  _power_set "$id" "state=stopped" "expires=$(date +%s)"
+  _power_event stop "$id" "$(date +%s)"
+}
+_instance_renew() {  # id [why]
+  local id=$1 lease_s; lease_s=$(_dur_s "$VM_LEASE")
+  log "renewing lease of $id → $VM_LEASE${2:+ ($2)}"
+  octl vm lease renew "$id" --lease "$VM_LEASE" >/dev/null || return 1
+  local now; now=$(date +%s)
+  _power_set "$id" "expires=$((now + lease_s))" "lease=$lease_s"
+  _power_event renew "$id" "$((now + lease_s))" "${2:-}"
+}
+
+# Seconds of lease left per the remembered prediction ("" if unknown).
+_lease_left() { local e; e=$(_power_get "$1" expires); [[ -n "$e" ]] && echo $(( e - $(date +%s) )) || true; }
+
+# ensure_vm_up — make the selected VM target usable, seamlessly: if its lease
+# is predicted to have expired, or ssh fails and octl reports it stopped, start
+# it (and wait for ssh). Only ACTIVE subcommands call this; passive probes
+# (jobs-probe/watch, ip, dest, status) never wake a VM, so the portal's polling
+# cannot keep an idle VM running. MCTL_AUTOSTART=0 disables it.
+ensure_vm_up() {
+  [[ "$T_KIND" == vm && "$AUTOSTART" == 1 && -z "${VM_IP:-}" ]] || return 0
+  local id; id=$(_vm_bound_id); [[ -n "$id" ]] || return 0
+  local left; left=$(_lease_left "$id")
+  local cache="$MCTL_DIR/$T_NAME.ip" ip=""
+  [[ -s "$cache" ]] && ip=$(cat "$cache")
+  # Fast path: lease predicted alive with margin and ssh port open — no octl.
+  if [[ -n "$left" ]] && (( left > 120 )) && [[ -n "$ip" ]] \
+     && timeout 2 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null; then
+    return 0
+  fi
+  local row st exp
+  row=$(_octl_row "$id") || die "cannot read the state of $id from octl (SSO? try: octl login)"
+  IFS=$'\t' read -r st ip exp <<<"$row"
+  _power_observe "$id" "$st" "$exp"
+  case "$st" in
+    running)
+      # Still up but about to hit its lease: renew rather than lose the run.
+      if (( exp > 0 && exp - $(date +%s) < 120 )); then _instance_renew "$id" "expiring" || warn "lease renew failed"; fi
+      ;;
+    stopping)
+      log "$id is stopping (lease ended) — waiting to restart it"
+      local i; for i in $(seq 1 60); do sleep 5; row=$(_octl_row "$id") || continue; st=${row%%$'\t'*}; [[ "$st" == stopped ]] && break; done
+      [[ "$st" == stopped ]] || die "$id did not finish stopping"
+      _instance_start "$id" auto 1 || die "auto-start of $id failed (capacity? see: octl vm list)"
+      ;;
+    stopped)
+      log "VM '$T_NAME' ($id) is stopped$( [[ -n "$left" ]] && (( left <= 0 )) && echo " (lease ended $(_hm $(( -left ))) ago)") — auto-starting"
+      _instance_start "$id" auto 1 || die "auto-start of $id failed (capacity? see: octl vm list)"
+      ;;
+    pending) log "$id is booting" ;;
+    *) die "$id is '$st' — cannot auto-start" ;;
+  esac
+  # Wait for sshd (a fresh boot takes ~1 min after EC2 reports running).
+  local deadline=$(( $(date +%s) + WAKE_TIMEOUT ))
+  while :; do
+    RESOLVED_IP=""; rm -f "$cache"
+    ip=$(_discover_ip 2>/dev/null || true)
+    if [[ -n "$ip" ]] && timeout 3 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null \
+       && ssh $SSH_OPTS "$( [[ -n "$T_USER" && "$T_USER" != - ]] && echo "$T_USER@")$ip" true 2>/dev/null; then
+      echo "$ip" > "$cache"; RESOLVED_IP=$ip; break
+    fi
+    (( $(date +%s) < deadline )) || die "VM '$T_NAME' ($id) did not become reachable over ssh within ${WAKE_TIMEOUT}s"
+    sleep 5
+  done
+  [[ "$st" == running ]] || ok "VM '$T_NAME' ($id) is up at $ip"
+}
+
+# Top up the lease before a long job (or from the portal keepalive): renew when
+# less than $1 is left.
+lease_topup() {  # threshold(dur) [why]
+  [[ "$T_KIND" == vm ]] || return 0
+  local id; id=$(_vm_bound_id); [[ -n "$id" ]] || return 0
+  local th left; th=$(_dur_s "$1"); left=$(_lease_left "$id")
+  if [[ -z "$left" ]]; then
+    local row st ip exp; row=$(_octl_row "$id") || { warn "cannot read lease of $id"; return 0; }
+    IFS=$'\t' read -r st ip exp <<<"$row"; _power_observe "$id" "$st" "$exp"
+    [[ "$st" == running ]] || return 0
+    left=$(_lease_left "$id"); [[ -n "$left" ]] || left=0
+  fi
+  # A lease granted moments ago (fresh start/renew) is not worth renewing again.
+  local fresh=$(( $(_dur_s "$VM_LEASE") - 120 ))
+  if (( left < th && left < fresh )); then _instance_renew "$id" "${2:-$(_hm "$left") left < $1}" || warn "lease renew of $id failed"; fi
+}
+
+cmd_lease() {
+  local id; id=$(_vm_require_bound lease)
+  case "${1:-status}" in
+    status|""|--refresh)
+      local refresh=${2:-}; [[ "${1:-}" == --refresh ]] && refresh=--refresh
+      if [[ "$refresh" == --refresh || -z "$(_power_get "$id" expires)" ]]; then
+        local row st ip exp; row=$(_octl_row "$id") || die "octl vm list failed"
+        IFS=$'\t' read -r st ip exp <<<"$row"; _power_observe "$id" "$st" "$exp"
+      fi
+      local s e st2 by now; now=$(date +%s)
+      s=$(_power_get "$id" started); e=$(_power_get "$id" expires); st2=$(_power_get "$id" state); by=$(_power_get "$id" by)
+      printf 'target    %s (%s)\nstate     %s (as last seen)\n' "$T_NAME" "$id" "${st2:-unknown}"
+      [[ -n "$s" ]] && printf 'started   %s (%s ago, %s)\n' "$(date -d "@$s" '+%F %H:%M')" "$(_hm $((now - s)))" "${by:-?}"
+      if [[ -n "$e" ]]; then
+        if (( e > now )); then printf 'stops     %s (in %s, predicted)\n' "$(date -d "@$e" '+%F %H:%M')" "$(_hm $((e - now)))"
+        else printf 'stopped   %s (%s ago, predicted)\n' "$(date -d "@$e" '+%F %H:%M')" "$(_hm $((now - e)))"; fi
+      fi
+      printf 'policy    lease %s · renew before jobs if < %s · keepalive if < %s · autostart %s\n' \
+        "$VM_LEASE" "$RENEW_BELOW" "$KEEPALIVE_BELOW" "$( [[ $AUTOSTART == 1 ]] && echo on || echo off)"
+      ;;
+    renew)
+      shift
+      if [[ "${1:-}" == --if-below ]]; then lease_topup "${2:?--if-below needs a duration}" "keepalive"
+      else _instance_renew "$id" manual || die "lease renew failed"; ok "lease of $id renewed ($VM_LEASE)"; fi
+      ;;
+    *) die "usage: mctl lease [status [--refresh] | renew [--if-below DUR]]" ;;
+  esac
+}
+
+_vm_power() {  # $1=start|stop
+  local id; id=$(_vm_require_bound "$1")
+  log "${1}ing VM target '$T_NAME' ($id)"
+  if [[ "$1" == start ]]; then _instance_start "$id" manual 0 || die "start failed"
+  else _instance_stop "$id" 0 || die "stop failed"; fi
+  rm -f "$MCTL_DIR/$T_NAME.ip"   # a restarted VM usually comes back on a new IP
+  ok "VM '$T_NAME' ($id) $1 requested"
+}
+cmd_start() { _vm_power start; }
+cmd_stop()  { _vm_power stop; }
+cmd_wake()  { [[ "$T_KIND" == vm ]] || { ok "'$T_NAME' is kind=$T_KIND (always on)"; return 0; }
+  _vm_require_bound wake >/dev/null; AUTOSTART=1 ensure_vm_up; lease_topup "$RENEW_BELOW" "wake"
+  ok "VM '$T_NAME' is up ($(vm_ip))"; }
+
+# ---------------------------------------------------------------------------
+# vm — list instances and choose which one the `vm` target (the Main VM) uses.
+# Neo, delegated builds and the portal all follow the `vm` target, so switching
+# Main is a registry change; the previous instance stays usable as vm-<id6>.
+# ---------------------------------------------------------------------------
+_set_target_line() {  # name kind user host
+  awk -v n="$1" '!(NF && $1==n)' "$TARGETS_FILE" > "$TARGETS_FILE.tmp" 2>/dev/null || true
+  printf "%-11s %-7s %-16s %s\n" "$1" "$2" "$3" "$4" >> "$TARGETS_FILE.tmp"
+  mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+}
+_drop_target_line() {
+  awk -v n="$1" '!(NF && $1==n)' "$TARGETS_FILE" > "$TARGETS_FILE.tmp" 2>/dev/null || true
+  mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+}
+_forget_caches() { rm -f "$MCTL_DIR/$1.ip" "$MCTL_DIR/$1.home"; }
+
+cmd_vm() {
+  local action=${1:-list}; shift || true
+  _seed_targets
+  case "$action" in
+    list|ls)
+      local rows; rows=$(_octl_vm_rows) || die "octl vm list failed"
+      printf "%-21s %-9s %-15s %-12s %-17s %s\n" INSTANCE STATE IP TARGET LEASE-ENDS DESCRIPTION
+      while IFS=$'\t' read -r id st ip _owner desc lease; do
+        [[ -n "$id" ]] || continue
+        local t; t=$(awk -v h="$id" '($2=="vm" && $4==h){printf "%s%s", sep, $1; sep=","}' "$TARGETS_FILE")
+        local le="-" exp=0
+        if [[ -n "$lease" && "$lease" != - ]]; then exp=$(date -u -d "$lease" +%s 2>/dev/null || echo 0); (( exp > 0 )) && le=$(date -d "@$exp" '+%m-%d %H:%M'); fi
+        _power_observe "$id" "$st" "$exp"
+        printf "%-21s %-9s %-15s %-12s %-17s %s\n" "$id" "$st" "$ip" "${t:--}" "$le" "$desc"
+      done <<<"$rows"
+      ;;
+    main)
+      local id=${1:-} user=""
+      shift || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in --user) user=${2:?"--user needs a login"}; shift 2 ;; *) die "unknown option: $1" ;; esac
+      done
+      if [[ -z "$id" ]]; then
+        local cur; cur=$(_target_line vm)
+        read -r _ _ _ id _ <<<"$cur"
+        echo "${id:--}"; return
+      fi
+      [[ "$id" =~ ^i-[0-9a-f]{8,17}$ ]] || die "not an instance id: $id"
+      local rows; rows=$(_octl_vm_rows) || die "octl vm list failed"
+      local row; row=$(awk -F'\t' -v id="$id" '$1==id' <<<"$rows")
+      [[ -n "$row" ]] || die "instance $id is not one of your VMs (see: mctl vm list)"
+      # A target already bound to this instance keeps its login; else use the
+      # owner tag octl sets (new VMs log in as the SSO identity).
+      local prev; prev=$(awk -v h="$id" '($2=="vm" && $4==h){print; exit}' "$TARGETS_FILE")
+      if [[ -z "$user" ]]; then
+        local pu; read -r _ _ pu _ <<<"$prev"
+        if [[ -n "$pu" ]]; then user=$pu; else user=$(cut -f4 <<<"$row"); fi
+      fi
+      local old; old=$(_target_line vm)
+      local _on _ok oldu oldid; read -r _on _ok oldu oldid _ <<<"$old"
+      if [[ "$oldid" == "$id" ]]; then
+        _set_target_line vm vm "${user:--}" "$id"
+        ok "Main VM is already $id"; return
+      fi
+      if [[ -n "$old" ]]; then
+        if [[ "$oldid" == i-* ]]; then
+          local keep="vm-${oldid#i-}"; keep=${keep:0:9}
+          _set_target_line "$keep" vm "${oldu:--}" "$oldid"
+          log "previous Main $oldid kept as target '$keep'"
+        else
+          warn "previous 'vm' target was unbound; it is replaced (not kept)"
+        fi
+      fi
+      local pn; pn=$(awk '{print $1}' <<<"$prev")
+      [[ -n "$pn" && "$pn" != vm ]] && _drop_target_line "$pn" && _forget_caches "$pn"
+      _set_target_line vm vm "${user:--}" "$id"
+      _forget_caches vm
+      ok "Main VM (target 'vm') → $id (login ${user:-local user})"
+      ;;
+    start|stop)
+      local id=${1:-}; [[ "$id" =~ ^i-[0-9a-f]{8,17}$ ]] || die "usage: mctl vm $action <instance-id> [-w]"
+      local w=0; [[ "${2:-}" == -w || "${2:-}" == --wait ]] && w=1
+      T_NAME=$(awk -v h="$id" '($2=="vm" && $4==h){print $1; exit}' "$TARGETS_FILE")
+      if [[ "$action" == start ]]; then _instance_start "$id" manual "$w" || die "octl vm start $id failed"
+      else _instance_stop "$id" "$w" || die "octl vm stop $id failed"; fi
+      ok "$id $action requested"
+      ;;
+    *) die "unknown 'vm' action: $action (list|main [<instance-id> [--user LOGIN]]|start|stop <instance-id>)" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# provision — install prerequisites on a target from recipe lists.
+#   Recipes: <dir>/recipes/<name>.sh defining check() (0 = already satisfied)
+#   and install(), optionally todo() (prints a pending manual step). Header
+#   comments: `# desc:`, `# where: remote|local`, `# needs: a b`,
+#   `# timeout: <secs>`. Remote recipes run on the target in a login shell;
+#   local ones run here with $MCTL_DEST/$MCTL_HOST/$MCTL_LOGIN/
+#   $MCTL_REMOTE_HOME and `r <cmd>` (ssh to the target).
+#   Lists: one recipe per line, `include <list>`, `#` comments. Default list:
+#   vm.list for kind=vm, machine.list otherwise. Results per target land in
+#   ~/.mctl/provision/<target>.state (TSV) and a log per run.
+# ---------------------------------------------------------------------------
+_prov_list_path() {  # name|path [relative-to-dir]
+  local l=$1 rel=${2:-} c
+  for c in "$l" ${rel:+"$rel/$l" "$rel/$l.list"} "$PROVISION_DIR/lists/$l" "$PROVISION_DIR/lists/$l.list"; do
+    [[ -f "$c" ]] && { readlink -f "$c"; return; }
+  done
+  die "provision list not found: $l (lists: $(ls "$PROVISION_DIR/lists" 2>/dev/null | tr '\n' ' '))"
+}
+_prov_expand() {  # list-path depth → recipe names (may repeat)
+  local f=$1 depth=${2:-0} line w rest
+  (( depth < 8 )) || die "include nesting too deep at $f"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%%#*}; read -r w rest <<<"$line" || true
+    [[ -n "$w" ]] || continue
+    if [[ "$w" == include ]]; then _prov_expand "$(_prov_list_path "$rest" "$(dirname "$f")")" $((depth + 1))
+    else echo "$w"; fi
+  done < "$f"
+}
+_prov_recipe() {  # name → path (next to the list first, then the default set)
+  local n=$1 c
+  [[ "$n" =~ ^[A-Za-z0-9_.-]+$ ]] || die "bad recipe name: $n"
+  for c in ${PROV_LIST_DIR:+"$PROV_LIST_DIR/../recipes/$n.sh" "$PROV_LIST_DIR/$n.sh"} "$PROVISION_DIR/recipes/$n.sh"; do
+    [[ -f "$c" ]] && { echo "$c"; return; }
+  done
+  return 1
+}
+_prov_meta() { sed -n "s/^# $2:[[:space:]]*//p" "$1" | head -1; }
+_prov_footer='
+if [ "${PROV_FORCE:-0}" != 1 ] && check >/dev/null 2>&1; then echo "@@STATE ok"
+elif [ "${PROV_DRY:-0}" = 1 ]; then echo "@@STATE missing"; exit 0
+else
+  install || { echo "@@STATE fail install exited $?"; exit 1; }
+  check || { echo "@@STATE fail check still fails after install"; exit 1; }
+  echo "@@STATE installed"
+fi
+if type todo >/dev/null 2>&1; then _m=$(todo 2>/dev/null) || true; [ -z "$_m" ] || echo "@@TODO $_m"; fi
+exit 0'
+_prov_record() {  # recipe status secs note
+  local f="$MCTL_DIR/provision/$T_NAME.state"; mkdir -p "${f%/*}"; touch "$f"
+  awk -F'\t' -v r="$1" '$1!=r' "$f" > "$f.tmp" || true
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$(date +%s)" "$3" "${4//$'\t'/ }" >> "$f.tmp"; mv "$f.tmp" "$f"
+}
+
+cmd_provision() {
+  local list="" only="" skip="" dry=0 force=0 show=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --list|-l) list=${2:?"--list needs a list name or file"}; shift 2 ;;
+      --only)    only=${2:?"--only needs recipe names"}; shift 2 ;;
+      --skip)    skip=${2:?"--skip needs recipe names"}; shift 2 ;;
+      --dry-run|-n) dry=1; shift ;;
+      --force)   force=1; shift ;;
+      --status)  show=1; shift ;;
+      *) die "unknown provision option: $1 (--list L --only a,b --skip a,b --dry-run --force --status)" ;;
+    esac
+  done
+  if (( show )); then
+    local f="$MCTL_DIR/provision/$T_NAME.state"
+    [[ -s "$f" ]] || { echo "'$T_NAME' has never been provisioned"; return 0; }
+    printf '%-13s %-10s %-16s %s\n' RECIPE STATUS WHEN NOTE
+    while IFS=$'\t' read -r r st ts secs note; do
+      printf '%-13s %-10s %-16s %s\n' "$r" "$st" "$(date -d "@$ts" '+%m-%d %H:%M')" "$note"
+    done < "$f"
+    return 0
+  fi
+  [[ -n "$list" ]] || { [[ "$T_KIND" == vm ]] && list=vm || list=machine; }
+  local lp; lp=$(_prov_list_path "$list")
+  local PROV_LIST_DIR; PROV_LIST_DIR=$(dirname "$lp")
+  local names
+  if [[ -n "$only" ]]; then names=$(tr ', ' '\n\n' <<<"$only" | grep .)
+  else names=$(_prov_expand "$lp" | awk '!seen[$0]++'); fi
+  if [[ -n "$skip" ]]; then names=$(grep -vxF -f <(tr ', ' '\n\n' <<<"$skip" | grep .) <<<"$names" || true); fi
+  [[ -n "$names" ]] || die "nothing to provision"
+
+  local n p; for n in $names; do _prov_recipe "$n" >/dev/null || die "recipe not found: $n"; done
+  local dest host login rh
+  dest=$(sshdest); host=${dest#*@}
+  login=$T_USER; [[ -n "$login" && "$login" != - ]] || login=$USER
+  rh=$(remote_home)
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  local logf="$MCTL_DIR/provision/logs/$T_NAME-$stamp.log"; mkdir -p "${logf%/*}"
+  log "provisioning '$T_NAME' ($dest) from $(basename "$lp")$( (( dry )) && echo ' [dry-run]'): $(tr '\n' ' ' <<<"$names")"
+  local env_pre
+  env_pre=$(printf 'export MCTL_TARGET=%q MCTL_KIND=%q MCTL_DEST=%q MCTL_HOST=%q MCTL_LOGIN=%q MCTL_REMOTE_HOME=%q GIT_NAME=%q GIT_EMAIL=%q PROV_DRY=%q PROV_FORCE=%q\n' \
+    "$T_NAME" "$T_KIND" "$dest" "$host" "$login" "$rh" "$(git config --global user.name || true)" \
+    "$(git config --global user.email || true)" "$dry" "$force")
+  local keeper=""
+  if [[ "$T_KIND" == vm ]] && (( ! dry )); then
+    # Long recipes (rtl) outlive the short lease: keep it topped up meanwhile.
+    ( while sleep 300; do lease_topup "$KEEPALIVE_BELOW" "provision keepalive" >/dev/null 2>&1 || true; done ) &
+    keeper=$!; trap "kill $keeper 2>/dev/null || true" EXIT
+  fi
+  local -A failed=(); local bad=0 todos=()
+  for n in $names; do
+    p=$(_prov_recipe "$n")
+    local where to needs desc st="" note="" t0 blocked=""
+    where=$(_prov_meta "$p" where); to=$(_prov_meta "$p" timeout); needs=$(_prov_meta "$p" needs); desc=$(_prov_meta "$p" desc)
+    for d in $needs; do [[ -n "${failed[$d]:-}" ]] && blocked=$d; done
+    if [[ -n "$blocked" ]]; then
+      warn "$n: blocked ($blocked failed)"; failed[$n]=1; bad=1
+      (( dry )) || _prov_record "$n" blocked 0 "needs $blocked"; continue
+    fi
+    printf '%s── %s%s (%s)%s %s\n' "$_B" "$n" "$_RST" "${where:-remote}" "$_D" "$desc$_RST" >&2
+    t0=$(date +%s)
+    local out_fifo; out_fifo=$(mktemp -u); mkfifo "$out_fifo"
+    if [[ "$where" == local ]]; then
+      ( local_script="$env_pre
+r() { ssh -A $SSH_OPTS \"\$MCTL_DEST\" \"\$@\" </dev/null; }
+$(cat "$p")
+$_prov_footer"
+        timeout -k 10 "${to:-$STEP_TIMEOUT}" bash -c "$local_script" </dev/null ) > "$out_fifo" 2>&1 &
+    else
+      ( { echo "$env_pre"; cat "$p"; echo "$_prov_footer"; } | \
+        timeout -k 10 "${to:-$STEP_TIMEOUT}" ssh -A $SSH_OPTS "$dest" \
+          'f=$(mktemp) && cat > "$f" && bash -l "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc' ) > "$out_fifo" 2>&1 &
+    fi
+    local line
+    while IFS= read -r line; do
+      echo "$line" >> "$logf"
+      case "$line" in
+        "@@STATE "*) st=${line#@@STATE }; note=${st#* }; [[ "$note" == "$st" ]] && note=""; st=${st%% *} ;;
+        "@@TODO "*)  todos+=("$n: ${line#@@TODO }"); note="todo: ${line#@@TODO }" ;;
+        *) printf '   %s│%s %s\n' "$_D" "$_RST" "$line" >&2 ;;
+      esac
+    done < "$out_fifo"
+    wait $! || true; rm -f "$out_fifo"
+    [[ -n "$st" ]] || { st=fail; note="no result (timeout ${to:-$STEP_TIMEOUT}s or ssh failure)"; }
+    local secs=$(( $(date +%s) - t0 ))
+    case "$st" in
+      ok)        ok "$n: already in place" ;;
+      installed) ok "$n: installed (${secs}s)" ;;
+      missing)   warn "$n: missing (dry-run)" ;;
+      *)         warn "$n: FAILED — $note"; failed[$n]=1; bad=1 ;;
+    esac
+    (( dry )) || _prov_record "$n" "$st" "$secs" "$note"
+  done
+  local t; for t in "${todos[@]}"; do warn "manual step — $t"; done
+  [[ -z "$keeper" ]] || { kill "$keeper" 2>/dev/null || true; trap - EXIT; }
+  log "log: $logf"
+  (( bad == 0 )) || die "provisioning '$T_NAME' had failures (re-run: mctl -t $T_NAME provision — finished recipes are skipped)"
+  if (( dry )); then ok "dry-run done for '$T_NAME' (nothing changed)"; else ok "'$T_NAME' provisioned"; fi
+}
+
+# ---------------------------------------------------------------------------
+# mirror — align remote mirror workspace to the exact local branches.
+# ---------------------------------------------------------------------------
+snapshot_rows() {
+  local ws=$1 state_file=$2 ws_name line section="" key value repo_path branch sha
+  ws_name=$(basename "$ws")
+  while IFS= read -r line; do
+    case "$line" in
+      "# WIP_INFO") section=wip; continue ;;
+      "# WS_UPSTREAM_INFO"|"# MODE") section=other; continue ;;
+      \#*|"") continue ;;
+    esac
+    [[ "$section" == wip && "${line%%=*}" == "$ws_name:"* ]] || continue
+    key=${line%%=*}; value=${line#*=}
+    repo_path=${value%%:*}; branch=${value#*:}
+    [[ -n "$repo_path" && -n "$branch" && "$branch" != "$value" ]] \
+      || die "invalid branch-map entry in $state_file: $line"
+    case "$repo_path" in
+      /*|..|../*|*/../*|*/..) die "branch-map path escapes workspace: $repo_path" ;;
+    esac
+    sha=$(git -C "$ws/$repo_path" rev-parse "refs/heads/$branch^{commit}" 2>/dev/null) \
+      || die "snapshot branch '$branch' is missing in $ws/$repo_path"
+    printf '%s\t%s\t%s\n' "$repo_path" "$branch" "$sha"
+  done < "$state_file"
+}
+
+push_snapshot_branches() {
+  local ws=$1 state_file=$2 ws_name line section="" key value repo_path branch
+  local upstream="" prefix=${MCTL_PUSH_PREFIX:-dev/${USER:-$(id -un)}/}
+  local local_sha remote_sha
+  local -a push_paths=() push_branches=() push_shas=() push_remote_shas=()
+  [[ -n "$prefix" ]] || die "MCTL_PUSH_PREFIX must not be empty"
+  ws_name=$(basename "$ws")
+  upstream=$(awk -v ws="$ws_name" '
+    /^# WS_UPSTREAM_INFO$/ { in_upstream=1; next }
+    /^#/ { in_upstream=0 }
+    in_upstream && index($0, ws "=") == 1 {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$state_file")
+  [[ -n "$upstream" ]] || upstream=main
+  while IFS= read -r line; do
+    case "$line" in
+      "# WIP_INFO") section=wip; continue ;;
+      "# WS_UPSTREAM_INFO") section=upstream; continue ;;
+      "# MODE") section=other; continue ;;
+      \#*|"") continue ;;
+    esac
+    key=${line%%=*}; value=${line#*=}
+    [[ "$section" == upstream ]] && continue
+    [[ "$section" == wip && "$key" == "$ws_name:"* ]] || continue
+    repo_path=${value%%:*}; branch=${value#*:}
+    [[ -n "$repo_path" && -n "$branch" && "$branch" != "$value" ]] \
+      || die "invalid branch-map entry in $state_file: $line"
+    case "$repo_path" in
+      /*|..|../*|*/../*|*/..) die "branch-map path escapes workspace: $repo_path" ;;
+    esac
+    [[ "$branch" == "$upstream" || "$branch" == main ]] && continue
+    local_sha=$(git -C "$ws/$repo_path" rev-parse "refs/heads/$branch^{commit}" 2>/dev/null) \
+      || die "snapshot branch '$branch' is missing in $ws/$repo_path"
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_BATCH" \
+      timeout -k 10 "$STEP_TIMEOUT" git -C "$ws/$repo_path" fetch --quiet origin "refs/heads/$branch" \
+      >/dev/null 2>&1 || true
+    remote_sha=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_BATCH" \
+      timeout -k 10 "$STEP_TIMEOUT" git -C "$ws/$repo_path" ls-remote --heads origin "refs/heads/$branch" \
+      | awk 'NR == 1 { print $1 }') \
+      || die "cannot query origin/$branch for $ws/$repo_path"
+    if [[ "$branch" == "$prefix"* ]]; then
+      push_paths+=("$repo_path"); push_branches+=("$branch")
+      push_shas+=("$local_sha"); push_remote_shas+=("$remote_sha")
+    else
+      [[ -n "$remote_sha" && "$local_sha" == "$remote_sha" ]] \
+        || die "refusing to push protected branch '$branch' in $repo_path: local=$local_sha origin=${remote_sha:-MISSING}; set MCTL_PUSH_PREFIX only if this branch is yours"
+    fi
+  done < "$state_file"
+
+  if ((${#push_branches[@]})); then
+    log "branches permitted by MCTL_PUSH_PREFIX='$prefix' (force-with-lease):"
+    printf '  %-36s %-42s %-12s %s\n' REPO BRANCH LOCAL_SHA ORIGIN_SHA >&2
+    for i in "${!push_branches[@]}"; do
+      printf '  %-36s %-42s %-12s %s\n' "${push_paths[$i]}" "${push_branches[$i]}" \
+        "${push_shas[$i]}" "${push_remote_shas[$i]:-MISSING}" >&2
+    done
+  else
+    log "no non-baseline branches match MCTL_PUSH_PREFIX='$prefix'"
+  fi
+  for i in "${!push_branches[@]}"; do
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_BATCH" \
+      timeout -k 10 "$STEP_TIMEOUT" git -C "$ws/${push_paths[$i]}" push \
+        --force-with-lease="refs/heads/${push_branches[$i]}:${push_remote_shas[$i]}" \
+        origin "${push_shas[$i]}:refs/heads/${push_branches[$i]}" \
+      || die "push rejected for ${push_paths[$i]}:${push_branches[$i]} (origin changed or push failed)"
+  done
+}
+
+verify_remote_branches() {
+  local rws=$1 rows=$2 encoded remote_output remote_ws_q mismatch=0 seen=0 expected_count
+  local -a mismatches=()
+  expected_count=$(printf '%s\n' "$rows" | wc -l)
+  encoded=$(printf '%s\n' "$rows" | base64 | tr -d '\n')
+  remote_ws_q=$(shell_quote "$rws")
+  remote_output=$(rlogin "remote_ws=$remote_ws_q
+printf '%s' '$encoded' | base64 -d | while IFS=\"\$(printf '\\t')\" read -r rel branch expected; do
+  actual=\$(git -C \"\$remote_ws/\$rel\" rev-parse HEAD 2>/dev/null || printf MISSING)
+  printf '%s\\t%s\\t%s\\t%s\\n' \"\$rel\" \"\$branch\" \"\$expected\" \"\$actual\"
+done") || die "could not verify remote branch HEADs on '$T_NAME'"
+  while IFS=$'\t' read -r rel branch expected actual; do
+    [[ -n "$rel" ]] || continue
+    seen=$((seen + 1))
+    if [[ "$expected" != "$actual" ]]; then
+      mismatches+=("$rel"$'\t'"$branch"$'\t'"$expected"$'\t'"$actual")
+      mismatch=1
+    fi
+  done <<< "$remote_output"
+  if [[ $seen -ne $expected_count ]]; then
+    mismatches+=("verification output"$'\t'"expected $expected_count repos"$'\t'"$expected_count"$'\t'"$seen")
+    mismatch=1
+  fi
+  if [[ $mismatch -ne 0 ]]; then
+    printf '  %-36s %-42s %-12s %s\n' REPO BRANCH LOCAL_SHA REMOTE_SHA >&2
+    for row in "${mismatches[@]}"; do
+      IFS=$'\t' read -r rel branch expected actual <<< "$row"
+      printf '  %-36s %-42s %-12s %s\n' "$rel" "$branch" "$expected" "$actual" >&2
+    done
+  fi
+  [[ $mismatch -eq 0 ]] || die "remote branch verification failed on '$T_NAME' (see mismatches above)"
+}
+
+cmd_mirror() (
+  local sync=0 allow_drift=0 ws_arg=""
+  for arg in "$@"; do
+    case "$arg" in
+      --sync) sync=1 ;;
+      --allow-manifest-drift) allow_drift=1 ;;
+      *) ws_arg=$arg ;;
+    esac
+  done
+  local ws; ws=$(find_ws "$ws_arg")
+  local parent; parent=$(dirname "$ws")
+  local name; name=$(basename "$ws")
+  local tag; tag=$(ws_tag "$ws")
+  local rws; rws=$(map_remote "$ws")
+  local rparent; rparent=$(map_remote "$parent")
+  local rh; rh=$(remote_home)
+  local state_file="$HOME/.wip/saved/$tag.wip"
+  local rows
+  local source source_id source_path source_rev remote remote_path remote_id remote_rev
+  source=$(workspace_identity "$ws") || die "cannot register source workspace"
+  source_id=$(workspace_field "$source" id)
+  source_path=$(workspace_field "$source" path)
+  source_rev=$(workspace_field "$source" rev)
+  remote_path=$(map_remote "$source_path")
+  remote=$(workspace_remote_identity "$remote_path" "$source_rev") || die "cannot identify remote slot"
+  remote_path=$(workspace_field "$remote" path)
+  remote_id=$(workspace_field "$remote" id)
+  remote_rev=$(workspace_field "$remote" rev)
+  workspace_policy_guard "$source_path" "" mirror-source || die "source workspace purpose refuses mirroring"
+  workspace_policy_guard "$remote_path" "$T_NAME" mirror || die "destination workspace purpose refuses mirroring"
+  workspace_slot_unoccupied "$remote_path" || die "remote workspace reservation refused"
+  workspace_mirror_guard "$remote" "$source_id" || die "remote workspace is not available for this mirror"
+
+  check_manifest_drift "$ws" "$rws" "$allow_drift"
+  log "scanning local branches for $ws"
+  ( cd "$parent" && wip scan >/dev/null ) || die "local wip scan failed for $parent"
+  ( cd "$ws" && wip save "$tag" >/dev/null ) || die "wip save failed for $ws"
+  [[ -s "$state_file" ]] || die "wip snapshot missing: $state_file"
+  rows=$(snapshot_rows "$ws" "$state_file") || die "could not resolve snapshot branches from $state_file"
+  [[ -n "$rows" ]] || die "snapshot has no repositories for workspace '$name'"
+  push_snapshot_branches "$ws" "$state_file"
+
+  if [[ $sync -eq 1 ]]; then
+    log "guarded sync of remote slot before branch replay"
+    workspace_sync_slot "$remote_path" "$remote_id" "$remote_rev" \
+      || die "remote slot refused sync (release existing holders/mirror first)"
+    check_manifest_drift "$ws" "$rws" "$allow_drift"
+  fi
+
+  local mirror_started=0 mirror_complete=0
+  mirror_exit() {
+    local rc=$?
+    trap - EXIT
+    if [[ $mirror_started -eq 1 && $mirror_complete -eq 0 ]]; then
+      workspace_set_mirror "$remote_path" "$remote_id" "$source_id" "$source_path" failed "$remote_rev" \
+        || warn "could not mark remote mirror failed; inspect its status before reuse"
+      workspace_mirror_state "$remote_path" "$source_id" "$source_path" failed >/dev/null \
+        || warn "could not record failed mirror in local registry"
+    fi
+    exit "$rc"
+  }
+  trap mirror_exit EXIT
+  workspace_set_mirror "$remote_path" "$remote_id" "$source_id" "$source_path" syncing "$remote_rev" \
+    || die "remote slot refused mirror reservation"
+  mirror_started=1
+  workspace_mirror_state "$remote_path" "$source_id" "$source_path" syncing >/dev/null \
+    || die "cannot record mirror reservation"
+
+  log "copying branch map to '$T_NAME'"
+  rlogin "mkdir -p ~/.wip/saved" || die "cannot prepare remote branch-map directory"
+  timeout -k 10 "$STEP_TIMEOUT" scp $SSH_OPTS -q \
+      "$HOME/.wip/saved/$tag.wip" "$(sshdest):$rh/.wip/saved/$tag.wip" \
+      || die "scp of branch map to '$T_NAME' timed out or failed"
+
+  log "aligning remote mirror ($rparent) to recorded branches"
+  local qrparent qrws qtag
+  qrparent=$(shell_quote "$rparent"); qrws=$(shell_quote "$rws"); qtag=$(shell_quote "$tag")
+  STEP_TIMEOUT=${MCTL_MIRROR_TIMEOUT:-${VM_MIRROR_TIMEOUT:-1200}} \
+    rlogin "$GIT_BATCH
+cd $qrparent || exit 1
+wip load $qtag || exit 1
+test -f $qrparent/.wip/state || exit 1
+cd $qrws && wip ws checkout && wip ws hard-reset --yes" \
+      || die "remote align timed out or failed for $name on '$T_NAME'"
+  verify_remote_branches "$rws" "$rows"
+  workspace_set_mirror "$remote_path" "$remote_id" "$source_id" "$source_path" active "$remote_rev" \
+    || die "cannot mark verified remote mirror active"
+  workspace_mirror_state "$remote_path" "$source_id" "$source_path" active >/dev/null \
+    || die "cannot record verified mirror in registry"
+  mirror_complete=1
+  ok "mirror aligned on '$T_NAME': $name"
+)
+
+# ---------------------------------------------------------------------------
+# Generic detached job runner (build/test/run). Survives SSH hangups.
+# ---------------------------------------------------------------------------
+start_job() {   # $1=remote_ws  $2=kind  $3=script  $4=force  $5=jobdir  $6=local_ws  $7=target
+  local rws=$1 kind=$2 cmd=$3 force=${4:-0} jd=$5 lws=${6:-} target=${7:-}
+  local logf="$jd/$kind.log"
+  log "starting detached $kind on '$T_NAME' in $rws: $cmd"
+  # setsid+nohup detaches the wrapper; `trap '' HUP` (inherited by the child)
+  # keeps the real build/test alive after the login shell exits. CRITICAL: `cd`
+  # must be a SEPARATE statement — `cd $ws && setsid ... &` backgrounds the whole
+  # compound and the child dies instantly. Completion tracked by a log sentinel;
+  # the session-leader PID (PID==PGID) is recorded in <kind>.pid.
+  # GUARD: build, test and run share ONE working tree, so refuse a second running job
+  # (of EITHER kind) unless --force (which kills the old process group first).
+  local out rc=0 encoded qrws qjd qcmd qlog qtarget target_block target_file
+  encoded=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+  qrws=$(shell_quote "$rws"); qjd=$(shell_quote "$jd")
+  qcmd=$(shell_quote "$jd/$kind.cmd"); qlog=$(shell_quote "$logf")
+  qtarget=$(shell_quote "$target")
+  target_file=$(shell_quote "$jd/$kind.target")
+  if [[ -n "$target" ]]; then
+    target_block="printf '%s\\n' $qtarget > $target_file"
+  else
+    target_block="rm -f $target_file"
+  fi
+  out=$(rlogin "mkdir -p $qjd
+running=
+for pf in $qjd/*.pid; do
+  [ -e \"\$pf\" ] || continue
+  k=\$(basename \"\$pf\" .pid)
+  if kill -0 \"\$(cat \"\$pf\")\" 2>/dev/null && ! grep -q __MCTL_DONE__ $qjd/\$k.log 2>/dev/null; then running=\$k; break; fi
+done
+if [ -n \"\$running\" ]; then
+  if [ \"$force\" = 1 ]; then
+    for pf in $qjd/*.pid; do [ -e \"\$pf\" ] && kill -TERM -\"\$(cat \"\$pf\")\" 2>/dev/null; done; true
+  else
+    echo __MCTL_BUSY__ kind=\$running pid=\$(cat $qjd/\$running.pid 2>/dev/null); exit 3
+  fi
+fi
+cd $qrws || exit 1
+if [ -f $qlog ]; then
+  mkdir -p $qjd/runs
+  ots=\$(cat $qjd/$kind.started 2>/dev/null || stat -c %Y $qlog)
+  opid=\$(cat $qjd/$kind.pid 2>/dev/null || echo 0)
+  arc=$qjd/runs/$kind-\$(date -d @\$ots +%Y%m%d-%H%M%S 2>/dev/null || echo \$ots)-\$opid
+  mv -f $qlog \$arc.log 2>/dev/null
+  [ -f $qcmd ] && cp -f $qcmd \$arc.cmd 2>/dev/null
+  ls -1t $qjd/runs/$kind-*.log 2>/dev/null | tail -n +\$((${MCTL_KEEP_RUNS:-30}+1)) | while read -r old; do rm -f \"\$old\" \"\${old%.log}.cmd\"; done
+fi
+printf '%s' '$encoded' | base64 -d > $qcmd || exit 1
+date +%s > $qjd/$kind.started
+$target_block
+setsid nohup bash -c 'trap \"\" HUP; NO_COLOR=1 TERM=dumb bash \"\$1\" 2>&1 | sed -r \"s/\\x1b\\[[0-9;]*m//g\" > \"\$2\"; rc=\${PIPESTATUS[0]}; printf \"__MCTL_DONE__ rc=%s\\n\" \"\$rc\" >> \"\$2\"; exit \"\$rc\"' mctl-job $qcmd $qlog > /dev/null 2>&1 < /dev/null &
+p=\$!
+echo \$p > $qjd/$kind.pid
+disown 2>/dev/null || true
+printf 'launched: %s pid=%s\\n' $qrws \$p") || rc=$?
+  if [[ "$out" == *__MCTL_BUSY__* ]]; then
+    local rk; rk=$(sed -n 's/.*kind=\([^ ]*\).*/\1/p' <<<"$out")
+    die "a ${rk:-build/test} job is already RUNNING on '$T_NAME' — poll it (mctl -t $T_NAME ${rk:-build}-status), or re-run with --force to replace it"
+  fi
+  [[ $rc -eq 0 ]] || die "failed to launch $kind on '$T_NAME' (rc=$rc)${out:+ — $out}"
+  local jpid; jpid=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)
+  [[ -n "$lws" ]] && joblog_add "$kind" "$lws" "$(ws_tag "$lws")" "$cmd" "${jpid:-}" "$jd"
+  echo "$logf"
+}
+
+job_status() {  # $1=name(basename)  $2=kind  $3=remote_jobdir
+  local name=$1 kind=$2 jd=$3
+  local logf="$jd/$kind.log" qjd qlog
+  qjd=$(shell_quote "$jd")
+  qlog=$(shell_quote "$logf")
+  local out
+  out=$(rlogin "pf=$qjd/$kind.pid
+if [ ! -f $qlog ]; then echo STATE=NONE; exit 0; fi
+if grep -q __MCTL_CANCELLED__ $qlog; then
+  echo STATE=CANCELLED \$(grep -o 'rc=[0-9]*' $qlog | tail -1)
+elif grep -q __MCTL_DONE__ $qlog; then
+  echo STATE=DONE \$(grep -o 'rc=[0-9]*' $qlog | tail -1)
+elif [ -f \"\$pf\" ] && kill -0 \"\$(cat \"\$pf\")\" 2>/dev/null; then
+  echo STATE=RUNNING pid=\$(cat \"\$pf\")
+else
+  echo STATE=DIED
+fi
+sed -r 's/\\x1b\\[[0-9;]*m//g' $qlog | awk '{
+  line=tolower(\$0)
+  if (line ~ /error:|error failed|: failed|fail / ||
+      (line ~ /common\\.star/ && line ~ /load/ && line ~ /error/)) {
+    if (line ~ /error failed removing stage container/ ||
+        (line ~ /common\\.star/ && line ~ /load/ && line ~ /error/)) benign++
+    else errors++
+  }
+} END { printf \"ERRORS=%d\\nBENIGN_ERRORS=%d\\n\", errors, benign }'
+if [ -f $qjd/$kind.target ]; then echo TARGET=\$(cat $qjd/$kind.target); fi
+if [ \"$kind\" = build ]; then
+  echo __PROJECTS__
+sed -r 's/\\x1b\\[[0-9;]*m//g' $qlog | awk '
+    /Building project name=/ {
+      line=\$0; sub(/^.*Building project name=/, \"\", line); sub(/[ ,[:space:]].*$/, \"\", line)
+      current=line; names[++count]=current; totals[current]=\"(no Total/Fail summary)\"
+    }
+    /Total:.*Fail:/ {
+      if (current != \"\") { totals[current]=\$0; current=\"\" }
+    }
+    END { for (i=1; i<=count; i++) printf \"%s\\t%s\\n\", names[i], totals[names[i]] }
+  ' | sort -u
+  echo __PROJECTS_END__
+fi
+echo __TAIL__
+sed -r 's/\\x1b\\[[0-9;]*m//g' $qlog 2>/dev/null | grep -v -e __MCTL_DONE__ -e __MCTL_CANCELLED__ | tail -n 25") || true
+
+  local state; state=$(sed -n 's/^STATE=//p' <<<"$out" | head -1)
+  local key=${state%% *}; local extra=${state#"$key"}; extra=${extra# }
+  local errc benign target projects
+  errc=$(sed -n 's/^ERRORS=//p' <<<"$out" | head -1)
+  benign=$(sed -n 's/^BENIGN_ERRORS=//p' <<<"$out" | head -1)
+  target=$(sed -n 's/^TARGET=//p' <<<"$out" | head -1)
+  projects=$(sed -n '/^__PROJECTS__$/,/^__PROJECTS_END__$/p' <<<"$out" | sed '1d;$d')
+  local tail; tail=$(sed -n '/^__TAIL__$/,$p' <<<"$out" | tail -n +2)
+  local target_built=1
+  if [[ "$key" == DONE && "$extra" == rc=0 && -n "$target" ]]; then
+    awk -F '\t' -v target="$target" '$1 == target { found=1 } END { exit !found }' \
+      <<<"$projects" || target_built=0
+  fi
+
+  local col label=$key
+  case "$key" in
+    DONE)    [[ "$extra" == rc=0 ]] && col=$_GRN || col=$_RED ;;
+    RUNNING) col=$_CYN ;;
+    DIED)    col=$_RED; extra="killed mid-work: no completion, process gone" ;;
+    CANCELLED) col=$_YLW; extra="stopped by mctl cancel${extra:+ ($extra)}" ;;
+    NONE)    col=$_D;   extra="no job recorded" ;;
+    "")      col=$_YLW; label="UNREACHABLE"; extra="no status from '$T_NAME'" ;;
+    *)       col=$_YLW ;;
+  esac
+  if [[ $target_built -eq 0 ]]; then
+    label="TARGET NOT BUILT"
+    col=$_RED
+    extra="requested project '$target' is absent from the build log"
+  fi
+  echo "${col}${_B}●${_RST} ${_B}${kind}${_RST} @ ${name} ${_D}[$T_NAME]${_RST} — ${col}${_B}${label}${_RST}${extra:+ ${_D}(${extra})${_RST}}"
+  if [[ -n "$errc" && "$errc" -gt 0 && "$key" != NONE ]]; then
+    echo "  ${_YLW}▲ ${errc} non-benign error line(s) matched in log${_RST}"
+  fi
+  if [[ -n "$benign" && "$benign" -gt 0 && "$key" != NONE ]]; then
+    echo "  ${_D}${benign} known-benign error line(s) (stage cleanup/common.star)${_RST}"
+  fi
+  if [[ -n "$projects" ]]; then
+    echo "  Per-project build summary:"
+    while IFS=$'\t' read -r project summary; do
+      [[ -n "$project" ]] && printf '    %-52s %s\n' "$project" "$summary"
+    done <<< "$projects"
+  fi
+  if [[ -n "$tail" ]]; then
+    echo "  ${_D}── last 25 log lines ──${_RST}"
+    sed "s/^/  ${_D}│${_RST} /" <<<"$tail"
+  fi
+}
+
+shell_join() {
+  local joined="" arg quoted
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    joined+="${joined:+ }$quoted"
+  done
+  printf '%s' "$joined"
+}
+
+build_target_from_args() {
+  while (($#)); do
+    case "$1" in
+      --args|--config|--board|--variant)
+        if (($# > 1)); then shift 2; else shift; fi
+        ;;
+      --*=*) shift ;;
+      -*) shift ;;
+      *) printf '%s' "$1"; return ;;
+    esac
+  done
+}
+
+resolve_project_name() {
+  local ws=$1 requested=$2
+  [[ -n "$requested" ]] || return 0
+  python3 - "$ws/.repo/manifest.xml" "$requested" 2>/dev/null <<'PY' || printf '%s' "$requested"
+import sys
+import xml.etree.ElementTree as ET
+
+manifest, requested = sys.argv[1:3]
+root = ET.parse(manifest).getroot()
+for project in root.iter("project"):
+    name = project.get("name", "")
+    path = project.get("path", name.rsplit("/", 1)[-1])
+    if requested in (name, path):
+        print(name)
+        break
+else:
+    print(requested)
+PY
+}
+
+cmd_build() {
+  local force=0 parallel=1 allow_drift=0 rest=()
+  for a in "$@"; do
+    case "$a" in
+      --force|-f) force=1 ;;
+      --no-parallel) parallel=0 ;;
+      --allow-manifest-drift) allow_drift=1 ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  local ws
+  if ((${#rest[@]})) && is_workspace_arg "${rest[0]}"; then
+    ws=$(cd "${rest[0]}" && pwd)
+    rest=("${rest[@]:1}")
+  else
+    ws=$(find_ws)
+  fi
+  workspace_log_start "$ws" build || return $?
+  local rws; rws=$(map_remote "$ws")
+  local tag; tag=$(ws_tag "$ws"); local jd; jd=$(remote_jobdir "$tag")
+  local target_raw target parallel_arg="" args cmd
+  target_raw=$(build_target_from_args "${rest[@]}")
+  target=$(resolve_project_name "$ws" "$target_raw")
+  check_manifest_drift "$ws" "$rws" "$allow_drift"
+  [[ $parallel -eq 1 ]] && parallel_arg="--parallel"
+  args=$(shell_join "${rest[@]}")
+  cmd="octl ws build${parallel_arg:+ $parallel_arg}${args:+ $args}"
+  log "resolved workspace: $ws; remote workspace: $rws"
+  log "resolved build command: $cmd"
+  start_job "$rws" build "$cmd" "$force" "$jd" "$ws" "$target" >/dev/null
+  ok "build launched on '$T_NAME' — poll with: ${_B}mctl -t $T_NAME build-status $ws${_RST}"
+}
+cmd_build_status() {
+  local ws; ws=$(find_ws "${1:-}")
+  local tag; tag=$(ws_tag "$ws")
+  job_status "$(basename "$ws")" build "$(remote_jobdir "$tag")"
+}
+
+cmd_test() {
+  local a=${1:?"usage: mctl test '<octl ws test args>' [ws] [--force]"}; shift || true
+  local force=0 ws=""
+  for x in "$@"; do
+    case "$x" in
+      --force|-f) force=1 ;;
+      *)
+        if [[ -z "$ws" ]] && is_workspace_arg "$x"; then
+          ws=$(cd "$x" && pwd)
+        else
+          printf -v x '%q' "$x"
+          a+=" $x"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$ws" ]] || ws=$(find_ws)
+  workspace_log_start "$ws" test || return $?
+  local rws; rws=$(map_remote "$ws")
+  local tag; tag=$(ws_tag "$ws"); local jd; jd=$(remote_jobdir "$tag")
+  start_job "$rws" test "octl ws test $a" "$force" "$jd" "$ws" >/dev/null
+  ok "test launched on '$T_NAME' — poll with: ${_B}mctl -t $T_NAME test-status $ws${_RST}"
+}
+cmd_test_status() {
+  local ws; ws=$(find_ws "${1:-}")
+  local tag; tag=$(ws_tag "$ws")
+  job_status "$(basename "$ws")" test "$(remote_jobdir "$tag")"
+}
+
+cmd_run() {
+  local script=${1:?"usage: mctl run '<script>' [ws] [--force]"}; shift || true
+  local force=0 ws=""
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) force=1 ;;
+      *)
+        if [[ -z "$ws" ]] && is_workspace_arg "$arg"; then
+          ws=$(cd "$arg" && pwd)
+        else
+          die "unexpected mctl run argument: $arg"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$ws" ]] || ws=$(find_ws)
+  workspace_log_start "$ws" run || return $?
+  local rws; rws=$(map_remote "$ws")
+  local tag; tag=$(ws_tag "$ws"); local jd; jd=$(remote_jobdir "$tag")
+  log "resolved workspace: $ws; remote workspace: $rws"
+  start_job "$rws" run "$script" "$force" "$jd" "$ws" >/dev/null
+  ok "script launched on '$T_NAME' — poll with: ${_B}mctl -t $T_NAME run-status $ws${_RST}"
+}
+
+cmd_run_status() {
+  local ws; ws=$(find_ws "${1:-}")
+  local tag; tag=$(ws_tag "$ws")
+  job_status "$(basename "$ws")" run "$(remote_jobdir "$tag")"
+}
+
+# ---------------------------------------------------------------------------
+# pull results — rsync from the target to the local (home-relative) path.
+# ---------------------------------------------------------------------------
+_rsync_from() { rsync -az -e "ssh -A $SSH_OPTS" "$@"; }
+
+report_remote_images() {
+  local rws=$1 jobdir=$2 qrws qjd
+  qrws=$(shell_quote "$rws"); qjd=$(shell_quote "$jobdir")
+  rlogin "workspace=$qrws
+jobdir=$qjd
+log=\$jobdir/build.log
+started=\$(cat \"\$jobdir/build.started\" 2>/dev/null || echo 0)
+phase_epoch() {
+  line=\$(sed -r 's/\\x1b\\[[0-9;]*m//g' \"\$1\" | grep -im1 -E \"\$2\" 2>/dev/null || true)
+  stamp=\$(printf '%s\\n' \"\$line\" | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}[T ][0-9:.+-]+(Z|[+-][0-9]{2}:[0-9]{2})?' | head -1)
+  [ -n \"\$stamp\" ] && date -d \"\$stamp\" +%s 2>/dev/null || echo 0
+}
+extract_epoch=0
+compile_epoch=0
+if [ -f \"\$log\" ]; then
+  extract_epoch=\$(phase_epoch \"\$log\" 'extract.*artifact|artifact.*extract')
+  compile_epoch=\$(phase_epoch \"\$log\" 'Building project name=')
+fi
+[ \"\$extract_epoch\" -gt 0 ] || extract_epoch=\$started
+printf 'IMAGE_PHASE extract_epoch=%s compile_epoch=%s build_started=%s\\n' \"\$extract_epoch\" \"\$compile_epoch\" \"\$started\"
+total=0
+after_compile=0
+while IFS= read -r -d '' file; do
+  if ! mtime=\$(stat -c %Y \"\$file\" 2>/dev/null); then
+    echo \"IMAGE_WARNING could not read mtime for \$file\"
+    continue
+  fi
+  if ! digest=\$(sha256sum \"\$file\" 2>/dev/null); then
+    echo \"IMAGE_WARNING could not hash \$file\"
+    continue
+  fi
+  sha=\${digest%% *}
+  if [ \"\$mtime\" -gt \"\$extract_epoch\" ]; then freshness=AFTER_EXTRACT
+  else freshness=PRE_EXTRACT
+  fi
+  if [ \"\$compile_epoch\" -gt 0 ] && [ \"\$mtime\" -gt \"\$compile_epoch\" ]; then after_compile=\$((after_compile + 1)); fi
+  printf 'IMAGE\\t%s\\t%s\\t%s\\t%s\\n' \"\$freshness\" \"\$mtime\" \"\$sha\" \"\$file\"
+  total=\$((total + 1))
+done < <(find \"\$workspace/build_artifacts\" \"\$workspace/zephyr_apps\" -type f \\
+  \\( -name 'spi_flash_image_*.bin' -o -name '*.fwpkg' \\) -print0 2>/dev/null)
+if [ \"\$total\" -eq 0 ]; then
+  echo 'IMAGE_WARNING no spi_flash_image_*.bin or *.fwpkg artifacts found'
+elif [ \"\$compile_epoch\" -gt 0 ] && [ \"\$after_compile\" -eq 0 ]; then
+  echo 'IMAGE_WARNING all discovered images predate the compile phase; they may be extracted prebuilt artifacts'
+elif [ \"\$compile_epoch\" -eq 0 ]; then
+  echo 'IMAGE_WARNING compile timestamp unavailable; image freshness relative to compilation could not be confirmed'
+fi"
+}
+
+cmd_pull_build() {
+  local ws; ws=$(find_ws "${1:-}")
+  workspace_log_start "$ws" pull-build
+  local rws; rws=$(map_remote "$ws")
+  local tag; tag=$(ws_tag "$ws")
+  local jd; jd=$(local_jobdir "$tag"); local rjd; rjd=$(remote_jobdir "$tag")
+  local dest; dest=$(sshdest)
+  log "pulling binaries + logs for $ws from '$T_NAME'"
+  if rlogin "test -d $(shell_quote "$rws")/build_artifacts" 2>/dev/null; then
+    _rsync_from "$dest:$rws/build_artifacts/" "$ws/build_artifacts/" \
+      || die "failed to pull build_artifacts from '$T_NAME'"
+  else
+    warn "remote build_artifacts directory missing on '$T_NAME'"
+  fi
+  _rsync_from --prune-empty-dirs \
+    --include='*/' --include='build_logs/***' --include='build/***' --exclude='*' \
+    "$dest:$rws/zephyr_apps/" "$ws/zephyr_apps/"
+  mkdir -p "$jd"; _rsync_from "$dest:$rjd/" "$jd/" 2>/dev/null || true
+  report_remote_images "$rws" "$rjd"
+  ok "pull-build complete"
+}
+
+cmd_pull_logs() {
+  local ws; ws=$(find_ws "${1:-}")
+  workspace_log_start "$ws" pull-logs
+  local rws; rws=$(map_remote "$ws")
+  local tag; tag=$(ws_tag "$ws")
+  local jd; jd=$(local_jobdir "$tag"); local rjd; rjd=$(remote_jobdir "$tag")
+  local dest; dest=$(sshdest)
+  log "pulling logs only for $ws from '$T_NAME'"
+  _rsync_from --prune-empty-dirs \
+    --include='*/' --include='build_logs/***' --include='*.log' --exclude='*' \
+    "$dest:$rws/zephyr_apps/" "$ws/zephyr_apps/"
+  mkdir -p "$jd"; _rsync_from "$dest:$rjd/" "$jd/" 2>/dev/null || true
+  ok "pull-logs complete"
+}
+
+# ---------------------------------------------------------------------------
+# release — return remote repos to their manifest baseline and sync.
+# ---------------------------------------------------------------------------
+cmd_release() {
+  local ws; ws=$(find_ws "${1:-}")
+  local source source_id source_path source_rev remote_path remote remote_id rev
+  source=$(workspace_identity "$ws") || die "cannot identify source workspace"
+  source_id=$(workspace_field "$source" id)
+  source_path=$(workspace_field "$source" path)
+  source_rev=$(workspace_field "$source" rev)
+  remote_path=$(map_remote "$source_path")
+  remote=$(workspace_remote_identity "$remote_path" "$source_rev") || die "cannot identify remote slot"
+  remote_path=$(workspace_field "$remote" path)
+  remote_id=$(workspace_field "$remote" id)
+  rev=$(workspace_field "$remote" rev)
+  python3 -c '
+import json,sys
+m=json.loads(sys.argv[1]).get("mirror")
+if m and m.get("source_id") != sys.argv[2]:
+    raise SystemExit("remote mirror belongs to another source; release refused")
+' "$remote" "$source_id" || die "remote mirror ownership mismatch"
+  log "releasing guarded remote slot on '$T_NAME': $remote_path"
+  workspace_checked free "$remote_path" "$remote_id" "$rev" >/dev/null \
+    || die "remote release failed; mirror relation retained"
+  workspace_mirror_state "$remote_path" "$source_id" "$source_path" released >/dev/null \
+    || die "remote freed, but registry reconciliation failed; refresh remote status"
+  ok "release complete on '$T_NAME'"
+}
+
+# ---------------------------------------------------------------------------
+# wip — proxy any wip_/ws_ action to the target mirror.
+# ---------------------------------------------------------------------------
+cmd_wip() {
+  local action=${1:?"usage: mctl wip <action> [ws|--wip]"}; shift || true
+  action=${action//_/-}
+  local scope_ws=1; local target="${1:-}"
+  if [[ "$target" == "--wip" ]]; then scope_ws=0; target=""; fi
+  local ws; ws=$(find_ws "$target")
+  workspace_log_start "$ws" wip || return $?
+  local rws; rws=$(map_remote "$ws")
+  local rparent; rparent=$(map_remote "$(dirname "$ws")")
+  if [[ $scope_ws -eq 0 ]]; then
+    workspace_policy_guard_tree "$rparent" || return $?
+  fi
+  if [[ $scope_ws -eq 1 ]]; then
+    rlogin_cred "$GIT_BATCH cd $rparent && wip scan >/dev/null && cd $rws && wip ws $action --yes"
+  else
+    rlogin_cred "$GIT_BATCH cd $rparent && wip scan >/dev/null && wip all $action --yes"
+  fi
+}
+
+cmd_sh() {
+  local c=${1:?"usage: mctl sh '<cmd>' [ws]"}
+  local ws; ws=$(find_ws "${2:-}")
+  workspace_log_start "$ws" sh || return $?
+  local rws; rws=$(map_remote "$ws")
+  rlogin_cred "cd $rws && $c"
+}
+
+usage() { awk 'NR>1 && /^set -euo pipefail/{exit} NR>1' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; }
+
+# ---------------------------------------------------------------------------
+main() {
+  # Global target selector: -t/--target NAME anywhere before the subcommand.
+  local tsel=""
+  while [[ "${1:-}" == -t || "${1:-}" == --target ]]; do
+    tsel=${2:?"-t/--target needs a name"}; shift 2
+  done
+  local sub=${1:-}; shift || true
+  # Registry/lifecycle commands that don't need a live connection first.
+  case "$sub" in
+    targets)       cmd_targets "$@"; return ;;
+    target)        cmd_target "$@"; return ;;
+    use)           cmd_use "$@"; return ;;
+    vm)            cmd_vm "$@"; return ;;
+    ""|-h|--help|help) usage; return ;;
+  esac
+  # Lifecycle/setup/ip/provision accept an optional POSITIONAL target token (a
+  # registered name, a hostname, or user@host) in addition to the global -t flag.
+  if [[ -z "$tsel" && "$sub" =~ ^(ip|start|stop|setup|provision|wake|lease)$ && -n "${1:-}" && "${1:0:1}" != "-" ]] \
+     && [[ ! "$sub" =~ ^(provision|lease)$ || -n "$(_target_line "$1")" ]]; then
+    tsel=$1; shift
+  fi
+  select_target "$tsel"
+  # Active commands need the machine: wake a stopped/expired VM first. Passive
+  # ones (probes, ip/dest, status, workspace status) never do — see ensure_vm_up.
+  case "$sub" in
+    sh|mirror|build|test|run|pull-build|pull-logs|release|wip|term|setup|provision|setup-machine) ensure_vm_up ;;
+    workspace) [[ "${1:-}" == status ]] || ensure_vm_up ;;
+  esac
+  case "$sub" in build|test|run) lease_topup "$RENEW_BELOW" "before $sub" ;; esac
+  case "$sub" in
+    ip)            [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]] && rm -f "$MCTL_DIR/$T_NAME.ip"; vm_ip ;;
+    dest)          sshdest ;;
+    start)         cmd_start "$@" ;;
+    stop)          cmd_stop "$@" ;;
+    wake)          cmd_wake "$@" ;;
+    lease)         cmd_lease "$@" ;;
+    setup|provision) cmd_provision "$@" ;;
+    setup-machine) provision_target ;;
+    sh)            ( cmd_sh "$@" ) ;;
+    workspace)     cmd_workspace "$@" ;;
+    mirror)        cmd_mirror "$@" ;;
+    build)         ( cmd_build "$@" ) ;;
+    build-status|status) cmd_build_status "$@" ;;
+    test)          ( cmd_test "$@" ) ;;
+    test-status)   cmd_test_status "$@" ;;
+    pull-build)    ( cmd_pull_build "$@" ) ;;
+    pull-logs)     ( cmd_pull_logs "$@" ) ;;
+    jobs)          cmd_jobs "$@" ;;
+    jobs-probe)    cmd_jobs_probe "$@" ;;
+    jobs-watch)    cmd_jobs_watch "$@" ;;
+    term)          cmd_term "$@" ;;
+    bmc)           cmd_bmc "$@" ;;
+    jobs-sync)     cmd_jobs_sync "$@" ;;
+    jobs-tail)     cmd_jobs_tail "$@" ;;
+    cancel)        cmd_cancel "$@" ;;
+    run)           ( cmd_run "$@" ) ;;
+    run-status)    cmd_run_status "$@" ;;
+    release)       cmd_release "$@" ;;
+    wip)           ( cmd_wip "$@" ) ;;
+    *) die "unknown subcommand: $sub (try: mctl help)" ;;
+  esac
+}
+main "$@"

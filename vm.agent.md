@@ -63,7 +63,7 @@ All commands support: `--output json/text/table`, `--verbose`, `--silent`, `--pl
 
 1. **List VMs**: Run `octl vm list` with appropriate filters. Report NAME, INSTANCE ID, TYPE, STATE, and PRIVATE IP.
 2. **Provide VM info**: When asked for machine details (e.g. IP for SSH), run `octl vm list` and extract the relevant fields. The PRIVATE IP column is used for SSH access.
-3. **Create a VM**: First discover current flavors (see above), confirm flavor and options with user, then run `octl vm create --flavor <type> [flags] -w`.
+3. **Create a VM**: First discover current flavors (see above), confirm flavor and options with user, then run `octl vm create --flavor <type> [flags] -w`. If AZ capacity errors persist on an existing instance, a new VM may land in another AZ. Afterwards offer `mctl vm main <new-id>` and `mctl setup vm`.
 4. **Start a VM**: Run `octl vm start INSTANCE-ID -w`, then verify the machine is reachable by pinging its private IP (`ping -c 3 <IP>`). Report success only after ping succeeds. If ping fails, retry a few times with short waits.
 5. **Stop a VM**: Confirm with user, then run `octl vm stop INSTANCE-ID -w`.
 6. **Delete a VM**: Confirm with user, then run `octl vm delete INSTANCE-ID -w`.
@@ -71,7 +71,8 @@ All commands support: `--output json/text/table`, `--verbose`, `--silent`, `--pl
 ## Serving Other Agents
 
 When another agent or user needs VM information (e.g. "what's the IP of my machine?", "how do I SSH into my VM?"), run `octl vm list` and provide:
-- **SSH command**: `ssh <PRIVATE_IP>`
+- **SSH command**: `ssh $(mctl -t <target> dest)` — the login differs per VM (newer VMs use the SSO identity, e.g. `yoni.izutskiver@<PRIVATE_IP>`), so never assume `ssh <PRIVATE_IP>`
+- **Main VM**: `mctl vm main` prints the instance the `vm` target (neo-ask, default delegation, portal) is bound to; `mctl vm list` maps every instance to its mctl target. After creating a replacement VM, switch with `mctl vm main <id>` (or the portal's *Set as main*) — the previous one stays as target `vm-<id6>`
 - **Instance ID**: for lifecycle operations
 - **State**: whether it's running/stopped
 - **Instance type**: the machine flavor

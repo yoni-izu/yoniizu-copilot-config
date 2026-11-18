@@ -1,7 +1,7 @@
 ---
 name: vm-delegate
-description: "Delegate FW workspace work to a mirror workspace on ANY machine (EC2 VM or shared lab desktop) via the mctl script (formerly vmctl). Use when: mirror/align a workspace to a VM or remote machine, remote build, run a full parallel workspace build on a strong machine, pull build results/binaries/logs back, run workspace tests remotely, release/clean up the remote mirror workspace, run any wip_/ws_ git operation remotely, start/stop a VM, manage machine targets, execute a command on a target and pull its output, or delegate long-running work that must survive SSH hangups."
-argument-hint: "Optional -t <target>, an operation (mirror/workspace/build/build-status/test/test-status/pull-build/pull-logs/release/wip/sh/start/stop/setup), and optionally a workspace path"
+description: "Delegate FW workspace work to a mirror workspace on ANY machine (EC2 VM or shared lab desktop) via the mctl script (formerly vmctl). Use when: mirror/align a workspace to a VM or remote machine, remote build, run a full parallel workspace build on a strong machine, pull build results/binaries/logs back, run workspace tests remotely, release/clean up the remote mirror workspace, run any wip_/ws_ git operation remotely, start/stop/wake a VM, VM lease and auto-start, provision a new VM or lab machine with prerequisites, manage machine targets, execute a command on a target and pull its output, or delegate long-running work that must survive SSH hangups."
+argument-hint: "Optional -t <target>, an operation (mirror/workspace/build/build-status/test/test-status/pull-build/pull-logs/release/wip/sh/start/stop/wake/lease/provision), and optionally a workspace path"
 ---
 
 > **Portal handoff:** For Team Portal/dashboard questions, feature requests,
@@ -33,14 +33,17 @@ path relative to `$HOME`**. All operations go through one script, `~/bin/mctl`
 every action can be run by hand with no AI involvement.
 
 > **Targets.** A *target* is a named machine in `~/.mctl/targets`:
-> `kind=vm` (personal EC2 — IP auto-discovered from `octl vm list`, **never
-> hardcoded**; supports `mctl start`/`mctl stop`) or `kind=remote` (any ssh
+> `kind=vm` (personal EC2 — **bound to an instance id** in the registry's host
+> column; IP auto-discovered from `octl vm list` for that id, **never
+> hardcoded**; supports `mctl start`/`mctl stop` of that id) or `kind=remote` (any ssh
 > `user@host`, e.g. a lab desktop, assumed always up). Select a target with
 > `-t/--target NAME` before the subcommand, or set a default with `mctl use
 > NAME` (precedence: `-t` ▸ `$MCTL_TARGET` ▸ `~/.mctl/default` ▸ `vm`). Manage
-> targets with `mctl targets`, `mctl target add <name> <user@host>|--vm`,
-> `mctl target rm <name>`, and `mctl setup [name]` (deploys the `wip` CLI +
-> state dirs). For a `kind=vm` target the private IP is cached in
+> targets with `mctl targets`, `mctl target add <name> <user@host> [--bmc [user@]host]|--vm [user] [instance-id]`,
+> `mctl target bmc <name> <[user@]host|->` (set/clear a lab machine's BMC; optional 5th
+> registry column), `mctl target rm <name>`, `mctl -t <name> bmc` (interactive SSH to the
+> BMC, default user `root`, password via `sshpass -e` from `~/.pilot/bmc.pw` if present), and `mctl provision [name]` (installs the target's
+> prerequisites from recipe lists — see **Provisioning a machine**). For a `kind=vm` target the private IP is cached in
 > `~/.mctl/<name>.ip`, self-validating (reused only while SSH/22 is reachable,
 > so a new/torn-down VM auto-invalidates it). Force a refresh with `mctl -t
 > <name> ip --refresh`; override with `VM_IP=`.
@@ -97,12 +100,12 @@ every action can be run by hand with no AI involvement.
   command runs inside a login shell (`bash -l -s` fed over stdin).
 - **The target must have the `wip` CLI.** All remote git ops (`mirror`,
   `release`, `mctl wip …`) call `~/bin/wip` on the target. A fresh mirror may
-  not have it yet — run `mctl setup [name]` once (it deploys `wip` + state dirs
-  if missing). Remote workspace-manager checks also require WIP to advertise
+  not have it yet — run `mctl provision [name]` once (its `wip` recipe deploys
+  it, and redeploys whenever the local copy changes). Remote workspace-manager checks also require WIP to advertise
   `forall-argv-v1` via `wip capabilities`; update an older target WIP before
   those checks. To deploy by hand:
   ```bash
-  ~/bin/wip-deploy "$(mctl -t <name> ip)"     # vm target (by IP)
+  ~/bin/wip-deploy "$(mctl -t <name> dest)"   # vm target ([user@]ip)
   ~/bin/wip-deploy user@host                   # remote target
   ```
 - `rtk` does **not** exist on remote machines — never prefix remote commands
@@ -115,9 +118,12 @@ Prefix any command with `-t <target>` to pick a machine (or set a default with
 
 | You want to… | Command |
 |---|---|
-| List / manage machine targets | `mctl targets` · `mctl target add <name> <user@host>` · `mctl use <name>` |
-| Prepare a target (deploy `wip` + dirs) | `mctl setup [name]` |
+| List / manage machine targets | `mctl targets` · `mctl target add <name> <user@host> [--bmc host]` · `mctl target bmc <name> <host\|->` · `mctl use <name>` |
+| Open a shell on a lab machine's BMC | `mctl -t <name> bmc` |
+| Install a target's prerequisites (wip, creds, git, copilot, neo, RTL mirrors…) | `mctl provision [name]` · `--dry-run` · `--status` |
 | Start / stop a VM target | `mctl -t <vm> start` · `mctl -t <vm> stop` |
+| Make sure a VM is up (auto-starts it) | `mctl -t <vm> wake` |
+| Last start, predicted stop, lease policy · renew | `mctl -t <vm> lease` · `mctl -t <vm> lease renew` |
 | Align the remote mirror to my local branches | `mctl mirror [ws]` |
 | Full parallel build (detached) | `mctl build [ws] [extra args]` |
 | Check the remote build | `mctl build-status [ws]` |
@@ -135,6 +141,9 @@ Prefix any command with `-t <target>` to pick a machine (or set a default with
 | Any `wip` git op remotely | `mctl wip <action> [ws]` or `... --wip` |
 | Run an arbitrary command in the remote ws root | `mctl sh '<cmd>' [ws]` |
 | Print a VM target's private IP (auto-discovered) | `mctl -t <vm> ip` (add `--refresh`) |
+| Print a target's ssh destination (`[user@]host`) | `mctl -t <name> dest` |
+| List your EC2 instances and their targets | `mctl vm list` |
+| Show / switch the Main VM (target `vm`) | `mctl vm main` · `mctl vm main <instance-id> [--user LOGIN]` |
 
 `[ws]` is optional — omit it to use the workspace containing the current
 directory. Run from inside the FW workspace (e.g. `~/projects/iridium/one/fw`)
@@ -151,6 +160,108 @@ SHA-256 checksums from the relevant machines. It does not flash hardware.
 `mctl sh` is text-only because it captures output using shell command
 substitution. Do not stream raw image/tar bytes through it; use the binary-safe
 transfer procedure in `fw-deploy`, or `pull-build` for the full artifact tree.
+
+## Switching the Main VM (new or replacement instance)
+
+Target `vm` is the **Main VM**: `neo-ask`, the default `mctl` target and the
+portal's terminal/live link (`terminal_targets`/`live_targets` = `vm`) all
+follow it by name. Nothing else stores an instance id or IP, so switching is a
+single registry change:
+
+```bash
+octl vm create --flavor m7i.48xlarge -d main-dev-vm   # if a new one is needed
+mctl vm list                                         # instance ids <-> targets
+mctl vm main i-<new-id> --user <login>               # rebind target vm
+mctl provision vm                                    # everything in lists/vm.list
+```
+
+- The previous Main is kept as target `vm-<first 6 hex of its id>` (same
+  login), so it can still be started, probed and released. Switching back
+  (`mctl vm main <old-id>`) reuses that target's login and drops the alias.
+  The portal's **★ Set as main** on a VM card does the same.
+- `--user` defaults to a login already recorded for that instance, else the
+  instance's `owner` tag. VMs created through `octl vm create` accept the SSO
+  identity (e.g. `yoni.izutskiver`), not the local WSL user; mctl remaps paths
+  home-relative, so `/home/<local>/projects/...` → `/home/<sso>/projects/...`.
+- **Use `mctl -t <vm> dest`, never a bare IP, for hand-rolled ssh** — the login
+  is per-VM.
+- An unbound `kind=vm` target (host `-`) is legacy: it resolves to the only
+  running VM and refuses when several run; `start`/`stop` refuse outright. Bind
+  it with `mctl vm main <id>`.
+- What does **not** move: workspaces mirrored on the old VM (recreate/clone
+  them, then `mctl mirror`; old remote workspace records under `vm` show as
+  missing). neo-brain + its RTL mirrors for `neo-ask` are rebuilt on the new
+  VM by `mctl provision vm` (recipes `neo`, `rtl`; RTL is cloned on the VM only).
+  The one manual step left is `ssh -t "$(mctl dest)" '~/.local/bin/copilot login'`. Dispatches record the bound
+  `instance` in `joblog.jsonl`, so history shows which machine ran a job.
+- Leases are handled for you — see **VM power: auto-start and lease**.
+
+## VM power: auto-start and lease
+
+mctl starts VMs on a short lease (`MCTL_VM_LEASE`, default **30m**) and
+remembers every start/renew/stop in `~/.mctl/power/<instance-id>`
+(started, expires, by) plus a JSONL event log `~/.mctl/power.log`.
+
+- **Prediction.** `mctl lease` prints when the VM was started and when it is
+  predicted to stop (lease expiry). While the lease is predicted live and ssh/22
+  answers, no `octl` call is made.
+- **Auto-start, on demand.** *Active* commands (`sh`, `mirror`, `build`,
+  `test`, `run`, `pull-*`, `release`, `wip`, `term`, `provision`/`setup`,
+  `workspace` other than `status`, `wake`) start a stopped or lease-expired VM,
+  wait for ssh (`MCTL_WAKE_TIMEOUT`, 600 s) and continue. *Passive* commands
+  (`jobs` — local log only — and `jobs-probe/watch/sync/tail`, `ip`, `dest`,
+  `*-status`, `cancel`, `workspace status`) never wake a VM: the portal polls
+  them every few seconds, so waking there would keep an idle VM up (and billed)
+  around the clock, against the on-demand policy; a stopped VM has no running
+  jobs to report anyway. `neo-ask` calls
+  `mctl wake` first. Disable with `MCTL_AUTOSTART=0`.
+- **Renewal.** `build`/`test`/`run`/`wake` renew when less than
+  `MCTL_RENEW_BELOW` (30m) is left. While a delegated job is confirmed running,
+  the portal watchdog (every 60 s) calls `mctl lease renew --if-below 10m`
+  (`MCTL_KEEPALIVE_BELOW`) so a long build is never reaped; a long `provision`
+  keeps its own lease alive. An idle VM simply stops at lease end — no cost —
+  and comes back on the next active command.
+- The portal VM card shows *started … ago (auto|manual)*, the *predicted stop*,
+  and flags a cached "running" whose lease has passed as probably stopped.
+
+## Provisioning a machine
+
+`mctl provision [name]` installs prerequisites from **recipe lists** under
+[provision/](provision/) (override the root with `MCTL_PROVISION_DIR`):
+
+| List | Default for | Recipes |
+|---|---|---|
+| `lists/machine.list` | `kind=remote` (lab desktops/servers) | `creds git wip copilot btop` (`dirs` is optional: `--only dirs`) |
+| `lists/vm.list` | `kind=vm` | `include machine.list` + `octl_update neo rtl` |
+| `lists/neo.list` | — | `neo rtl` |
+
+```bash
+mctl provision vm --dry-run          # what is missing (nothing changes)
+mctl provision vm                    # install the missing ones (in place = skipped)
+mctl provision dsk70 --only creds,wip
+mctl provision vm --list neo         # or --list /path/to/my.list
+mctl provision vm --skip rtl --force # reinstall all but rtl
+mctl provision vm --status           # last result per recipe
+```
+
+- **Recipe** = `provision/recipes/<name>.sh` defining `check()` (exit 0 when
+  already satisfied), `install()`, and optionally `todo()` (echoes a manual
+  step, e.g. *copilot login*). Headers: `# desc:`, `# where: remote|local`,
+  `# needs: <recipes>` (blocked if one failed), `# timeout: <secs>`.
+  `remote` recipes run on the target in a login shell with agent forwarding;
+  `local` ones run here with `$MCTL_DEST`, `$MCTL_HOST`, `$MCTL_LOGIN`,
+  `$MCTL_REMOTE_HOME` and `r <cmd>` (ssh to the target). Both get
+  `$MCTL_TARGET`, `$MCTL_KIND`, `$GIT_NAME`, `$GIT_EMAIL`.
+- **List** = one recipe per line, `#` comments, `include <list>`; duplicates run
+  once. A list given by path may keep its own recipes next to it
+  (`../recipes/` or the same dir) before falling back to the defaults.
+- Results: `~/.mctl/provision/<target>.state` (TSV, latest per recipe — shown
+  on the portal card) and a full log per run in `~/.mctl/provision/logs/`.
+  The portal's **⚙ Provision** button runs it live in a terminal window.
+- `mctl setup` is an alias of `provision`; `mctl setup-machine` keeps the old
+  credentials-only copy (`setup_machine.sh`).
+- To add a prerequisite once and for all: drop a recipe in `recipes/`, add its
+  name to the right list, and `mctl provision <target>`.
 
 ## Standard delegated-build flow
 
@@ -316,6 +427,19 @@ python3 ~/.copilot/skills/vm-delegate/vd.py vms        # EC2 power state
 python3 ~/.copilot/skills/vm-delegate/vd.py start|stop <instance-id>
 ```
 
+### Local-runner jobs (kind `flash`)
+
+Some jobs run on THIS machine against a target (today: the portal's Flash FW).
+`vd.start_local_job(target, "flash", argv, label=, meta=)` runs argv in a
+`systemd-run --user` transient unit `mctl-<id>` (so a portal restart does not
+kill it; `journalctl --user -u mctl-<id>`), with its log, pid and events under
+`~/.mctl/local/<id>/`, and records it in the delegation history with
+`runner:"local"`. `jobs()`, `read_log`, `tail`, `log_view` (mode `local`) and
+`cancel` all handle it; `refresh()` never probes it. Status comes from the
+wrapper's `__MCTL_DONE__ rc=N` sentinel (0 passed, 130 cancelled, else failed);
+cancel is refused during the write/verify/boot phases. One running flash job per
+target. Tests: `test_local_jobs.py`.
+
 ### Refresh one machine, not the fleet
 
 Only use `refresh` or `sync` when all logs on the target are known source-free;
@@ -380,10 +504,15 @@ in `state["errors"]` and surfaced verbatim in the payload's `error` string. It
 does **not** silently drop the target, and the probe is retried next refresh.
 
 `vd.py vms` parses `octl vm list --output json` (instance id, state, type,
-private IP, lease expiry) and matches each instance to an mctl target through
-the cached `~/.mctl/<target>.ip`, caching the result in the delegation database.
-`vd.py start|stop <id>` shells out to `octl vm start|stop`; a start also clears
-the cached IPs, because a resumed VM usually comes back on a different one.
+private IP, lease expiry) and matches each instance to an mctl target by the
+**instance id bound in `~/.mctl/targets`** (every personal VM shares the same
+EC2 Name, so neither name nor IP can tell them apart). Only an unbound legacy
+`kind=vm` target falls back to its cached `~/.mctl/<target>.ip`. The target and
+`main` flag are attached when the payload is read, so a Main switch shows
+without re-querying octl. `vd.py start|stop <id>` shells out to
+`octl vm start|stop`; a start clears the IP caches of the targets bound to that
+instance (and of unbound VM targets) — a resumed VM usually has a new IP.
+`vd.py main [<id> [login]]` prints or switches the Main VM via `mctl vm main`.
 
 `octl` brackets its JSON with noise — `INF ... Validating SSO credentials` lines
 before it and, when a newer octl exists, an "A new release is available" banner
@@ -402,6 +531,7 @@ running job highlighted below it, then the full history.
 | **Sync logs** | `POST /api/vm-sync` → `vd.portal_sync()`, scoped by the target filter | one rsync per target — no probe, no octl |
 | **Log ▸ open** | `POST /api/vm-log` → `vd.portal_log()` | reads the local mirror (falls back to the remote) |
 | **Log ▸ tail** | `POST /api/vm-tail` → `vd.portal_tail()`, re-polled every 5 s | one `tail -n` ssh per poll |
+| **★ Set as main** on a VM card | `POST /api/vm-main {"id": "i-…"}` → `vd.portal_set_main()` → `mctl vm main` | registry rewrite only — no ssh, no octl power action |
 
 Neither costs a model token. Three design points worth keeping:
 
@@ -529,7 +659,7 @@ pitfalls (`twister-out`, external-FW versions, missing guards), see `build-fw`, 
 | **Mirror refused: "remote workspace is missing or unsafe"** | The slot was still on an old experiment's `dev/*` branches with untracked files. `mctl -t vm workspace status <path> <WS-R-id> <rev>` lists the reasons, and `mirror` was `None` | Inspect before freeing. For each repo on a `dev/*` branch, check `ls-remote` + `merge-base --is-ancestor`, and back up the branch map with `wip scan && wip save <name>` **on the target**. Push any commit that is only local, or ask the user. Only then free the slot |
 | **Guarded `workspace free` fails on an older target `octl`** | `octl ws sync --no-plugins: ERROR: unknown flag: --no-plugins`. The checkout half had already run, so `status` then showed `safe=True` | Run `octl update` on the target. A partly completed free can still leave the slot safe, so re-check `workspace status` before retrying |
 | **`mirror` verification fails on baseline repos that are behind locally** | `REPO … LOCAL_SHA … REMOTE_SHA` mismatch for `infra` and `build_framework`, local one commit behind origin | Either `wip ws pull` locally first, or, to reproduce local exactly, pin the target with `git checkout --detach <local-sha>`. Then diff per-repo `rev-parse HEAD` lists for both sides |
-| **Detached build hangs silently on expired AWS SSO** | `build-status` says RUNNING, `build.log` is 0 bytes, and the child is `aws sso login --no-browser --profile devops-cli` | Kill the job. `mctl sh` captures output, so the device URL never shows. Run `ssh -A -tt <ip> 'bash -lc "aws sso login --no-browser --profile devops-cli"'` (async) and hand the URL/code to the user. If the CLI then reports `InvalidGrantException`, check `aws sts get-caller-identity` before re-prompting, because the token may already be valid |
+| **Detached build hangs silently on expired AWS SSO** | `build-status` says RUNNING, `build.log` is 0 bytes, and the child is `aws sso login --no-browser --profile devops-cli` | Kill the job. `mctl sh` captures output, so the device URL never shows. Run `ssh -A -tt "$(mctl -t <vm> dest)" 'bash -lc "aws sso login --no-browser --profile devops-cli"'` (async) and hand the URL/code to the user. If the CLI then reports `InvalidGrantException`, check `aws sts get-caller-identity` before re-prompting, because the token may already be valid |
 | **`mctl sh` grep over `~/.mctl/jobs/*/build.log` matches other workspaces' logs** | Old `FAILED BUILDS` lines from other slots get mixed into the result | Grep this job's log only: `~/.mctl/jobs/<home-relative-path-with-underscores>_fw/build.log` (for example `projects_iridium_a1_power_on_003_fw`) |
 | **Git hooks on the target reject non-`dev/<user>/…` branch names** | `Invalid branch name. Must follow the convention…` on `checkout -B test/…` | The checkout still happens (only a warning), but use `dev/<user>/…` for scratch branches to avoid confusion. Never push scratch branches from the target |
 

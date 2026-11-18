@@ -31,7 +31,7 @@ fleet refresh waits for every dead lab desktop.
     vd.py watchdog [max_age]   re-probe only targets holding unconfirmed jobs
     vd.py sync    [target]     mirror logs only
     vd.py log|tail <target> <tag> [kind]
-    vd.py vms | start <id> | stop <id>
+    vd.py vms | start <id> | stop <id> | main [<id> [login]]
     vd.py cancel <job-id>      stop a running job via `mctl cancel`
 
 A status is a READING, not a fact. It is only true as of `checked`, the moment
@@ -47,6 +47,9 @@ import json
 import hashlib
 import os
 import re
+import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -63,6 +66,8 @@ JOBSTATE = MCTL_DIR / "jobstate.json"
 VMSTATE = MCTL_DIR / "vmstate.json"
 TARGETS = MCTL_DIR / "targets"
 MCTL = Path(os.path.expanduser("~/bin/mctl"))
+# Lease margin below which the watchdog renews a VM that has a running job.
+KEEPALIVE_BELOW = os.environ.get("MCTL_KEEPALIVE_BELOW", "10m")
 PROJECTS = Path(os.path.expanduser("~/projects"))
 
 PROBE_TIMEOUT = 90          # seconds per target; a dead box must not wedge the UI
@@ -430,6 +435,197 @@ def owns_slot(job: dict) -> bool:
     return bool(peers) and peers[0].get("id") == job.get("id")
 
 
+# --------------------------------------------------------------------------
+# local-runner jobs — work that runs on THIS machine against a target (a FW
+# flash drives the target's BMC/host over ssh). Same joblog record and Jobs UI
+# as a dispatched job, but its status is read from the local log + pid, never
+# probed on the target. Each run is a transient systemd user unit
+# (``mctl-<id>.service``) so it survives a portal restart and its output is
+# also in ``journalctl --user -u mctl-<id>``.
+# --------------------------------------------------------------------------
+LOCAL_DIR = MCTL_DIR / "local"
+LOCAL_KINDS = {"flash"}
+LOCAL_DONE = "__MCTL_DONE__"
+# A local job in one of these phases (from its events.jsonl) must not be stopped.
+LOCAL_UNSTOPPABLE = {"write", "verify", "boot"}
+_ENV_PASS = ("PATH", "HOME", "USER", "LANG", "SSH_AUTH_SOCK")
+
+
+def is_local(job: dict | None) -> bool:
+    return bool(job) and job.get("runner") == "local"
+
+
+def local_files(job: dict) -> dict:
+    """Paths of a local job, DERIVED from its id (never trusted from the record)."""
+    d = LOCAL_DIR / job["id"]
+    kind = job.get("kind") or "flash"
+    return {"dir": d, "log": d / f"{kind}.log", "pid": d / "pid", "events": d / "events.jsonl"}
+
+
+def _pid_of(job: dict) -> int | None:
+    try:
+        raw = local_files(job)["pid"].read_text().strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
+def _pid_runs_job(pid: int | None, job: dict) -> bool:
+    """Alive AND still this job's process (guards against pid reuse)."""
+    if not pid:
+        return False
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    if job["id"] in cmd:
+        return True
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return f"MCTL_JOB_ID={job['id']}".encode() in env.split(b"\0")
+
+
+def local_events(job: dict) -> list[dict]:
+    out = []
+    try:
+        text = local_files(job)["events"].read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def local_phase(job: dict) -> str:
+    phase = ""
+    for e in local_events(job):
+        if e.get("type") == "phase":
+            phase = e.get("phase") or phase
+    return phase
+
+
+def local_status(job: dict) -> dict:
+    """Live reading of a local job: status/rc/pid/lines/last_line/finished/phase."""
+    f = local_files(job)
+    pid = _pid_of(job)
+    out = {"status": "unknown", "rc": None, "pid": pid, "lines": 0, "errors": 0,
+           "last_line": "", "finished": "", "phase": local_phase(job)}
+    try:
+        st = f["log"].stat()
+        with f["log"].open("rb") as fh:
+            data = fh.read()
+    except OSError:
+        started = _epoch(job.get("started", ""))
+        out["status"] = "running" if started and time.time() - started < 15 else "died"
+        return out
+    lines = [l for l in data.decode("utf-8", "replace").splitlines() if l.strip()]
+    rc = None
+    for line in reversed(lines[-5:]):
+        m = re.match(re.escape(LOCAL_DONE) + r" rc=(\d+)", line)
+        if m:
+            rc = int(m.group(1))
+            break
+    body = [l for l in lines if not l.startswith(LOCAL_DONE)]
+    out.update(lines=len(body), last_line=_clean(body[-1])[:300] if body else "",
+               errors=sum(1 for l in body if re.search(r"\bfailed\b|\berror\b", l, re.I)))
+    if rc is not None:
+        out.update(rc=rc, status="passed" if rc == 0 else ("cancelled" if rc == 130 else "failed"))
+    elif _pid_runs_job(pid, job) or time.time() - st.st_mtime < 5:
+        out["status"] = "running"         # alive, or exiting and the sentinel is due
+    else:
+        out["status"] = "died"
+    if out["status"] != "running":
+        out["finished"] = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+    return out
+
+
+def start_local_job(target: str, kind: str, argv: list[str], *, label: str = "",
+                    meta: dict | None = None) -> dict:
+    """Run ``argv`` locally as a job against ``target``.
+
+    ``argv`` may contain the tokens ``{events}`` and ``{job}``, replaced by the
+    job's events file and id. Refuses a second running job of the same kind on
+    the same target. Returns ``{"job": record}`` or ``{"error": ...}``.
+    """
+    if kind not in LOCAL_KINDS:
+        return {"error": f"unsupported local job kind: {kind}"}
+    if not (_safe_id(target) and is_target(target)):
+        return {"error": f"unknown target: {target}"}
+    for j in _read_log():
+        if (is_local(j) and j.get("kind") == kind and (j.get("target") or "") == target
+                and local_status(j)["status"] == "running"):
+            return {"error": f"a {kind} job is already running on {target} ({j['id']})",
+                    "job_id": j["id"]}
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    jid = f"{kind}-{target}-{stamp}-{os.urandom(2).hex()}"
+    rec = {"id": jid, "target": target, "dest": "", "kind": kind, "ws": "", "tag": jid,
+           "cmd": label or " ".join(argv), "pid": None, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "state": "dispatched", "runner": "local", "unit": f"mctl-{jid}",
+           "jobdir": str(LOCAL_DIR / jid), **(meta or {})}
+    f = local_files(rec)
+    f["dir"].mkdir(parents=True, exist_ok=True)
+    argv = [a.replace("{events}", str(f["events"])).replace("{job}", jid) for a in argv]
+    log, pidf = shlex.quote(str(f["log"])), shlex.quote(str(f["pid"]))
+    # The job's own process writes the pid; the wrapper appends the exit status.
+    # Output goes to the log AND the unit's journal.
+    script = (f"export MCTL_JOB_ID={jid}; {shlex.join(argv)} > >(tee -a {log}) 2>&1 < /dev/null & "
+              f"c=$!; echo $c > {pidf}; wait $c; rc=$?; sleep 0.2; "
+              f'echo "{LOCAL_DONE} rc=$rc" >> {log}; exit $rc')
+    env, _ = agent_env()
+    try:
+        if shutil.which("systemd-run"):
+            setenv = [f"--setenv={k}={env[k]}" for k in _ENV_PASS if env.get(k)]
+            setenv += [f"--setenv={k}={v}" for k, v in env.items()
+                       if k.startswith(("MCTL_", "FW_FLASH_"))]
+            p = subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                                f"--unit={rec['unit']}", *setenv, "bash", "-c", script],
+                               capture_output=True, text=True, timeout=30)
+            if p.returncode != 0:
+                return {"error": (p.stderr or "").strip() or f"systemd-run failed (rc={p.returncode})"}
+        else:
+            rec.pop("unit")
+            subprocess.Popen(["bash", "-c", script], env=env, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"could not start the job: {e}"}
+    for _ in range(50):                       # wait for the pid so cancel works at once
+        if f["pid"].exists():
+            break
+        time.sleep(0.05)
+    _append_log(rec)
+    return {"job": rec}
+
+
+def cancel_local(job: dict) -> dict:
+    st = local_status(job)
+    if st["status"] != "running":
+        return {"error": f"job is not running (status: {st['status']})"}
+    if st["phase"] in LOCAL_UNSTOPPABLE:
+        return {"error": f"refusing to stop during the {st['phase']} phase: interrupting a "
+                         "flash write can leave the part unbootable"}
+    pid = st["pid"]
+    if not _pid_runs_job(pid, job):
+        return {"error": "job has no live process to signal"}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        return {"error": str(e)}
+    for _ in range(100):
+        if local_status(job)["status"] != "running":
+            break
+        time.sleep(0.1)
+    after = local_status(job)
+    word = {"cancelled": "CANCELLED", "running": "CANCEL-REFUSED"}.get(after["status"], "FINISHED")
+    return {"result": word, "job_id": job["id"], "target": job.get("target") or "",
+            "tag": job.get("tag", ""), "kind": job.get("kind", ""), "pid": pid}
+
+
 def _mirror_is(job: dict, mirror: dict, next_start: float | None = None) -> bool:
     """Does the stored copy belong to THIS dispatch?"""
     if not mirror["exists"]:
@@ -462,9 +658,11 @@ def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
     newest dispatch is served the LIVE remote log, and an older one is told its
     output is gone rather than being shown a successor's.
     """
+    job = _job_by_id(job_id) if job_id else None
+    if is_local(job):
+        return _read_local(job, limit)
     path = local_log(target, tag, kind)
     mirror = mirror_run(target, tag, kind)
-    job = _job_by_id(job_id) if job_id else None
 
     if job:
         mine = _mirror_is(job, mirror)
@@ -507,6 +705,24 @@ def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
             "provenance": ("stored copy of this run" if job
                            else "stored copy of the newest mirrored run"),
             "mtime": mirror["at"]}
+
+
+def _read_local(job: dict, limit: int = LOG_MAX_BYTES) -> dict:
+    path = local_files(job)["log"]
+    if not path.exists():
+        return {"error": f"no log yet for {job['id']}", "path": str(path), "text": "",
+                "bytes": 0, "truncated": False, "source": "none"}
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        if size > limit:
+            fh.seek(size - limit)
+            fh.readline()
+        raw = fh.read()
+    return {"error": "", "path": str(path), "source": "local",
+            "text": _clean(raw.decode("utf-8", "replace")), "bytes": size,
+            "truncated": size > limit, "provenance": "local job log",
+            "job_pid": _pid_of(job), "log_pid": _pid_of(job),
+            "mtime": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")}
 
 
 def sync_logs(target: str) -> dict:
@@ -572,6 +788,10 @@ def tail(target: str, tag: str, kind: str, lines: int = 200, job_id: str = "") -
     so it stops instead of lying.
     """
     job = _job_by_id(job_id) if job_id else None
+    if is_local(job):
+        held = _read_local(job)
+        return {"error": held["error"], "text": "\n".join(held["text"].splitlines()[-lines:]),
+                "source": "local", "at": time.strftime("%H:%M:%S")}
     if job and not owns_slot(job):
         return {"error": f"a newer run in the same workspace ({tag}) now owns "
                          f"{kind}.log on {target} \u2014 this job's live tail ended",
@@ -609,7 +829,7 @@ def refresh(only: str | None = None, sync: bool = True,
     # the one the user actually wants to watch -- could never be discovered.
     pending: set[str] = set(targets())
     for j in jobs:
-        if jstate.get(j["id"], {}).get("status") not in TERMINAL:
+        if not is_local(j) and jstate.get(j["id"], {}).get("status") not in TERMINAL:
             pending.add(j.get("target") or "vm")
     pulled = MCTL_DIR / "jobs"
     if pulled.is_dir():
@@ -643,6 +863,8 @@ def refresh(only: str | None = None, sync: bool = True,
     # newest dispatch for that (target, tag, kind). Anything older is history.
     seen: set[tuple[str, str, str]] = set()
     for j in sorted(jobs, key=lambda r: _epoch(r.get("started", "")), reverse=True):
+        if is_local(j):
+            continue                      # read from the local log, never probed
         jid = j["id"]
         cur = jstate.setdefault(jid, {})
         if cur.get("status") in TERMINAL:
@@ -761,6 +983,76 @@ def _tagval(tags: list, key: str) -> str:
     return ""
 
 
+MAIN_TARGET = "vm"              # mctl's Main VM: neo-ask and default delegation use it
+_INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
+
+
+def vm_targets() -> dict[str, str]:
+    """Every mctl `kind=vm` target -> its bound EC2 instance id ("" if unbound).
+
+    The binding lives in the registry's host column (`mctl vm main <id>`), so
+    the instance a target means survives IP changes and the shared EC2 Name.
+    """
+    out = {}
+    if not TARGETS.exists():
+        return out
+    for line in TARGETS.read_text(encoding="utf-8").splitlines():
+        cols = line.split()
+        if len(cols) >= 2 and not cols[0].startswith("#") and cols[1] == "vm":
+            host = cols[3] if len(cols) >= 4 else ""
+            out[cols[0]] = host if _INSTANCE_RE.match(host) else ""
+    return out
+
+
+_BMC_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
+
+
+def target_bmcs() -> dict[str, str]:
+    """`kind=remote` targets with a BMC (registry column 5, `-` = none) -> [user@]host."""
+    out = {}
+    if not TARGETS.exists():
+        return out
+    for line in TARGETS.read_text(encoding="utf-8").splitlines():
+        cols = line.split()
+        if (len(cols) >= 5 and not cols[0].startswith("#") and cols[1] == "remote"
+                and cols[4] != "-" and _BMC_RE.fullmatch(cols[4])):
+            out[cols[0]] = cols[4]
+    return out
+
+
+def target_bindings() -> dict[str, str]:
+    """Only the bound `kind=vm` targets -> instance id."""
+    return {name: iid for name, iid in vm_targets().items() if iid}
+
+
+def main_instance() -> str:
+    return target_bindings().get(MAIN_TARGET, "")
+
+
+def _annotate(machines_list: list[dict]) -> list[dict]:
+    """Attach the mctl target and Main flag from the CURRENT registry.
+
+    Bindings win over the IP cache; an unbound legacy target still matches by
+    cached IP. Done at read time so `set_main` shows without an octl re-query.
+    """
+    by_id = {}
+    for name, iid in target_bindings().items():
+        # The Main name wins when an instance has several targets.
+        if iid not in by_id or name == MAIN_TARGET:
+            by_id[iid] = name
+    bound = set(target_bindings())
+    ips = {t: ip for t, ip in _target_ips().items() if t not in bound}
+    main = main_instance()
+    out = []
+    for m in machines_list:
+        m = dict(m)
+        iid, ip = m.get("id") or "", m.get("ip") or ""
+        m["target"] = by_id.get(iid) or next((t for t, v in ips.items() if ip and v == ip), "")
+        m["main"] = bool(main) and iid == main
+        out.append(m)
+    return out
+
+
 def _target_ips() -> dict[str, str]:
     """Cached private IP per mctl target, so an instance can be matched to one."""
     out = {}
@@ -821,7 +1113,6 @@ def machines(force: bool = False) -> dict:
         err = (p.stderr or raw or "").strip().splitlines()
         return failed(err[-1] if err else "could not parse octl vm list")
 
-    ips = _target_ips()
     now = time.time()
     out = []
     for inst in data.get("aws") or []:
@@ -841,13 +1132,14 @@ def machines(force: bool = False) -> dict:
             "type": inst.get("instance_type") or "",
             "state": (inst.get("state") or "unknown").lower(),
             "ip": ip,
-            "target": next((t for t, v in ips.items() if v == ip), ""),
+            "target": "",
             "desc": _tagval(tags, "description"),
             "lease": lease,
             "lease_left": int(left),
             "lease_left_h": _human_dur(left) if left > 0 else ("expired" if lease else ""),
         })
-    out.sort(key=lambda m: (m["state"] != "running", m["name"]))
+    out = _annotate(out)
+    out.sort(key=lambda m: (not m["main"], m["state"] != "running", m["name"]))
     state = {"machines": out, "checked": time.strftime("%Y-%m-%dT%H:%M:%S"),
              "error": "", "age": int(now), "last_attempt": attempted}
     baseline.update(state)
@@ -856,26 +1148,148 @@ def machines(force: bool = False) -> dict:
 
 
 def power(action: str, instance_id: str) -> dict:
-    """`octl vm start|stop <id>`, then re-read the instance list."""
+    """`mctl vm start|stop <id>`, then re-read the instance list.
+
+    Routed through mctl (not octl directly) so the start time, lease and the
+    power event log in ~/.mctl/power stay the single record of VM power, and
+    the IP cache of every target meaning this instance is dropped.
+    """
     if action not in ("start", "stop"):
         return {"error": f"unsupported action: {action}"}
-    if not instance_id.startswith("i-"):
+    if not _INSTANCE_RE.match(instance_id or ""):
         return {"error": f"not an instance id: {instance_id}"}
-    cmd = ["octl", "vm", action, instance_id]
+    cmd = [str(MCTL), "vm", action, instance_id]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=OCTL_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"error": f"octl vm {action} timed out ({OCTL_TIMEOUT}s)"}
+        return {"error": f"mctl vm {action} timed out ({OCTL_TIMEOUT}s)"}
     except OSError as e:
         return {"error": str(e)}
     if p.returncode != 0:
-        err = ((p.stderr or "") + (p.stdout or "")).strip().splitlines()
-        return {"error": err[-1] if err else f"octl vm {action} failed (rc={p.returncode})"}
-    # A restarted VM almost always comes back on a different private IP.
-    if action == "start":
-        for f in MCTL_DIR.glob("*.ip"):
-            f.unlink(missing_ok=True)
+        err = _ANSI.sub("", (p.stderr or "") + (p.stdout or "")).strip().splitlines()
+        return {"error": err[-1] if err else f"mctl vm {action} failed (rc={p.returncode})"}
     return {"ok": True, "action": action, "id": instance_id, **machines(force=True)}
+
+
+# --------------------------------------------------------------------------
+# power memory + provisioning (owned by mctl: ~/.mctl/power, ~/.mctl/provision)
+# --------------------------------------------------------------------------
+POWER_DIR = MCTL_DIR / "power"
+POWER_LOG = MCTL_DIR / "power.log"
+PROVISION_STATE = MCTL_DIR / "provision"
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def power_memory(instance_id: str) -> dict:
+    """mctl's key=value record for one instance (started/expires/by/state)."""
+    out: dict[str, str] = {}
+    try:
+        text = (POWER_DIR / instance_id).read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def power_view(m: dict, now: float | None = None) -> dict:
+    """Started / predicted-stop for a machine card.
+
+    The octl reading is cached, so a VM listed as running whose lease has
+    since passed has almost certainly been stopped by the lease reaper --
+    flag it as predicted-stopped rather than asserting a stale "running".
+    """
+    now = time.time() if now is None else now
+    mem = power_memory(m.get("id") or "")
+    started = int(mem.get("started") or 0) or None
+    expires = int(mem.get("expires") or 0) or None
+    if not expires and m.get("lease"):
+        try:
+            expires = int(datetime.strptime(m["lease"], "%Y-%m-%dT%H:%M:%SZ")
+                          .replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            expires = None
+    state = m.get("state") or ""
+    running = state in ("running", "pending")
+    view = {
+        "started_ts": started if running else None,
+        "started_by": mem.get("by", "") if running else "",
+        "started_ago_h": _human_dur(now - started) if running and started else "",
+        "stop_ts": expires if running else None,
+        "stop_in_h": _human_dur(expires - now) if running and expires and expires > now else "",
+        "predicted_stopped": bool(running and expires and expires <= now),
+    }
+    if view["predicted_stopped"]:
+        view["stopped_ago_h"] = _human_dur(now - expires)
+    return view
+
+
+def power_events(limit: int = 8) -> list[dict]:
+    """Newest-first tail of mctl's power log (start / auto-start / renew / stop)."""
+    try:
+        lines = POWER_LOG.read_text(encoding="utf-8").splitlines()[-200:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict):
+            out.append(ev)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def provision_status(target: str) -> dict:
+    """Latest result per recipe from `mctl provision` for one target."""
+    f = PROVISION_STATE / f"{target}.state"
+    try:
+        lines = f.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {"recipes": [], "ok": None, "last": ""}
+    recipes = []
+    for line in lines:
+        cols = line.split("\t")
+        if len(cols) < 3:
+            continue
+        recipes.append({"recipe": cols[0], "status": cols[1],
+                        "ts": int(cols[2]) if cols[2].isdigit() else 0,
+                        "note": cols[4] if len(cols) > 4 else ""})
+    last = max((r["ts"] for r in recipes), default=0)
+    bad = [r["recipe"] for r in recipes if r["status"] not in ("ok", "installed")]
+    todo = [r["recipe"] for r in recipes if r["note"].startswith("todo:")]
+    return {"recipes": recipes, "ok": not bad, "failed": bad, "todo": todo,
+            "last": datetime.fromtimestamp(last).isoformat(timespec="seconds") if last else "",
+            "last_age_h": _human_dur(time.time() - last) if last else ""}
+
+
+def keepalive() -> dict:
+    """Top up the lease of every VM target that has a confirmed-running job.
+
+    Nothing else locally is alive for the whole of a long delegated build, so
+    the portal's watchdog carries it. Cheap: `mctl lease renew --if-below`
+    reads mctl's power memory and only calls octl when a renewal is due.
+    """
+    try:
+        rows = jobs()
+    except Exception:                                        # noqa: BLE001
+        return {}
+    busy = {r["target"] for r in rows if r["status"] == "running" and not r["stale"]}
+    out = {}
+    for t in sorted(busy & set(target_bindings())):
+        try:
+            p = subprocess.run([str(MCTL), "-t", t, "lease", "renew", "--if-below", KEEPALIVE_BELOW],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=OCTL_TIMEOUT)
+            out[t] = "ok" if p.returncode == 0 else _ANSI.sub("", (p.stderr or "").strip())[-200:]
+        except (subprocess.TimeoutExpired, OSError) as e:
+            out[t] = str(e)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -915,6 +1329,9 @@ def jobs() -> list[dict]:
     out = []
     for j in log_rows:
         st = jstate.get(j["id"], {})
+        local = is_local(j)
+        if local:
+            st = {**local_status(j), "checked": time.strftime("%Y-%m-%dT%H:%M:%S")}
         status = st.get("status") or "unknown"
         checked = st.get("checked") or ""
         t_chk = _epoch(checked)
@@ -957,10 +1374,15 @@ def jobs() -> list[dict]:
         # workspace overwrites the first, and serving the leftover as the new
         # job's output is exactly how a fresh job shows a previous run's log.
         mine = _mirror_is(j, mirror, later[0] if later else 0.0)
+        if local:
+            held = local_files(j)["log"]
+            mine, owns = held.exists(), True
+            mirror = {"pid": st.get("pid"), "at": st.get("finished") or ""}
         out.append({
             "id": j["id"],
             "target": target,
             "dest": j.get("dest") or "",
+            "instance": j.get("instance") or "",
             "kind": kind,
             "ws": j.get("ws") or "",
             "ws_label": _ws_label(j.get("ws") or "", tag),
@@ -997,6 +1419,14 @@ def jobs() -> list[dict]:
             "log_pid": mirror["pid"],
             "log_at": mirror["at"],
             "log_bytes": held.stat().st_size if (mine and held.exists()) else 0,
+            "runner": "local" if local else "remote",
+            "unit": j.get("unit") or "",
+            "phase": (st.get("phase") or "") if local else "",
+            "cancellable": (status == "running" and (st.get("phase") or "") not in LOCAL_UNSTOPPABLE)
+                           if local else None,
+            "image": j.get("image") or "",
+            "method": j.get("method") or "",
+            "oams": j.get("oams") or [],
         })
     out.sort(key=lambda r: _epoch(r["started"]), reverse=True)
     return out
@@ -1032,7 +1462,10 @@ def payload() -> dict:
     # whole fleet look freshly checked.
     seen_at = state.get("checked") or {}
     tried_at = state.get("attempted") or {}
-    machine_of = {m["target"]: m for m in (vms.get("machines") or []) if m.get("target")}
+    vm_list = [{**m, **power_view(m, now)} for m in _annotate(vms.get("machines") or [])]
+    machine_of = {m["target"]: m for m in vm_list if m.get("target")}
+    bindings = target_bindings()
+    bmcs = target_bmcs()
     tgts = []
     for name in targets():
         at = seen_at.get(name) or ""
@@ -1050,8 +1483,11 @@ def payload() -> dict:
             "jobs": sum(1 for r in rows if r["target"] == name),
             "running": sum(1 for r in rows if r["target"] == name and r["status"] == "running"),
             "stale": sum(1 for r in rows if r["target"] == name and r["stale"]),
-            "instance": (m or {}).get("id", ""),
+            "instance": (m or {}).get("id", "") or bindings.get(name, ""),
             "state": (m or {}).get("state", ""),
+            "main": name == MAIN_TARGET and name in bindings,
+            "bmc": bmcs.get(name, ""),
+            "provision": provision_status(name),
         })
 
     attempt = state.get("last_attempt") or ""
@@ -1070,7 +1506,10 @@ def payload() -> dict:
         "counts": counts,
         "targets": [t["name"] for t in tgts],
         "target_state": tgts,
-        "machines": vms.get("machines") or [],
+        "machines": sorted(vm_list, key=lambda m: not m.get("main")),
+        "power_events": power_events(),
+        "main_target": MAIN_TARGET,
+        "main_instance": bindings.get(MAIN_TARGET, ""),
         "machines_checked": checked,
         # How stale each half of the view is. Without this a day-old "stopped"
         # reading is indistinguishable from a live one -- the exact reason the
@@ -1097,6 +1536,8 @@ def is_target(name: str) -> bool:
 
 def has_instance(name: str) -> bool:
     """True when an mctl target is backed by an EC2 instance we can power-query."""
+    if name in target_bindings():
+        return True
     ip = (MCTL_DIR / f"{name}.ip")
     if not ip.exists():
         return False
@@ -1143,9 +1584,11 @@ def unverified_targets(max_age: float = STALE_AFTER) -> list[str]:
 
 def watchdog(max_age: float = STALE_AFTER) -> dict:
     """One self-healing pass: re-probe only targets holding unconfirmed jobs."""
+    kept = keepalive()
     due = unverified_targets(max_age)
     if not due:
-        return {"probed": 0, "targets": [], "errors": {}, "skipped": "nothing unconfirmed"}
+        return {"probed": 0, "targets": [], "errors": {}, "skipped": "nothing unconfirmed",
+                "keepalive": kept}
     errors: dict[str, str] = {}
     done: list[str] = []
     for t in due:
@@ -1154,7 +1597,7 @@ def watchdog(max_age: float = STALE_AFTER) -> dict:
         res = refresh(t)
         errors.update(res.get("errors") or {})
         done.extend(res.get("targets") or [])
-    return {"probed": len(done), "targets": done, "errors": errors}
+    return {"probed": len(done), "targets": done, "errors": errors, "keepalive": kept}
 
 
 def portal_refresh(only: str | None = None) -> dict:
@@ -1185,6 +1628,117 @@ def portal_machines() -> dict:
     return out
 
 
+def set_main(instance_id: str, user: str = "") -> dict:
+    """Make an instance the Main VM via `mctl vm main` (registry-only, no ssh).
+
+    The previous Main stays registered as target vm-<id6>, so its jobs,
+    workspaces and power controls remain reachable.
+    """
+    if not _INSTANCE_RE.match(instance_id or ""):
+        return {"error": f"not an instance id: {instance_id}"}
+    if user and not re.match(r"^[A-Za-z0-9._-]+$", user):
+        return {"error": f"invalid login: {user}"}
+    cmd = [str(MCTL), "vm", "main", instance_id] + (["--user", user] if user else [])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=OCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"error": f"mctl vm main timed out ({OCTL_TIMEOUT}s)"}
+    except OSError as e:
+        return {"error": str(e)}
+    if p.returncode != 0 or main_instance() != instance_id:
+        err = _clean((p.stderr or "") + (p.stdout or "")).strip().splitlines()
+        return {"error": err[-1] if err else f"mctl vm main failed (rc={p.returncode})"}
+    return {"ok": True, "main": instance_id}
+
+
+def portal_set_main(instance_id: str) -> dict:
+    """Switch the Main VM, then return the full payload."""
+    res = set_main(instance_id)
+    if res.get("error"):
+        return res
+    out = payload()
+    out["acted"] = f"main {instance_id}"
+    return out
+
+
+def portal_target(data: dict) -> dict:
+    """Register/unregister a target via mctl without contacting the machine."""
+    action, name = data.get("action"), data.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", name):
+        raise ValueError("Target name must be 1-63 letters, digits, hyphens or underscores")
+    known = targets()
+    if action == "add":
+        if set(data) - {"bmc"} != {"action", "name", "kind", "address", "login"}:
+            raise ValueError("Add requires name, kind, address and login")
+        kind, address, login = data["kind"], data["address"], data["login"]
+        bmc = data.get("bmc") or ""
+        if bmc and (not isinstance(bmc, str) or not _BMC_RE.fullmatch(bmc)):
+            raise ValueError("BMC must be a hostname or IPv4 address, optionally user@host")
+        if name in known:
+            raise ValueError(f"Target {name} already exists; choose a different name")
+        if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]{0,63}", login):
+            raise ValueError("A valid SSH login is required")
+        if not isinstance(address, str):
+            raise ValueError("A hostname or EC2 instance id is required")
+        if kind == "vm":
+            if bmc:
+                raise ValueError("VM targets have no BMC")
+            if not _INSTANCE_RE.fullmatch(address):
+                raise ValueError("An EC2 instance id is required")
+            if address in target_bindings().values():
+                raise ValueError("That instance is already registered")
+            args = ["add", name, "--vm", login, address]
+        elif kind == "remote":
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", address):
+                raise ValueError("A valid SSH hostname or IPv4 address is required")
+            args = ["add", name, f"{login}@{address}"] + (["--bmc", bmc] if bmc else [])
+        else:
+            raise ValueError("Machine kind must be remote or vm")
+    elif action == "bmc":
+        if set(data) != {"action", "name", "bmc"}:
+            raise ValueError("Set BMC requires only a target name and bmc")
+        bmc = data["bmc"]
+        if name not in known:
+            raise ValueError(f"Unknown target: {name}")
+        if name in vm_targets():
+            raise ValueError("VM targets have no BMC")
+        if not isinstance(bmc, str) or (bmc and not _BMC_RE.fullmatch(bmc)):
+            raise ValueError("BMC must be a hostname or IPv4 address, optionally user@host")
+        args = ["bmc", name, bmc or "-"]
+    elif action == "remove":
+        if set(data) != {"action", "name"}:
+            raise ValueError("Remove requires only a target name")
+        if name not in known:
+            raise ValueError(f"Unknown target: {name}")
+        if name == MAIN_TARGET:
+            raise ValueError("Switch the Main VM before removing its target")
+        if any(j["target"] == name and j["status"] not in TERMINAL for j in jobs()):
+            raise ValueError("Target has running or unverified jobs; resolve them before removing it")
+        args = ["rm", name]
+    else:
+        raise ValueError("Action must be add, remove or bmc")
+    try:
+        p = subprocess.run([str(MCTL), "target", *args], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
+    except subprocess.TimeoutExpired:
+        return {"error": "mctl target timed out; check the registry before retrying"}
+    except OSError as e:
+        return {"error": str(e)}
+    if p.returncode:
+        return {"error": _clean(p.stderr or p.stdout).strip()
+                or f"mctl target failed (rc={p.returncode})"}
+    if action == "bmc":
+        if target_bmcs().get(name, "") != bmc:
+            return {"error": "mctl target did not persist the requested registry change"}
+    elif (name in targets()) != (action == "add"):
+        return {"error": "mctl target did not persist the requested registry change"}
+    out = payload()
+    out["message"] = (f"Target {name}: BMC {'set to ' + bmc if bmc else 'cleared'}" if action == "bmc"
+                      else f"Target {name} {'registered' if action == 'add' else 'removed'}")
+    return out
+
+
 def portal_power(action: str, instance_id: str) -> dict:
     """Start/stop an instance, then return the full refreshed payload."""
     res = power(action, instance_id)
@@ -1212,6 +1766,8 @@ def cancel(job_id: str) -> dict:
     job = _job_by_id(job_id or "")
     if not job:
         return {"error": "unknown job"}
+    if is_local(job):
+        return cancel_local(job)
     target = job.get("target") or "vm"
     tag, kind = job.get("tag", ""), job.get("kind", "") or "build"
     if not (_safe_id(target) and _safe_id(tag) and kind in ("build", "test", "run")):
@@ -1261,7 +1817,8 @@ def portal_cancel(job_id: str) -> dict:
     word = res["result"].split(" ", 1)[0]
     out["acted"] = {"CANCELLED": f"cancelled {res['kind']} {res['tag']}",
                     "FINISHED": "job had already finished",
-                    "DIED": "job was no longer running"}.get(
+                    "DIED": "job was no longer running",
+                    "CANCEL-REFUSED": "the job refused to stop (it is writing flash)"}.get(
                         word, f"not cancelled: {res['result']}")
     if word not in ("CANCELLED", "FINISHED", "DIED"):
         out["error"] = f"not cancelled: {res['result']}"
@@ -1284,7 +1841,7 @@ def job_statuses() -> dict:
     state = (_read_state().get("jobs") or {})
     out = {}
     for j in _read_log():
-        st = state.get(j["id"]) or {}
+        st = local_status(j) if is_local(j) else (state.get(j["id"]) or {})
         out[j["id"]] = {"status": st.get("status") or "unknown", "rc": st.get("rc"),
                         "target": j.get("target") or "vm", "tag": j.get("tag", ""),
                         "kind": j.get("kind", ""),
@@ -1311,6 +1868,16 @@ def log_view(job_id: str) -> dict:
     job = _job_by_id(job_id or "")
     if not job:
         return {"error": "unknown job"}
+    if is_local(job):
+        f = local_files(job)
+        if not f["log"].exists():
+            return {"error": f"no local log for {job['id']}"}
+        running = local_status(job)["status"] == "running"
+        lp = shlex.quote(str(f["log"]))
+        follow = (f"tail -n 300 -F {lp}" if running else f"tail -n {LOG_VIEW_LINES} {lp}")
+        title = f"{job.get('target')}:{job.get('kind')} {job['id']}"
+        return {"mode": "local", "target": job.get("target") or "", "running": running,
+                "command": follow, "title": ("tail -F " if running else "tail ") + title}
     target = job.get("target") or "vm"
     tag, kind = job.get("tag", ""), job.get("kind", "") or "build"
     if not (_safe_id(target) and _safe_id(tag) and _safe_id(kind)):
@@ -1418,7 +1985,18 @@ def main(argv: list[str]) -> int:
         for m in st["machines"]:
             print(f"{m['state']:10} {m['name']:28} {m['id']:21} {m['type']:14} "
                   f"{m['ip'] or '-':16} lease {m['lease_left_h'] or '-':>9}  "
-                  f"{('-> ' + m['target']) if m['target'] else ''}")
+                  f"{('-> ' + m['target']) if m['target'] else ''}"
+                  f"{'  [MAIN]' if m.get('main') else ''}")
+        return 0
+    if cmd == "main":
+        if len(argv) < 3:
+            print(main_instance() or "-")
+            return 0
+        res = set_main(argv[2], argv[3] if len(argv) > 3 else "")
+        if res.get("error"):
+            print(f"[vd] {res['error']}", file=sys.stderr)
+            return 1
+        print(f"[vd] Main VM is now {argv[2]} (target {MAIN_TARGET})")
         return 0
     if cmd in ("start", "stop"):
         if len(argv) < 3:
