@@ -62,11 +62,24 @@ function peRun(url){ return url ? peLink("/workflow?url="+encodeURIComponent(url
 // An opaque no-cors fetch resolves when the explorer answers and rejects when
 // it is down, so the sidebar dot can say whether its links will work.
 function peProbe(){
-  const dot=document.querySelector(".pe-dot"); if(!dot||!PE_URL) return;
+  const dot=document.querySelector(".pe-dot:not(.gf-dot)"); if(!dot||!PE_URL) return;
   fetch(PE_URL+"/diagnostics",{mode:"no-cors",cache:"no-store"})
     .then(()=>{ dot.classList.add("up"); dot.title="explorer is up"; })
     .catch(()=>{ dot.classList.add("down");
       dot.title="explorer not reachable \u2014 systemctl --user start pipeline-explorer"; });
+}
+// Grafana + Platform portal: linked to; Grafana health is probed via the server.
+const GRAFANA = BOOT.grafana || {};
+const PLATFORM = BOOT.platform || {};
+function gfDash(key, extra){
+  const d=(GRAFANA.dashboards||{})[key]; return d ? d.url+(extra||"") : "";
+}
+function gfProbe(){
+  const dot=document.querySelector(".gf-dot"); if(!dot||!SERVED) return;
+  fetch("/api/grafana-health",{cache:"no-store"}).then(r=>r.json()).then(h=>{
+    dot.classList.add(h.ok?"up":"down");
+    dot.title=h.ok?("Grafana "+(h.version||"up")):("Grafana not reachable: "+(h.error||"unhealthy"));
+  }).catch(()=>{ dot.classList.add("down"); dot.title="Grafana health unknown"; });
 }
 // Offset between this browser's clock and the server's, measured ONCE when a
 // payload arrives. It must never be recomputed per tick: Date.now()-now_ts
@@ -3262,9 +3275,11 @@ const PREFS_KEY="team-portal-prefs-v1";
 const PREF_CHOICES={clock:["auto","12","24"], actionPollMs:[1000,1500,3000,5000,10000],
   vmPollMs:[5000,15000,30000,60000], pulsePollMs:[0,30000,60000,300000]};
 const PREF_DEFAULTS={landing:"last", hidden:[], order:[], clock:"auto", compact:false,
-  actionPollMs:1500, vmPollMs:15000, pulseHidden:[], pulseOrder:[], pulsePollMs:60000};
+  actionPollMs:1500, vmPollMs:15000, pulseHidden:[], pulseOrder:[], pulsePollMs:60000,
+  vmHidden:[], vmPanelsHidden:[], machineTarget:""};
 function readPrefs(raw, ids, cardIds=[]){
-  const out={...PREF_DEFAULTS, hidden:[], order:[], pulseHidden:[], pulseOrder:[]};
+  const out={...PREF_DEFAULTS, hidden:[], order:[], pulseHidden:[], pulseOrder:[],
+    vmHidden:[], vmPanelsHidden:[]};
   let v; try{ v=JSON.parse(raw||"{}"); }catch(_){ return out; }
   if(!v||typeof v!=="object") return out;
   if(v.landing==="last"||ids.includes(v.landing)) out.landing=v.landing;
@@ -3274,6 +3289,11 @@ function readPrefs(raw, ids, cardIds=[]){
   if(Array.isArray(v.pulseOrder)) out.pulseOrder=[...new Set(v.pulseOrder.filter(id=>cardIds.includes(id)))];
   for(const k of ["clock","actionPollMs","vmPollMs","pulsePollMs"]) if(PREF_CHOICES[k].includes(v[k])) out[k]=v[k];
   if(typeof v.compact==="boolean") out.compact=v.compact;
+  if(Array.isArray(v.vmHidden)) out.vmHidden=[...new Set(v.vmHidden.filter(id=>
+    typeof id==="string"&&/^i-[0-9a-f]{8,17}$/.test(id)))];
+  if(Array.isArray(v.vmPanelsHidden)) out.vmPanelsHidden=[...new Set(v.vmPanelsHidden.filter(id=>
+    ["vms","machines","machine-card"].includes(id)))];
+  if(typeof v.machineTarget==="string") out.machineTarget=v.machineTarget;
   return out;
 }
 // Nav order: saved order first, then any section not yet placed, in default order.
@@ -3333,13 +3353,21 @@ function buildSections(){
         <span class="section-label">${esc(s.label)}</span>${badge}</button>`;
     }).join("");
     return `<div class="nav-group"><div class="nav-group-label">${esc(group)}</div>${items}</div>`;
-  }).join("")+(PE_URL?`<div class="nav-group"><div class="nav-group-label">Elsewhere</div>
-    <a class="section-btn pe-ext" href="${esc(PE_URL)}" target="_blank" rel="noopener"
+  }).join("")+((PE_URL||GRAFANA.url||PLATFORM.url)?`<div class="nav-group"><div class="nav-group-label">Elsewhere</div>
+    ${PE_URL?`<a class="section-btn pe-ext" href="${esc(PE_URL)}" target="_blank" rel="noopener"
        title="Oded's CI/CD pipeline explorer: queues, pipeline history, branch timeline, manifests">
       <span class="section-icon" aria-hidden="true">⇢</span>
-      <span class="section-label">Pipelines</span><span class="pe-dot" title="checking…"></span></a></div>`:"");
-  peProbe();
-  box.querySelectorAll(".section-btn").forEach(b=>
+      <span class="section-label">Pipelines</span><span class="pe-dot" title="checking…"></span></a>`:""}
+    ${GRAFANA.url?`<a class="section-btn pe-ext" href="${esc(GRAFANA.url)}" target="_blank" rel="noopener"
+       title="Grafana: CI runners, jobs, EC2 cost, DevOps dashboards">
+      <span class="section-icon" aria-hidden="true">📈</span>
+      <span class="section-label">Grafana</span><span class="gf-dot pe-dot" title="checking…"></span></a>`:""}
+    ${PLATFORM.url?`<a class="section-btn pe-ext" href="${esc(PLATFORM.url)}" target="_blank" rel="noopener"
+       title="Platform portal (SSO): machines, PLDM, DevOps self-service">
+      <span class="section-icon" aria-hidden="true">⚙</span>
+      <span class="section-label">Platform</span></a>`:""}</div>`:"");
+  peProbe(); gfProbe();
+  box.querySelectorAll(".section-btn[data-section]").forEach(b=>
     b.addEventListener("click",()=>selectSection(b.dataset.section)));
 }
 function initOverviewTiles(){
@@ -3739,13 +3767,20 @@ function prRows(f){
     const why=(p.checks_fail&&run&&PE_URL)
       ? ' <a class="ci-btn why" href="'+esc(peRun(run))+'" target="_blank" rel="noopener" '
         +'title="Open the failing run in the pipeline explorer: jobs, logs and failure analysis">why red \u2192</a>' : "";
+    const sher=(SERVED&&p.checks_fail&&run&&/\/actions\/runs\/\d+\/job\/\d+/.test(run))
+      ? ' <button class="ci-btn" data-sherlock="'+esc(run)+'" '
+        +'title="Classify this failing job with octl ci sherlock (read-only)">sherlock</button>' : "";
+    const stage=(SERVED&&p.url)
+      ? ' <button class="pr-x" data-prstage="'+esc(p.url)+'" '
+        +'title="octl ci pr-status: is this PR in a version, did integration pass, is it in CD (read-only)">stage</button>' : "";
     const pipe=(PE_URL&&p.url)
       ? ' <a class="pr-x pe-pipe" href="'+esc(pePr(p.url))+'" target="_blank" rel="noopener" '
         +'title="Where this PR is in the pipeline: CI, merge queue, integration, CD, delivery (pipeline explorer)">\u21e2</a>' : "";
     return '<tr><td><a href="'+esc(p.url||"#")+'" target="_blank" rel="noopener" title="'+esc(p.title||"")+'">'
-      +esc(p.repo)+' #'+p.number+'</a><span class="pr-row-tools">'+pipe+ciBtn+rmBtn+'</span></td>'
+      +esc(p.repo)+' #'+p.number+'</a><span class="pr-row-tools">'+pipe+stage+ciBtn+rmBtn+'</span>'
+      +'<div class="devops-out" hidden></div></td>'
       +'<td class="pr-title" title="'+esc(p.title||"")+'">'+esc(p.title||"")+'</td>'
-      +'<td>'+ci+why+'</td>'
+      +'<td>'+ci+why+sher+'</td>'
       +'<td class="chk">'+detail+'</td>'
       +'<td class="chk">'+esc(gate)+'</td>'
       +'<td><span class="st" style="--sk:'+sc+'">'+esc(p.status||"?")+'</span></td></tr>';
@@ -3808,7 +3843,7 @@ async function ciTriage(fid,force,btn){
       const run=await (await fetch("/api/ai/run/"+encodeURIComponent(j.run_id),{cache:"no-store",headers:aiHeaders()})).json();
       if(run.status!=="queued"&&run.status!=="running"){ aiShowRun(j.run_id); return; }
     }
-    AI.section=activeSection; aiOpen();
+    AI.devops=false; AI.section=activeSection; aiOpen();
     const turn={id:j.run_id,kind:"ci-triage",question:"Triage CI",status:"queued",progress:"queued"};
     AI.thread=[turn]; AI.busy=true; aiRenderThread();
     if(j.job) await aiWait(j.job,j.run_id,turn);
@@ -4116,6 +4151,48 @@ document.addEventListener("click",e=>{
     rerunCi(parseInt(t.dataset.ciAll,10),"all",null,t);
   else if(t.dataset.ciFail!=null)
     rerunCi(parseInt(t.dataset.ciFail,10),"failed",null,t);
+});
+
+// Read-only DevOps lookups: octl PR stage + sherlock job classification.
+function devopsKv(obj){
+  return Object.entries(obj||{}).filter(([,v])=>v!=null&&v!=="")
+    .map(([k,v])=>`<span class="dv-k">${esc(k)}</span> ${esc(typeof v==="object"?JSON.stringify(v):String(v))}`)
+    .join("<br>");
+}
+async function devopsLookup(t){
+  const tr=t.closest("tr"), out=tr&&tr.querySelector(".devops-out");
+  if(!out) return;
+  const stage=t.dataset.prstage!=null;
+  const url=stage?"/api/pr-stage?url="+encodeURIComponent(t.dataset.prstage)
+                 :"/api/sherlock?job="+encodeURIComponent(t.dataset.sherlock);
+  t.disabled=true; out.hidden=false; out.innerHTML=`<span class="muted">${stage?"Querying octl…":"Running sherlock…"}</span>`;
+  try{
+    const r=await fetch(url,{cache:"no-store"});
+    const j=await r.json().catch(()=>({ok:false,error:"HTTP "+r.status}));
+    if(!r.ok||!j.ok){
+      out.innerHTML=`<span class="bad">${esc(j.error||("HTTP "+r.status))}</span>`+
+        (j.raw?`<pre class="dv-raw">${esc(String(j.raw).slice(0,2000))}</pre>`:"");
+      return;
+    }
+    if(stage){
+      const vs=(j.versions||[]).map(v=>`<li>${esc(v.version)} — ${esc(v.status||"?")}`+
+        (v.cd_manifests&&v.cd_manifests.length?` · CD: ${esc(v.cd_manifests.join(", "))}`:"")+"</li>").join("");
+      out.innerHTML=`<b>Stage:</b> <span class="dv-stage dv-${esc(j.stage)}">${esc(j.stage)}</span>`+
+        ` <span class="muted">(${esc(j.project)}/${esc(j.manifest)})</span>`+(vs?`<ul>${vs}</ul>`:"");
+    }else{
+      const l=j.links||{};
+      out.innerHTML=devopsKv(j.classification)+
+        `<div class="dv-links">`+
+        (l.runner_details?`<a href="${esc(l.runner_details)}" target="_blank" rel="noopener">Runner details ↗</a> `:"")+
+        (l.job_lookup?`<a href="${esc(l.job_lookup)}" target="_blank" rel="noopener">Job lookup ↗</a>`:"")+`</div>`;
+    }
+  }catch(err){
+    out.innerHTML=`<span class="bad">${esc(String(err))}</span>`;
+  }finally{ t.disabled=false; }
+}
+document.addEventListener("click",e=>{
+  const t=e.target.closest("[data-sherlock],[data-prstage]");
+  if(t){ e.preventDefault(); devopsLookup(t); }
 });
 
 // Explicit scans probe GitHub and may update opted-in Jira tickets server-side.
@@ -4619,47 +4696,180 @@ function vmBindLogs(){
               b.dataset.id||"")));
   document.querySelectorAll(".vm-cancel").forEach(b=>b.addEventListener("click",()=>
     vmCancel(b.dataset.id,b.dataset.label)));
+  vmBindFlashOpen(document);
 }
 // A reading older than an hour is history, not status. Saying so is the whole
 // point: a day-old "stopped" that looked live is why the VM seemed unusable.
 function vmStale(h){ return /\d+\s*h/.test(h||""); }
+function vmActions(target,id="",main=false,up=true,bmc=false){
+  const off=SERVED?"":" disabled";
+  return '<select class="vm-actions" title="More actions" aria-label="Actions for '+esc(target||id)+'"'
+    +' data-target="'+esc(target)+'" data-id="'+esc(id)+'"'+off+'>'
+    +'<option value="">\u22ef</option>'
+    +(target?'<option value="provision"'+off+'>Provision</option>'
+      +(target==="vm"?"":'<option value="remove"'+off+'>Remove tracking</option>')
+      :'<option value="add"'+off+'>Add tracking</option>')
+    +(target?'<option value="sso"'+(SERVED&&up?"":" disabled")+'>SSO login'+(up?"":" (VM stopped)")+'</option>':"")
+    +(target&&bmc?'<option value="bmc"'+off+'>Set BMC\u2026</option>':"")
+    +(id&&!main?'<option value="main"'+off+'>Set as main</option>':"")
+    +'</select>';
+}
+function vmBindActions(box){
+  box.querySelectorAll(".vm-actions").forEach(select=>select.addEventListener("change",()=>{
+    const action=select.value;
+    select.value="";
+    if(!SERVED) return;
+    if(action==="provision") vmProvision(select.dataset.target);
+    else if(action==="main") vmSetMain(select.dataset.id,select);
+    else if(action==="remove") vmRemoveTarget(select.dataset.target);
+    else if(action==="add") vmAddDialog(select.dataset.id);
+    else if(action==="sso") vmSsoStart(select.dataset.target);
+    else if(action==="bmc") vmSetBmc(select.dataset.target);
+  }));
+  vmSsoBind(box);
+}
+// Folding: EC2 ids fold single VM cards (prefs.vmHidden); "vms"/"machines" fold
+// a whole panel and "machine-card" the machine card (prefs.vmPanelsHidden).
+function vmFoldList(key){ return /^i-/.test(key)?"vmHidden":"vmPanelsHidden"; }
+function vmFolded(key){ return prefs[vmFoldList(key)].includes(key); }
+function vmFoldToggle(key){
+  const list=vmFoldList(key), cur=prefs[list];
+  savePrefs({[list]:cur.includes(key)?cur.filter(x=>x!==key):[...cur,key]});
+}
+function vmChev(open){ return '<span class="vm-chev" aria-hidden="true">'+(open?"\u25be":"\u25b8")+'</span>'; }
+function vmPanelHead(key,title,count){
+  const open=!vmFolded(key);
+  return '<h3 class="vm-panel-h"><button type="button" class="vm-panel-fold" data-vm-fold="'+key+'"'
+    +' aria-expanded="'+open+'" title="'+(open?"Collapse ":"Expand ")+title+'">'+vmChev(open)+title
+    +'<span class="vm-count">'+count+'</span></button></h3>';
+}
+// One card layout for VMs and lab machines: title + compact tool row on one
+// line, key/value body below, and a fold arrow on the left edge.
+function vmCard(o){
+  const open=!vmFolded(o.key);
+  return '<article class="vm-card'+(o.cls?" "+o.cls:"")+(open?"":" folded")+'">'
+    +'<button type="button" class="vm-fold" data-vm-fold="'+esc(o.key)+'" aria-expanded="'+open+'"'
+    +' aria-label="'+(open?"Collapse ":"Expand ")+esc(o.label)+'" title="'+(open?"Collapse":"Expand")+'">'
+    +vmChev(open)+'</button>'
+    +'<header class="vm-card-h"><div class="vm-card-title">'+o.title+'</div>'
+    +(open?'<div class="vm-tools">'+o.tools+'</div>':"")+'</header>'
+    +(open?o.body||"":"")+'</article>';
+}
+function vmKv(rows){
+  rows=rows.filter(r=>r&&r[1]);
+  return rows.length?'<dl class="vm-kv">'+rows.map(([k,v])=>'<dt>'+esc(k)+'</dt><dd>'+v+'</dd>').join("")+'</dl>':"";
+}
+function vmJobsLine(t){
+  if(!t) return "";
+  return '<span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
+    +(t.checked?"probed "+esc(t.age_h)+" ago":"never probed")+'</span>'
+    +(t.running?' \u00b7 <b>'+t.running+' running</b>':"");
+}
+function vmOtherTargets(){
+  const ids=new Set((VMLOG.machines||[]).map(m=>m.id));
+  return (VMLOG.target_state||[]).filter(t=>!t.instance||!ids.has(t.instance));
+}
 // EC2 power state for each delegation target, straight from `octl vm list`.
 function renderVmMachines(){
   const ms=VMLOG.machines||[];
   const box=document.getElementById("vm-machines");
-  const strip=vmTargetStrip();
-  if(!ms.length){
-    box.innerHTML='<div class="vm-idle">No EC2 instance visible. Lab-machine targets are shown below when tracked. Hit <b>Check VM status</b> to '
-      +'query <code>octl vm list</code> \u2014 it revalidates SSO, so it takes a moment.</div>'+strip;
-    vmBindTargetRefresh(box);
-    vmBindTerms(box);
-    return;
-  }
   const stale=vmStale(VMLOG.machines_age_h);
-  box.innerHTML='<div class="vm-mach">'+ms.map(vmMachine).join("")+'</div>'
-    +'<div class="vm-mage'+(stale?" old":"")+'">'
-    +(stale?"\u26a0 ":"")+"power state read "+esc(VMLOG.machines_checked||"?")
-    +(VMLOG.machines_age_h?" \u00b7 "+esc(VMLOG.machines_age_h)+" ago":"")
-    +(stale?" \u2014 hit <b>Check VM status</b>, this is history":"")+'</div>'+strip;
+  box.innerHTML='<section class="vm-panel" id="vm-ec2-panel" aria-label="VM cards">'
+    +vmPanelHead("vms","VMs",ms.length)
+    +(vmFolded("vms")?"":ms.length?'<div class="vm-mach">'+ms.map(vmMachine).join("")+'</div>'
+      +'<div class="vm-foot"><span class="vm-mage'+(stale?" old":"")+'">'
+      +(stale?"\u26a0 ":"")+"Power state read "+esc(VMLOG.machines_checked||"?")
+      +(VMLOG.machines_age_h?" \u00b7 "+esc(VMLOG.machines_age_h)+" ago":"")
+      +(stale?" \u2014 hit <b>Check VM status</b>, this is history":"")+'</span> \u00b7 '+vmBudgetNote()+'</div>'
+      :'<div class="vm-idle">No EC2 instance visible. Hit <b>Check VM status</b> to query '
+        +'<code>octl vm list</code> \u2014 it revalidates SSO, so it takes a moment.</div>')
+    +'</section><section class="vm-panel" id="vm-machine-panel" aria-label="Machine card">'
+    +vmPanelHead("machines","Machine",vmOtherTargets().length)
+    +(vmFolded("machines")?"":vmTargetStrip())+'</section>';
+  box.querySelectorAll("[data-vm-fold]").forEach(b=>b.addEventListener("click",()=>{
+    const key=b.dataset.vmFold;
+    vmFoldToggle(key);
+    renderVmMachines();
+    const again=box.querySelector('[data-vm-fold="'+key+'"]');
+    if(again) again.focus();
+  }));
+  const pick=box.querySelector("#vm-machine-pick");
+  if(pick) pick.addEventListener("change",e=>{
+    savePrefs({machineTarget:e.target.value});
+    renderVmMachines();
+    box.querySelector("#vm-machine-pick").focus();
+  });
   box.querySelectorAll(".vm-pw").forEach(b=>b.addEventListener("click",()=>
     vmPower(b.dataset.action, b.dataset.id, b)));
   vmBindTargetRefresh(box);
   vmBindTerms(box);
+  vmBindActions(box);
+  if(SERVED&&!VMSSO.loaded) vmSsoPoll();
 }
-// Targets with no EC2 instance behind them (lab desktops, NUCs) get no machine
-// card, but they are still probed and still go stale — so they get their own
-// row with the same per-target refresh.
+// Platform EC2 policy (devops-expert skill, references/vms-and-runners.md).
+function vmBudgetNote(){
+  const href=gfDash("ec2_cost");
+  return '<span class="vm-budget">Budget $50/month per user \u00b7 mctl starts VMs on a 30m lease,'
+    +' renews it before work and while a job runs, and auto-starts a stopped VM on the next mctl action'
+    +' \u00b7 lease max 72h'
+    +' \u00b7 instances stopped 60 days are terminated'
+    +(href?' \u00b7 <a href="'+esc(href)+'" target="_blank" rel="noopener">EC2 cost in Grafana \u2197</a>':"")
+    +'</span>';
+}
+// Unlisted VM targets remain selectable alongside lab machines.
 function vmTargetStrip(){
-  const ts=(VMLOG.target_state||[]).filter(t=>!t.instance);
-  if(!ts.length) return "";
-  return '<div class="vm-tstrip">'+ts.map(t=>
-    '<span class="vm-t'+(t.error?" bad":"")+'" title="'+esc(t.error||"reachable")+'">'
-    +'<b>'+esc(t.name)+'</b>'
-    +'<span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
-    +(t.checked?esc(t.age_h)+" ago":"never")+'</span>'
-    +(t.error?'<span class="vm-t-err">\u26a0</span>':"")
-    +vmLiveBadge(t.name)+vmTermBtn(t.name,true)
-    +vmTargetBtn(t.name)+'</span>').join("")+'</div>';
+  const ts=vmOtherTargets();
+  if(!ts.length) return '<div class="vm-idle">No other machines tracked. Use <b>Add machine</b> to register one.</div>';
+  const t=ts.find(t=>t.name===prefs.machineTarget)||ts[0];
+  const pick=ts.length>1
+    ?'<select id="vm-machine-pick" class="vm-pick" aria-label="Select machine" title="Switch machine">'
+      +ts.map(x=>'<option value="'+esc(x.name)+'"'+(x.name===t.name?" selected":"")+'>'
+        +esc(x.name)+(x.instance?" (VM target)":"")+'</option>').join("")+'</select>'
+    :'<h4>'+esc(t.name)+'</h4>';
+  const title='<span class="vm-dot '+(t.error?"bad":t.checked?"ok":"")+'"></span>'+pick+vmLiveBadge(t.name);
+  const body=vmKv([
+    ["Jobs",vmJobsLine(t)],
+    ["Flash",vmFlashLine(t)],
+    ["Instance",t.instance?esc(t.instance):""],
+    ["BMC",t.bmc?esc(t.bmc):""],
+    ["Error",t.error?'<span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':""],
+    ["Setup",vmProvBadge(t)],
+  ])+vmSsoSlot(t.name);
+  return vmCard({key:"machine-card",label:t.name,cls:t.error?"bad":"",title,body,
+    tools:vmTermBtn(t.name,true)+vmBmcBtn(t)+vmFlashBtn(t)+vmTargetBtn(t.name)+vmActions(t.name,"",false,true,!t.instance)});
+}
+// Result of the last `mctl provision` on a target (latest per recipe).
+function vmProvBadge(t){
+  const p=(t&&t.provision)||{};
+  if(!p.recipes||!p.recipes.length)
+    return '<span class="vm-prov none" title="Never provisioned with mctl provision">unprovisioned</span>';
+  const lines=p.recipes.map(r=>r.recipe+": "+r.status+(r.note?" \u2014 "+r.note:"")).join("\n");
+  const cls=p.ok?(p.todo&&p.todo.length?"todo":"ok"):"bad";
+  const txt=p.ok?(p.todo&&p.todo.length?"provisioned \u00b7 "+p.todo.length+" manual":"provisioned")
+                :"provision \u26a0 "+p.failed.join(", ");
+  return '<span class="vm-prov '+cls+'" title="'+esc("Last run "+(p.last_age_h||"?")+" ago\n"+lines)+'">'
+    +esc(txt)+'</span>';
+}
+// Runs `mctl -t <target> provision` (the target's default recipe list) live in
+// a terminal window; finished recipes are skipped, so re-running is cheap.
+function vmProvision(target){
+  if(!SERVED){ document.getElementById("vm-refresh-note").textContent="Serve the portal to provision"; return; }
+  if(!confirm("Run mctl provision on "+target+"?\n\nInstalls the missing prerequisites from its default list"
+    +" (a stopped VM is started first). Output streams into a terminal window.")) return;
+  termOpen({kind:"provision",target},"prov-"+target);
+}
+// Started / predicted stop from mctl's power memory. A cached "running" whose
+// lease has passed is shown as probably stopped -- the reaper beat the probe.
+function vmPowerLine(m){
+  if(m.predicted_stopped)
+    return '<span class="vm-lease bad" title="The cached state says running, but the lease ended '
+      +esc(m.stopped_ago_h||"")+' ago, so the instance has most likely been stopped. The next mctl action starts it again.">'
+      +'\u26a0 lease ended '+esc(m.stopped_ago_h||"")+' ago \u2014 probably stopped; auto-starts on next use</span>';
+  const bits=[];
+  if(m.started_ago_h) bits.push("started "+esc(m.started_ago_h)+" ago"+(m.started_by?" ("+esc(m.started_by)+")":""));
+  if(m.stop_in_h&&m.stop_ts) bits.push("predicted stop "+esc(new Date(m.stop_ts*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}))
+    +" (in "+esc(m.stop_in_h)+")");
+  return bits.length?'<span class="vm-lease">'+bits.join(" \u00b7 ")+'</span>':"";
 }
 // A shell on the machine, in its own window: attaches to the persistent tmux
 // session "portal" (so work survives closing the window), bash otherwise.
@@ -4680,9 +4890,202 @@ function vmLiveBadge(name){
   return '<span class="vm-livebadge '+esc(l.state)+'" title="'+esc(title)+'">'
     +(l.state==="connected"?"live":l.state)+'</span>';
 }
+// Lab machines only (EC2 VMs have no BMC); the server resolves the BMC host.
+function vmBmcBtn(t){
+  if(t.instance) return "";
+  return '<button class="vm-bmc" data-target="'+esc(t.name)+'"'+(t.bmc&&SERVED?"":" disabled")
+    +' title="'+(t.bmc?"Open an ssh terminal on "+esc(t.name)+"\u2019s BMC ("+esc(t.bmc)+")"
+      :"No BMC set \u2014 use \u22ef \u203a Set BMC\u2026")+'">&gt;_ BMC</button>';
+}
 function vmBindTerms(box){
   box.querySelectorAll(".vm-term").forEach(b=>b.addEventListener("click",()=>
     vmTermOpen(b.dataset.target)));
+  box.querySelectorAll(".vm-bmc").forEach(b=>b.addEventListener("click",()=>
+    termOpen({kind:"bmc",target:b.dataset.target},"bmc-"+b.dataset.target)));
+  box.querySelectorAll(".vm-flash").forEach(b=>b.addEventListener("click",()=>
+    vmFlashDialog(b.dataset.target)));
+  vmBindFlashOpen(box);
+}
+function vmBindFlashOpen(root){
+  root.querySelectorAll(".vm-flash-open:not([data-bound])").forEach(b=>{
+    b.dataset.bound="1";
+    b.addEventListener("click",()=>flashWindow(b.dataset.id));
+  });
+}
+// --- Flash FW -------------------------------------------------------------
+// Images come from the fw-deploy store, the flash runs fw-flasher's fw_flash.py
+// as a local machine job (kind "flash"), so it lands in the Jobs list with its
+// log and survives a portal restart. The progress window is /flash?id=.
+function vmFlashRunning(name){
+  return (VMLOG.jobs||[]).find(j=>j.kind==="flash"&&j.target===name&&j.status==="running");
+}
+function vmFlashBtn(t){
+  if(t.instance) return "";
+  const run=vmFlashRunning(t.name);
+  if(run) return '<button class="vm-flash-open live" data-id="'+esc(run.id)+'"'
+    +' title="A flash is running on '+esc(t.name)+' — open its progress window">'
+    +'<span class="spin">\u21bb</span> Flashing\u2026</button>';
+  return '<button class="vm-flash" data-target="'+esc(t.name)+'"'+(SERVED?"":" disabled")
+    +' title="Flash a firmware image from the fw-deploy store onto '+esc(t.name)+'\u2019s OAMs">'
+    +'\u26a1 Flash FW</button>';
+}
+function vmFlashLine(t){
+  const last=(VMLOG.jobs||[]).filter(j=>j.kind==="flash"&&j.target===t.name)
+    .sort((a,b)=>(b.started||"").localeCompare(a.started||""))[0];
+  if(!last) return "";
+  return '<button class="linklike vm-flash-open" data-id="'+esc(last.id)+'" title="Open the flash progress window">'
+    +esc((last.method||"")+" "+(last.image||"")+" \u2192 OAM "+(last.oams||[]).join(","))+'</button>'
+    +' <span class="vm-st '+esc(last.status)+'">'+esc(last.status==="failed"&&last.rc===2?"not verified":last.status)+'</span>';
+}
+function flashWindow(id){
+  if(!SERVED||!id) return null;
+  const w=window.open("/flash?"+new URLSearchParams({id}).toString(),"flash-"+id,"popup=yes,width=980,height=760");
+  if(!w) alert("The browser blocked the flash window \u2014 allow pop-ups for this page.");
+  return w;
+}
+function flashSize(n){ return n>=1048576?(n/1048576).toFixed(1)+" MB":n>=1024?Math.round(n/1024)+" KB":(n||0)+" B"; }
+function vmFlashDialog(target){
+  if(!SERVED) return;
+  const previousFocus=document.activeElement, dialog=document.createElement("dialog");
+  dialog.className="ws-modal vm-flash-dialog";
+  dialog.setAttribute("aria-labelledby","vm-flash-title");
+  dialog.innerHTML='<form><h3 id="vm-flash-title">Flash FW \u00b7 '+esc(target)+'</h3>'
+    +'<div class="flash-body"><p class="ro-note">Reading the image store and probing '+esc(target)
+    +' (read-only: BMC device list, flash versions, host tools)\u2026</p></div>'
+    +'<div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>'
+    +'<button type="button" class="ws-modal-cancel">Cancel</button>'
+    +'<button type="button" class="flash-back" hidden>\u2190 Back</button>'
+    +'<button type="submit" class="primary" disabled>Review\u2026</button></div></form>';
+  document.body.appendChild(dialog);
+  const form=dialog.querySelector("form"), body=dialog.querySelector(".flash-body"),
+        msg=dialog.querySelector(".ws-modal-msg"), submit=form.querySelector('[type="submit"]'),
+        back=dialog.querySelector(".flash-back");
+  const st={images:[],disc:null,step:"pick",busy:false,sel:{}};
+  const close=()=>{ if(!st.busy) dialog.close(); };
+  dialog.addEventListener("close",()=>{ dialog.remove(); previousFocus?.focus(); });
+  dialog.addEventListener("cancel",e=>{ if(st.busy) e.preventDefault(); });
+  dialog.addEventListener("keydown",e=>{ e.stopPropagation(); if(e.key==="Escape"){ e.preventDefault(); close(); } });
+  dialog.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  back.addEventListener("click",()=>{ st.step="pick"; draw(); });
+  dialog.showModal();
+
+  const imgs=()=>st.images.filter(i=>i.valid&&(!st.sel.project||i.project===st.sel.project));
+  const method=()=>st.disc&&st.disc.methods[st.sel.method];
+  function collect(){
+    const f=form.elements, v=n=>f.namedItem(n);
+    if(v("project")) st.sel.project=v("project").value;
+    if(v("image")) st.sel.image=v("image").value;
+    const m=form.querySelector('input[name="method"]:checked'); if(m) st.sel.method=m.value;
+    st.sel.oams=[...form.querySelectorAll('input[name="oam"]:checked')].map(x=>parseInt(x.value,10));
+    if(v("force")) st.sel.force=v("force").checked;
+    if(v("reset_verify")) st.sel.reset_verify=v("reset_verify").checked;
+  }
+  function pickHtml(){
+    const projects=[...new Set(st.images.filter(i=>i.valid).map(i=>i.project))].sort();
+    if(!st.sel.project||!projects.includes(st.sel.project)) st.sel.project=projects[0]||"";
+    const list=imgs();
+    if(!list.some(i=>i.directory===st.sel.image)) st.sel.image=(list[0]||{}).directory||"";
+    const bad=st.images.filter(i=>!i.valid).length;
+    const img=list.find(i=>i.directory===st.sel.image);
+    const ms=Object.entries(st.disc.methods);
+    if(!st.sel.method||!(st.disc.methods[st.sel.method]||{}).available) st.sel.method=st.disc.default||"";
+    const m=method(), oams=(m&&m.oams)||[];
+    if(!st.sel.oams) st.sel.oams=[];
+    const one=st.sel.method==="spi-bmc";
+    return '<fieldset><legend>Image</legend>'
+      +(st.images.length?"":'<p class="vm-t-err">The fw-deploy store is empty. Import an image first: '
+        +'<code>fw-deploy import &lt;image&gt; --project \u2026 --topic \u2026 --notes \u2026 --platform \u2026</code></p>')
+      +'<label>Project<select name="project">'+projects.map(p=>'<option'+(p===st.sel.project?" selected":"")+'>'+esc(p)+'</option>').join("")+'</select></label>'
+      +'<label>Image<select name="image">'+list.map(i=>'<option value="'+esc(i.directory)+'"'+(i.directory===st.sel.image?" selected":"")+'>'
+        +esc([i.deployment,i.platform,i.variant].filter(Boolean).join(" / ")+" \u00b7 "+(i.created_utc||"").slice(0,16))+'</option>').join("")+'</select></label>'
+      +(img?'<p class="flash-imgmeta"><code>'+esc(img.image)+'</code> \u00b7 '+flashSize(img.size)+' \u00b7 sha256 <code title="'+esc(img.sha256)+'">'+esc((img.sha256||"").slice(0,16))+'\u2026</code>'
+        +(img.notes?'<br><span class="muted">'+esc(String(img.notes).split("\n").find(l=>l.trim())||"")+'</span>':"")+'</p>':"")
+      +(bad?'<p class="ro-note">'+bad+' store entr'+(bad>1?"ies":"y")+' failed verification and are hidden.</p>':"")
+      +'</fieldset><fieldset><legend>Method</legend>'
+      +ms.map(([k,v])=>'<label class="flash-radio'+(v.available?"":" off")+'" title="'+esc(v.reason||"")+'">'
+        +'<input type="radio" name="method" value="'+esc(k)+'"'+(k===st.sel.method?" checked":"")+(v.available?"":" disabled")+'> '
+        +esc(v.label||k)+(v.available?"":' <span class="muted">\u2014 '+esc(v.reason||"unavailable")+'</span>')+'</label>').join("")
+      +'</fieldset><fieldset><legend>OAMs'+(oams.length&&!one?' <button type="button" class="linklike flash-all">all</button> \u00b7 <button type="button" class="linklike flash-none">none</button>':"")+'</legend>'
+      +(oams.length?'<div class="flash-oams">'+oams.map(o=>{
+          const ready=!o.state||/^ready$/i.test(o.state);
+          return '<label class="flash-oam'+(ready?"":" warn")+'"><input type="'+(one?"radio":"checkbox")+'" name="oam" value="'+o.index+'"'
+            +(st.sel.oams.includes(o.index)?" checked":"")+'> <b>'+esc(o.label||("OAM "+o.index))+'</b>'
+            +(o.state?' <span class="vm-st '+(ready?"passed":"failed")+'">'+esc(o.state)+'</span>':"")
+            +(o.build||o.version?'<br><span class="muted">'+esc(o.build||o.version)+'</span>':"")+'</label>';
+        }).join("")+'</div>':'<p class="muted">'+(m?"No OAMs reported for this method.":"No usable flash method on this machine.")+'</p>')
+      +'</fieldset><fieldset><legend>Options</legend>'
+      +'<label class="flash-radio"><input type="checkbox" name="reset_verify"'+(st.sel.reset_verify?" checked":"")+'> Reset &amp; verify boot after writing'
+      +' <span class="muted">(intrusive: resets each OAM and checks the booted build)</span></label>'
+      +'<label class="flash-radio"><input type="checkbox" name="force"'+(st.sel.force?" checked":"")+'> Flash OAMs that are not READY'
+      +' <span class="muted">(skips the readiness gate)</span></label></fieldset>';
+  }
+  function reviewHtml(){
+    const img=st.images.find(i=>i.directory===st.sel.image)||{}, m=method()||{};
+    const rows=(m.oams||[]).filter(o=>st.sel.oams.includes(o.index));
+    return '<p>Review before writing. Read-back verification runs after every write'
+      +(st.sel.reset_verify?", then each OAM is reset and its booted build checked":"")+'.</p>'
+      +'<dl class="vm-kv flash-review"><dt>Machine</dt><dd>'+esc(target)+'</dd>'
+      +'<dt>Method</dt><dd>'+esc(m.label||st.sel.method)+'</dd>'
+      +'<dt>Image</dt><dd>'+esc([img.project,img.deployment,img.platform,img.variant].filter(Boolean).join(" / "))+'<br><code>'+esc(img.path||"")+'</code></dd>'
+      +'<dt>SHA-256</dt><dd><code>'+esc(img.sha256||"")+'</code></dd>'
+      +'<dt>Size</dt><dd>'+flashSize(img.size)+'</dd>'
+      +'<dt>OAMs</dt><dd>'+rows.map(o=>esc(o.label||("OAM "+o.index))+(o.build?' <span class="muted">(now '+esc(o.build)+')</span>':"")).join("<br>")+'</dd>'
+      +(st.sel.force?'<dt>Force</dt><dd class="vm-t-err">readiness gate skipped</dd>':"")+'</dl>'
+      +'<p class="ro-note">A write in progress cannot be stopped; the job can be cancelled only before the write phase starts.</p>';
+  }
+  function validate(){
+    collect();
+    const n=st.sel.oams.length, ok=!!(st.sel.image&&st.sel.method&&n);
+    submit.disabled=!ok||st.busy;
+    submit.textContent=st.step==="pick"?"Review\u2026":"\u26a1 Flash "+n+" OAM"+(n===1?"":"s");
+    msg.textContent=st.step==="pick"&&!ok?(!st.sel.image?"Pick an image":!st.sel.method?"No usable method":"Select at least one OAM"):"";
+  }
+  function draw(){
+    back.hidden=st.step!=="review";
+    body.innerHTML=st.step==="pick"?pickHtml():reviewHtml();
+    body.querySelectorAll("select,input").forEach(x=>x.addEventListener("change",()=>{
+      collect();
+      if(["project","method"].includes(x.name)||x.name==="image"){ if(x.name==="method") st.sel.oams=[]; draw(); }
+      else validate();
+    }));
+    const all=body.querySelector(".flash-all"), none=body.querySelector(".flash-none");
+    if(all) all.addEventListener("click",()=>{ body.querySelectorAll('input[name="oam"]').forEach(x=>x.checked=true); validate(); });
+    if(none) none.addEventListener("click",()=>{ body.querySelectorAll('input[name="oam"]').forEach(x=>x.checked=false); validate(); });
+    validate();
+  }
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(st.busy||submit.disabled) return;
+    if(st.step==="pick"){ collect(); st.step="review"; draw(); submit.focus(); return; }
+    st.busy=true; submit.disabled=true; back.disabled=true; msg.textContent="Starting\u2026";
+    const win=window.open("about:blank","flash-pending","popup=yes,width=980,height=760");
+    try{
+      const r=await fetch("/api/flash/start",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({target,method:st.sel.method,image:st.sel.image,oams:st.sel.oams,
+          force:!!st.sel.force,reset_verify:!!st.sel.reset_verify})});
+      const j=await r.json();
+      if(!r.ok) throw new Error(j.error||"flash failed to start");
+      if(win){ win.location.href="/flash?"+new URLSearchParams({id:j.job}).toString(); win.name="flash-"+j.job; }
+      else flashWindow(j.job);
+      st.busy=false; dialog.close();
+      vmLivePoll(); vmTimersSync();
+    }catch(err){
+      if(win) win.close();
+      msg.textContent=err.message; st.busy=false; back.disabled=false; validate();
+    }
+  });
+  (async()=>{
+    try{
+      const [ri,rd]=await Promise.all([fetch("/api/flash/images",{cache:"no-store"}),
+        fetch("/api/flash/discover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target})})]);
+      const ji=await ri.json(), jd=await rd.json();
+      if(!ri.ok) throw new Error("image store: "+(ji.error||ri.status));
+      if(!rd.ok) throw new Error("probe "+target+": "+(jd.error||rd.status));
+      st.images=ji.images||[]; st.disc=jd; draw();
+    }catch(err){
+      body.innerHTML='<p class="vm-t-err">\u26a0 '+esc(err.message)+'</p>';
+    }
+  })();
 }
 // One ↻ per target. Scoping matters because an unreachable host costs a 90 s
 // ssh timeout, so "just the VM" returns in seconds where the fleet takes minutes.
@@ -4699,29 +5102,31 @@ function vmMachine(m){
   const on=m.state==="running", busy=["pending","stopping","shutting-down"].includes(m.state);
   const act=on?"stop":"start";
   const lease=m.lease_left_h
-    ? '<span class="vm-lease'+(m.lease_left<=0?" bad":"")+'">lease '+esc(m.lease_left_h)
+    ? '<span class="vm-lease'+(m.lease_left<=0?" bad":(m.lease_left<3600?" warn":""))+'"'
+      +(m.lease_left>0&&m.lease_left<3600?' title="Lease expires within the hour \u2014 extend it or the instance stops"':"")+'>lease '+esc(m.lease_left_h)
       +(m.lease_left>0?" left":"")+'</span>' : "";
   const t=(VMLOG.target_state||[]).find(x=>x.name===m.target);
-  const probe=t
-    ? '<div class="vm-m-sub"><span class="vm-t-age'+(vmStale(t.age_h)?" old":"")+'">'
-      +(t.checked?"jobs probed "+esc(t.age_h)+" ago":"jobs never probed")+'</span>'
-      +(t.running?' \u00b7 <b>'+t.running+' running</b>':"")
-      +(t.error?' \u00b7 <span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':"")+'</div>'
+  const main=m.main
+    ? '<span class="vm-main" title="Main VM: target vm \u2014 neo-ask and default delegation run here">Main</span>'
     : "";
-  return '<div class="vm-m"><div class="vm-m-l">'
-    +'<h4><span class="vm-dot '+esc(m.state)+'"></span>'+esc(m.name)
-    +'<span class="vm-m-st">'+esc(m.state)+'</span></h4>'
-    +'<div class="vm-m-sub">'+esc(m.type)+(m.ip?' \u00b7 '+esc(m.ip):"")
-    +(m.target?' \u00b7 target <b>'+esc(m.target)+'</b>':"")
-    +(m.desc?' \u00b7 '+esc(m.desc):"")+'</div>'
-    +(lease?'<div class="vm-m-sub">'+lease+'</div>':"")
-    +probe
-    +'</div><div class="vm-m-act">'
-    +(m.target?vmLiveBadge(m.target)+vmTermBtn(m.target, on):"")
-    +(m.target?vmTargetBtn(m.target):"")
+  const title='<span class="vm-dot '+esc(m.state)+'"></span><h4>'+esc(m.name)+'</h4>'
+    +'<span class="vm-m-st">'+esc(m.state)+'</span>'+main+(m.target?vmLiveBadge(m.target):"");
+  const tools=(m.target?vmTermBtn(m.target,on):"")
     +'<button class="vm-pw '+act+'" data-action="'+act+'" data-id="'+esc(m.id)+'"'
     +(busy?" disabled":"")+' title="octl vm '+act+' '+esc(m.id)+'">'
-    +(busy?esc(m.state):(on?"\u25a0 Stop":"\u25b6 Start"))+'</button></div></div>';
+    +(busy?esc(m.state):(on?"\u25a0 Stop":"\u25b6 Start"))+'</button>'
+    +(m.target?vmTargetBtn(m.target):"")
+    +vmActions(m.target||"",m.id,!!m.main,on);
+  const body=vmKv([
+    ["Instance",esc(m.id)+' \u00b7 '+esc(m.type)+(m.ip?' \u00b7 '+esc(m.ip):"")],
+    ["Target",m.target?'<b>'+esc(m.target)+'</b>':'<span class="vm-t-age">not tracked</span>'],
+    ["Note",m.desc?esc(m.desc):""],
+    ["Power",[lease,vmPowerLine(m)].filter(Boolean).join(" \u00b7 ")],
+    ["Jobs",vmJobsLine(t)],
+    ["Error",t&&t.error?'<span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':""],
+    ["Setup",t?vmProvBadge(t):""],
+  ])+(m.target?vmSsoSlot(m.target):"");
+  return vmCard({key:m.id,label:m.name,cls:m.main?"main":"",title,tools,body});
 }
 async function vmPower(action,id,btn){
   const note=document.getElementById("vm-refresh-note");
@@ -4742,6 +5147,191 @@ async function vmPower(action,id,btn){
     document.querySelectorAll(".vm-pw").forEach(b=>b.disabled=false);
   }
 }
+// SSO login: `octl login` runs on the target (never starting a stopped VM); the
+// device link it prints is opened here. The window is opened on the click,
+// because a pop-up opened after an await is blocked, then pointed at the link.
+// Only an AWS SSO https link is ever opened (the server filters it as well).
+const VMSSO={logins:{},wins:{},timer:null,loaded:false};
+function vmSsoOk(url){
+  try{ const u=new URL(url);
+    return u.protocol==="https:"&&!u.port&&!u.username
+      &&/^(?:[a-z0-9-]+\.awsapps\.com|device\.sso\.[a-z0-9-]+\.amazonaws\.com)$/.test(u.hostname);
+  }catch(e){ return false; }
+}
+function vmSsoActive(l){ return !!l&&(l.state==="starting"||l.state==="waiting"); }
+function vmSsoSlot(target){
+  return '<div class="vm-sso-slot" data-target="'+esc(target)+'">'+vmSsoHtml(target)+'</div>';
+}
+function vmSsoHtml(target){
+  const l=VMSSO.logins[target];
+  if(!l) return "";
+  const t=(VMLOG.target_state||[]).find(x=>x.name===target);
+  const shared=t&&!t.instance&&target!=="vm"?" \u00b7 lab machines share one home, so this covers them all":"";
+  let body='<b>SSO login:</b> '+esc(l.message||l.state);
+  if(vmSsoActive(l)){
+    if(l.code) body+=' \u00b7 code <code class="vm-sso-code">'+esc(l.code)+'</code>';
+    if(l.url&&vmSsoOk(l.url)) body+=' \u00b7 <a href="'+esc(l.url)+'" target="_blank" rel="noopener noreferrer">Open link \u2197</a>';
+    body+=' <button class="vm-sso-cancel btn" data-target="'+esc(target)+'">Cancel</button>';
+  }else if(l.state==="done") body+=shared;
+  return '<div class="vm-sso '+esc(l.state)+'" role="status">'+body+'</div>';
+}
+function vmSsoPaint(){
+  document.querySelectorAll(".vm-sso-slot").forEach(slot=>{
+    const html=vmSsoHtml(slot.dataset.target);
+    if(slot.innerHTML!==html){ slot.innerHTML=html; vmSsoBind(slot); }
+  });
+}
+function vmSsoBind(box){
+  box.querySelectorAll(".vm-sso-cancel").forEach(b=>b.addEventListener("click",()=>
+    vmSsoPost(b.dataset.target,"cancel")));
+}
+function vmSsoWin(target,l){
+  const w=VMSSO.wins[target];
+  if(!w) return;
+  if(w.closed){ delete VMSSO.wins[target]; return; }
+  if(l&&l.url&&vmSsoOk(l.url)){
+    try{ w.opener=null; w.location.replace(l.url); }catch(e){}
+    delete VMSSO.wins[target];
+  }else if(!vmSsoActive(l)){ w.close(); delete VMSSO.wins[target]; }
+}
+function vmSsoAdopt(logins){
+  VMSSO.logins=logins||{};
+  Object.keys(VMSSO.wins).forEach(t=>vmSsoWin(t,VMSSO.logins[t]));
+  vmSsoPaint();
+  const busy=Object.values(VMSSO.logins).some(vmSsoActive)||Object.keys(VMSSO.wins).length;
+  clearTimeout(VMSSO.timer);
+  if(busy) VMSSO.timer=setTimeout(vmSsoPoll,2000);
+}
+async function vmSsoPoll(){
+  if(!SERVED) return;
+  VMSSO.loaded=true;
+  try{
+    const r=await fetch("/api/sso-login");
+    const j=await r.json();
+    if(r.ok) vmSsoAdopt(j.logins);
+  }catch(e){ clearTimeout(VMSSO.timer); VMSSO.timer=setTimeout(vmSsoPoll,5000); }
+}
+async function vmSsoPost(target,action){
+  const r=await fetch("/api/sso-login",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({target,action})});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.error||"SSO login failed");
+  VMSSO.logins[target]=j.login;
+  vmSsoAdopt(VMSSO.logins);
+  return j.login;
+}
+async function vmSsoStart(target){
+  const note=document.getElementById("vm-refresh-note");
+  if(!SERVED){ note.textContent="Serve the portal to run SSO login"; return; }
+  const w=window.open("","_blank");
+  if(w){
+    try{ w.document.title="SSO login \u2014 "+target;
+      w.document.body.textContent="Waiting for the AWS SSO link from "+target+"\u2026"; }catch(e){}
+    VMSSO.wins[target]=w;
+  }
+  try{
+    await vmSsoPost(target,"start");
+    note.textContent="SSO login started on "+target+(w?"":" \u2014 pop-up blocked, use Open link on the card");
+  }catch(e){
+    if(w) w.close();
+    delete VMSSO.wins[target];
+    note.textContent="SSO login failed: "+e.message;
+  }
+}
+async function vmSetMain(id){
+  const note=document.getElementById("vm-refresh-note");
+  if(!SERVED){ note.textContent="Serve the portal to change the Main VM"; return; }
+  if(!confirm("Make "+id+" the Main VM?\n\nTarget \u201cvm\u201d (neo-ask, default delegation) will point at it; "
+    +"the current Main stays registered as vm-<id>. Workspaces mirrored on the old VM are not moved."))
+    return;
+  document.querySelectorAll(".vm-actions").forEach(b=>b.disabled=true);
+  note.textContent="mctl vm main "+id+"\u2026";
+  try{
+    const r=await fetch("/api/vm-main",{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})});
+    const j=await r.json();
+    if(!r.ok||(j.error&&!j.machines)) throw new Error(j.error||"switch failed");
+    vmAdoptPayload(j); renderVmlog(); buildSections();
+    note.textContent="Main VM is now "+id;
+  }catch(e){
+    note.textContent="Set main failed: "+e.message;
+    document.querySelectorAll(".vm-actions").forEach(b=>b.disabled=false);
+  }
+}
+async function vmTargetPost(body){
+  const r=await fetch("/api/vm-target",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j=await r.json();
+  if(!r.ok||!Array.isArray(j.targets)) throw new Error(j.error||"Machine tracking failed");
+  vmAdoptPayload(j); renderVmlog(); buildSections();
+  document.getElementById("vm-refresh-note").textContent=j.message;
+  return j;
+}
+async function vmSetBmc(name){
+  if(!SERVED) return;
+  const t=(VMLOG.target_state||[]).find(x=>x.name===name)||{};
+  const v=prompt("BMC for "+name+" \u2014 hostname or IPv4, optionally user@host (default user root).\n"
+    +"Leave empty to clear.",t.bmc||"");
+  if(v===null||v.trim()===(t.bmc||"")) return;
+  const note=document.getElementById("vm-refresh-note");
+  try{
+    await vmTargetPost({action:"bmc",name,bmc:v.trim()});
+  }catch(e){ note.textContent="Set BMC failed: "+e.message; }
+}
+async function vmRemoveTarget(name){
+  if(!SERVED) return;
+  if(!confirm("Remove tracking for "+name+"?\n\nThis unregisters the shared mctl target and disables its portal controls."
+    +" The machine is not stopped or deleted; job and workspace history is kept."
+    +" EC2 instances remain visible as untracked inventory.")) return;
+  const note=document.getElementById("vm-refresh-note");
+  try{
+    await vmTargetPost({action:"remove",name});
+  }catch(e){ note.textContent="Remove tracking failed: "+e.message; }
+}
+function vmAddDialog(instance=""){
+  if(!SERVED){ document.getElementById("vm-refresh-note").textContent="Serve the portal to add machines"; return; }
+  const previousFocus=document.activeElement, dialog=document.createElement("dialog");
+  dialog.className="ws-modal vm-add-dialog";
+  dialog.setAttribute("aria-labelledby","vm-add-title");
+  dialog.innerHTML='<form><h3 id="vm-add-title">Add tracked machine</h3>'
+    +'<p class="ro-note">Registers a shared mctl target. Does not connect, start or provision the machine.</p>'
+    +'<label>Target name<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,62}" maxlength="63" placeholder="build-desktop"></label>'
+    +'<label>Machine type<select name="kind"><option value="remote">SSH machine</option>'
+    +'<option value="vm"'+(instance?" selected":"")+'>EC2 VM</option></select></label>'
+    +'<label>SSH hostname / IPv4 address, or EC2 instance ID<input name="address" required value="'+esc(instance)+'"></label>'
+    +'<label>SSH login<input name="login" required pattern="[A-Za-z_][A-Za-z0-9._-]{0,63}" autocomplete="username"></label>'
+    +'<label>BMC host (optional, SSH machines only)<input name="bmc" placeholder="bmc-sa-els23-csr"'
+    +' pattern="([A-Za-z_][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}"></label>'
+    +'<p class="ro-note">Enable live status separately in Settings &gt; Machines.</p>'
+    +'<div class="ws-modal-act"><span class="ws-modal-msg" role="status"></span>'
+    +'<button type="button" class="ws-modal-cancel">Cancel</button>'
+    +'<button type="submit" class="primary">Add machine</button></div></form>';
+  document.body.appendChild(dialog);
+  let saving=false;
+  const close=()=>{ if(!saving) dialog.close(); };
+  dialog.addEventListener("close",()=>{ dialog.remove(); previousFocus?.focus(); });
+  dialog.addEventListener("cancel",e=>{ if(saving) e.preventDefault(); });
+  dialog.addEventListener("keydown",e=>{
+    e.stopPropagation();
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+  });
+  dialog.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  dialog.querySelector("form").addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(saving) return;
+    const form=e.target, button=form.querySelector('[type="submit"]');
+    const get=name=>form.elements.namedItem(name).value.trim();
+    saving=true; button.disabled=true;
+    try{
+      const req={action:"add",name:get("name"),kind:get("kind"),address:get("address"),login:get("login")};
+      if(req.kind==="remote"&&get("bmc")) req.bmc=get("bmc");
+      await vmTargetPost(req);
+      saving=false; close();
+    }catch(error){ form.querySelector(".ws-modal-msg").textContent=error.message; }
+    finally{ saving=false; button.disabled=false; }
+  });
+  dialog.showModal();
+}
 function vmRow(j){
   const c=VM_STATUS_COLOR[j.status]||PBI.grey;
   const rc=(j.rc===null||j.rc===undefined)?"":" rc="+j.rc;
@@ -4750,7 +5340,7 @@ function vmRow(j){
   const title=(VM_STATUS_TITLE[j.status]||"")+(j.note?" \u2014 "+j.note:"")
     +(j.stale?" \u2014 "+vmStaleTitle(j):"");
   return '<tr class="task'+(j.status==="running"?" on":"")+(j.stale?" vm-stale":"")+'">'
-    +'<td title="'+esc(j.dest||"")+'">'+esc(j.target)+'</td>'
+    +'<td title="'+esc([j.dest,j.instance].filter(Boolean).join(" \u00b7 "))+'">'+esc(j.target)+'</td>'
     +'<td>'+esc(j.kind)+'</td>'
     +'<td class="vm-ws"><b>'+esc(j.ws_label||j.tag)+'</b>'
       +(j.adopted?'<span>found on target \u00b7 not dispatched from here</span>':"")+'</td>'
@@ -4767,16 +5357,23 @@ function vmRow(j){
     +'<td title="'+esc(title)+'">'
       +'<span class="vm-st '+esc(j.status)+'" style="--sk:'+c+'">'+esc(j.status)+esc(rc)+'</span>'
       +'<span class="vm-verline">'+vmVerified(j)+'</span>'+tail+'</td>'
-    +'<td class="vm-logcell">'+vmLogLink(j)+vmCancelButton(j)+'</td></tr>';
+    +'<td class="vm-logcell">'+vmLogLink(j)+vmFlashProgressBtn(j)+vmCancelButton(j)+'</td></tr>';
 }
 // Only a run that still owns its workspace slot can be stopped: mctl kills the
 // pid recorded in that slot and refuses when a newer run has taken it over.
 function vmCancelButton(j){
-  if(j.status!=="running"||j.owns_slot===false||!j.pid||!["build","test","run"].includes(j.kind))
+  if(j.kind==="flash"&&j.status==="running"&&!j.cancellable)
+    return '<button class="vm-cancel" disabled title="Writing flash ('+esc(j.phase||"")+') \u2014 cannot be stopped safely">\u25a0 stop</button>';
+  if(j.status!=="running"||j.owns_slot===false||!j.pid||!["build","test","run","flash"].includes(j.kind))
     return "";
   return '<button class="vm-cancel" data-id="'+esc(j.id)+'" data-label="'
     +esc(j.kind+" "+(j.ws_label||j.tag)+" on "+j.target)+'"'
     +' title="Stop this job on '+esc(j.target)+' (queued as a portal action)">\u25a0 stop</button>';
+}
+function vmFlashProgressBtn(j){
+  if(j.kind!=="flash") return "";
+  return '<button class="vm-flash-open" data-id="'+esc(j.id)+'" title="Open the flash progress window (per-OAM state, phases, result)">'
+    +'\u26a1 progress</button>';
 }
 async function vmCancel(id,label){
   const note=document.getElementById("vm-refresh-note");
@@ -4934,6 +5531,7 @@ async function checkVms(){
   }
 }
 document.getElementById("vm-vms").addEventListener("click",checkVms);
+document.getElementById("vm-add")?.addEventListener("click",()=>vmAddDialog());
 document.getElementById("vm-target").addEventListener("change",e=>{
   vmTargets=msVals(e.target); vmTarget=vmTargets.length===1?vmTargets[0]:""; renderVmlog();
 });
@@ -5307,7 +5905,8 @@ let AI_USAGE={};
    request and polls the action + run record. Answers arrive as HTML rendered
    server-side by markdown-it with raw HTML disabled. */
 const AI_SECTION_IDS=["overview","work","ws","bugs","prs","vm","raid","team"];
-const AI={open:false, thread:[], busy:false, history:[], section:null};
+const AI={open:false, thread:[], busy:false, history:[], section:null, devops:false};
+function aiSec(){ return AI.devops?"devops":activeSection; }
 function aiHeaders(){
   const h={"Content-Type":"application/json"};
   if(activeSection==="team"&&window.TeamUI&&window.TeamUI.isPrivate&&window.TeamUI.isPrivate()) h["X-Team-Private"]="1";
@@ -5338,7 +5937,8 @@ function aiEnsureDrawer(){
       <button type="button" class="ab-close" id="ai-pop" title="Pop out this conversation into a window" aria-label="Pop out into a window">⧉</button>
       <button type="button" class="ab-close" id="ai-close" aria-label="Close AI panel">&times;</button></div>
     <div class="ai-actions"><button type="button" class="btn primary" id="ai-explain">Explain this view</button>
-      <button type="button" class="btn" id="ai-new">New conversation</button></div>
+      <button type="button" class="btn" id="ai-new">New conversation</button>
+      <label class="ai-devops" title="Answer CI/CD, octl, Grafana and DevOps questions using the devops-expert knowledge"><input type="checkbox" id="ai-devops"> DevOps mode</label></div>
     <div class="ai-thread" id="ai-thread" aria-live="polite"></div>
     <form class="ai-ask" id="ai-ask"><textarea id="ai-q" rows="3" placeholder="Ask about this view… (Ctrl+Enter to send)"></textarea>
       <button type="submit" class="btn primary" id="ai-send">Ask</button></form>
@@ -5354,6 +5954,7 @@ function aiEnsureDrawer(){
   });
   d.querySelector("#ai-explain").addEventListener("click",()=>aiSubmit("explain"));
   d.querySelector("#ai-new").addEventListener("click",()=>{ AI.thread=[]; aiRenderThread(); });
+  d.querySelector("#ai-devops").addEventListener("change",e=>{ AI.devops=e.target.checked; aiOpen(); });
   d.querySelector("#ai-ask").addEventListener("submit",e=>{ e.preventDefault(); aiSubmit("ask"); });
   d.querySelector("#ai-q").addEventListener("keydown",e=>{
     if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){ e.preventDefault(); aiSubmit("ask"); } });
@@ -5370,13 +5971,14 @@ function aiSyncButton(){
   b.hidden=!SERVED||!AI_SECTION_IDS.includes(activeSection);
   b.disabled=AI_USAGE.enabled===false;
   b.title=AI_USAGE.enabled===false?"AI is turned off in Settings":"Explain this view or ask a question (AI)";
-  if(AI.open&&AI.section!==activeSection) aiOpen();
+  if(AI.open&&AI.section!==aiSec()) aiOpen();
 }
 function aiOpen(){
   const d=aiEnsureDrawer();
-  if(AI.section!==activeSection){ AI.thread=[]; AI.section=activeSection; }
+  if(AI.section!==aiSec()){ AI.thread=[]; AI.section=aiSec(); }
   AI.open=true; d.hidden=false;
-  const label=(SECTIONS.find(s=>s.id===activeSection)||{}).label||activeSection;
+  d.querySelector("#ai-devops").checked=AI.devops;
+  const label=AI.devops?"DevOps":((SECTIONS.find(s=>s.id===activeSection)||{}).label||activeSection);
   d.querySelector("#ai-sec").textContent=label;
   d.querySelector("#ai-usage").textContent=aiUsageLabel();
   aiRenderThread(); aiLoadHistory();
@@ -5409,7 +6011,7 @@ function aiRenderThread(){
 async function aiLoadHistory(){
   const ul=document.getElementById("ai-hist"); if(!ul) return;
   try{
-    const r=await fetch("/api/ai/runs?section="+encodeURIComponent(activeSection),{cache:"no-store",headers:aiHeaders()});
+    const r=await fetch("/api/ai/runs?section="+encodeURIComponent(aiSec()),{cache:"no-store",headers:aiHeaders()});
     const j=await r.json();
     if(j.usage){ AI_USAGE=j.usage; const u=document.getElementById("ai-usage"); if(u) u.textContent=aiUsageLabel(); }
     ul.innerHTML=(j.runs||[]).filter(x=>!["auto-review","review-turn"].includes(x.kind)).map(x=>
@@ -5422,8 +6024,9 @@ async function aiShowRun(id){
     const r=await fetch("/api/ai/run/"+encodeURIComponent(id),{cache:"no-store",headers:aiHeaders()});
     const j=await r.json();
     if(!r.ok) throw new Error(j.error||r.status);
+    AI.devops=j.section==="devops";
     if(j.section&&j.section!==activeSection&&AI_SECTION_IDS.includes(j.section)) selectSection(j.section);
-    AI.section=activeSection; aiOpen(); AI.thread=[j]; aiRenderThread();
+    AI.section=aiSec(); aiOpen(); AI.thread=[j]; aiRenderThread();
   }catch(e){ notifyCard({title:"AI",body:String(e.message||e),tone:"bad"}); }
 }
 async function aiLoadRun(id){
@@ -5440,7 +6043,7 @@ async function aiSubmit(kind){
   const question=kind==="ask"?q.value.trim():"";
   if(kind==="ask"&&!question){ q.focus(); return; }
   const last=AI.thread[AI.thread.length-1];
-  const body={kind, section:activeSection, question, focus:aiFocus()};
+  const body={kind, section:aiSec(), question, focus:aiFocus()};
   if(kind==="ask"&&last&&last.status==="done"&&last.session_id) body.parent=last.id;
   AI.busy=true;
   const turn={id:null,kind,question,status:"queued",progress:"queued"};
@@ -5653,7 +6256,6 @@ const SETTING_GROUPS=[
     ["review_timeout_s","Review timeout","seconds per review draft run or interactive-review turn"],
     ["allow_jira_github_reads","Allow Jira / GitHub reads","read-only lookups during AI runs; the only GitHub write is posting an interactive review you confirmed"]]],
   ["machines","Machines",[
-    ["terminal_targets","Terminal machines","comma-separated targets that get a >_ Terminal button"],
     ["live_targets","Live-status machines","comma-separated targets kept on a persistent ssh status link"],
     ["live_interval_s","Live update interval","seconds between probes on the live link"]]],
   ["notify","Notifications",[

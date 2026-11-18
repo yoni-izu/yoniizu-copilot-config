@@ -225,6 +225,506 @@ test("machine rows offer stop only for a running job that still owns its slot", 
   assert.match(source, /cancelled:"stopped from the portal/);
 });
 
+function machineMenuHarness() {
+  const context = vm.createContext({
+    SERVED: true, URL,
+    prefs: {vmHidden: [], vmPanelsHidden: [], machineTarget: ""},
+    esc: s => String(s ?? "").replace(/[&<>"]/g, c =>
+      ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])),
+    VMLOG: {target_state: [], machines: [], terminal_targets: ["vm", "other", "desk"], live: {}},
+    setTimeout: () => 0, clearTimeout: () => {},
+    fetch: async () => ({ok: true, json: async () => ({logins: {}})}),
+  });
+  vm.runInContext(block("function vmStale(", "function vmTargetStrip("), context);
+  vm.runInContext(block("function vmTargetStrip(", "// State of the persistent"), context);
+  vm.runInContext(block("function vmLiveBadge(", "async function vmPower("), context);
+  vm.runInContext(block("const VMSSO=", "async function vmSetMain("), context);
+  return context;
+}
+
+test("SSO login is offered on tracked targets and disabled on a stopped VM", () => {
+  const context = machineMenuHarness();
+  const running = context.vmMachine({name: "Main", id: "i-main", type: "m7i", state: "running", target: "vm", main: true});
+  assert.match(running, /<option value="sso">SSO login<\/option>/);
+  const stopped = context.vmMachine({name: "Other", id: "i-other", type: "m7i", state: "stopped", target: "other"});
+  assert.match(stopped, /<option value="sso" disabled>SSO login \(VM stopped\)<\/option>/);
+  const untracked = context.vmMachine({name: "Loose", id: "i-loose", type: "m7i", state: "running", target: ""});
+  assert.doesNotMatch(untracked, /value="sso"/);
+  context.VMLOG.target_state = [{name: "desk", instance: ""}];
+  assert.match(context.vmTargetStrip(), /<option value="sso">SSO login<\/option>/);
+  context.SERVED = false;
+  assert.match(context.vmActions("desk"), /<option value="sso" disabled>/);
+});
+
+test("SSO card status shows code and only opens AWS SSO links", () => {
+  const context = machineMenuHarness();
+  assert.equal(context.vmSsoOk("https://elmnt.awsapps.com/start/#/device?user_code=ABCD-EFGH"), true);
+  assert.equal(context.vmSsoOk("https://device.sso.eu-central-1.amazonaws.com/?user_code=ABCD-EFGH"), true);
+  for(const bad of ["http://elmnt.awsapps.com/start", "https://evil.com/?x=.awsapps.com",
+                    "https://elmnt.awsapps.com.evil.com/", "javascript:alert(1)", "https://u@elmnt.awsapps.com/"])
+    assert.equal(context.vmSsoOk(bad), false, bad);
+  vm.runInContext("VMSSO", context).logins.vm = {target: "vm", state: "waiting", message: "Waiting", code: "ABCD-EFGH",
+                             url: "https://elmnt.awsapps.com/start/#/device?user_code=ABCD-EFGH"};
+  const html = context.vmSsoHtml("vm");
+  assert.match(html, /ABCD-EFGH/);
+  assert.match(html, /href="https:\/\/elmnt\.awsapps\.com\/start/);
+  assert.match(html, /rel="noopener noreferrer"/);
+  assert.match(html, /class="vm-sso-cancel btn" data-target="vm"/);
+  vm.runInContext("VMSSO", context).logins.vm.url = "https://evil.example/";
+  assert.doesNotMatch(context.vmSsoHtml("vm"), /evil|href=/);
+  vm.runInContext("VMSSO", context).logins.desk = {target: "desk", state: "done", message: "Logged in"};
+  context.VMLOG.target_state = [{name: "desk", instance: ""}];
+  assert.match(context.vmSsoHtml("desk"), /share one home/);
+  assert.doesNotMatch(context.vmSsoHtml("desk"), /Cancel/);
+  assert.equal(context.vmSsoHtml("nobody"), "");
+});
+
+test("SSO pop-up is pointed at the safe link or closed on failure", () => {
+  const context = machineMenuHarness();
+  context.document = {querySelectorAll: () => []};
+  context.setTimeout = () => 1; context.clearTimeout = () => {};
+  const win = () => ({closed: false, opener: {}, replaced: null, shut: false,
+    location: {replace(u) { win.last.replaced = u; }}, close() { this.shut = true; }});
+  let w = win.last = win();
+  vm.runInContext("VMSSO", context).wins.vm = w;
+  context.vmSsoAdopt({vm: {state: "starting"}});
+  assert.equal(w.replaced, null);
+  assert.ok(vm.runInContext("VMSSO", context).wins.vm);
+  context.vmSsoAdopt({vm: {state: "waiting", url: "https://evil.example/"}});
+  assert.equal(w.replaced, null);
+  context.vmSsoAdopt({vm: {state: "waiting", url: "https://elmnt.awsapps.com/start/#/device"}});
+  assert.equal(w.replaced, "https://elmnt.awsapps.com/start/#/device");
+  assert.equal(w.opener, null);
+  assert.equal(vm.runInContext("VMSSO", context).wins.vm, undefined);
+  w = win.last = win();
+  vm.runInContext("VMSSO", context).wins.desk = w;
+  context.vmSsoAdopt({desk: {state: "failed", message: "VM is stopped"}});
+  assert.equal(w.shut, true);
+  assert.equal(vm.runInContext("VMSSO", context).wins.desk, undefined);
+});
+
+test("native machine action menus retain quick controls and protect the main target", () => {
+  const context = machineMenuHarness();
+  const main = {name: "Main", id: "i-main", type: "m7i", state: "running", target: "vm", main: true};
+  const other = {name: "Other", id: "i-other", type: "m7i", state: "stopped", target: "other"};
+  const mainHtml = context.vmMachine(main);
+  const mainMenu = mainHtml.match(/<select class="vm-actions"[^]*?<\/select>/)[0];
+  assert.match(mainMenu, /aria-label="Actions for vm"/);
+  assert.match(mainMenu, /<option value="provision">Provision<\/option>/);
+  assert.doesNotMatch(mainMenu, /value="main"|value="remove"|<button/);
+  const mainQuick = mainHtml.replace(mainMenu, "");
+  assert.match(mainQuick, /class="vm-term" data-target="vm"/);
+  assert.match(mainQuick, /class="vm-trf" data-target="vm"/);
+  assert.match(mainQuick, /class="vm-pw stop"/);
+
+  const otherHtml = context.vmMachine(other);
+  const otherMenu = otherHtml.match(/<select class="vm-actions"[^]*?<\/select>/)[0];
+  assert.match(otherMenu, /value="provision"/);
+  assert.match(otherMenu, /value="main"/);
+  assert.match(otherMenu, /value="remove"/);
+  const otherQuick = otherHtml.replace(otherMenu, "");
+  assert.match(otherQuick, /class="vm-term" data-target="other" disabled/);
+  assert.match(otherQuick, /class="vm-pw start"/);
+  assert.match(context.vmMachine({...other, state: "pending"}), /class="vm-pw start"[^>]* disabled/);
+
+  const unbound = context.vmMachine({...other, target: ""});
+  assert.match(unbound, /value="main"/);
+  assert.match(unbound, /value="add"/);
+  assert.doesNotMatch(unbound, /value="provision"|value="remove"/);
+  assert.match(mainHtml, /<option value="">\u22ef<\/option>|<option value="">⋯<\/option>/);
+  assert.match(mainHtml, /class="vm-fold" data-vm-fold="i-main" aria-expanded="true" aria-label="Collapse Main"/);
+  assert.match(mainHtml, /<dt>Instance<\/dt><dd>i-main · m7i<\/dd>/);
+  context.SERVED = false;
+  assert.match(context.vmMachine(main), /<select class="vm-actions"[^>]* disabled>/);
+  assert.match(context.vmMachine(main), /<option value="provision" disabled>/);
+  assert.doesNotMatch(context.vmMachine(main), /value="hide"/);
+  context.prefs.vmHidden = ["i-main"];
+  const folded = context.vmMachine(main);
+  assert.match(folded, /class="vm-card main folded"/);
+  assert.match(folded, /aria-expanded="false" aria-label="Expand Main"/);
+  assert.doesNotMatch(folded, /vm-actions|vm-kv|vm-pw/);
+});
+
+test("lab targets offer native menus and escape labels", () => {
+  const context = machineMenuHarness();
+  context.VMLOG.machines = [{id: "i-main"}];
+  context.VMLOG.target_state = [
+    {name: "vm", instance: "i-main"},
+    {name: "desk", instance: ""},
+    {name: "retired", instance: "i-gone"},
+  ];
+  const html = context.vmTargetStrip();
+  const menus = Array.from(html.matchAll(/<select class="vm-actions"[^]*?<\/select>/g), m => m[0]);
+  assert.equal(menus.length, 1);
+  assert.match(menus[0], /data-target="desk"/);
+  assert.match(menus[0], /value="provision"/);
+  assert.match(menus[0], /value="remove"/);
+  assert.match(html, /<option value="retired">retired \(VM target\)<\/option>/);
+  assert.doesNotMatch(menus.join(""), /<button/);
+  assert.match(html, /class="vm-trf" data-target="desk"/);
+  assert.doesNotMatch(html, /<b>vm<\/b>/);
+  const escaped = context.vmActions('a"<&');
+  assert.match(escaped, /data-target="a&quot;&lt;&amp;"/);
+  assert.match(escaped, /aria-label="Actions for a&quot;&lt;&amp;"/);
+  context.prefs.machineTarget = "retired";
+  const selected = context.vmTargetStrip();
+  assert.match(selected, /<option value="retired" selected>/);
+  assert.match(selected, /class="vm-actions"[^>]*data-target="retired"/);
+  assert.doesNotMatch(selected, /class="vm-actions"[^>]*data-target="desk"/);
+  context.prefs.machineTarget = "no-longer-registered";
+  assert.match(context.vmTargetStrip(), /<option value="desk" selected>/);
+});
+
+test("lab machine cards offer a BMC terminal and Set BMC; VMs do not", () => {
+  const context = machineMenuHarness();
+  context.VMLOG.target_state = [{name: "desk", instance: "", bmc: "bmc-sa-els23-csr"}];
+  const html = context.vmTargetStrip();
+  assert.match(html, /<button class="vm-bmc" data-target="desk" title="[^"]*bmc-sa-els23-csr[^"]*">&gt;_ BMC<\/button>/);
+  assert.match(html, /<dt>BMC<\/dt><dd>bmc-sa-els23-csr<\/dd>/);
+  assert.match(html, /<option value="bmc">Set BMC\u2026<\/option>|<option value="bmc">Set BMC…<\/option>/);
+  context.VMLOG.target_state = [{name: "desk", instance: ""}];
+  const none = context.vmTargetStrip();
+  assert.match(none, /class="vm-bmc" data-target="desk" disabled title="No BMC set/);
+  assert.doesNotMatch(none, /<dt>BMC/);
+  context.VMLOG.target_state = [{name: "vm-old", instance: "i-gone"}];
+  const vmTarget = context.vmTargetStrip();
+  assert.doesNotMatch(vmTarget, /vm-bmc|value="bmc"/);
+  assert.doesNotMatch(context.vmMachine({name: "Main", id: "i-main", type: "m7i", state: "running", target: "vm", main: true}),
+                      /vm-bmc|value="bmc"/);
+  const opened = [];
+  context.termOpen = (spec, name) => opened.push([spec, name]);
+  const btn = {dataset: {target: "desk"}, addEventListener(e, cb) { this.click = cb; }};
+  context.vmBindTerms({querySelectorAll: sel => sel === ".vm-bmc" ? [btn] : []});
+  btn.click();
+  assert.deepEqual(JSON.parse(JSON.stringify(opened)), [[{kind: "bmc", target: "desk"}, "bmc-desk"]]);
+});
+
+test("Set BMC prompts, sends the trimmed host or clears it, and skips no-ops", async () => {
+  const context = machineMenuHarness();
+  vm.runInContext(block("async function vmTargetPost(", "async function vmRemoveTarget("), context);
+  const posts = [], note = {textContent: ""};
+  context.document = {getElementById: () => note};
+  context.VMLOG.target_state = [{name: "desk", bmc: "bmc-old"}];
+  context.vmTargetPost = async body => posts.push(body);
+  for(const answer of [null, "bmc-old", "  root@bmc-new ", ""]){
+    context.prompt = () => answer;
+    await context.vmSetBmc("desk");
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(posts)),
+    [{action: "bmc", name: "desk", bmc: "root@bmc-new"}, {action: "bmc", name: "desk", bmc: ""}]);
+  context.vmTargetPost = async () => { throw new Error("bad host"); };
+  context.prompt = () => "x";
+  await context.vmSetBmc("desk");
+  assert.equal(note.textContent, "Set BMC failed: bad host");
+  context.SERVED = false;
+  context.prompt = () => { throw new Error("must not prompt"); };
+  await context.vmSetBmc("desk");
+});
+
+test("native menu dispatch resets selection and does nothing in static mode", () => {
+  const context = machineMenuHarness();
+  const calls = [];
+  const select = {
+    value: "", dataset: {target: "desk", id: "i-other"},
+    addEventListener(event, callback) { assert.equal(event, "change"); this.change = callback; },
+  };
+  context.vmProvision = target => calls.push(["provision", target]);
+  context.vmSetMain = id => calls.push(["main", id]);
+  context.vmRemoveTarget = target => calls.push(["remove", target]);
+  context.vmAddDialog = id => calls.push(["add", id]);
+  context.vmSsoStart = target => calls.push(["sso", target]);
+  context.vmSetBmc = target => calls.push(["bmc", target]);
+  context.vmBindActions({querySelectorAll: sel => sel === ".vm-actions" ? [select] : []});
+  for(const action of ["provision", "main", "remove", "add", "sso", "bmc", ""]){
+    select.value = action;
+    select.change();
+    assert.equal(select.value, "");
+  }
+  assert.deepEqual(calls, [["provision", "desk"], ["main", "i-other"], ["remove", "desk"], ["add", "i-other"], ["sso", "desk"], ["bmc", "desk"]]);
+  context.SERVED = false;
+  select.value = "provision";
+  select.change();
+  assert.equal(calls.length, 6);
+  assert.equal(select.value, "");
+});
+
+test("machine rendering binds action menus with or without EC2 cards", () => {
+  const context = machineMenuHarness(), calls = [];
+  const menu = {
+    dataset: {target: "other", id: "i-other"}, value: "", events: {},
+    addEventListener(event, callback) { this.events[event] = callback; },
+  };
+  const box = {
+    innerHTML: "",
+    querySelector: () => ({addEventListener() {}, focus() {}}),
+    querySelectorAll(selector) {
+      return selector === ".vm-actions" ? [menu] : [];
+    },
+  };
+  context.document = {getElementById: () => box};
+  context.SERVED = true;
+  context.confirm = () => true;
+  context.vmProvision = target => calls.push({target});
+  context.vmSetMain = id => calls.push({main: id});
+  context.gfDash = () => "";
+  context.VMLOG.machines = [
+    {name: "Other", id: "i-other", type: "test", state: "running", target: "other"},
+  ];
+  context.VMLOG.target_state = [{name: "other", instance: "i-other"}];
+  context.renderVmMachines();
+  assert.match(box.innerHTML, /data-target="other" data-id="i-other"/);
+  menu.value = "provision";
+  menu.events.change();
+  menu.value = "main";
+  menu.events.change();
+  assert.equal(calls[0].target, "other");
+  assert.equal(calls[1].main, "i-other");
+  context.renderVmMachines();
+  assert.match(box.innerHTML, /<select class="vm-actions" title="More actions"/);
+
+  context.VMLOG.machines = [];
+  context.VMLOG.target_state = [{name: "desk", instance: ""}];
+  menu.dataset.target = "desk";
+  context.renderVmMachines();
+  assert.match(box.innerHTML, /data-target="desk"/);
+  menu.value = "provision";
+  menu.events.change();
+  assert.equal(calls[2].target, "desk");
+});
+
+test("provision still requires confirmation and is unavailable in static mode", () => {
+  const context = machineMenuHarness();
+  const note = {textContent: ""}, calls = [], prompts = [];
+  let approved = false;
+  context.SERVED = true;
+  context.document = {getElementById: () => note};
+  context.confirm = message => { prompts.push(message); return approved; };
+  context.termOpen = (spec, name) => calls.push({spec, name});
+  context.vmProvision("desk");
+  assert.equal(calls.length, 0);
+  assert.match(prompts[0], /stopped VM is started first/);
+  approved = true;
+  context.vmProvision("desk");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].spec.kind, "provision");
+  assert.equal(calls[0].spec.target, "desk");
+  assert.equal(calls[0].name, "prov-desk");
+  context.SERVED = false;
+  context.vmProvision("desk");
+  assert.equal(calls.length, 1);
+  assert.equal(prompts.length, 2);
+  assert.equal(note.textContent, "Serve the portal to provision");
+});
+
+test("card fold arrows and the machine selector retain preferences across renders", () => {
+  const context = machineMenuHarness();
+  const control = dataset => ({dataset, events: {}, focus() { this.focused = true; },
+    addEventListener(event, callback) { this.events[event] = callback; }});
+  const folds = {}, picker = control({});
+  const fold = key => (folds[key] ||= control({vmFold: key}));
+  const box = {
+    innerHTML: "",
+    querySelector: selector => {
+      const m = selector.match(/data-vm-fold="([^"]+)"/);
+      if(m) return fold(m[1]);
+      return selector === "#vm-machine-pick" && /id="vm-machine-pick"/.test(box.innerHTML) ? picker : null;
+    },
+    querySelectorAll: selector => selector === "[data-vm-fold]"
+      ? Array.from(box.innerHTML.matchAll(/data-vm-fold="([^"]+)"/g), m => fold(m[1])) : [],
+  };
+  context.document = {getElementById: () => box};
+  context.gfDash = () => "";
+  context.savePrefs = changes => Object.assign(context.prefs, changes);
+  context.VMLOG.machines = [
+    {id:"i-11111111",name:"One",state:"running"},
+    {id:"i-22222222",name:"Two",state:"stopped"},
+  ];
+  context.VMLOG.target_state = [{name:"desk-a"},{name:"desk-b",error:"SSH refused"}];
+  context.VMLOG.terminal_targets = ["desk-a", "desk-b"];
+  context.prefs.vmHidden = ["i-11111111"];
+  context.renderVmMachines();
+  assert.equal((box.innerHTML.match(/<article class="vm-card/g)||[]).length, 3);
+  assert.equal((box.innerHTML.match(/<article class="vm-card folded"/g)||[]).length, 1);
+  assert.doesNotMatch(box.innerHTML, /Hidden VMs|vm-restore|data-vm-panel/);
+  assert.match(box.innerHTML, /<select id="vm-machine-pick" class="vm-pick"/);
+  assert.match(box.innerHTML, /<option value="desk-a" selected>/);
+  picker.events.change({target:{value:"desk-b"}});
+  assert.equal(context.prefs.machineTarget, "desk-b");
+  assert.match(box.innerHTML, /SSH refused/);
+  assert.match(box.innerHTML, /class="vm-term" data-target="desk-b"/);
+  fold("i-11111111").events.click();
+  assert.deepEqual([...context.prefs.vmHidden], []);
+  assert.equal(fold("i-11111111").focused, true);
+  fold("i-22222222").events.click();
+  assert.deepEqual([...context.prefs.vmHidden], ["i-22222222"]);
+  fold("machine-card").events.click();
+  assert.deepEqual([...context.prefs.vmPanelsHidden], ["machine-card"]);
+  assert.doesNotMatch(box.innerHTML, /SSH refused/);
+  fold("vms").events.click();
+  fold("machines").events.click();
+  assert.deepEqual([...context.prefs.vmPanelsHidden], ["machine-card", "vms", "machines"]);
+  assert.doesNotMatch(box.innerHTML, /<article class="vm-card/);
+  assert.match(box.innerHTML, /data-vm-fold="vms" aria-expanded="false"/);
+  context.VMLOG.target_state = [{name:"desk-a"}];
+  context.prefs.vmPanelsHidden = [];
+  context.renderVmMachines();
+  assert.doesNotMatch(box.innerHTML, /vm-machine-pick/);
+  assert.match(box.innerHTML, /<h4>desk-a<\/h4>/);
+});
+
+test("set as main still requires confirmation and sends the selected instance", async () => {
+  const context = machineMenuHarness();
+  const note = {textContent: ""}, button = {disabled: false, textContent: ""}, requests = [];
+  let approved = false;
+  context.SERVED = true;
+  context.document = {getElementById: () => note, querySelectorAll: () => [button]};
+  context.confirm = () => approved;
+  context.fetch = async (url, options) => {
+    requests.push({url, options});
+    return {ok: true, json: async () => ({machines: [], jobs: []})};
+  };
+  context.vmAdoptPayload = () => {};
+  context.renderVmlog = () => {};
+  context.buildSections = () => {};
+  vm.runInContext(block("async function vmSetMain(", "function vmRow("), context);
+  await context.vmSetMain("i-other", button);
+  assert.equal(requests.length, 0);
+  approved = true;
+  await context.vmSetMain("i-other", button);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/vm-main");
+  assert.equal(requests[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {id: "i-other"});
+  context.SERVED = false;
+  await context.vmSetMain("i-other", button);
+  assert.equal(requests.length, 1);
+  assert.equal(note.textContent, "Serve the portal to change the Main VM");
+});
+
+test("target mutations adopt the full payload, preserve errors, and confirm removal", async () => {
+  const context = machineMenuHarness(), requests = [], adopted = [];
+  const note = {textContent: ""};
+  context.document = {getElementById: () => note};
+  context.vmAdoptPayload = data => adopted.push(data);
+  context.renderVmlog = () => {};
+  context.buildSections = () => {};
+  let approved = false, ok = true;
+  context.confirm = () => approved;
+  context.fetch = async (url, opts) => {
+    requests.push({url, body: JSON.parse(opts.body)});
+    return {ok, json: async () => ok ? {targets: ["vm"], jobs: [], message: "Removed"} : {error: "running jobs"}};
+  };
+  vm.runInContext(block("async function vmTargetPost(", "function vmRow("), context);
+  await context.vmRemoveTarget("desk");
+  assert.equal(requests.length, 0);
+  approved = true;
+  await context.vmRemoveTarget("desk");
+  assert.deepEqual(requests[0], {url: "/api/vm-target", body: {action: "remove", name: "desk"}});
+  assert.equal(adopted.length, 1);
+  assert.equal(note.textContent, "Removed");
+  ok = false;
+  await context.vmRemoveTarget("desk");
+  assert.match(note.textContent, /Remove tracking failed: running jobs/);
+  assert.equal(adopted.length, 1);
+  context.SERVED = false;
+  await context.vmRemoveTarget("desk");
+  assert.equal(requests.length, 2);
+});
+
+test("machine cards mark the Main VM and offer Set as main on the others", () => {
+  const context = vm.createContext({
+    SERVED: true,
+    esc: s => String(s), VMLOG: {target_state: [], machines: [], terminal_targets: [], live: {}},
+  });
+  vm.runInContext(block("function vmStale(", "function vmTargetStrip("), context);
+  vm.runInContext(block("function vmTermBtn(", "function vmBindTerms("), context);
+  vm.runInContext(block("function vmTargetBtn(", "function vmBindTargetRefresh("), context);
+  vm.runInContext(block("function vmProvBadge(", "// A shell on the machine"), context);
+  vm.runInContext(block("function vmMachine(", "async function vmPower("), context);
+  vm.runInContext(block("const VMSSO=", "async function vmSetMain("), context);
+  context.prefs = {vmHidden: [], vmPanelsHidden: []};
+  const m = {name: "me-personal", id: "i-012e7b37b8bfe283b", type: "m7i", state: "running", target: "vm"};
+  const main = context.vmMachine({...m, main: true});
+  assert.match(main, /class="vm-card main"/);
+  assert.match(main, /class="vm-main"/);
+  assert.doesNotMatch(main, /value="main"/);
+  const other = context.vmMachine({...m, id: "i-0ebef8d9fb0fc8d84", target: "vm-0ebef8", main: false});
+  assert.match(other, /value="main">Set as main/);
+  assert.match(other, /i-0ebef8d9fb0fc8d84 \u00b7 m7i|i-0ebef8d9fb0fc8d84 · m7i/);
+  assert.match(source, /fetch\("\/api\/vm-main"/);
+});
+
+test("machine cards show power memory, a predicted stop and provisioning", () => {
+  const context = vm.createContext({
+    SERVED: true,
+    esc: s => String(s),
+    VMLOG: {terminal_targets: [], live: {}, machines: [],
+            target_state: [{name: "vm", provision: {recipes: [{recipe: "rtl", status: "fail", note: "x"}],
+                                                    ok: false, failed: ["rtl"], todo: [], last_age_h: "1h"}}]},
+  });
+  vm.runInContext(block("function vmStale(", "function vmTargetStrip("), context);
+  vm.runInContext(block("function vmTermBtn(", "function vmBindTerms("), context);
+  vm.runInContext(block("function vmTargetBtn(", "function vmBindTargetRefresh("), context);
+  vm.runInContext(block("function vmProvBadge(", "// A shell on the machine"), context);
+  vm.runInContext(block("function vmMachine(", "async function vmPower("), context);
+  vm.runInContext(block("const VMSSO=", "async function vmSetMain("), context);
+  context.prefs = {vmHidden: [], vmPanelsHidden: []};
+  const m = {name: "me", id: "i-012e7b37b8bfe283b", type: "m7i", state: "running", target: "vm",
+             started_ago_h: "12m", started_by: "auto", stop_in_h: "18m", stop_ts: 1794928000};
+  const card = context.vmMachine(m);
+  assert.match(card, /started 12m ago \(auto\)/);
+  assert.match(card, /predicted stop .* \(in 18m\)/);
+  assert.match(card, /class="vm-prov bad"[^>]*>provision \u26a0 rtl|class="vm-prov bad"[^>]*>provision ⚠ rtl/);
+  assert.match(card, /value="provision">Provision/);
+  const gone = context.vmMachine({...m, predicted_stopped: true, stopped_ago_h: "5m"});
+  assert.match(gone, /lease ended 5m ago/);
+  assert.doesNotMatch(gone, /predicted stop/);
+  context.VMLOG.target_state = [{name: "vm", provision: {recipes: []}}];
+  assert.match(context.vmMachine(m), /unprovisioned/);
+  assert.match(source, /termOpen\(\{kind:"provision"/);
+});
+
+test("target strip keeps a bound target whose instance octl no longer lists", () => {
+  const context = vm.createContext({
+    SERVED: true,
+    prefs: {machineTarget: "", vmHidden: [], vmPanelsHidden: []},
+    esc: s => String(s),
+    VMLOG: {machines: [{id: "i-1"}], terminal_targets: [], live: {},
+            target_state: [{name: "vm", instance: "i-1"}, {name: "vm-gone", instance: "i-2"},
+                           {name: "dsk61", instance: ""}]},
+  });
+  vm.runInContext(block("function vmStale(", "function renderVmMachines("), context);
+  vm.runInContext(block("function vmTargetStrip(", "// State of the persistent"), context);
+  vm.runInContext("function vmLiveBadge(){return ''} function vmTermBtn(){return ''} function vmTargetBtn(){return ''} function vmSsoSlot(){return ''} function vmActions(){return ''} function vmBmcBtn(){return ''} function vmFlashBtn(){return ''} function vmFlashLine(){return ''}", context);
+  const html = context.vmTargetStrip();
+  assert.match(html, /<option value="vm-gone"( selected)?>vm-gone \(VM target\)/);
+  assert.match(html, /dsk61/);
+  assert.doesNotMatch(html, /<option value="vm"[ >]/);
+});
+
+test("Flash FW: lab-only button, running badge, last run line, guarded stop", () => {
+  const context = vm.createContext({SERVED: true, esc: s => String(s),
+    VMLOG: {jobs: [
+      {id: "f1", kind: "flash", target: "srv22", status: "failed", rc: 2, started: "2026-01-01T00:00:00",
+       method: "bmc", image: "iridium/t", oams: [1, 3]},
+      {id: "f2", kind: "flash", target: "dsk61", status: "running", started: "2026-01-02T00:00:00"}]}});
+  vm.runInContext(block("function vmFlashRunning(", "function flashWindow("), context);
+  vm.runInContext(block("function vmCancelButton(", "function vmFlashProgressBtn("), context);
+  vm.runInContext(block("function vmFlashProgressBtn(", "async function vmCancel("), context);
+  assert.equal(context.vmFlashBtn({name: "vm", instance: "i-1"}), "");
+  assert.match(context.vmFlashBtn({name: "srv22", instance: ""}), /class="vm-flash" data-target="srv22"/);
+  assert.match(context.vmFlashBtn({name: "dsk61", instance: ""}), /vm-flash-open live" data-id="f2"/);
+  const line = context.vmFlashLine({name: "srv22"});
+  assert.match(line, /bmc iridium\/t \u2192 OAM 1,3/);
+  assert.match(line, /not verified/);
+  assert.equal(context.vmFlashLine({name: "none"}), "");
+  const w = {id: "f2", kind: "flash", target: "dsk61", status: "running", pid: 5, phase: "write", cancellable: false};
+  assert.match(context.vmCancelButton(w), /disabled/);
+  assert.match(context.vmCancelButton({...w, phase: "upload", cancellable: true}), /class="vm-cancel" data-id="f2"/);
+  assert.match(context.vmFlashProgressBtn(w), /vm-flash-open/);
+  assert.equal(context.vmFlashProgressBtn({kind: "build"}), "");
+});
+
 test("RAID Open only hides closed rows and retains them when cleared", () => {
   const elements = {"raid-openonly": {checked: true}};
   const context = vm.createContext({
@@ -1203,7 +1703,8 @@ test("browser prefs are validated and drive nav order and visibility", () => {
   assert.equal(context.readPrefs("{broken", ids).clock, "auto");
   const p = context.readPrefs(JSON.stringify({landing: "bugs", hidden: ["work", "settings", "nope"],
     order: ["bugs", "bugs", "x", "overview"], clock: "24", compact: true,
-    actionPollMs: 7, vmPollMs: 30000}), ids);
+    actionPollMs: 7, vmPollMs: 30000, vmHidden:["i-11111111","bad",null,"i-11111111"],
+    vmPanelsHidden:["vms","machines","other","vms"], machineTarget:"desk-b"}), ids);
   assert.equal(p.landing, "bugs");
   assert.deepEqual([...p.hidden], ["work"]);
   assert.deepEqual([...p.order], ["bugs", "overview"]);
@@ -1211,6 +1712,9 @@ test("browser prefs are validated and drive nav order and visibility", () => {
   assert.equal(p.compact, true);
   assert.equal(p.actionPollMs, 1500);
   assert.equal(p.vmPollMs, 30000);
+  assert.deepEqual([...p.vmHidden], ["i-11111111"]);
+  assert.deepEqual([...p.vmPanelsHidden], ["vms","machines"]);
+  assert.equal(p.machineTarget, "desk-b");
   assert.equal(context.readPrefs(JSON.stringify({landing: "gone"}), ids).landing, "last");
   assert.deepEqual(context.navSections(sections, p).map(s => s.id), ["bugs", "overview", "settings"]);
 });

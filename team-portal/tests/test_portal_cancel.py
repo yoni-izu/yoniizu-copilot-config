@@ -236,6 +236,90 @@ class EndpointTests(unittest.TestCase):
         with patch.object(portal, "start_vm_cancel_job", side_effect=ValueError("not running")):
             self.assertEqual(handler("/api/vm-cancel", {"id": "j1"}).do_POST()[0], 409)
 
+    def test_vm_main_endpoint(self):
+        iid = "i-012e7b37b8bfe283b"
+        fake = SimpleNamespace(portal_set_main=Mock(return_value={"machines": [], "main_instance": iid}))
+        with patch.object(portal, "vd", fake):
+            for bad in ({}, {"id": 3}, {"id": "vm"}, {"id": "i-xyz"}, {"id": iid, "user": "x"},
+                        {"id": iid + "; rm"}):
+                self.assertEqual(handler("/api/vm-main", bad).do_POST()[0], 400, bad)
+            status, _ = handler("/api/vm-main", {"id": iid},
+                                {"Origin": "http://evil.example", "Host": "h"}).do_POST()
+            self.assertEqual(status, 403)
+            fake.portal_set_main.assert_not_called()
+            status, body = handler("/api/vm-main", {"id": iid}).do_POST()
+            self.assertEqual((status, body["main_instance"]), (200, iid))
+            fake.portal_set_main.assert_called_once_with(iid)
+            fake.portal_set_main.return_value = {"error": "not one of your VMs"}
+            self.assertEqual(handler("/api/vm-main", {"id": iid}).do_POST()[0], 400)
+            self.assertTrue(portal.VM_REFRESH_LOCK.acquire(blocking=False))
+            try:
+                self.assertEqual(handler("/api/vm-main", {"id": iid}).do_POST()[0], 409)
+            finally:
+                portal.VM_REFRESH_LOCK.release()
+        with patch.object(portal, "vd", None):
+            self.assertEqual(handler("/api/vm-main", {"id": iid}).do_POST()[0], 503)
+
+    def test_vm_target_endpoint(self):
+        data = {"action": "remove", "name": "desk"}
+        result = {"jobs": [], "targets": [], "machines": [], "message": "Target desk removed"}
+        fake = SimpleNamespace(portal_target=Mock(return_value=result))
+        live = Mock()
+        with patch.object(portal, "vd", fake), patch.object(portal, "LIVE", live), \
+                patch.object(portal, "vmlog_payload", return_value=result):
+            status, _ = handler("/api/vm-target", data,
+                                {"Origin": "http://evil.example", "Host": "h"}).do_POST()
+            self.assertEqual(status, 403)
+            fake.portal_target.assert_not_called()
+            self.assertEqual(handler("/api/vm-target", data).do_POST(), (200, result))
+            fake.portal_target.assert_called_once_with(data)
+            live.sync.assert_called_once()
+            fake.portal_target.side_effect = ValueError("running jobs")
+            self.assertEqual(handler("/api/vm-target", data).do_POST()[0], 400)
+            self.assertFalse(portal.VM_REFRESH_LOCK.locked())
+            fake.portal_target.side_effect = OSError("storage unavailable")
+            self.assertEqual(handler("/api/vm-target", data).do_POST()[0], 500)
+            fake.portal_target.side_effect = None
+            fake.portal_target.return_value = {"error": "mctl failed"}
+            self.assertEqual(handler("/api/vm-target", data).do_POST()[0], 400)
+            with portal.VM_REFRESH_LOCK:
+                self.assertEqual(handler("/api/vm-target", data).do_POST()[0], 409)
+        with patch.object(portal, "vd", None):
+            self.assertEqual(handler("/api/vm-target", data).do_POST()[0], 503)
+
+    def test_removed_targets_are_not_enabled_for_live_status(self):
+        cfg = {"live_targets": ["desk"], "live_interval_s": 15}
+        with patch.object(portal.portal_settings, "load", return_value={"machines": cfg}), \
+                patch.object(portal, "vd", SimpleNamespace(targets=lambda: ["vm"])):
+            self.assertEqual(portal.registered_machine_settings(),
+                             {"live_targets": [], "live_interval_s": 15})
+            self.assertEqual(cfg["live_targets"], ["desk"], "saved settings must not be rewritten")
+
+    def test_every_registered_target_gets_a_terminal(self):
+        fake = SimpleNamespace(targets=lambda: ["vm", "desk"])
+        with patch.object(portal, "vd", fake):
+            self.assertEqual(portal.term_spec({"kind": "shell", "target": "desk"})["target"], "desk")
+            with self.assertRaises(portal.terminal.TermError):
+                portal.term_spec({"kind": "shell", "target": "gone"})
+        with patch.object(portal, "vd", None), self.assertRaises(portal.terminal.TermError):
+            portal.term_spec({"kind": "shell", "target": "vm"})
+
+    def test_bmc_terminal_needs_a_registered_bmc(self):
+        fake = SimpleNamespace(targets=lambda: ["vm", "desk"], target_bmcs=lambda: {"desk": "bmc-desk"})
+        with patch.object(portal, "vd", fake):
+            self.assertEqual(portal.term_spec({"kind": "bmc", "target": "desk"})["argv"][1:], ["-t", "desk", "bmc"])
+            for target in ("vm", "gone", ""):
+                with self.assertRaises(portal.terminal.TermError):
+                    portal.term_spec({"kind": "bmc", "target": target})
+
+    def test_legacy_terminal_targets_setting_is_ignored_not_rejected(self):
+        out = portal.portal_settings.validate(
+            {"machines": {"terminal_targets": ["vm"], "live_targets": ["vm", "desk"]}})
+        self.assertNotIn("terminal_targets", out["machines"])
+        self.assertEqual(out["machines"]["live_targets"], ["vm", "desk"])
+        with self.assertRaises(portal.portal_settings.SettingsError):
+            portal.portal_settings.validate({"machines": {"bogus": 1}})
+
 
 if __name__ == "__main__":
     unittest.main()

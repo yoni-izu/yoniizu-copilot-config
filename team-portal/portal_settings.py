@@ -59,9 +59,9 @@ DEFAULTS: dict[str, Any] = {
         "review_timeout_s": 2400,
         "allow_jira_github_reads": True,
     },
-    # Machines with a browser terminal and/or a persistent SSH live-status link.
+    # Machines kept on a persistent SSH live-status link. Every registered
+    # target gets a terminal; the old "terminal_targets" key is ignored.
     "machines": {
-        "terminal_targets": ["vm"],
         "live_targets": ["vm"],
         "live_interval_s": 15,
     },
@@ -99,6 +99,10 @@ class RevisionConflict(Exception):
 
 class ApplyError(RuntimeError):
     """The timer could not be updated; settings were rolled back (HTTP 500)."""
+
+
+# Retired keys still found in saved files; dropped instead of failing validation.
+LEGACY_KEYS = {"machines": {"terminal_targets"}}
 
 
 def _merge(base: dict, extra: dict) -> dict:
@@ -177,7 +181,10 @@ def validate(data: Any) -> dict:
             raise SettingsError(f"routine.steps maps {', '.join(ROUTINE_STEPS)} to true/false")
     extra = {"routine": routine}
     for group in ("ai", "machines", "notify"):
-        extra[group] = _validate_group(group, data.get(group, {}))
+        values = data.get(group, {})
+        if isinstance(values, dict) and LEGACY_KEYS.get(group):
+            values = {k: v for k, v in values.items() if k not in LEGACY_KEYS[group]}
+        extra[group] = _validate_group(group, values)
     return _merge(DEFAULTS, extra)
 
 

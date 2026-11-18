@@ -77,12 +77,27 @@ class TokenTests(unittest.TestCase):
         tok = terminal.issue_token(spec, now=1000.0)
         self.assertIsNone(terminal.take_token(tok, now=1000.0 + terminal.TOKEN_TTL + 1))
 
-    def test_shell_spec_only_for_configured_targets(self):
+    def test_shell_spec_only_for_registered_targets(self):
         with self.assertRaises(terminal.TermError):
             terminal.shell_spec("dsk61", ["vm"])
         spec = terminal.shell_spec("vm", ["vm"])
         self.assertEqual(spec["argv"][1:4], ["-t", "vm", "term"])
         self.assertIn("tmux new -A -s portal", spec["argv"][-1])
+
+    def test_provision_spec_only_for_registered_targets(self):
+        with self.assertRaises(terminal.TermError):
+            terminal.provision_spec("evil;rm", ["vm"])
+        spec = terminal.provision_spec("dsk61", ["vm", "dsk61"])
+        self.assertEqual(spec["argv"][1:], ["-t", "dsk61", "provision"])
+        self.assertEqual(spec["kind"], "provision")
+
+    def test_bmc_spec_only_for_targets_with_a_bmc(self):
+        with self.assertRaises(terminal.TermError):
+            terminal.bmc_spec("vm", {"dsk61": "bmc-sa-dsk61-csr"})
+        spec = terminal.bmc_spec("dsk61", {"dsk61": "bmc-sa-dsk61-csr"})
+        self.assertEqual(spec["argv"][1:], ["-t", "dsk61", "bmc"])
+        self.assertEqual(spec["kind"], "bmc")
+        self.assertIn("bmc-sa-dsk61-csr", spec["title"])
 
     def test_log_spec_quotes_remote_script_and_passes_errors(self):
         spec = terminal.log_spec({"mode": "remote", "target": "vm", "title": "x",
@@ -90,9 +105,12 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(spec["argv"][-1], "bash -lc 'echo '\"'\"'a'\"'\"'; tail b.log'")
         with self.assertRaises(terminal.TermError):
             terminal.log_spec({"error": "gone"})
-        # Logs are only ever shown on their machine; no local viewer.
+        # Local-runner jobs (fw flash) run here, so their log is viewed here;
+        # the view must be a vd-built command, never a client argv.
         with self.assertRaises(terminal.TermError):
             terminal.log_spec({"mode": "local", "argv": ["less", "/x"], "title": "y"})
+        spec = terminal.log_spec({"mode": "local", "command": "tail -n 5 /x", "title": "y"})
+        self.assertEqual(spec["argv"], ["bash", "-c", "tail -n 5 /x"])
 
 
 class SessionTests(unittest.TestCase):

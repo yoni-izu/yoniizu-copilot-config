@@ -103,6 +103,20 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("Jobs delegated to a VM or lab machine that are still running", client)
         self.assertIn('if(id==="vm") return (VMLOG.running||[]).length;', client)
 
+    def test_machine_action_menu_assets_in_served_and_static_html(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        self.assertIn('<select class="vm-actions"', static)
+        self.assertIn(".vm-actions { width:auto; field-sizing:content", static)
+        self.assertIn(".vm-fold { position:absolute; left:0", static)
+        self.assertIn('id="vm-add"', static)
+        self.assertIn('id="vm-add"', served)
+        self.assertNotIn('class="vm-more"', static)
+        self.assertRegex(served, r'src="/assets/portal\.js\?v=\d+"')
+        self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
+
     def test_team_notes_disclosure_assets_in_served_and_static_html(self):
         with patch.object(portal.wm, "load", return_value={}), \
                 patch.object(portal, "boot_payload", return_value="{}"):

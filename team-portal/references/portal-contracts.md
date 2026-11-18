@@ -50,8 +50,7 @@ Three tiles:
     (separate cap, default 150, 0 disables), run timeout, review timeout and
     whether Explain/Ask may *read* Jira/GitHub. The routine's `ai` step toggle sits with
     the other step toggles.
-  - **Machines**: terminal targets (get a `>_ Terminal` button), live-status targets
-    (persistent ssh link) and the live update interval (5–300 s).
+  - **Machines**: live-status targets (persistent ssh link) and the live update interval (5–300 s).
   - **Notifications**: master switch, the four kinds (action queue, machine jobs, AI,
     machine reachability) and the Windows toast fallback.
 - **Routine status**: timer active/enabled, next and last trigger, linger, last brief result, and any schedule problem.
@@ -672,6 +671,9 @@ run as the always-on systemd user service `pipeline-explorer.service` on
 - **⇢ Pipelines ▾** in the PR toolbar opens the explorer's views: open PRs & merge queue,
   pipeline history, integration queue, branch timeline, manifest versions, BKC, diagnostics.
 - An **Elsewhere → Pipelines** rail link with a live up/down dot (probes `/diagnostics`).
+- **Elsewhere → Grafana** and **Elsewhere → Platform** rail links come from the boot
+  payload (`grafana`, `platform`). The Grafana dot uses `GET /api/grafana-health`
+  (cached 60 s); Platform needs SSO so it is a plain link with no probe.
 
 If the explorer is down the links still render; the dot turns red.
 
@@ -707,6 +709,18 @@ Endpoints: `GET /api/prs`, `POST /api/pr-scan` and `POST /api/pldm-test` (serial
 `POST /api/feature-untrack`, `POST /api/pr-track`, and `POST /api/pr-untrack`; CI reruns use
 `POST /api/pr-ci`. Without the `pr-monitor` skill the section renders empty and the scans return 503.
 
+**DevOps helpers on PR rows** (read-only, served only; knowledge in the
+[`devops-expert`](../../skills/devops-expert/SKILL.md) skill):
+
+- **Stage** (`GET /api/pr-stage?url=<github PR url>`) runs `octl` against the project
+  integration manifest and reports where the merged change is: `not-in-version`,
+  `integration-pending`, `integration-passed`, `integration-failed` or `in-cd`, with
+  the first artifact version carrying it. Cached 300 s per URL; a non-PR URL is 400.
+- **Sherlock** (`GET /api/sherlock?job=<actions job url>`) shows `octl ci sherlock`'s
+  failure classification for a failing job. Cached 900 s per job; only shown when the
+  failing check carries a job URL (run URLs hide it); a non-job URL is 400.
+- Both shell out to `octl` only for read commands and never trigger CI.
+
 ### Machines section
 
 A read-only view over [`vm-delegate`](../../skills/vm-delegate/SKILL.md)'s delegation history, driven by
@@ -718,6 +732,56 @@ The short **Machines** section name covers both VM and lab-machine targets. The
 navigation badge continues to count confirmed running delegated jobs; the separate
 **Check VM status** control remains an EC2-only `octl vm list` check.
 
+- Two panels, **VMs** (EC2 cards stacked vertically) and **Machine**, each with a
+  foldable heading (chevron + count). The Machine panel has exactly one card; with
+  2+ other registered targets (including VM targets missing from the EC2
+  inventory) its title is a content-sized **Select machine** dropdown (max 24ch),
+  otherwise a plain name. Selection falls back to the first available target if
+  the chosen one disappears.
+- Every card shares one layout (`vmCard`): a small fold arrow on the left edge
+  (▾/▸, `aria-expanded`), a single header row with the title (status dot, name,
+  state, Main/live badges) and a compact tool row (`>_ Terminal`, `>_ BMC` on
+  lab-machine cards, power on EC2 cards, ↻ refresh, ⋯ Actions), then a key/value
+  body (Instance, Target, BMC, Power, Jobs, Error, Setup, …; empty rows omitted) and the SSO status slot. A folded
+  card shows only its title row.
+- The native **⋯ Actions** select (`field-sizing: content`, max 18ch; the popup
+  sizes itself to its options) contains Provision, Set as main (non-main EC2),
+  Add/Remove tracking (non-main targets), SSO login and Set BMC… (lab machines
+  only; a prompt prefilled with the current BMC, empty clears). It resets after
+  selection; selecting an operation retains its existing confirmation. There are
+  no nested buttons. Static exports disable the whole menu.
+- **SSO login** (Actions menu, tracked targets only; disabled on a non-running
+  VM and in static exports) runs `mctl -t <target> term "bash -lc 'OCTL_PLAIN=true octl login'"`
+  with `MCTL_AUTOSTART=0` (never starts a VM) via [sso_login.py](../sso_login.py).
+  `POST /api/sso-login {"target":T,"action":"start|cancel"}` (same-origin,
+  registered target, one login per target); `GET /api/sso-login` returns per-target
+  state. The output is scanned for the device link and one-time code; only https
+  links on `*.awsapps.com` or `device.sso.<region>.amazonaws.com` are exposed,
+  and the client re-checks before opening. The client opens a blank window on the
+  click (pop-up blockers) and points it at the link; if blocked, the card shows
+  **Open link**. The card's status slot is repainted in place while polling every
+  2 s, shows the code, Cancel, and then Logged in / failed (redacted) / cancelled.
+  10-minute timeout; finished state is kept 15 minutes in memory; link and code
+  are never logged or journaled.
+- Folding a VM card stores its instance id in `prefs.vmHidden`; folding a panel
+  (`vms`, `machines`) or the machine card (`machine-card`) stores the key in
+  `prefs.vmPanelsHidden`. Folds and the selected machine persist in browser
+  preferences across refreshes/reloads; focus returns to the toggled arrow.
+  Folding never unregisters targets, filters job history, stops machines or alters
+  monitoring. Reset browser preferences in Settings to restore the defaults.
+- **Add machine** opens a form for a unique target name, SSH login and either
+  an SSH hostname/IPv4 address or explicit EC2 instance ID, plus an optional
+  BMC (`[user@]host`, lab machines only).
+  `POST /api/vm-target` sends `{"action":"add","name":N,"kind":"remote|vm","address":A,"login":U[,"bmc":B]}`,
+  `{"action":"bmc","name":N,"bmc":B}` (empty B clears) or `{"action":"remove","name":N}`
+  to `vd.portal_target()` and then `mctl target add [--bmc]|bmc|rm`.
+  Same-origin checks and `VM_REFRESH_LOCK` apply. Registration never probes,
+  powers or provisions the machine; live status is enabled separately in
+  Settings, while Terminal is available on every registered target. Removal requires confirmation and refuses the Main target `vm`
+  and targets with running or unverified jobs. It does not stop/delete a machine,
+  delete job/workspace history, or rewrite saved settings. Removed names are
+  excluded from enabled live links. EC2 inventory remains visible with
+  a **Not tracked** label and **Add tracking** option.
 - **Stop** on a confirmed-running row that still owns its slot (`build`/`test`/`run`)
   posts `POST /api/vm-cancel {id}`, which queues a `vm-cancel` action (claims
   `domain:delegation` + `vm:<target>`). It runs `vd.portal_cancel` → `mctl cancel`
@@ -741,6 +805,14 @@ navigation badge continues to count confirmed running delegated jobs; the separa
 - **Check VM status** (`POST /api/vm-machines`) re-reads only `octl vm list`; **Sync logs**
   (`POST /api/vm-sync`) only rsyncs VM and lab-machine job logs, also scoped by the target filter.
   Both are narrower than a full refresh.
+- **Main VM** (`POST /api/vm-main {"id": "i-<hex>"}`): the ★ *Set as main* button under
+  Actions on a non-main EC2 card rebinds mctl target `vm` to that instance via `vd.portal_set_main()` →
+  `mctl vm main <id>` (registry rewrite only; the previous main stays as target `vm-<id6>`).
+  Same-origin only, the id must match `^i-[0-9a-f]{8,17}$`, holds `VM_REFRESH_LOCK` (409 when
+  busy), 503 without vd. Machines are matched to targets by the **instance id bound in
+  `~/.mctl/targets`**, never by EC2 Name or IP. The machines payload carries `main_target`,
+  `main_instance` and a per-machine `main` flag; the main card sorts first and shows a *Main*
+  badge. Live-link settings name target `vm`, so they follow the switch.
 - The **Log** column (and the live-job cards) open the log in a **browser terminal**
   window that always runs `tail` **on the machine** (`vd.log_view(job_id)` builds it):
   `tail -F` for a running job, the last 20 000 lines (the terminal's scrollback) of a
@@ -749,7 +821,39 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   local mirror is never shown; a run with no archive reports an error.
   The job id binds the log to its run. `POST /api/vm-log` / `/api/vm-tail` remain for
   compatibility but the page no longer uses them.
-- **`>_ Terminal`** on a machine card (targets listed in Settings > Machines) opens
+- **`>_ BMC`** on lab-machine cards (EC2 targets never have one; disabled until a
+  BMC is set) opens the same `/term` window with `kind:"bmc"`; the server builds
+  `mctl -t <target> bmc` from the registry (`vd.target_bmcs()`), which runs plain
+  `ssh -tt root@<bmc>` with the shared lab password fed via `sshpass -e` from
+  `~/.pilot/bmc.pw` when present (never in argv). BMCs have no tmux, so closing the
+  window ends the session. There is no confirm step (user decision), but a BMC shell
+  can power-cycle the tray — treat it as a machine control.
+- **`⚡ Flash FW`** on lab-machine cards (never EC2 targets) opens a modal fed by
+  `GET /api/flash/images` (`fw-deploy list --json`; invalid store entries hidden) and
+  `POST /api/flash/discover {target}` (`fw_flash.py discover`, read-only, ≤150 s):
+  project → image → method (bmc / pcie / spi-ftdi / spi-bmc; unavailable ones disabled
+  with the probe's reason) → OAM tick boxes with live state/build (spi-bmc: exactly
+  one) → options (Reset & verify boot, off by default; Force = skip the READY gate) →
+  a **Review** step (machine, method, image path, full SHA-256, OAMs with current
+  build) → `Flash N OAMs`. `POST /api/flash/start {target, method, image, oams[,
+  force, reset_verify]}` accepts only those keys; `image` is a store *directory* that
+  the server re-resolves against a fresh verified listing (the client never names a
+  path), then starts `fw_flash.py run` as a vm-delegate **local-runner job** (kind
+  `flash`, systemd-run transient unit `mctl-<job>`), so it survives a portal restart
+  and is in that machine's **Jobs** list like any delegated run: status, `⌗ open`/tail
+  log (local `tail`; the log carries the BMC `journalctl -u orchestrator` lines
+  prefixed `[journal]`), `■ stop` (disabled in write/verify/boot — interrupting a
+  write can brick the part), and `⚡ progress`. 409 when a flash already runs on the
+  target. Start/settle publish `machine_jobs` notifications and bump `live.changed`.
+  The card shows a `↻ Flashing…` button while one runs and a Flash row with the last
+  run. **`/flash?id=<job>`** (`assets/flash.js`) is the progress pop-up: verdict pill,
+  phase stepper, per-OAM table (state, %, before/after build, detail), the last 200
+  log lines (follow toggle), the full-log terminal and Cancel; it polls
+  `GET /api/flash/status?id=` every 2 s and stops when the job settles. Exit rc 2 is
+  shown as "written but NOT verified", never as success.
+- **`>_ Terminal`** on every machine card (any registered mctl target; the payload's
+  `terminal_targets` lists them all, and a legacy saved `machines.terminal_targets`
+  setting is silently dropped on load) opens
   `/term` in a pop-up window: xterm.js over a same-origin WebSocket (`/ws/term`) to a
   local pty running `mctl -t <target> term`, attached to the remote tmux session
   `portal` (`tmux new -A`), so closing the window only detaches and reopening resumes.
@@ -762,6 +866,27 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   shows a `live` / `reconnecting` / `down` badge. The link never powers a VM on, backs
   off 5→120 s when dropped, and the manual refresh and watchdog remain the fallback.
   Reachability transitions (after the first known state) raise notifications.
+- **Power memory** (owned by mctl, read by `vd.power_view()`): each EC2 card shows
+  *started … ago (auto|manual)* and the *predicted stop* (lease expiry) from
+  `~/.mctl/power/<instance-id>`, falling back to the `lease_expires_at` tag. A cached
+  `running` whose lease has passed is rendered *lease ended … ago — probably stopped;
+  auto-starts on next use* (`predicted_stopped`), never as live. `power_events` carries
+  the newest entries of `~/.mctl/power.log`. Start/Stop (`POST /api/vm-power`) call
+  `mctl vm start|stop <id>` so the power memory stays the single record.
+- **Lease keepalive**: each watchdog pass (`run_vm_watchdog`, 60 s) runs
+  `vd.keepalive()` first: for every VM target with a confirmed-running job it calls
+  `mctl -t <t> lease renew --if-below 10m` (no octl call unless a renewal is due).
+  Idle VMs are never woken or renewed by the portal.
+- **Provisioning**: every target (EC2 card and lab strip) shows a badge from
+  `~/.mctl/provision/<target>.state` (`unprovisioned` / `provisioned` /
+  `provisioned · N manual` / `provision ⚠ <failed>`; tooltip lists each recipe) and a
+  **Provision** entry in Actions. After a confirm it opens the browser terminal with
+  `{"kind": "provision", "target": T}`; the server builds the spec
+  `mctl -t T provision` (T must be a registered mctl target), so the default list
+  for that target runs live and finished recipes are skipped.
+- **EC2 budget note**: the power strip states the cost model (instances bill while
+  running; stop idle VMs) and links the Grafana cost dashboard. A lease countdown under
+  one hour gets the `warn` style.
 - The header and the power strip print how **stale** each reading is (`refresh_age_h`,
   `machines_age_h`). Without that, a day-old `stopped` is indistinguishable from a live one.
 
@@ -816,6 +941,11 @@ Markdown rendered server-side with raw HTML disabled.
   posts its own sections as context (`kind: brief`), waits for the job and stores the
   text in the brief. A cap/disabled answer is a step warning, never a failed run.
 
+- **DevOps section** (`section: "devops"`, drawer toggle, not a nav section): context is
+  the [`devops-expert`](../../skills/devops-expert/SKILL.md) skill's SKILL.md and reference
+  index plus the Grafana/Platform links, so Ask answers CI/CD, `octl`, Grafana and
+  platform questions. Same read-only profile and budget.
+
 ### AI CI triage (PRs section)
 
 A feature whose PRs include `ci-fail` rows shows **✦ Triage CI (n)** in its PR
@@ -836,6 +966,9 @@ checks, run URLs, siblings) plus recent sightings for those repos.
   feature id → latest `{run_id, status, verdict, summary, stale}`; `stale` means the
   failing runs changed since. The toolbar shows a `✦ <verdict>` badge that opens the
   run in the drawer (dashed when stale).
+- **Sherlock context**: when a cached `octl ci sherlock` result exists for a failing job
+  (see the PR-row Sherlock button), it is added to the triage context; triage never
+  runs sherlock itself.
 - **After a run**: the answer's final `PORTAL-TRIAGE: {json}` line (hidden from the
   displayed answer) gives the verdict. The portal records one sighting per item
   through `pfa.record(source="portal")` and adds the PR Monitor feature note

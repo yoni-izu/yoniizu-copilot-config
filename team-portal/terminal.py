@@ -59,9 +59,27 @@ class TermError(ValueError):
 
 def shell_spec(target: str, allowed: list[str]) -> dict:
     if target not in allowed:
-        raise TermError(f"'{target}' is not a terminal machine (Settings > Machines)")
+        raise TermError(f"'{target}' is not a registered mctl target")
     return {"argv": [str(MCTL), "-t", target, "term", SHELL_REMOTE],
             "title": f"{target} \u00b7 tmux {TMUX_SESSION}", "kind": "shell",
+            "target": target}
+
+
+def bmc_spec(target: str, bmcs: dict[str, str]) -> dict:
+    """Plain ssh to the target's registered BMC via `mctl bmc` (no tmux there)."""
+    if target not in bmcs:
+        raise TermError(f"'{target}' has no registered BMC")
+    return {"argv": [str(MCTL), "-t", target, "bmc"],
+            "title": f"{target} \u00b7 BMC {bmcs[target]}", "kind": "bmc",
+            "target": target}
+
+
+def provision_spec(target: str, known: list[str]) -> dict:
+    """`mctl provision` on a registered target, live in a terminal window."""
+    if target not in known:
+        raise TermError(f"'{target}' is not a registered mctl target")
+    return {"argv": [str(MCTL), "-t", target, "provision"],
+            "title": f"{target} \u00b7 provision", "kind": "provision",
             "target": target}
 
 
@@ -73,6 +91,13 @@ def log_spec(view: dict) -> dict:
                          "bash -lc " + _sh_quote(view["command"])],
                 "title": view.get("title") or "log", "kind": "log",
                 "target": view["target"]}
+    if view.get("mode") == "local":
+        # A local-runner job (e.g. fw flash): its log lives on this machine.
+        if not isinstance(view.get("command"), str) or not view["command"]:
+            raise TermError("no way to show this log on its machine")
+        return {"argv": ["bash", "-c", view["command"]],
+                "title": view.get("title") or "log", "kind": "log",
+                "target": view.get("target") or ""}
     raise TermError("no way to show this log on its machine")
 
 

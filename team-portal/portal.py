@@ -52,6 +52,7 @@ from action_queue import ActionQueue  # noqa: E402
 import maintenance  # noqa: E402
 import portal_settings  # noqa: E402
 import terminal  # noqa: E402
+import sso_login  # noqa: E402
 import events  # noqa: E402
 import live_status  # noqa: E402
 import ai  # noqa: E402
@@ -497,6 +498,7 @@ __STYLES__
       <div class="slicer">
         <select id="vm-target" data-filter><option value="">All targets</option></select>
         <label class="chip"><input type="checkbox" id="vm-livefirst" checked> Live on top</label>
+        <button id="vm-add" class="btn">+ Add machine</button>
         <button id="vm-vms" class="btn" title="Query `octl vm list` for the power state, lease and IP of every EC2 instance. Does not touch the targets over ssh.">&#9741; Check VM status</button>
         <button id="vm-sync" class="btn" title="Mirror VM and lab-machine job logs into ~/.mctl/jobs. Each target keeps only the newest log per workspace and overwrites it on the next run, so syncing makes an old log openable later.">&#8595; Sync logs</button>
         <button id="vm-refresh" class="btn primary" title="Refresh job state and logs for every VM and lab-machine target, then re-read EC2 power state. One ssh round trip per machine plus an octl call. No model, no tokens.">&#8635; Refresh status</button>
@@ -745,7 +747,7 @@ def vmlog_payload() -> dict:
     except Exception as e:
         return {"jobs": [], "running": [], "counts": {}, "targets": [], "machines": [],
                 "machines_checked": "", "last_refresh": "", "log": "", "error": str(e)}
-    body["terminal_targets"] = portal_settings.load()["machines"]["terminal_targets"]
+    body["terminal_targets"] = list(vd.targets())
     body["live"] = live_payload()["links"]
     return body
 
@@ -785,7 +787,7 @@ ASSETS = Path(__file__).resolve().parent / "assets"
 ASSET_TYPES = {".css": "text/css; charset=utf-8",
                ".js": "application/javascript; charset=utf-8"}
 # Every servable asset, by exact name, so a crafted path cannot escape.
-ASSET_NAMES = ("portal.css", "pulse.js", "portal.js", "team.js", "term.js", "aichat.js",
+ASSET_NAMES = ("portal.css", "pulse.js", "portal.js", "team.js", "term.js", "aichat.js", "flash.js",
                "vendor/xterm.js", "vendor/xterm.css", "vendor/addon-fit.js")
 
 
@@ -837,23 +839,187 @@ def term_spec(data: dict) -> dict:
         raise terminal.TermError("request must be an object")
     kind = data.get("kind")
     if kind == "shell":
-        allowed = portal_settings.load()["machines"]["terminal_targets"]
-        return terminal.shell_spec(str(data.get("target") or ""), allowed)
+        if vd is None:
+            raise terminal.TermError("vm-delegate is not installed")
+        return terminal.shell_spec(str(data.get("target") or ""), vd.targets())
     if kind == "log":
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
         return terminal.log_spec(vd.log_view(str(data.get("job") or "")))
-    raise terminal.TermError("kind must be shell or log")
+    if kind == "provision":
+        if vd is None:
+            raise terminal.TermError("vm-delegate is not installed")
+        return terminal.provision_spec(str(data.get("target") or ""), vd.targets())
+    if kind == "bmc":
+        if vd is None:
+            raise terminal.TermError("vm-delegate is not installed")
+        return terminal.bmc_spec(str(data.get("target") or ""), vd.target_bmcs())
+    raise terminal.TermError("kind must be shell, bmc, log or provision")
 
 
 def asset_stamp() -> str:
     """Cache-buster derived from the assets' mtimes."""
-    return str(int(max((ASSETS / n).stat().st_mtime for n in ("portal.css", "pulse.js", "portal.js", "team.js"))))
+    return str(int(max((ASSETS / n).stat().st_mtime for n in ("portal.css", "pulse.js", "portal.js", "team.js", "flash.js"))))
 
 
 # Oded's CI/CD pipeline explorer (~/odeds_sandbox, pipeline-explorer.service).
 # The portal only deep-links into it; it never calls it.
 PIPELINE_EXPLORER_URL = os.environ.get("PIPELINE_EXPLORER_URL", "http://127.0.0.1:8080")
+
+# Platform DevOps surfaces (see the devops-expert skill). The portal deep-links
+# into Grafana / the Platform portal and runs a few read-only octl queries.
+GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://grafana.elmnt.local").rstrip("/")
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "https://portal.ai.elmnt.local").rstrip("/")
+OCTL_PROJECT = os.environ.get("PORTAL_OCTL_PROJECT", "iridium")
+OCTL_MANIFEST = os.environ.get("PORTAL_OCTL_MANIFEST", "psoc-fw-ci")
+DEVOPS_SKILL_DIR = Path.home() / ".copilot/skills/devops-expert"
+GRAFANA_DASHBOARDS = {
+    "ci_build_overview": ("CI Build Overview", "/d/ci-build-overview"),
+    "ci_failure_reasons": ("CI Failure Reasons", "/d/ci-failure-reasons"),
+    "merge_queue_health": ("Merge Queue Health", "/d/merge-queue-health"),
+    "workflow_general": ("Workflow general view", "/d/df0453g684wzkf/workflow-general-view"),
+    "tests_results": ("Tests results", "/d/begsnb827dse8d/tests-results"),
+    "update_manifest": ("Update manifest", "/d/ce4fbxj65q6f4s2/update-manifest"),
+    "integration_manifest": ("Integration manifest", "/d/devkmoy145edcc/integration-manifest"),
+    "pldm_queue": ("PLDM job queue", "/d/pldm-job-queue-v1/pldm-job-queue"),
+    "ec2_autostop": ("EC2 auto-stop monitor", "/d/ec2-auto-stop-monitor"),
+    "ec2_cost": ("EC2 personal VM cost", "/d/ec2-personal-usage-cost/ec2-personal-vm-usage-cost?from=now/M&to=now"),
+    "alerts": ("Alerts overview", "/d/alerts-overview/alerts-overview?orgId=1&var-datasource=P4169E866C3094E38"),
+    "runner_details": ("Runner details", "/d/ce4fbxj65q6f4b/runner-details"),
+    "job_lookup": ("Runner dispatcher job lookup", "/d/runner-dispatcher-lookup/runner-dispatcher-e28094-job-lookup?orgId=1&var-dc_job=dc"),
+}
+_PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
+_JOB_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+/job/\d+$")
+_DEVOPS_CACHE: dict[str, tuple[float, dict]] = {}
+_DEVOPS_LOCK = threading.Lock()
+
+
+def grafana_links() -> dict:
+    return {key: {"title": title, "url": GRAFANA_URL + path}
+            for key, (title, path) in GRAFANA_DASHBOARDS.items()}
+
+
+def _devops_cached(key: str, ttl: float, fn) -> dict:
+    now = time.time()
+    with _DEVOPS_LOCK:
+        hit = _DEVOPS_CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    value = fn()
+    with _DEVOPS_LOCK:
+        _DEVOPS_CACHE[key] = (time.time(), value)
+        if len(_DEVOPS_CACHE) > 256:
+            for k in sorted(_DEVOPS_CACHE, key=lambda k: _DEVOPS_CACHE[k][0])[:64]:
+                _DEVOPS_CACHE.pop(k, None)
+    return value
+
+
+def grafana_health() -> dict:
+    """Unauthenticated Grafana /api/health probe, cached for 60s."""
+    def probe() -> dict:
+        import ssl
+        import urllib.request
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE   # internal CA; read-only health probe
+        try:
+            with urllib.request.urlopen(GRAFANA_URL + "/api/health", timeout=4, context=ctx) as r:
+                body = json.loads(r.read(4096).decode() or "{}")
+            return {"ok": body.get("database") == "ok", "version": body.get("version"),
+                    "checked_at": ai.now_iso()}
+        except (OSError, ValueError) as error:
+            return {"ok": False, "error": str(error)[:200], "checked_at": ai.now_iso()}
+    return _devops_cached("grafana-health", 60, probe)
+
+
+def _octl(args: list[str], timeout: int = 90) -> tuple[int, str, str]:
+    try:
+        cp = subprocess.run(["octl", *args], capture_output=True, text=True, timeout=timeout,
+                            stdin=subprocess.DEVNULL)
+        return cp.returncode, cp.stdout, cp.stderr
+    except FileNotFoundError:
+        return 127, "", "octl not found on PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"octl timed out after {timeout}s"
+
+
+def pr_stage(url: str) -> dict:
+    """Which artifact versions contain a PR and their integration status (read-only)."""
+    if not _PR_URL_RE.match(url or ""):
+        raise ValueError("expected https://github.com/<owner>/<repo>/pull/<n>")
+
+    def query() -> dict:
+        rc, out, err = _octl(["artifacts", "versions", "--pr", url, "-p", OCTL_PROJECT,
+                              "-m", OCTL_MANIFEST, "--top", "5", "-o", "json"])
+        base = {"url": url, "project": OCTL_PROJECT, "manifest": OCTL_MANIFEST,
+                "checked_at": ai.now_iso()}
+        if rc != 0:
+            return {**base, "ok": False, "error": (err or out).strip()[-600:] or f"octl exit {rc}"}
+        try:
+            raw = json.loads(out or "[]")
+        except ValueError:
+            return {**base, "ok": False, "error": "unparseable octl output", "raw": out[-2000:]}
+        rows = raw if isinstance(raw, list) else raw.get("versions") or raw.get("items") or []
+        versions = [{"version": r.get("Version") or r.get("version"),
+                     "status": r.get("IntegrationStatus") or r.get("integration_status"),
+                     "cd_manifests": r.get("CDManifests") or r.get("cd_manifests") or []}
+                    for r in rows if isinstance(r, dict)]
+        if not versions:
+            stage = "not-in-version"
+        elif any(v["status"] == "Passed" for v in versions):
+            stage = "integration-passed"
+        elif any(v["status"] == "Failed" for v in versions):
+            stage = "integration-failed"
+        else:
+            stage = "integration-pending"
+        if any(v["cd_manifests"] for v in versions):
+            stage = "in-cd"
+        return {**base, "ok": True, "stage": stage, "versions": versions}
+    return _devops_cached("stage:" + url, 300, query)
+
+
+def _job_grafana_links(job_url: str) -> dict:
+    from urllib.parse import quote
+    run_url = job_url.split("/job/")[0]
+    return {"runner_details": GRAFANA_URL + GRAFANA_DASHBOARDS["runner_details"][1]
+            + "?var-workflow_link=" + quote(run_url + "/attempts/1", safe=""),
+            "job_lookup": GRAFANA_URL + GRAFANA_DASHBOARDS["job_lookup"][1]
+            + "&var-job_link=" + quote(job_url, safe="")}
+
+
+def sherlock(job_url: str) -> dict:
+    """`octl workflow sherlock` failure classification for one job (read-only)."""
+    if not _JOB_URL_RE.match(job_url or ""):
+        raise ValueError("expected https://github.com/<o>/<r>/actions/runs/<run>/job/<job>")
+
+    def query() -> dict:
+        rc, out, err = _octl(["workflow", "sherlock", job_url], timeout=180)
+        text = (out or "").strip()
+        result = {"job": job_url, "ok": rc == 0, "checked_at": ai.now_iso(),
+                  "links": _job_grafana_links(job_url), "raw": text[-6000:]}
+        if rc != 0:
+            result["error"] = (err or out).strip()[-600:] or f"octl exit {rc}"
+            return result
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                result["classification"] = {k: parsed[k] for k in parsed
+                                            if isinstance(parsed[k], (str, int, float, bool))}
+        except ValueError:
+            fields = {}
+            for line in text.splitlines():
+                m = re.match(r"^\s*([A-Za-z][\w /-]{1,30}):\s+(.+)$", line)
+                if m and m.group(1).strip().lower() not in fields:
+                    fields[m.group(1).strip().lower()] = m.group(2).strip()[:300]
+            result["classification"] = fields
+        return result
+    return _devops_cached("sherlock:" + job_url, 900, query)
+
+
+def sherlock_cached(job_url: str) -> dict | None:
+    with _DEVOPS_LOCK:
+        hit = _DEVOPS_CACHE.get("sherlock:" + job_url)
+    return hit[1] if hit else None
 
 
 def _journal_settings(status: str, detail: str, applied: str) -> None:
@@ -884,6 +1050,8 @@ def boot_payload(tasks: list[dict], wd: dict) -> str:
         "vmlog": vmlog_payload(),
         "team": team_api.payload(),
         "explorer": {"url": PIPELINE_EXPLORER_URL.rstrip("/")},
+        "grafana": {"url": GRAFANA_URL, "dashboards": grafana_links()},
+        "platform": {"url": PLATFORM_URL},
         "settings": portal_settings.payload(include_status=False),
     }, ensure_ascii=False).replace("</", "<\\/")
 
@@ -2144,6 +2312,7 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
 # Notifications for every tab (and a Windows toast when none is open).
 EVENTS = events.Bus(settings=lambda: portal_settings.load()["notify"])
 LIVE: live_status.Manager | None = None
+SSO_LOGINS = sso_login.SsoLogins()
 LIVE_STATE = {"changed": 0.0}
 JOB_DONE_WORDS = {"passed": ("\u2713 passed", "ok"), "failed": ("\u2717 failed", "bad"),
                   "died": ("\u2717 died", "bad")}
@@ -2187,13 +2356,19 @@ def live_reach(target: str, up: bool, why: str) -> None:
                    else f"{target} became unreachable", why or "", "ok" if up else "bad", "#vm")
 
 
+def registered_machine_settings() -> dict:
+    cfg = portal_settings.load()["machines"]
+    known = set(vd.targets()) if vd is not None else set()
+    return cfg | {"live_targets": [t for t in cfg["live_targets"] if t in known]}
+
+
 def start_live_status() -> None:
     global LIVE
     if vd is None:
         return
     LIVE = live_status.Manager(
         live_block, live_reach, lambda: vd.agent_env()[0],
-        lambda: portal_settings.load()["machines"])
+        registered_machine_settings)
     LIVE.sync()
 
 
@@ -2201,7 +2376,7 @@ def start_live_status() -> None:
 AI_STORE = ai.Store(STATE_DIR / "ai")
 AI_SECTIONS = {"overview": "Overview", "work": "Tasks", "ws": "Workspaces",
                "bugs": "Bugs", "prs": "PRs", "vm": "Machines", "raid": "RAID",
-               "team": "Team"}
+               "team": "Team", "devops": "DevOps"}
 # Live job dicts of running AI calls, so a follow-up can't race its parent.
 AI_ACTIVE: set[str] = set()
 
@@ -2259,6 +2434,10 @@ def ai_section_data(section: str, private: bool) -> Any:
         return raid_payload()
     if section == "team":
         return team_api.payload("private" if private else "shared", None)
+    if section == "devops":
+        return {"grafana_url": GRAFANA_URL, "grafana": grafana_links(),
+                "platform_url": PLATFORM_URL, "octl_project": OCTL_PROJECT,
+                "octl_manifest": OCTL_MANIFEST, "skill": str(DEVOPS_SKILL_DIR)}
     raise ValueError("unknown section")
 
 
@@ -2375,15 +2554,22 @@ def run_ai_job(job: dict) -> None:
             data = ai_section_data(run["section"], run.get("private", False))
             text, cut = ai.compact(data)
             label = AI_SECTIONS[run["section"]]
-            prompt = (ai.explain_prompt(run["section"], label, text, read_at, cut, run["focus"])
+            focus = run["focus"]
+            if run["section"] == "devops":
+                focus = (f"Answer from the devops-expert skill: read {DEVOPS_SKILL_DIR}/SKILL.md "
+                         f"and the relevant {DEVOPS_SKILL_DIR}/references/*.md first. "
+                         + (focus or "")).strip()
+            prompt = (ai.explain_prompt(run["section"], label, text, read_at, cut, focus)
                       if run["kind"] == "explain" else
                       ai.ask_prompt(run["section"], label, text, read_at, cut,
-                                    run["question"], run["focus"]))
+                                    run["question"], focus))
         run.update(context_bytes=len(text), truncated=cut)
         AI_STORE.save(run)
         argv = ai.build_argv(prompt, model=cfg["model"], profile=run.get("profile") or "read",
                              allow_reads=cfg["allow_jira_github_reads"],
-                             resume=run.get("resume"))
+                             resume=run.get("resume"),
+                             read_dirs=((str(DEVOPS_SKILL_DIR),)
+                                        if run.get("section") == "devops" else ()))
         timeout = max(cfg["timeout_s"], 600) if run["kind"] == "ci-triage" else cfg["timeout_s"]
         with ai_cancellable(job) as cancel:
             result = ai.run_copilot(argv, cwd=str(Path.home()), timeout=timeout,
@@ -2486,6 +2672,14 @@ def start_ci_triage(feature_id, force: bool = False) -> dict:
     context = {"id": feature_id, "name": feature.get("name"), "jira": feature.get("jira"),
                "prs": [{k: p.get(k) for k in keep if p.get(k) is not None}
                        for p in feature.get("prs") or []]}
+    known = {}
+    for p in feature.get("prs") or []:
+        for u in p.get("failed_runs") or []:
+            hit = sherlock_cached(u) if isinstance(u, str) and _JOB_URL_RE.match(u) else None
+            if hit and hit.get("ok"):
+                known[u] = hit.get("classification") or hit.get("raw", "")[-1500:]
+    if known:
+        context["sherlock"] = known
     AI_STORE.reserve(cfg["daily_cap"])
     name = feature.get("name") or f"feature {feature_id}"
     run = ai.new_run("ci-triage", section="prs", question=f"Triage CI \u00b7 {name}",
@@ -3483,6 +3677,200 @@ def start_vm_refresh_job(target: str | None = None) -> str:
     return enqueue_action(job)
 
 
+# --- Flash FW --------------------------------------------------------------
+# Images come from the fw-deploy store; the flash itself is fw-flasher's
+# fw_flash.py, run as a vm-delegate local-runner job (kind "flash") so it shows
+# in the machine's Jobs list with its full log (BMC orchestrator journal
+# included) and survives a portal restart.
+FW_DEPLOY = Path.home() / ".copilot/skills/fw-deploy/scripts/fw_deploy.py"
+FW_FLASH = Path.home() / ".copilot/skills/fw-flasher/scripts/fw_flash.py"
+FLASH_METHODS = ("bmc", "pcie", "spi-ftdi", "spi-bmc")
+FLASH_DISCOVER_TIMEOUT = 150
+FLASH_WATCH_MAX = 4 * 3600
+
+
+def _tool_error(p: subprocess.CompletedProcess, what: str) -> str:
+    lines = [l for l in (p.stderr or "").strip().splitlines() if l.strip()]
+    return lines[-1] if lines else f"{what} failed (rc={p.returncode})"
+
+
+def flash_images() -> dict:
+    """The fw-deploy local image store (read-only listing, verified identities)."""
+    if not FW_DEPLOY.exists():
+        raise RuntimeError("fw-deploy is not installed")
+    p = subprocess.run([sys.executable, str(FW_DEPLOY), "list", "--json"],
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError(_tool_error(p, "fw-deploy list"))
+    data = json.loads(p.stdout or "{}")
+    images = data.get("images") or []
+    return {"root": data.get("root") or "", "images": images,
+            "projects": sorted({i.get("project") or "" for i in images} - {""})}
+
+
+def _flash_target(target) -> str:
+    if vd is None:
+        raise RuntimeError("vm-delegate is not installed")
+    if not isinstance(target, str) or target not in vd.targets():
+        raise ValueError(f"'{target}' is not a registered machine")
+    if target in vd.vm_targets():
+        raise ValueError(f"'{target}' is a cloud VM; flashing needs a lab machine")
+    return target
+
+
+def flash_discover(target) -> dict:
+    """Read-only: which flash methods work on this machine, and its OAMs."""
+    target = _flash_target(target)
+    try:
+        p = subprocess.run([sys.executable, str(FW_FLASH), "discover", "--target", target, "--json"],
+                           capture_output=True, text=True, timeout=FLASH_DISCOVER_TIMEOUT,
+                           env=vd.agent_env()[0])
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"discovery on {target} timed out ({FLASH_DISCOVER_TIMEOUT}s)") from e
+    if p.returncode != 0:
+        raise RuntimeError(_tool_error(p, "fw-flash discover"))
+    return json.loads(p.stdout)
+
+
+def flash_start(payload: dict) -> dict:
+    """Validate a Flash FW request and start it as a local-runner machine job."""
+    allowed = {"target", "method", "image", "oams", "force", "reset_verify"}
+    if not isinstance(payload, dict) or not set(payload) <= allowed:
+        raise ValueError("send {target, method, image, oams[, force, reset_verify]}")
+    target = _flash_target(payload.get("target"))
+    method = payload.get("method")
+    if method not in FLASH_METHODS:
+        raise ValueError(f"method must be one of {', '.join(FLASH_METHODS)}")
+    oams = payload.get("oams")
+    if (not isinstance(oams, list) or not oams or len(oams) > 64
+            or any(not isinstance(o, int) or isinstance(o, bool) or not 0 <= o < 64 for o in oams)):
+        raise ValueError("oams must be a non-empty list of OAM indexes")
+    oams = sorted(set(oams))
+    if method == "spi-bmc" and len(oams) != 1:
+        raise ValueError("spi-bmc writes one flash part; select exactly one")
+    for flag in ("force", "reset_verify"):
+        if not isinstance(payload.get(flag, False), bool):
+            raise ValueError(f"{flag} must be true or false")
+    # The image is named by its store directory and resolved against a fresh,
+    # verified listing -- the client never supplies a path that gets flashed.
+    want = payload.get("image")
+    img = next((i for i in flash_images()["images"] if i.get("directory") == want), None)
+    if img is None:
+        raise ValueError("unknown image; pick one from the fw-deploy store")
+    if not img.get("valid"):
+        raise ValueError(f"image failed verification: {img.get('error') or 'invalid'}")
+    argv = [sys.executable, str(FW_FLASH), "run", "--target", target, "--method", method,
+            "--image", img["path"], "--sha256", img["sha256"],
+            "--events", "{events}", "--job-id", "{job}"]
+    for o in oams:
+        argv += ["--oam", str(o)]
+    if payload.get("force"):
+        argv.append("--force")
+    if payload.get("reset_verify"):
+        argv.append("--reset-verify")
+    name = "/".join(x for x in (img.get("project"), img.get("deployment"),
+                                img.get("platform"), img.get("variant")) if x)
+    label = f"fw-flash {method} {name or img.get('image')} \u2192 OAM {','.join(map(str, oams))}"
+    res = vd.start_local_job(target, "flash", argv, label=label, meta={
+        "image": name or img.get("image") or "", "image_dir": img["directory"],
+        "sha256": img["sha256"], "method": method, "oams": oams,
+        "reset_verify": bool(payload.get("reset_verify")), "force": bool(payload.get("force"))})
+    if res.get("error"):
+        raise FileExistsError(res["error"]) if res.get("job_id") else ValueError(res["error"])
+    job = res["job"]
+    LIVE_STATE["changed"] = time.time()
+    EVENTS.publish("machine_jobs", f"Flash started \u00b7 {target}",
+                   f"{method}: {name} \u2192 OAM {','.join(map(str, oams))}", "",
+                   f"/flash?id={job['id']}")
+    threading.Thread(target=_flash_watch, args=(job,), daemon=True,
+                     name=f"flash-watch-{job['id']}").start()
+    return {"job": job["id"], "target": target}
+
+
+def _flash_watch(job: dict) -> None:
+    """Notify once the flash settles (the Jobs list re-reads on live.changed)."""
+    t0 = time.time()
+    while time.time() - t0 < FLASH_WATCH_MAX:
+        time.sleep(3)
+        try:
+            st = vd.local_status(job)
+        except Exception:                                   # noqa: BLE001
+            continue
+        if st["status"] == "running":
+            continue
+        LIVE_STATE["changed"] = time.time()
+        word, tone = {"passed": ("verified", "ok"), "cancelled": ("cancelled", "warn")}.get(
+            st["status"], ("NOT verified" if st.get("rc") == 2 else st["status"], "bad"))
+        EVENTS.publish("machine_jobs", f"Flash {word} \u00b7 {job.get('target')}",
+                       (st.get("last_line") or "")[:300], tone, f"/flash?id={job['id']}")
+        return
+
+
+def flash_status(job_id: str) -> dict:
+    """Progress of one flash job, folded from its events + the log tail."""
+    if vd is None:
+        raise RuntimeError("vm-delegate is not installed")
+    job = vd._job_by_id(job_id or "")
+    if not vd.is_local(job) or job.get("kind") != "flash":
+        raise LookupError("unknown flash job")
+    st = vd.local_status(job)
+    oams = {str(o): {"oam": o, "state": "pending", "pct": None, "message": ""}
+            for o in job.get("oams") or []}
+    phases, result, image, cancel = [], None, {}, None
+    for e in vd.local_events(job):
+        kind = e.get("type")
+        if kind == "phase":
+            phases.append({"phase": e.get("phase"), "message": e.get("message") or "",
+                           "t": e.get("t")})
+        elif kind == "oam":
+            row = oams.setdefault(str(e.get("oam")), {"oam": e.get("oam"), "state": "pending",
+                                                      "pct": None, "message": ""})
+            row["state"] = e.get("state") or row["state"]
+            if e.get("pct") is not None:
+                row["pct"] = e["pct"]
+            if e.get("message"):
+                row["message"] = e["message"]
+            for k in ("before", "after"):
+                if e.get(k):
+                    row[k] = e[k]
+        elif kind == "image":
+            image = {k: e.get(k) for k in ("sha256", "size", "expected", "path")}
+        elif kind == "result":
+            result = {k: e.get(k) for k in ("ok", "error", "cancelled", "expected")}
+            for i, r in (e.get("oams") or {}).items():
+                row = oams.setdefault(str(i), {"oam": int(i), "pct": None, "message": ""})
+                row["state"] = r.get("state") or row.get("state")
+                if r.get("reason"):
+                    row["message"] = r["reason"]
+                for k in ("before", "after", "booted"):
+                    if r.get(k):
+                        row[k] = r[k]
+        elif kind == "cancel":
+            cancel = {"accepted": bool(e.get("accepted")), "t": e.get("t")}
+    phase = phases[-1]["phase"] if phases else ""
+    log = vd._read_local(job, 96 * 1024)
+    return {"id": job["id"], "target": job.get("target"), "method": job.get("method"),
+            "image": job.get("image"), "sha256": job.get("sha256"), "started": job.get("started"),
+            "reset_verify": job.get("reset_verify"), "unit": job.get("unit") or "",
+            "status": st["status"], "rc": st["rc"], "finished": st["finished"],
+            "phase": phase, "phases": phases, "oams": [oams[k] for k in sorted(oams, key=int)],
+            "result": result, "image_info": image, "cancel": cancel,
+            "cancellable": st["status"] == "running" and phase not in vd.LOCAL_UNSTOPPABLE,
+            "log": "\n".join(log.get("text", "").splitlines()[-200:])}
+
+
+def render_flash_page() -> str:
+    """The Flash FW progress pop-up (assets/flash.js)."""
+    v = asset_stamp()
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Flash FW</title>'
+            f'<link rel="stylesheet" href="/assets/portal.css?v={v}"></head>'
+            '<body class="flash-page"><main id="flash-root" class="flash-window" '
+            'aria-live="polite"></main>'
+            f'<script src="/assets/flash.js?v={v}"></script></body></html>')
+
+
 # gh review state → (banner icon, tone) for each streamed review-scan row.
 REVIEW_SCAN_ICONS = {
     "approved": ("\u2713", "ok"), "merged": ("\u2713", "ok"),
@@ -3886,6 +4274,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
             route = urlparse(self.path).path
             if route == "/term":
                 return self._send(200, render_term_page(), "text/html; charset=utf-8")
+            if route == "/flash":
+                return self._send(200, render_flash_page(), "text/html; charset=utf-8")
+            if route in ("/api/flash/images", "/api/flash/status"):
+                try:
+                    if route == "/api/flash/images":
+                        body = flash_images()
+                    else:
+                        body = flash_status(parse_qs(urlparse(self.path).query).get("id", [""])[0])
+                except LookupError as e:
+                    return self._send(404, json.dumps({"error": str(e)}))
+                except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+                    return self._send(500, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps(body, ensure_ascii=False))
             if route == "/ws/term":
                 token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
                 spec = terminal.take_token(token)
@@ -3897,6 +4298,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 env = vd.agent_env()[0] if vd is not None else None
                 terminal.serve(self.connection, spec, env)
                 return None
+            if route in {"/api/grafana-health", "/api/pr-stage", "/api/sherlock"}:
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    if route == "/api/grafana-health":
+                        body = {**grafana_health(), "url": GRAFANA_URL}
+                    elif route == "/api/pr-stage":
+                        body = pr_stage(query.get("url", [""])[0])
+                    else:
+                        body = sherlock(query.get("job", [""])[0])
+                except ValueError as error:
+                    return self._send(400, json.dumps({"error": str(error)}))
+                return self._send(200, json.dumps(body))
             if route == "/api/events":
                 try:
                     seq = int(parse_qs(urlparse(self.path).query).get("since", ["0"])[0])
@@ -3939,6 +4352,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, json.dumps(review_chat_public(chat), ensure_ascii=False))
             if route == "/api/term/active":
                 return self._send(200, json.dumps({"sessions": terminal.active()}))
+            if route == "/api/sso-login":
+                return self._send(200, json.dumps({"logins": SSO_LOGINS.status()}))
             if self.path.startswith("/assets/"):
                 name = self.path[len("/assets/"):].split("?")[0]
                 ctype = ASSET_TYPES.get(Path(name).suffix)
@@ -4415,6 +4830,96 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 if "machines" not in result:
                     return self._send(400, json.dumps(result, ensure_ascii=False))
                 return self._send(200, json.dumps(result, ensure_ascii=False))
+
+            # Main VM: which instance the `vm` target (neo-ask, default
+            # delegation) points at. Registry-only via `mctl vm main`; the old
+            # Main stays registered as vm-<id6>.
+            if self.path == "/api/vm-main":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                ident = payload.get("id")
+                if set(payload) != {"id"} or not isinstance(ident, str) \
+                        or not re.fullmatch(r"i-[0-9a-f]{8,17}", ident):
+                    return self._send(400, json.dumps({"error": "an EC2 instance id is required"}))
+                if not VM_REFRESH_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a VM operation is already running"}))
+                try:
+                    result = vd.portal_set_main(ident)
+                except Exception as e:                       # noqa: BLE001
+                    return self._send(500, json.dumps({"error": str(e)}))
+                finally:
+                    VM_REFRESH_LOCK.release()
+                if "machines" not in result:
+                    return self._send(400, json.dumps(result, ensure_ascii=False))
+                return self._send(200, json.dumps(result, ensure_ascii=False))
+
+            # Remote `octl login`: the device link is opened by the browser.
+            if self.path == "/api/sso-login":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                target, action = payload.get("target"), payload.get("action")
+                if set(payload) != {"target", "action"} or not isinstance(target, str) \
+                        or action not in ("start", "cancel"):
+                    return self._send(400, json.dumps({"error": "target and action start|cancel are required"}))
+                try:
+                    if action == "start":
+                        result = SSO_LOGINS.start(target, vd.targets())
+                    else:
+                        result = SSO_LOGINS.cancel(target)
+                except sso_login.SsoError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"login": result}))
+
+            # Flash FW: read-only discovery, then a validated local-runner job.
+            if self.path in ("/api/flash/discover", "/api/flash/start"):
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                try:
+                    if self.path == "/api/flash/discover":
+                        if set(payload) != {"target"}:
+                            raise ValueError("send {target}")
+                        body = flash_discover(payload["target"])
+                    else:
+                        body = flash_start(payload)
+                except FileExistsError as e:
+                    return self._send(409, json.dumps({"error": str(e)}))
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                except (RuntimeError, json.JSONDecodeError) as e:
+                    return self._send(502, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps(body, ensure_ascii=False))
+
+            if self.path == "/api/vm-target":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                if vd is None:
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
+                if not VM_REFRESH_LOCK.acquire(blocking=False):
+                    return self._send(409, json.dumps({"error": "a VM operation is already running"}))
+                try:
+                    result = vd.portal_target(payload)
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                except Exception as e:                       # noqa: BLE001
+                    return self._send(500, json.dumps({"error": str(e)}))
+                finally:
+                    VM_REFRESH_LOCK.release()
+                if "jobs" not in result:
+                    return self._send(400, json.dumps(result, ensure_ascii=False))
+                if LIVE is not None and payload.get("action") == "remove":
+                    LIVE.sync()
+                return self._send(200, json.dumps(vmlog_payload() | {
+                    "message": result["message"]}, ensure_ascii=False))
 
             # --- tracked roster + groups -------------------------------------
             # Which workspaces the portal shows is user-editable; every mutation
