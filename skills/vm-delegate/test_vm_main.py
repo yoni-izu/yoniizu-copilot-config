@@ -218,6 +218,60 @@ class VdMainTests(unittest.TestCase):
                 vd.portal_target(data)
         self.run.assert_not_called()
 
+    def test_target_rows_reads_every_column(self):
+        rows = vd.target_rows()
+        self.assertEqual(rows["vm-0ebef8"], {"kind": "vm", "login": "", "host": OLD, "bmc": ""})
+        self.assertEqual(rows["dsk61"], {"kind": "remote", "login": "me", "host": "dsk61", "bmc": ""})
+
+    def test_target_edit_uses_mctl_set_and_verifies(self):
+        def fake(cmd, **_):
+            self.assertEqual(cmd[2], "set")
+            a = dict(zip(cmd[4::2], cmd[5::2]))
+            line = f"dsk61 remote {a['--user']} {a['--host']}" + ("" if a["--bmc"] == "-" else " " + a["--bmc"])
+            self.targets.write_text(REGISTRY.replace("dsk61       remote  me       dsk61", line))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.run.side_effect = fake
+        with patch.object(vd, "payload", return_value={"jobs": []}), patch.object(vd, "jobs", return_value=[]):
+            res = vd.portal_target({"action": "edit", "name": "dsk61", "login": "you",
+                                    "address": "dsk61.lab", "bmc": "root@bmc-61"})
+            self.assertEqual(self.run.call_args.args[0],
+                             [str(vd.MCTL), "target", "set", "dsk61", "--user", "you",
+                              "--host", "dsk61.lab", "--bmc", "root@bmc-61"])
+            self.assertIn("login → you", res["message"])
+            self.assertIn("bmc → root@bmc-61", res["message"])
+            res = vd.portal_target({"action": "edit", "name": "dsk61", "login": "you",
+                                    "address": "dsk61.lab", "bmc": ""})
+            self.assertEqual(res["message"], "Target dsk61: bmc cleared")
+            calls = self.run.call_count
+            res = vd.portal_target({"action": "edit", "name": "dsk61", "login": "you", "address": "dsk61.lab"})
+            self.assertEqual(res["message"], "Target dsk61: nothing changed")
+            self.assertEqual(self.run.call_count, calls)
+            self.run.side_effect = lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, "", "")
+            self.assertIn("did not persist", vd.portal_target(
+                {"action": "edit", "name": "dsk61", "login": "x", "address": "dsk61.lab"})["error"])
+
+    def test_target_edit_vm_sets_instance_without_bmc(self):
+        self.run.side_effect = lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, "", "")
+        with patch.object(vd, "payload", return_value={"jobs": []}), patch.object(vd, "jobs", return_value=[]):
+            vd.portal_target({"action": "edit", "name": "vm-0ebef8", "login": "me", "address": OLD})
+        self.assertEqual(self.run.call_args.args[0],
+                         [str(vd.MCTL), "target", "set", "vm-0ebef8", "--user", "me", "--host", OLD])
+
+    def test_target_edit_invalid_inputs_never_run_a_command(self):
+        e = {"action": "edit", "name": "dsk61", "login": "me", "address": "dsk61"}
+        for data in [e | {"name": "unknown"}, e | {"login": ""}, e | {"login": "a b"},
+                     e | {"address": "-oProxy=x"}, e | {"bmc": "x;y"}, e | {"bmc": None},
+                     e | {"kind": "vm"}, e | {"newname": "x"}, {"action": "edit", "name": "dsk61"},
+                     {"action": "edit", "name": "vm", "login": "me", "address": "host"},
+                     {"action": "edit", "name": "vm", "login": "me", "address": NEW, "bmc": "b"},
+                     {"action": "edit", "name": "vm-0ebef8", "login": "", "address": NEW}]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                vd.portal_target(data)
+        with patch.object(vd, "jobs", return_value=[{"target": "dsk61", "status": "running"}]), \
+                self.assertRaisesRegex(ValueError, "running jobs"):
+            vd.portal_target(e | {"address": "other"})
+        self.run.assert_not_called()
+
     def test_target_remove_refuses_running_and_unverified_jobs(self):
         for status in ("running", "unknown"):
             with patch.object(vd, "jobs", return_value=[{"target": "dsk61", "status": status}]):

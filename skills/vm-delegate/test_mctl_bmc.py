@@ -72,6 +72,30 @@ class MctlBmc(unittest.TestCase):
         self.mctl("target", "bmc", "dsk61", "-")
         self.assertIn("has no BMC", self.mctl("-t", "dsk61", "bmc").stderr)
 
+    def test_set_edits_in_place_and_drops_caches(self):
+        home = self.home / ".mctl" / "dsk61.home"
+        home.write_text("/home/yoni\n")
+        r = self.mctl("target", "set", "dsk61", "--bmc", "root@b1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(home.exists())                     # BMC-only edit keeps caches
+        r = self.mctl("target", "set", "dsk61", "--user", "u2", "--host", "h2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(home.exists())
+        lines = self.reg.read_text().splitlines()
+        self.assertEqual(lines[1], "dsk61\tremote\tu2\th2\troot@b1")   # order kept
+        self.assertEqual(self.mctl("target", "set", "dsk61", "--bmc", "-").returncode, 0)
+        self.assertIn("dsk61\tremote\tu2\th2\n", self.reg.read_text())
+        self.assertEqual(self.mctl("target", "set", "vm", "--host", "i-0123456789abcdef0").returncode, 0)
+        self.assertIn("vm\tvm\tyoni\ti-0123456789abcdef0\n", self.reg.read_text())
+
+    def test_set_rejects_bad_input(self):
+        for args in (("nobody", "--user", "x"), ("dsk61",), ("dsk61", "--host", "-oProxy=x"),
+                     ("dsk61", "--user", "a b"), ("dsk61", "--bmc", "x;y"), ("dsk61", "--name", "z"),
+                     ("vm", "--bmc", "b1"), ("vm", "--host", "myhost")):
+            r = self.mctl("target", "set", *args)
+            self.assertNotEqual(r.returncode, 0, args)
+        self.assertEqual(self.reg.read_text(), REGISTRY)
+
 
 if __name__ == "__main__":
     unittest.main()

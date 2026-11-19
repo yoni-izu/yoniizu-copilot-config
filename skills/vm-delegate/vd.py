@@ -1020,6 +1020,21 @@ def target_bmcs() -> dict[str, str]:
     return out
 
 
+def target_rows() -> dict[str, dict]:
+    """Registry row per target: kind, login, host ("" for `-`/missing) and bmc."""
+    out = {}
+    if not TARGETS.exists():
+        return out
+    for line in TARGETS.read_text(encoding="utf-8").splitlines():
+        cols = line.split()
+        if len(cols) < 2 or cols[0].startswith("#"):
+            continue
+        col = lambda i: cols[i] if len(cols) > i and cols[i] != "-" else ""   # noqa: E731
+        out[cols[0]] = {"kind": cols[1], "login": col(2), "host": col(3),
+                        "bmc": col(4) if cols[1] == "remote" else ""}
+    return out
+
+
 def target_bindings() -> dict[str, str]:
     """Only the bound `kind=vm` targets -> instance id."""
     return {name: iid for name, iid in vm_targets().items() if iid}
@@ -1466,13 +1481,18 @@ def payload() -> dict:
     machine_of = {m["target"]: m for m in vm_list if m.get("target")}
     bindings = target_bindings()
     bmcs = target_bmcs()
+    rows_reg = target_rows()
     tgts = []
     for name in targets():
         at = seen_at.get(name) or ""
         tried = tried_at.get(name) or ""
         m = machine_of.get(name)
+        reg = rows_reg.get(name, {})
         tgts.append({
             "name": name,
+            "kind": reg.get("kind", ""),
+            "login": reg.get("login", ""),
+            "host": reg.get("host", ""),
             "checked": at,
             "age_h": _human_dur(now - _epoch(at)) if at else "",
             # When we last ASKED, which differs from `checked` exactly when the
@@ -1706,6 +1726,42 @@ def portal_target(data: dict) -> dict:
         if not isinstance(bmc, str) or (bmc and not _BMC_RE.fullmatch(bmc)):
             raise ValueError("BMC must be a hostname or IPv4 address, optionally user@host")
         args = ["bmc", name, bmc or "-"]
+    elif action == "edit":
+        if not {"action", "name", "login", "address"} <= set(data) <= {"action", "name", "login", "address", "bmc"}:
+            raise ValueError("Edit requires name, login and address (and bmc for lab machines)")
+        if name not in known:
+            raise ValueError(f"Unknown target: {name}")
+        reg = target_rows()[name]
+        login, address, bmc = data["login"], data["address"], data.get("bmc", "")
+        is_vm = reg["kind"] == "vm"
+        if not isinstance(login, str) or not (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]{0,63}", login) or (is_vm and login == "")):
+            raise ValueError("A valid SSH login is required")
+        if not isinstance(address, str) or not isinstance(bmc, str):
+            raise ValueError("Address and BMC must be strings")
+        if is_vm:
+            if bmc:
+                raise ValueError("VM targets have no BMC")
+            if not _INSTANCE_RE.fullmatch(address):
+                raise ValueError("An EC2 instance id is required")
+            if any(iid == address and t != name for t, iid in target_bindings().items()):
+                raise ValueError("That instance is already registered to another target")
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", address):
+                raise ValueError("A valid SSH hostname or IPv4 address is required")
+            if bmc and not _BMC_RE.fullmatch(bmc):
+                raise ValueError("BMC must be a hostname or IPv4 address, optionally user@host")
+        want = {"kind": reg["kind"], "login": login, "host": address, "bmc": bmc}
+        if want == reg:
+            out = payload()
+            out["message"] = f"Target {name}: nothing changed"
+            return out
+        if (login, address) != (reg["login"], reg["host"]) and any(
+                j["target"] == name and j["status"] == "running" for j in jobs()):
+            raise ValueError("Target has running jobs; change its login or host after they finish")
+        args = ["set", name, "--user", login or "-", "--host", address]
+        if not is_vm:
+            args += ["--bmc", bmc or "-"]
     elif action == "remove":
         if set(data) != {"action", "name"}:
             raise ValueError("Remove requires only a target name")
@@ -1717,7 +1773,7 @@ def portal_target(data: dict) -> dict:
             raise ValueError("Target has running or unverified jobs; resolve them before removing it")
         args = ["rm", name]
     else:
-        raise ValueError("Action must be add, remove or bmc")
+        raise ValueError("Action must be add, edit, remove or bmc")
     try:
         p = subprocess.run([str(MCTL), "target", *args], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=15)
@@ -1731,9 +1787,17 @@ def portal_target(data: dict) -> dict:
     if action == "bmc":
         if target_bmcs().get(name, "") != bmc:
             return {"error": "mctl target did not persist the requested registry change"}
+    elif action == "edit":
+        if target_rows().get(name) != want:
+            return {"error": "mctl target did not persist the requested registry change"}
     elif (name in targets()) != (action == "add"):
         return {"error": "mctl target did not persist the requested registry change"}
     out = payload()
+    if action == "edit":
+        diff = [f"{k} {'→ ' + want[k] if want[k] else 'cleared'}"
+                for k in ("login", "host", "bmc") if want[k] != reg[k]]
+        out["message"] = f"Target {name}: " + ", ".join(diff)
+        return out
     out["message"] = (f"Target {name}: BMC {'set to ' + bmc if bmc else 'cleared'}" if action == "bmc"
                       else f"Target {name} {'registered' if action == 'add' else 'removed'}")
     return out

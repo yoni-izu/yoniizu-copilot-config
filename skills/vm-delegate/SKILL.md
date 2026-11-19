@@ -41,7 +41,8 @@ every action can be run by hand with no AI involvement.
 > NAME` (precedence: `-t` ▸ `$MCTL_TARGET` ▸ `~/.mctl/default` ▸ `vm`). Manage
 > targets with `mctl targets`, `mctl target add <name> <user@host> [--bmc [user@]host]|--vm [user] [instance-id]`,
 > `mctl target bmc <name> <[user@]host|->` (set/clear a lab machine's BMC; optional 5th
-> registry column), `mctl target rm <name>`, `mctl -t <name> bmc` (interactive SSH to the
+> registry column), `mctl target set <name> [--user U|-] [--host H|-] [--bmc B|-]` (edit a row in
+> place; name/kind fixed; a login/host change drops the cached `$HOME`/IP), `mctl target rm <name>`, `mctl -t <name> bmc` (interactive SSH to the
 > BMC, default user `root`, password via `sshpass -e` from `~/.pilot/bmc.pw` if present), and `mctl provision [name]` (installs the target's
 > prerequisites from recipe lists — see **Provisioning a machine**). For a `kind=vm` target the private IP is cached in
 > `~/.mctl/<name>.ip`, self-validating (reused only while SSH/22 is reachable,
@@ -118,7 +119,7 @@ Prefix any command with `-t <target>` to pick a machine (or set a default with
 
 | You want to… | Command |
 |---|---|
-| List / manage machine targets | `mctl targets` · `mctl target add <name> <user@host> [--bmc host]` · `mctl target bmc <name> <host\|->` · `mctl use <name>` |
+| List / manage machine targets | `mctl targets` · `mctl target add <name> <user@host> [--bmc host]` · `mctl target bmc <name> <host\|->` · `mctl target set <name> [--user U] [--host H] [--bmc B\|-]` · `mctl use <name>` |
 | Open a shell on a lab machine's BMC | `mctl -t <name> bmc` |
 | Install a target's prerequisites (wip, creds, git, copilot, neo, RTL mirrors…) | `mctl provision [name]` · `--dry-run` · `--status` |
 | Start / stop a VM target | `mctl -t <vm> start` · `mctl -t <vm> stop` |
