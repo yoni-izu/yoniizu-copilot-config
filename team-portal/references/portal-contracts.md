@@ -746,8 +746,15 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   card shows only its title row.
 - The native **⋯ Actions** select (`field-sizing: content`, max 18ch; the popup
   sizes itself to its options) contains Provision, Set as main (non-main EC2),
-  Add/Remove tracking (non-main targets), SSO login and Set BMC… (lab machines
-  only; a prompt prefilled with the current BMC, empty clears). It resets after
+  Add tracking (untracked EC2), SSO login and Edit details… (every tracked
+  target). Edit details opens a modal over the mctl registry row: name and kind
+  are read-only (they key job history, cached home and workspace bindings); SSH
+  login, host (EC2 instance id for VMs) and BMC (lab machines only, empty clears)
+  are editable and saved through `vd.portal_target({"action":"edit"})` →
+  `mctl target set`, read back before success. A no-change save just closes. The
+  modal's **Delete tracking** button confirms and removes the target (disabled
+  for the Main VM; refused server-side while jobs are running or unverified);
+  login/host edits are refused while jobs run. It resets after
   selection; selecting an operation retains its existing confirmation. There are
   no nested buttons. Static exports disable the whole menu.
 - **SSO login** (Actions menu, tracked targets only; disabled on a non-running

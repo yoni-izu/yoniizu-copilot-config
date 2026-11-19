@@ -4701,16 +4701,15 @@ function vmBindLogs(){
 // A reading older than an hour is history, not status. Saying so is the whole
 // point: a day-old "stopped" that looked live is why the VM seemed unusable.
 function vmStale(h){ return /\d+\s*h/.test(h||""); }
-function vmActions(target,id="",main=false,up=true,bmc=false){
+function vmActions(target,id="",main=false,up=true){
   const off=SERVED?"":" disabled";
   return '<select class="vm-actions" title="More actions" aria-label="Actions for '+esc(target||id)+'"'
     +' data-target="'+esc(target)+'" data-id="'+esc(id)+'"'+off+'>'
     +'<option value="">\u22ef</option>'
     +(target?'<option value="provision"'+off+'>Provision</option>'
-      +(target==="vm"?"":'<option value="remove"'+off+'>Remove tracking</option>')
       :'<option value="add"'+off+'>Add tracking</option>')
     +(target?'<option value="sso"'+(SERVED&&up?"":" disabled")+'>SSO login'+(up?"":" (VM stopped)")+'</option>':"")
-    +(target&&bmc?'<option value="bmc"'+off+'>Set BMC\u2026</option>':"")
+    +(target?'<option value="edit"'+off+'>Edit details\u2026</option>':"")
     +(id&&!main?'<option value="main"'+off+'>Set as main</option>':"")
     +'</select>';
 }
@@ -4721,10 +4720,9 @@ function vmBindActions(box){
     if(!SERVED) return;
     if(action==="provision") vmProvision(select.dataset.target);
     else if(action==="main") vmSetMain(select.dataset.id,select);
-    else if(action==="remove") vmRemoveTarget(select.dataset.target);
     else if(action==="add") vmAddDialog(select.dataset.id);
     else if(action==="sso") vmSsoStart(select.dataset.target);
-    else if(action==="bmc") vmSetBmc(select.dataset.target);
+    else if(action==="edit") vmEditDialog(select.dataset.target);
   }));
   vmSsoBind(box);
 }
@@ -4836,7 +4834,7 @@ function vmTargetStrip(){
     ["Setup",vmProvBadge(t)],
   ])+vmSsoSlot(t.name);
   return vmCard({key:"machine-card",label:t.name,cls:t.error?"bad":"",title,body,
-    tools:vmTermBtn(t.name,true)+vmBmcBtn(t)+vmFlashBtn(t)+vmTargetBtn(t.name)+vmActions(t.name,"",false,true,!t.instance)});
+    tools:vmTermBtn(t.name,true)+vmBmcBtn(t)+vmFlashBtn(t)+vmTargetBtn(t.name)+vmActions(t.name,"",false,true)});
 }
 // Result of the last `mctl provision` on a target (latest per recipe).
 function vmProvBadge(t){
@@ -4895,7 +4893,7 @@ function vmBmcBtn(t){
   if(t.instance) return "";
   return '<button class="vm-bmc" data-target="'+esc(t.name)+'"'+(t.bmc&&SERVED?"":" disabled")
     +' title="'+(t.bmc?"Open an ssh terminal on "+esc(t.name)+"\u2019s BMC ("+esc(t.bmc)+")"
-      :"No BMC set \u2014 use \u22ef \u203a Set BMC\u2026")+'">&gt;_ BMC</button>';
+      :"No BMC set \u2014 use \u22ef \u203a Edit details\u2026")+'">&gt;_ BMC</button>';
 }
 function vmBindTerms(box){
   box.querySelectorAll(".vm-term").forEach(b=>b.addEventListener("click",()=>
@@ -5268,26 +5266,77 @@ async function vmTargetPost(body){
   document.getElementById("vm-refresh-note").textContent=j.message;
   return j;
 }
-async function vmSetBmc(name){
-  if(!SERVED) return;
-  const t=(VMLOG.target_state||[]).find(x=>x.name===name)||{};
-  const v=prompt("BMC for "+name+" \u2014 hostname or IPv4, optionally user@host (default user root).\n"
-    +"Leave empty to clear.",t.bmc||"");
-  if(v===null||v.trim()===(t.bmc||"")) return;
-  const note=document.getElementById("vm-refresh-note");
-  try{
-    await vmTargetPost({action:"bmc",name,bmc:v.trim()});
-  }catch(e){ note.textContent="Set BMC failed: "+e.message; }
-}
 async function vmRemoveTarget(name){
-  if(!SERVED) return;
+  if(!SERVED) return false;
   if(!confirm("Remove tracking for "+name+"?\n\nThis unregisters the shared mctl target and disables its portal controls."
     +" The machine is not stopped or deleted; job and workspace history is kept."
-    +" EC2 instances remain visible as untracked inventory.")) return;
-  const note=document.getElementById("vm-refresh-note");
-  try{
-    await vmTargetPost({action:"remove",name});
-  }catch(e){ note.textContent="Remove tracking failed: "+e.message; }
+    +" EC2 instances remain visible as untracked inventory.")) return false;
+  await vmTargetPost({action:"remove",name});
+  return true;
+}
+// One form per registry row. Name and kind are keys elsewhere (job history,
+// cached $HOME, provision state), so they are shown but never editable.
+function vmEditDialog(name){
+  if(!SERVED) return;
+  const t=(VMLOG.target_state||[]).find(x=>x.name===name);
+  if(!t) return;
+  const isVm=t.kind==="vm"||!!t.instance, mainVm=name==="vm";
+  const loginPat=isVm?"([A-Za-z_][A-Za-z0-9._-]{0,63})?":"[A-Za-z_][A-Za-z0-9._-]{0,63}";
+  const previousFocus=document.activeElement, dialog=document.createElement("dialog");
+  dialog.className="ws-modal vm-add-dialog vm-edit-dialog";
+  dialog.setAttribute("aria-labelledby","vm-edit-title");
+  dialog.innerHTML='<form><h3 id="vm-edit-title">Machine details \u00b7 '+esc(name)+'</h3>'
+    +'<p class="ro-note">Edits the shared mctl target. Does not connect to, start or provision the machine.</p>'
+    +'<label>Target name<input name="name" value="'+esc(name)+'" readonly'
+      +' title="The name keys job history and workspace bindings; remove and re-add to rename"></label>'
+    +'<label>Machine type<input name="kind" value="'+(isVm?"EC2 VM":"SSH machine")+'" readonly></label>'
+    +'<label>'+(isVm?"EC2 instance ID":"SSH hostname / IPv4 address")+'<input name="address" required'
+      +' value="'+esc(t.host||t.instance||"")+'" pattern="'+(isVm?"i-[0-9a-f]{8,17}":"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")+'"></label>'
+    +'<label>SSH login<input name="login"'+(isVm?"":" required")+' pattern="'+loginPat+'"'
+      +' value="'+esc(t.login||"")+'" autocomplete="username"></label>'
+    +(isVm?"":'<label>BMC host (empty = none)<input name="bmc" value="'+esc(t.bmc||"")+'" placeholder="bmc-sa-els23-csr"'
+      +' pattern="([A-Za-z_][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}"></label>')
+    +'<p class="ro-note">A login or host change drops mctl\u2019s cached home/IP for this target.</p>'
+    +'<div class="ws-modal-act">'
+    +'<button type="button" class="btn danger vm-edit-delete"'+(mainVm?' disabled title="Switch the Main VM before removing its target"':
+      ' title="Unregister this target (machine and history are kept)"')+'>Delete tracking</button>'
+    +'<span class="ws-modal-msg" role="status"></span>'
+    +'<button type="button" class="ws-modal-cancel">Cancel</button>'
+    +'<button type="submit" class="primary">Save</button></div></form>';
+  document.body.appendChild(dialog);
+  let saving=false;
+  const msg=dialog.querySelector(".ws-modal-msg");
+  const close=()=>{ if(!saving) dialog.close(); };
+  dialog.addEventListener("close",()=>{ dialog.remove(); previousFocus?.focus(); });
+  dialog.addEventListener("cancel",e=>{ if(saving) e.preventDefault(); });
+  dialog.addEventListener("keydown",e=>{
+    e.stopPropagation();
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+  });
+  dialog.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  dialog.querySelector(".vm-edit-delete").addEventListener("click",async()=>{
+    if(saving) return;
+    saving=true;
+    try{ if(await vmRemoveTarget(name)){ saving=false; close(); } }
+    catch(error){ msg.textContent="Remove tracking failed: "+error.message; }
+    finally{ saving=false; }
+  });
+  dialog.querySelector("form").addEventListener("submit",async e=>{
+    e.preventDefault();
+    if(saving) return;
+    const form=e.target, button=form.querySelector('[type="submit"]');
+    const get=n=>form.elements.namedItem(n).value.trim();
+    const req={action:"edit",name,login:get("login"),address:get("address")};
+    if(!isVm) req.bmc=get("bmc");
+    if(req.login===(t.login||"")&&req.address===(t.host||t.instance||"")&&(isVm||req.bmc===(t.bmc||""))){
+      close(); return;
+    }
+    saving=true; button.disabled=true;
+    try{ await vmTargetPost(req); saving=false; close(); }
+    catch(error){ msg.textContent=error.message; }
+    finally{ saving=false; button.disabled=false; }
+  });
+  dialog.showModal();
 }
 function vmAddDialog(instance=""){
   if(!SERVED){ document.getElementById("vm-refresh-note").textContent="Serve the portal to add machines"; return; }

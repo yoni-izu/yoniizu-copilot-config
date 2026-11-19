@@ -771,6 +771,7 @@
   .vm-add-dialog form { display:flex; flex-direction:column; gap:12px; min-width:0; }
   dialog.vm-add-dialog { box-sizing:border-box; max-height:90vh; overflow-y:auto; }
   dialog.vm-add-dialog:not([open]) { display:none; }
+  .vm-edit-dialog input[readonly] { opacity:.65; cursor:default; }
   /* Machine cards: title + compact tool row on one line, key/value body,
      fold arrow on the left edge. Selects size to their content. */
   .vm-panel { margin-bottom:14px; }

@@ -326,7 +326,8 @@ test("native machine action menus retain quick controls and protect the main tar
   const mainMenu = mainHtml.match(/<select class="vm-actions"[^]*?<\/select>/)[0];
   assert.match(mainMenu, /aria-label="Actions for vm"/);
   assert.match(mainMenu, /<option value="provision">Provision<\/option>/);
-  assert.doesNotMatch(mainMenu, /value="main"|value="remove"|<button/);
+  assert.doesNotMatch(mainMenu, /value="main"|value="remove"|value="bmc"|<button/);
+  assert.match(mainMenu, /<option value="edit">Edit details(\u2026|…)<\/option>/);
   const mainQuick = mainHtml.replace(mainMenu, "");
   assert.match(mainQuick, /class="vm-term" data-target="vm"/);
   assert.match(mainQuick, /class="vm-trf" data-target="vm"/);
@@ -336,7 +337,8 @@ test("native machine action menus retain quick controls and protect the main tar
   const otherMenu = otherHtml.match(/<select class="vm-actions"[^]*?<\/select>/)[0];
   assert.match(otherMenu, /value="provision"/);
   assert.match(otherMenu, /value="main"/);
-  assert.match(otherMenu, /value="remove"/);
+  assert.match(otherMenu, /value="edit"/);
+  assert.doesNotMatch(otherMenu, /value="remove"/);
   const otherQuick = otherHtml.replace(otherMenu, "");
   assert.match(otherQuick, /class="vm-term" data-target="other" disabled/);
   assert.match(otherQuick, /class="vm-pw start"/);
@@ -345,7 +347,7 @@ test("native machine action menus retain quick controls and protect the main tar
   const unbound = context.vmMachine({...other, target: ""});
   assert.match(unbound, /value="main"/);
   assert.match(unbound, /value="add"/);
-  assert.doesNotMatch(unbound, /value="provision"|value="remove"/);
+  assert.doesNotMatch(unbound, /value="provision"|value="remove"|value="edit"/);
   assert.match(mainHtml, /<option value="">\u22ef<\/option>|<option value="">⋯<\/option>/);
   assert.match(mainHtml, /class="vm-fold" data-vm-fold="i-main" aria-expanded="true" aria-label="Collapse Main"/);
   assert.match(mainHtml, /<dt>Instance<\/dt><dd>i-main · m7i<\/dd>/);
@@ -373,7 +375,8 @@ test("lab targets offer native menus and escape labels", () => {
   assert.equal(menus.length, 1);
   assert.match(menus[0], /data-target="desk"/);
   assert.match(menus[0], /value="provision"/);
-  assert.match(menus[0], /value="remove"/);
+  assert.match(menus[0], /value="edit"/);
+  assert.doesNotMatch(menus[0], /value="remove"|value="bmc"/);
   assert.match(html, /<option value="retired">retired \(VM target\)<\/option>/);
   assert.doesNotMatch(menus.join(""), /<button/);
   assert.match(html, /class="vm-trf" data-target="desk"/);
@@ -390,16 +393,16 @@ test("lab targets offer native menus and escape labels", () => {
   assert.match(context.vmTargetStrip(), /<option value="desk" selected>/);
 });
 
-test("lab machine cards offer a BMC terminal and Set BMC; VMs do not", () => {
+test("lab machine cards offer a BMC terminal and Edit details; VMs have no BMC", () => {
   const context = machineMenuHarness();
   context.VMLOG.target_state = [{name: "desk", instance: "", bmc: "bmc-sa-els23-csr"}];
   const html = context.vmTargetStrip();
   assert.match(html, /<button class="vm-bmc" data-target="desk" title="[^"]*bmc-sa-els23-csr[^"]*">&gt;_ BMC<\/button>/);
   assert.match(html, /<dt>BMC<\/dt><dd>bmc-sa-els23-csr<\/dd>/);
-  assert.match(html, /<option value="bmc">Set BMC\u2026<\/option>|<option value="bmc">Set BMC…<\/option>/);
+  assert.match(html, /<option value="edit">Edit details(\u2026|…)<\/option>/);
   context.VMLOG.target_state = [{name: "desk", instance: ""}];
   const none = context.vmTargetStrip();
-  assert.match(none, /class="vm-bmc" data-target="desk" disabled title="No BMC set/);
+  assert.match(none, /class="vm-bmc" data-target="desk" disabled title="No BMC set[^"]*Edit details/);
   assert.doesNotMatch(none, /<dt>BMC/);
   context.VMLOG.target_state = [{name: "vm-old", instance: "i-gone"}];
   const vmTarget = context.vmTargetStrip();
@@ -414,26 +417,68 @@ test("lab machine cards offer a BMC terminal and Set BMC; VMs do not", () => {
   assert.deepEqual(JSON.parse(JSON.stringify(opened)), [[{kind: "bmc", target: "desk"}, "bmc-desk"]]);
 });
 
-test("Set BMC prompts, sends the trimmed host or clears it, and skips no-ops", async () => {
+function editDialogHarness(target){
   const context = machineMenuHarness();
-  vm.runInContext(block("async function vmTargetPost(", "async function vmRemoveTarget("), context);
-  const posts = [], note = {textContent: ""};
-  context.document = {getElementById: () => note};
-  context.VMLOG.target_state = [{name: "desk", bmc: "bmc-old"}];
-  context.vmTargetPost = async body => posts.push(body);
-  for(const answer of [null, "bmc-old", "  root@bmc-new ", ""]){
-    context.prompt = () => answer;
-    await context.vmSetBmc("desk");
-  }
-  assert.deepEqual(JSON.parse(JSON.stringify(posts)),
-    [{action: "bmc", name: "desk", bmc: "root@bmc-new"}, {action: "bmc", name: "desk", bmc: ""}]);
-  context.vmTargetPost = async () => { throw new Error("bad host"); };
-  context.prompt = () => "x";
-  await context.vmSetBmc("desk");
-  assert.equal(note.textContent, "Set BMC failed: bad host");
-  context.SERVED = false;
-  context.prompt = () => { throw new Error("must not prompt"); };
-  await context.vmSetBmc("desk");
+  vm.runInContext(block("async function vmRemoveTarget(", "function vmAddDialog("), context);
+  context.VMLOG.target_state = [target];
+  const handlers = {}, fields = {}, posts = [];
+  const node = sel => (handlers[sel] ??= {disabled: false, textContent: "",
+    addEventListener(ev, cb) { this["on" + ev] = cb; }});
+  const dialog = {
+    className: "", innerHTML: "", open: false, setAttribute() {},
+    addEventListener(ev, cb) { this["on" + ev] = cb; },
+    querySelector: sel => node(sel),
+    showModal() { this.open = true; }, close() { this.open = false; this.onclose?.(); }, remove() {},
+  };
+  context.document = {activeElement: null, body: {appendChild() {}}, createElement: () => dialog,
+                      getElementById: () => ({textContent: ""})};
+  context.vmTargetPost = async body => { posts.push(body); return {}; };
+  const form = {querySelector: sel => node(sel), elements: {namedItem: n => ({value: fields[n] ?? ""})}};
+  context.vmEditDialog(target.name);
+  const submit = () => dialog.querySelector("form").onsubmit({preventDefault() {}, target: form});
+  return {context, dialog, fields, posts, submit, node};
+}
+
+test("Edit details shows every registry field, locks name/kind and sends only real edits", async () => {
+  const h = editDialogHarness({name: "desk", kind: "remote", instance: "", login: "me", host: "desk.lab", bmc: "bmc-old"});
+  const html = h.dialog.innerHTML;
+  assert.match(html, /name="name" value="desk" readonly/);
+  assert.match(html, /name="kind" value="SSH machine" readonly/);
+  assert.match(html, /name="address" required value="desk.lab"/);
+  assert.match(html, /name="login" required[^>]*value="me"/);
+  assert.match(html, /name="bmc" value="bmc-old"/);
+  assert.match(html, /class="btn danger vm-edit-delete" title=/);
+  Object.assign(h.fields, {login: "me", address: "desk.lab", bmc: "bmc-old"});
+  await h.submit();
+  assert.equal(h.posts.length, 0);
+  assert.equal(h.dialog.open, false);
+  const h2 = editDialogHarness({name: "desk", kind: "remote", instance: "", login: "me", host: "desk.lab", bmc: "bmc-old"});
+  Object.assign(h2.fields, {login: " you ", address: "desk2.lab", bmc: ""});
+  await h2.submit();
+  assert.deepEqual(JSON.parse(JSON.stringify(h2.posts)),
+    [{action: "edit", name: "desk", login: "you", address: "desk2.lab", bmc: ""}]);
+  assert.equal(h2.dialog.open, false);
+  const h3 = editDialogHarness({name: "desk", kind: "remote", instance: "", login: "me", host: "desk.lab", bmc: ""});
+  h3.context.vmTargetPost = async () => { throw new Error("bad host"); };
+  Object.assign(h3.fields, {login: "me", address: "x", bmc: ""});
+  await h3.submit();
+  assert.equal(h3.node(".ws-modal-msg").textContent, "bad host");
+  assert.equal(h3.dialog.open, true);
+});
+
+test("Edit details on VMs edits the instance, has no BMC and protects the Main VM", async () => {
+  const h = editDialogHarness({name: "vm", kind: "vm", instance: "i-0123456789", login: "me", host: "i-0123456789", bmc: ""});
+  assert.match(h.dialog.innerHTML, /EC2 instance ID<input name="address" required value="i-0123456789"/);
+  assert.doesNotMatch(h.dialog.innerHTML, /name="bmc"/);
+  assert.match(h.dialog.innerHTML, /vm-edit-delete" disabled title="Switch the Main VM/);
+  Object.assign(h.fields, {login: "", address: "i-0123456789"});
+  await h.submit();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.posts)), [{action: "edit", name: "vm", login: "", address: "i-0123456789"}]);
+  const d = editDialogHarness({name: "desk", kind: "remote", instance: "", login: "me", host: "h", bmc: ""});
+  d.context.confirm = () => true;
+  await d.node(".vm-edit-delete").onclick();
+  assert.deepEqual(JSON.parse(JSON.stringify(d.posts)), [{action: "remove", name: "desk"}]);
+  assert.equal(d.dialog.open, false);
 });
 
 test("native menu dispatch resets selection and does nothing in static mode", () => {
@@ -445,21 +490,20 @@ test("native menu dispatch resets selection and does nothing in static mode", ()
   };
   context.vmProvision = target => calls.push(["provision", target]);
   context.vmSetMain = id => calls.push(["main", id]);
-  context.vmRemoveTarget = target => calls.push(["remove", target]);
   context.vmAddDialog = id => calls.push(["add", id]);
   context.vmSsoStart = target => calls.push(["sso", target]);
-  context.vmSetBmc = target => calls.push(["bmc", target]);
+  context.vmEditDialog = target => calls.push(["edit", target]);
   context.vmBindActions({querySelectorAll: sel => sel === ".vm-actions" ? [select] : []});
-  for(const action of ["provision", "main", "remove", "add", "sso", "bmc", ""]){
+  for(const action of ["provision", "main", "add", "sso", "edit", ""]){
     select.value = action;
     select.change();
     assert.equal(select.value, "");
   }
-  assert.deepEqual(calls, [["provision", "desk"], ["main", "i-other"], ["remove", "desk"], ["add", "i-other"], ["sso", "desk"], ["bmc", "desk"]]);
+  assert.deepEqual(calls, [["provision", "desk"], ["main", "i-other"], ["add", "i-other"], ["sso", "desk"], ["edit", "desk"]]);
   context.SERVED = false;
   select.value = "provision";
   select.change();
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 5);
   assert.equal(select.value, "");
 });
 
@@ -630,19 +674,18 @@ test("target mutations adopt the full payload, preserve errors, and confirm remo
     return {ok, json: async () => ok ? {targets: ["vm"], jobs: [], message: "Removed"} : {error: "running jobs"}};
   };
   vm.runInContext(block("async function vmTargetPost(", "function vmRow("), context);
-  await context.vmRemoveTarget("desk");
+  assert.equal(await context.vmRemoveTarget("desk"), false);
   assert.equal(requests.length, 0);
   approved = true;
-  await context.vmRemoveTarget("desk");
+  assert.equal(await context.vmRemoveTarget("desk"), true);
   assert.deepEqual(requests[0], {url: "/api/vm-target", body: {action: "remove", name: "desk"}});
   assert.equal(adopted.length, 1);
   assert.equal(note.textContent, "Removed");
   ok = false;
-  await context.vmRemoveTarget("desk");
-  assert.match(note.textContent, /Remove tracking failed: running jobs/);
+  await assert.rejects(context.vmRemoveTarget("desk"), /running jobs/);
   assert.equal(adopted.length, 1);
   context.SERVED = false;
-  await context.vmRemoveTarget("desk");
+  assert.equal(await context.vmRemoveTarget("desk"), false);
   assert.equal(requests.length, 2);
 });
 
