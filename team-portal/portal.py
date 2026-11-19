@@ -2312,7 +2312,8 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
 # Notifications for every tab (and a Windows toast when none is open).
 EVENTS = events.Bus(settings=lambda: portal_settings.load()["notify"])
 LIVE: live_status.Manager | None = None
-SSO_LOGINS = sso_login.SsoLogins()
+SSO_LOGINS = sso_login.SsoLogins(
+    env_for=lambda: vd.agent_env(recheck=True)[0] if vd is not None else dict(os.environ))
 LIVE_STATE = {"changed": 0.0}
 JOB_DONE_WORDS = {"passed": ("\u2713 passed", "ok"), "failed": ("\u2717 failed", "bad"),
                   "died": ("\u2717 died", "bad")}

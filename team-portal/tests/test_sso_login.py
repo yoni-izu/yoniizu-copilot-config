@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sso_login  # noqa: E402
 
 DEVICE = "https://elmnt.awsapps.com/start/#/device?user_code=ABCD-EFGH"
+SIGNIN = "https://eu-west-1.signin.aws/platform/authorize?request_uri=synthetic"
 
 
 def wait_for(cond, timeout=5.0):
@@ -27,10 +28,18 @@ class ParseTests(unittest.TestCase):
     def test_safe_url_allows_only_aws_sso_https(self):
         self.assertEqual(sso_login.safe_url(DEVICE), DEVICE)
         self.assertTrue(sso_login.safe_url("https://device.sso.eu-central-1.amazonaws.com/"))
+        self.assertEqual(sso_login.safe_url(SIGNIN), SIGNIN)
         for bad in ("http://elmnt.awsapps.com/start", "https://elmnt.awsapps.com.evil.com/",
                     "https://evil.com/?q=x.awsapps.com", "https://u:p@elmnt.awsapps.com/",
                     "https://elmnt.awsapps.com:8443/", "https://oidc.eu-central-1.amazonaws.com/x",
-                    "javascript:alert(1)"):
+                    "javascript:alert(1)", "http://eu-west-1.signin.aws/platform/authorize",
+                    "https://eu-west-1.signin.aws.evil.com/platform/authorize",
+                    "https://evil.signin.aws/platform/authorize",
+                    "https://eu-west-1.signin.aws/other",
+                    "https://eu-west-1.signin.aws/platform/authorize/extra",
+                    "https://u@eu-west-1.signin.aws/platform/authorize",
+                    "https://eu-west-1.signin.aws:8443/platform/authorize",
+                    "https://eu-west-1.signin.aws:bad/platform/authorize"):
             self.assertIsNone(sso_login.safe_url(bad), bad)
 
     def test_parse_finds_link_and_code_through_ansi_noise(self):
@@ -44,8 +53,14 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(sso_login.parse("go to https://evil.com/ code ABCD-EFGH"),
                          (None, "ABCD-EFGH"))
 
+    def test_parse_regional_signin_link_and_separate_code(self):
+        self.assertEqual(sso_login.parse(
+            f"Please visit the following URL:\n{SIGNIN}\nThen enter the code:\nABCD-EFGH\n"),
+            (SIGNIN, "ABCD-EFGH"))
+
     def test_redact_hides_link_and_code(self):
         self.assertEqual(sso_login._redact(f"bad {DEVICE} ABCD-EFGH"), "bad [link] [code]")
+        self.assertEqual(sso_login._redact(f"bad {SIGNIN} ABCD-EFGH"), "bad [link] [code]")
 
 
 class LifecycleTests(unittest.TestCase):
@@ -78,6 +93,30 @@ class LifecycleTests(unittest.TestCase):
         logins.start("vm", ["vm"])
         self.assertTrue(wait_for(lambda: logins.status()["vm"]["state"] != "starting"))
         self.assertEqual(seen.read_text().strip(), "0")
+
+    def test_resolved_agent_env_is_used_for_each_login_without_autostart(self):
+        seen = Path(self.tmp.name) / "env"
+        resolved = {"PATH": "/bin", "SSH_AUTH_SOCK": "/synthetic/agent", "MCTL_AUTOSTART": "1"}
+        env_for = unittest.mock.Mock(return_value=resolved)
+        logins = sso_login.SsoLogins(
+            self.script(f'echo "$SSH_AUTH_SOCK $MCTL_AUTOSTART" >> {seen}'), env_for=env_for)
+        for expected in ("/synthetic/agent", "/synthetic/new-agent"):
+            resolved["SSH_AUTH_SOCK"] = expected
+            logins.start("vm", ["vm"])
+            self.assertTrue(wait_for(lambda: logins.status()["vm"]["state"] == "done"))
+        self.assertEqual(seen.read_text().splitlines(),
+                         ["/synthetic/agent 0", "/synthetic/new-agent 0"])
+        self.assertEqual(env_for.call_count, 2)
+        self.assertEqual(resolved["MCTL_AUTOSTART"], "1")
+
+    def test_regional_signin_link_reaches_waiting_state(self):
+        logins = sso_login.SsoLogins(self.script(
+            f'echo "{SIGNIN}"; echo "ABCD-EFGH"; sleep 30'))
+        logins.start("vm", ["vm"])
+        self.addCleanup(logins.cancel, "vm")
+        self.assertTrue(wait_for(lambda: logins.status()["vm"]["state"] == "waiting"))
+        self.assertEqual(logins.status()["vm"]["url"], SIGNIN)
+        self.assertEqual(logins.status()["vm"]["code"], "ABCD-EFGH")
 
     def test_failure_message_is_redacted(self):
         logins = sso_login.SsoLogins(self.script(
@@ -132,6 +171,14 @@ class EndpointTests(unittest.TestCase):
         import portal
         from test_portal_cancel import handler
         self.portal, self.handler = portal, handler
+
+    def test_portal_sso_rechecks_existing_agent_resolver(self):
+        vd = unittest.mock.Mock()
+        vd.agent_env.return_value = ({"SSH_AUTH_SOCK": "/synthetic/agent"}, "")
+        with patch.object(self.portal, "vd", vd):
+            self.assertEqual(self.portal.SSO_LOGINS._env_for(),
+                             {"SSH_AUTH_SOCK": "/synthetic/agent"})
+        vd.agent_env.assert_called_once_with(recheck=True)
 
     def test_post_validates_and_dispatches(self):
         fake = unittest.mock.Mock()

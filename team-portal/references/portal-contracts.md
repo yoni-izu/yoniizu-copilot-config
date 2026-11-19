@@ -753,10 +753,13 @@ navigation badge continues to count confirmed running delegated jobs; the separa
 - **SSO login** (Actions menu, tracked targets only; disabled on a non-running
   VM and in static exports) runs `mctl -t <target> term "bash -lc 'OCTL_PLAIN=true octl login'"`
   with `MCTL_AUTOSTART=0` (never starts a VM) via [sso_login.py](../sso_login.py).
+  Each login rechecks the existing `vd.agent_env` SSH-agent resolver, as the
+  browser terminal does, instead of relying on the service-inherited agent.
   `POST /api/sso-login {"target":T,"action":"start|cancel"}` (same-origin,
   registered target, one login per target); `GET /api/sso-login` returns per-target
   state. The output is scanned for the device link and one-time code; only https
-  links on `*.awsapps.com` or `device.sso.<region>.amazonaws.com` are exposed,
+  links on `*.awsapps.com`, `device.sso.<region>.amazonaws.com`, or the
+  `/platform/authorize` path on `<region>.signin.aws` are exposed,
   and the client re-checks before opening. The client opens a blank window on the
   click (pop-up blockers) and points it at the link; if blocked, the card shows
   **Open link**. The card's status slot is repainted in place while polling every

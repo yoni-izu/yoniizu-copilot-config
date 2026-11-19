@@ -28,6 +28,7 @@ URL_RE = re.compile(r"https://[^\s'\"<>\x1b]+")
 CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4})\b")
 ALLOWED_HOST_RE = re.compile(
     r"^(?:[a-z0-9-]+\.awsapps\.com|device\.sso\.[a-z0-9-]+\.amazonaws\.com)$")
+SIGNIN_HOST_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+\.signin\.aws$")
 
 
 class SsoError(ValueError):
@@ -38,11 +39,13 @@ def safe_url(url: str) -> str | None:
     """The URL when it is an https AWS SSO device page, otherwise None."""
     try:
         parts = urlsplit(url.rstrip(".,;)"))
+        if parts.scheme != "https" or parts.username or parts.password or parts.port:
+            return None
     except ValueError:
         return None
-    if parts.scheme != "https" or parts.username or parts.password or parts.port:
-        return None
-    if not ALLOWED_HOST_RE.match((parts.hostname or "").lower()):
+    host = (parts.hostname or "").lower()
+    if not (ALLOWED_HOST_RE.fullmatch(host)
+            or (SIGNIN_HOST_RE.fullmatch(host) and parts.path == "/platform/authorize")):
         return None
     return parts.geturl()
 
@@ -76,10 +79,11 @@ def _redact(text: str) -> str:
 class SsoLogins:
     """One `octl login` per target at a time; state is in memory only."""
 
-    def __init__(self, argv_for=None, now=time.time):
+    def __init__(self, argv_for=None, now=time.time, *, env_for=None):
         self._lock = threading.Lock()
         self._runs: dict[str, dict] = {}
         self._argv_for = argv_for or (lambda t: [str(MCTL), "-t", t, "term", REMOTE_CMD])
+        self._env_for = env_for or (lambda: dict(os.environ))
         self._now = now
 
     def start(self, target: str, known: list[str]) -> dict:
@@ -93,7 +97,7 @@ class SsoLogins:
                    "message": "Connecting\u2026", "started": self._now(), "ended": None,
                    "proc": None, "buf": ""}
             self._runs[target] = run
-        env = dict(os.environ, MCTL_AUTOSTART="0")
+        env = dict(self._env_for(), MCTL_AUTOSTART="0")
         try:
             proc = subprocess.Popen(self._argv_for(target), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

@@ -5154,8 +5154,9 @@ async function vmPower(action,id,btn){
 const VMSSO={logins:{},wins:{},timer:null,loaded:false};
 function vmSsoOk(url){
   try{ const u=new URL(url);
-    return u.protocol==="https:"&&!u.port&&!u.username
-      &&/^(?:[a-z0-9-]+\.awsapps\.com|device\.sso\.[a-z0-9-]+\.amazonaws\.com)$/.test(u.hostname);
+    return u.protocol==="https:"&&!u.port&&!u.username&&!u.password
+      &&(/^(?:[a-z0-9-]+\.awsapps\.com|device\.sso\.[a-z0-9-]+\.amazonaws\.com)$/.test(u.hostname)
+        ||(/^[a-z]{2}(?:-[a-z]+)+-\d+\.signin\.aws$/.test(u.hostname)&&u.pathname==="/platform/authorize"));
   }catch(e){ return false; }
 }
 function vmSsoActive(l){ return !!l&&(l.state==="starting"||l.state==="waiting"); }

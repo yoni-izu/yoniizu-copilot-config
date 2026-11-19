@@ -260,8 +260,16 @@ test("SSO card status shows code and only opens AWS SSO links", () => {
   const context = machineMenuHarness();
   assert.equal(context.vmSsoOk("https://elmnt.awsapps.com/start/#/device?user_code=ABCD-EFGH"), true);
   assert.equal(context.vmSsoOk("https://device.sso.eu-central-1.amazonaws.com/?user_code=ABCD-EFGH"), true);
+  assert.equal(context.vmSsoOk("https://eu-west-1.signin.aws/platform/authorize?request_uri=synthetic"), true);
   for(const bad of ["http://elmnt.awsapps.com/start", "https://evil.com/?x=.awsapps.com",
-                    "https://elmnt.awsapps.com.evil.com/", "javascript:alert(1)", "https://u@elmnt.awsapps.com/"])
+                    "https://elmnt.awsapps.com.evil.com/", "javascript:alert(1)", "https://u@elmnt.awsapps.com/",
+                    "http://eu-west-1.signin.aws/platform/authorize",
+                    "https://eu-west-1.signin.aws.evil.com/platform/authorize",
+                    "https://evil.signin.aws/platform/authorize", "https://eu-west-1.signin.aws/other",
+                    "https://eu-west-1.signin.aws/platform/authorize/extra",
+                    "https://u@eu-west-1.signin.aws/platform/authorize",
+                    "https://eu-west-1.signin.aws:8443/platform/authorize",
+                    "https://eu-west-1.signin.aws:bad/platform/authorize"])
     assert.equal(context.vmSsoOk(bad), false, bad);
   vm.runInContext("VMSSO", context).logins.vm = {target: "vm", state: "waiting", message: "Waiting", code: "ABCD-EFGH",
                              url: "https://elmnt.awsapps.com/start/#/device?user_code=ABCD-EFGH"};
@@ -294,6 +302,13 @@ test("SSO pop-up is pointed at the safe link or closed on failure", () => {
   assert.equal(w.replaced, null);
   context.vmSsoAdopt({vm: {state: "waiting", url: "https://elmnt.awsapps.com/start/#/device"}});
   assert.equal(w.replaced, "https://elmnt.awsapps.com/start/#/device");
+  assert.equal(w.opener, null);
+  assert.equal(vm.runInContext("VMSSO", context).wins.vm, undefined);
+  w = win.last = win();
+  vm.runInContext("VMSSO", context).wins.vm = w;
+  const signin = "https://eu-west-1.signin.aws/platform/authorize?request_uri=synthetic";
+  context.vmSsoAdopt({vm: {state: "waiting", url: signin}});
+  assert.equal(w.replaced, signin);
   assert.equal(w.opener, null);
   assert.equal(vm.runInContext("VMSSO", context).wins.vm, undefined);
   w = win.last = win();
