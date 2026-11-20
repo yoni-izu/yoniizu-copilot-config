@@ -1,14 +1,12 @@
 # SE FLR reset policy — how an FLR reaches the C2C ports and who arms the SE units
 
-- **Recorded:** 2026-11-04
-- **Status:** Verified from A1 FW source (ip/se, ip/psoc el_reset, proj_infra DTS) + PSOC Specification Rev1.2.0 (§Reset flow, §FLR); builds verified (mng arm/asic both policies, sve_host host/asic)
-- **RTL branch/tag:** n/a (FW workspace `a1_power_on_0p5p231`, ip/se `iridium_release_0.5.231` + local change)
-- **Tags:** flr, function level reset, reset mask, unit_rst_en, el_enable_reset, el_reset_config_comp_reset_mask_die, pre_cfg, reset isr, start delay, start_dly, psoc keep alive, reboot, el_se_reinit, el_se_orch_setup_flr_reset, el_se_flr_reset_policy, all ports, down ports, reinit_requested, preserved port, scale engine, se, a1
+- **Recorded:** 2026-11-04 · **Corrected:** 2026-11-19
+- **Status:** Reset-flow facts verified from A1 FW + PSOC spec Rev1.2.0. The policy section was rewritten on 2026-11-19 from `ip/se` `main` (`f63b2df`) plus the change `4541021` (branch `dev/yoniizu/se-flr-reset-all-default`, PR ip.se.sw.fw#313 with ip.mng.sw.fw#547, IPSESW-509; not yet merged). VM-verified 2026-11-19: `octl ws unit-test ip/se` 5/5 suites pass, ip/mng 6/6 suites pass, and `zephyr_apps/mng` builds. `ip/mng/services/host_management/tests/` is not wired into any build, so its tests do not run. The 2026-11-04 description of an `EL_SE_FLR_RESET_POLICY` choice was wrong: that choice does not exist on `main`.
+- **RTL branch/tag:** n/a (FW only)
+- **Tags:** flr, function level reset, reset mask, unit_rst_en, el_enable_reset, pre_cfg, reset isr, start delay, psoc keep alive, reboot, el_se_reinit, flr_reset_all_ports, el_se_set_flr_reset_all_ports, EL_SE_FLR_RESET_DOWN_PORTS, EL_SE_FLR_RESET_ALL_PORTS_DEFAULT, set_host_config, c2c_reset_during_flr, kmd, all ports, marked ports, reinit_requested, owned port, scale engine, se, a1
 
 ## Scope / Question
-"Should the FW reset C2C on every FLR, and is setting the FLR reset mask enough (does the reboot
-re-initialise the ports)?" — the design facts behind the `EL_SE_FLR_RESET_POLICY` Kconfig choice
-introduced in `ip/se` (ALL_PORTS default / DOWN_PORTS / NO_PORTS).
+"Should the FW reset C2C on every FLR, and which ports?" — the reset-flow facts, plus the FW policy (reset all non-owned ports vs only marked ones, and who selects it).
 
 ## Findings
 
@@ -39,24 +37,20 @@ introduced in `ip/se` (ALL_PORTS default / DOWN_PORTS / NO_PORTS).
 After the FLR reboot, `el_se_port_classify()` (`el_se_reinit.c`) finds the PHY CPU of a cold-reset
 port halted (`el_dmp_ctrl_cpu_running` → false) → the port is `UNINITIALIZED` → ordinary full
 bring-up (PHY FW load, DM config, C2C/LUT, LTSSM). No post-FLR re-init code exists or is needed;
-this is the same path the earlier down-ports-only design relied on. Caveat: if FLR were ever put
+this path is shared by both modes. Caveat: if FLR were ever put
 into `psoc-keep-alive-types`, reset ports would **not** be re-initialised in place (no POST_CFG
 handler in SE).
 
-### The policy choice (`ip/se/drivers/scale_engine/Kconfig`, `choice EL_SE_FLR_RESET_POLICY`, depends on EL_RESET)
-| Symbol | Mechanism | Owned ports | `el_se_set_port_reinit()` |
-|---|---|---|---|
-| `EL_SE_FLR_RESET_ALL_PORTS` (**default**) | `el_se_orch_setup_flr_reset()` arms SE_0..SE_7 of every SE die **once at SE init**, right after `el_se_orch_check_dies()` (before anything else in init can fail). Static HW mask → works even if the MuC is hung when the host FLRs. No reset callback. | reset too (every physical port, C2C node or not) | `-ENOTSUP` |
-| `EL_SE_FLR_RESET_DOWN_PORTS` | per-die `EL_RESET_PRE_CFG` callback arms exactly `reinit_requested & ~owned & has-C2C-dev` at FLR time (ISR). | never reset | supported |
-| `EL_SE_FLR_RESET_NO_PORTS` / `EL_RESET=n` | nothing armed | — | `-ENOTSUP` |
-- Hidden `EL_SE_FLR_RESET = ALL || DOWN` gates the shared arming code.
-- `reinit_requested` link-health tracking is kept under every policy (it feeds `show se port_state`,
-  which now prints the active policy line); it only drives the FLR under DOWN_PORTS.
-- Consequence of ALL: every FLR drops all scale-up links of the chip → peers see Surprise Down
-  (`dm-surprise-down-reporting.md`) and retrain after the reboot.
-- SV test `test_se_flr_mask_all_ports` (`tests/reinit_tests_sv.c`) asserts the mask via
-  `el_reset_is_component_reset()`; it compiles in `sve_host` host/asic (has `EL_RESET` +
-  `EL_SE_SV` + `EL_PCIE_IF`).
+### The policy (runtime flag + Kconfig default + host override)
+- **Gate:** `CONFIG_EL_SE_FLR_RESET_DOWN_PORTS` (`ip/se/drivers/scale_engine/Kconfig:274`) builds the FLR `EL_RESET_PRE_CFG` callback. In the ISR, the callback arms the SE units of the selected ports (`el_se_reinit.c`, around line 273). When the option is off, nothing is armed, and `el_se_set_flr_reset_all_ports(true)` returns `-ENOTSUP` (`el_se_reinit.c:239-244`).
+- **Mode:** the RAM atomic `flr_reset_all_ports` (`el_se_reinit.c:222`):
+  - **reset-all:** every FLR resets every non-owned port.
+  - **marked-only:** only ports with `reinit_requested` set and not owned are reset.
+  - Ports owned by the system manager are **never** reset, in either mode.
+  - Marks matter only in marked-only mode, or on a platform reset.
+- **Boot default:** `CONFIG_EL_SE_FLR_RESET_ALL_PORTS_DEFAULT` (`Kconfig:292`; bool, depends on DOWN_PORTS, **default y** since `4763db1`) sets the initial value of the atomic. Before that change the initial value was 0 (marked-only). `show se port_state` labels the current mode "(default)" when it matches the knob (`el_se_reinit.c:209`).
+- **Runtime/host override:** `el_se_set_flr_reset_all_ports()` / `el_se_get_flr_reset_all_ports()` (`include/el_se.h:278/287`). ip/mng's PSOC MNG `SET_HOST_CONFIG` handler applies the `C2C_RESET_DURING_FLR` bit **unconditionally**, whether set or clear (`ip/mng/services/host_management/el_host_management.c:761-768, 798`). The KMD sends `SET_HOST_CONFIG` on every PSOC channel open, so a KMD with `c2c_reset_during_flr=0` reverts to marked-only. The Kconfig default therefore only governs until the first host config arrives, or when no KMD is present.
+- **Consequence of reset-all:** every FLR drops all non-owned scale-up links of the chip. Peers see a Surprise Down (`dm-surprise-down-reporting.md`) and retrain after the reboot.
 
 ### Related
 - `se-unit-reset-fanout.md` — what the SE unit reset physically resets (C2C + DM + DMP/PHY).
@@ -69,8 +63,9 @@ handler in SE).
   `el_reset_issue_scale_up_reset`), `infra/include/el_reset_common.h`
   (`el_reset_config_comp_reset_mask_die`, `el_reset_is_component_reset`, callback contract),
   `proj_infra/soc/dts/a1/a1_psoc.dtsi` (reset node), `ip/psoc/dts/bindings/reset/el,reset.yaml`.
-- FW: `ip/se/drivers/scale_engine/el_se_reinit.c`, `el_se_orch.c` (`el_se_orch_init`),
-  `Kconfig`, `docs/port_ownership_model.md` ("FLR policy").
+- FW: `ip/se/drivers/scale_engine/el_se_reinit.c`, `Kconfig`, `include/el_se.h`,
+  `docs/port_ownership_model.md` ("FLR mode: reset-all or marked-only");
+  `ip/mng/services/host_management/el_host_management.c` (host-config handler).
 - Historical secondary source: `PSOC Specification Rev1.2.0.docx` §Reset flow (P1440–P1460), §FLR (P1505–P1509); exact A1 Git original unverified. Legacy SoC/PRM paths in the source map provide context, not that missing original.
 
 ## A2 delta (2026-11-11, via Neo)
