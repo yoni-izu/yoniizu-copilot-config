@@ -51,6 +51,14 @@ independent website implementations.
 5. Implement all relevant surfaces. Read/write structured domain state only
    through its owner's API/CLI. Never bypass validation with direct SQL,
    rewrite legacy exports, or add a second authoritative cache.
+   **Settings first:** whenever a feature has user-tunable behavior (on/off
+   switches, intervals, limits, thresholds, retention, toggles), expose it in
+   the Settings section instead of hard-coding it. Add or extend a group in
+   `portal_settings.py` (defaults, validated ranges) and `SETTING_GROUPS` in
+   `assets/portal.js`. Apply changes on Save without a restart where feasible,
+   cover validation in tests and document the parameters in
+   `references/portal-contracts.md`. When touching an existing feature, move
+   its hard-coded tunables into Settings where practical.
 6. Test using temporary databases and mocked external systems. Preserve served
    and static behavior, URLs, multi-select filters, accessibility and browser
    preferences. A health response is not proof of correct data or UI.
