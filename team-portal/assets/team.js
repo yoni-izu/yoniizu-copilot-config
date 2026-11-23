@@ -1289,9 +1289,12 @@
   }
   async function refresh(){
     try{
-      if(await fetchTeam()) render();
+      const loaded=await fetchTeam();
+      if(loaded) render();
+      return loaded;
     }catch(err){
       const el = root(); if(el) el.innerHTML = `<div class="empty">Team refresh failed: ${esc(err.message)}</div>`;
+      return false;
     }
   }
   function hidePrivate(){
@@ -1316,9 +1319,13 @@
     if(h.startsWith("member/")){ resetSelection(); view.tab="members"; view.member=decodeURIComponent(h.slice(7)); render(); return; }
     if(h.startsWith("team/")){ view.tab = h.slice(5) || "overview"; render(); return; }
   }
+  function updateSummary(){
+    return Object.fromEntries(["members","assignments","items","meetings"]
+      .map(name=>[name,{length:(TEAM[name]||[]).length}]));
+  }
 
   if(state.view) view = Object.assign(view, state.view);
   if(!Array.isArray(view.logTypes)) view.logTypes=[];
   if(view.subtab==="focus") view.subtab="tasks";
-  window.TeamUI = {render, refresh, hidePrivate, index, navigate, isPrivate};
+  window.TeamUI = {render, refresh, hidePrivate, index, navigate, isPrivate, updateSummary};
 })();

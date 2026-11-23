@@ -38,6 +38,13 @@ generated file there is `portal-maintenance.timer.d/schedule.conf`, which
 `portal_settings.py` owns and rewrites from the Settings schedule. Never edit it
 by hand.
 Domain-owned code/data and the shared SQLite helper are intentionally external.
+`power_schedule.py` owns deadline/retry bookkeeping in private
+`state/power-schedule.json`, not machine observations. It reads cached deadlines
+through vm-delegate and performs due EC2-only observations through
+`vd.portal_machines()`, under the existing VM operation lock. Attempt state is
+saved before dispatch so interrupted checks cannot be endlessly replayed across
+restarts. There is one scheduler in the managed portal, independent of tabs;
+all actual power records remain authoritative in vm-delegate/mctl.
 The Overview owns no data. `assets/pulse.js` is a pure module (no DOM, no
 fetches) that turns the payloads other sections already serve into the Live
 pulse cards, hygiene rules and per-member activity summaries. The page,
@@ -64,8 +71,17 @@ routine's `PRAGMA integrity_check`, which opens `~/tasks/*.db` with
   tooling; the portal holds no session state across restarts (tmux keeps the remote side).
 - **Live link** (`live_status.py`) is one `mctl jobs-watch` ssh session per target;
   readings still land in `delegation.db` only through `vd.refresh(preprobed=…)`.
-- **Events** (`events.py`) is an in-memory bus (last 200) for notifications; it is not a
-  record and is lost on restart by design.
+- **Domain change watcher** (`domain_watch.py`) checks only stat metadata for the
+  tracked `~/tasks/*.db` files and their SQLite WAL files every scan interval
+  (Settings > Automatic updates, default two seconds; reconfigured live). It
+  never opens owner databases, and coalesces changes before publishing one
+  domain event. Domain events are silent and cause only the affected visible
+  section to re-read its owner API; other sections refresh when opened.
+- **Events** (`events.py`) is an in-memory bus (replay window from Settings, default 200) for notifications and
+  domain-change signals; it is not a record and is lost on restart by design.
+  `/api/stream` delivers events over SSE, replays within the retained window,
+  and asks tabs to resync after a restart or replay gap. `/api/events` remains
+  available for compatibility and as a browser fallback.
 
 ## Authority
 

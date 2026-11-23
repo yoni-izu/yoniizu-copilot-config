@@ -54,6 +54,8 @@ import portal_settings  # noqa: E402
 import terminal  # noqa: E402
 import sso_login  # noqa: E402
 import events  # noqa: E402
+import domain_watch  # noqa: E402
+import power_schedule  # noqa: E402
 import live_status  # noqa: E402
 import ai  # noqa: E402
 
@@ -152,6 +154,21 @@ __STYLES__
     </div>
   </div>
   <div class="topbar-tools">
+    <div class="aq-anchor" id="updates-anchor">
+      <button class="aq-card" id="updates-open" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="updates-panel" hidden>
+        <span class="aq-text"><small>UPDATES</small><b id="updates-summary">No updates yet</b></span>
+        <span class="aq-caret" aria-hidden="true">▾</span>
+      </button>
+      <div id="updates-panel" hidden>
+        <div class="ab-head">
+          <b>Recent updates</b>
+          <button id="updates-clear" type="button" class="ab-link">Clear</button>
+          <button id="updates-close" type="button" class="ab-close" aria-label="Dismiss updates">&times;</button>
+        </div>
+        <div id="updates-list"></div>
+        <div id="updates-detail"></div>
+      </div>
+    </div>
     <div class="aq-anchor" id="aq-anchor">
       <button class="aq-card" id="action-queue-open" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="align-banner" hidden>
         <span class="aq-spin" id="aq-spin" aria-hidden="true"></span>
@@ -749,6 +766,10 @@ def vmlog_payload() -> dict:
                 "machines_checked": "", "last_refresh": "", "log": "", "error": str(e)}
     body["terminal_targets"] = list(vd.targets())
     body["live"] = live_payload()["links"]
+    body["power_schedule"] = POWER_SCHEDULE.snapshot() if POWER_SCHEDULE else {
+        "error": POWER_SCHEDULE_ERROR, "instances": {}}
+    if POWER_SCHEDULE is not None:
+        POWER_SCHEDULE.wake.set()
     return body
 
 
@@ -1056,18 +1077,22 @@ def boot_payload(tasks: list[dict], wd: dict) -> str:
     }, ensure_ascii=False).replace("</", "<\\/")
 
 
-def render_dashboard_html(tasks: list[dict], inline: bool = False) -> str:
+def render_dashboard_html(tasks: list[dict], inline: bool = False,
+                          event_cursor: dict | None = None) -> str:
     """Render the portal. ``inline`` embeds the assets for the static export,
     which is opened over ``file://`` and so cannot fetch ``/assets/…``."""
     wd = wm.load()
     if inline:
         styles = "<style>\n" + asset_text("portal.css") + "\n</style>"
+        event_cursor = ""
         scripts = ("<script>\n" + asset_text("pulse.js") + "\n</script>"
                    + "<script>\n" + asset_text("portal.js") + "\n</script>"
                    + "<script>\n" + asset_text("team.js") + "\n</script>"
                    + "<script>\n" + asset_text("aichat.js") + "\n</script>")
     else:
         v = asset_stamp()
+        cursor = json.dumps(event_cursor or EVENTS.cursor(), separators=(",", ":"))
+        event_cursor = f"<script>window.PORTAL_EVENT_CURSOR={cursor};</script>"
         styles = f'<link rel="stylesheet" href="/assets/portal.css?v={v}">'
         scripts = (f'<script src="/assets/pulse.js?v={v}"></script>'
                    f'<script src="/assets/portal.js?v={v}"></script>'
@@ -1076,7 +1101,7 @@ def render_dashboard_html(tasks: list[dict], inline: bool = False) -> str:
     return (DASHBOARD_TEMPLATE
             .replace("__STYLES__", styles)
             .replace("__BOOTDATA__", boot_payload(tasks, wd))
-            .replace("__SCRIPTS__", scripts)
+            .replace("__SCRIPTS__", event_cursor + scripts)
             .replace("__GENERATED__", datetime.now().strftime("%d/%m/%Y %H:%M")))
 
 
@@ -2312,6 +2337,44 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
 # Notifications for every tab (and a Windows toast when none is open).
 EVENTS = events.Bus(settings=lambda: portal_settings.load()["notify"])
 LIVE: live_status.Manager | None = None
+WATCHER: domain_watch.Watcher | None = None
+POWER_SCHEDULE: power_schedule.PowerSchedule | None = None
+POWER_SCHEDULE_ERROR = ""
+
+
+def power_observations() -> dict:
+    """Local owner readings only; never initiate an EC2 or SSH query."""
+    cached = vd.machines()
+    now = time.time()
+    return {**cached, "machines": [{**m, **vd.power_view(m, now)}
+                                  for m in cached.get("machines", [])]}
+
+
+def start_power_schedule(stop: threading.Event) -> None:
+    global POWER_SCHEDULE, POWER_SCHEDULE_ERROR
+    try:
+        POWER_SCHEDULE = power_schedule.PowerSchedule(
+            STATE_DIR / "power-schedule.json", power_observations, vd.portal_machines,
+            lambda: portal_settings.load()["machines"], VM_REFRESH_LOCK,
+            lambda: EVENTS.publish_domains(["delegation"]), refresh_s=VM_WATCHDOG_EVERY)
+    except (OSError, ValueError) as error:
+        POWER_SCHEDULE_ERROR = f"Power scheduler unavailable: {error}"
+        print(f"[portal/power] {POWER_SCHEDULE_ERROR}", file=sys.stderr)
+        return
+    threading.Thread(target=POWER_SCHEDULE.run, args=(stop,), daemon=True,
+                     name="portal-power-schedule").start()
+
+
+def apply_live_updates(cfg: dict | None = None) -> None:
+    """Apply the Settings > Automatic updates server parameters without a restart."""
+    cfg = cfg or portal_settings.load()["live_updates"]
+    EVENTS.resize(cfg["replay_events"])
+    if POWER_SCHEDULE is not None:
+        POWER_SCHEDULE.wake.set()
+    if WATCHER is not None:
+        WATCHER.configure(enabled=cfg["enabled"],
+                          domains=[d for d in portal_settings.LIVE_DOMAINS if cfg[d]],
+                          interval=cfg["scan_interval_s"], quiet=cfg["quiet_ms"] / 1000)
 SSO_LOGINS = sso_login.SsoLogins(
     env_for=lambda: vd.agent_env(recheck=True)[0] if vd is not None else dict(os.environ))
 LIVE_STATE = {"changed": 0.0}
@@ -4076,6 +4139,9 @@ def run_workspace_job(job: dict, store_lock=None) -> None:
         if reading.get("stashes"):
             with ALIGN_LOCK:
                 job["stashes"] = reading["stashes"]
+        if reading.get("warnings"):
+            with ALIGN_LOCK:
+                job["warnings"] = reading["warnings"]
         if action == "free":
             progress({"step": "release", "label": "Releasing workspace holder"})
             with (store_lock or _threading.Lock()):
@@ -4135,6 +4201,10 @@ JOB_STEP_ERRORS_MAX = 100
 
 def record_job_step(job: dict, event: dict, prefix: str = "") -> None:
     """Fold a runtime progress event into the job's step timeline (caller holds ALIGN_LOCK)."""
+    if event.get("warning"):
+        warnings = job.setdefault("warnings", [])
+        if event["warning"] not in warnings:
+            warnings.append(event["warning"])
     key = f"{prefix}:{event.get('step')}" if prefix else str(event.get("step") or "")
     label = str(event.get("label") or event.get("step") or "working")
     if prefix:
@@ -4253,6 +4323,83 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.end_headers()
             self.wfile.write(data)
 
+        def _stream_event(self, name, cursor, body):
+            payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            self.wfile.write(
+                f"id: {cursor}\nevent: {name}\ndata: {payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        def _stream_bus_event(self, instance, event):
+            body = dict(event)
+            if event["kind"] == "ai":
+                body["ai"] = ai_usage_payload()
+            self._stream_event("message", f"{instance}:{event['seq']}", body)
+
+        def _stream_reset(self):
+            cursor = EVENTS.cursor()
+            self._stream_event(
+                "reset", f"{cursor['instance']}:{cursor['seq']}",
+                {"live": live_payload(), "ai": ai_usage_payload()})
+            return cursor
+
+        def _events_stream(self):
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            cfg = portal_settings.load()["live_updates"]
+            self.connection.settimeout(cfg["keepalive_s"] + 25)
+
+            last_id = self.headers.get("Last-Event-ID", "")
+            initial_connection = not last_id
+            if initial_connection:
+                last_id = parse_qs(urlparse(self.path).query).get("since", [""])[0]
+            last_state = time.monotonic()
+            if not last_id:
+                cursor = self._stream_reset()
+            else:
+                instance, separator, raw_seq = last_id.rpartition(":")
+                try:
+                    seq = int(raw_seq) if separator else -1
+                except ValueError:
+                    seq = -1
+                feed = EVENTS.wait_after(instance, seq, 0)
+                if feed["reset"]:
+                    cursor = self._stream_reset()
+                else:
+                    cursor = {"instance": feed["instance"], "seq": seq}
+                    if initial_connection:
+                        self._stream_event(
+                            "hello", f"{feed['instance']}:{seq}",
+                            {"live": live_payload(), "ai": ai_usage_payload()})
+                    for event in feed["events"]:
+                        self._stream_bus_event(feed["instance"], event)
+                        cursor["seq"] = event["seq"]
+
+            while True:
+                feed = EVENTS.wait_after(cursor["instance"], cursor["seq"], cfg["keepalive_s"])
+                if feed["reset"]:
+                    cursor = self._stream_reset()
+                    continue
+                if feed["events"]:
+                    for event in feed["events"]:
+                        self._stream_bus_event(feed["instance"], event)
+                        cursor["seq"] = event["seq"]
+                else:
+                    cursor["seq"] = feed["seq"]
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    cfg = portal_settings.load()["live_updates"]
+                    self.connection.settimeout(cfg["keepalive_s"] + 25)
+                    if time.monotonic() - last_state >= cfg["state_interval_s"]:
+                        self._stream_event(
+                            "state", f"{feed['instance']}:{cursor['seq']}",
+                            {"live": live_payload(), "ai": ai_usage_payload()})
+                        last_state = time.monotonic()
+
         def do_GET(self):
             if self.path == "/health":
                 return self._send(200, "ok", "text/plain")
@@ -4320,6 +4467,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 body["live"] = live_payload()
                 body["ai"] = ai_usage_payload()
                 return self._send(200, json.dumps(body))
+            if route == "/api/stream":
+                try:
+                    return self._events_stream()
+                except OSError:
+                    self.close_connection = True
+                    return None
             if route == "/api/ai/runs":
                 query = parse_qs(urlparse(self.path).query)
                 section = query.get("section", [None])[0]
@@ -4363,7 +4516,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return self._send(200, asset_text(name), ctype)
             if self.path in ("/", "/index.html"):
                 with lock:
-                    html = render_dashboard_html(tm.load()["tasks"])
+                    cursor = EVENTS.cursor()
+                    html = render_dashboard_html(tm.load()["tasks"], event_cursor=cursor)
                 return self._send(200, html, "text/html; charset=utf-8")
             if self.path == "/api/tasks":
                 with lock:
@@ -4682,6 +4836,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     _journal_settings("completed", "; ".join(result["changed"]), result["applied"])
                     if LIVE is not None:
                         threading.Thread(target=LIVE.sync, daemon=True).start()
+                    if any(c.startswith("live_updates.") for c in result["changed"]):
+                        apply_live_updates()
+                    if POWER_SCHEDULE is not None:
+                        POWER_SCHEDULE.wake.set()
+                    if any(c.startswith(("live_updates.", "machines.")) for c in result["changed"]):
+                        EVENTS.publish_settings()
                 return self._send(200, json.dumps({"ok": True, **result,
                                                    **portal_settings.payload()}, ensure_ascii=False))
 
@@ -5149,10 +5309,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     stop = threading.Event()
     worker = threading.Thread(target=httpd.serve_forever, daemon=True)
     worker.start()
+    global WATCHER
+    WATCHER = domain_watch.Watcher(Path.home() / "tasks", EVENTS.publish_domains)
+    apply_live_updates()
+    threading.Thread(target=WATCHER.run, args=(stop,), daemon=True,
+                     name="portal-domain-watch").start()
 
     # Keeps delegated machine job statuses honest without a click.
     if vd is not None:
         threading.Thread(target=run_vm_watchdog, args=(stop,), daemon=True).start()
+        start_power_schedule(stop)
         start_live_status()
     try:
         recover_review_chats()
@@ -5167,8 +5333,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
+        if POWER_SCHEDULE is not None:
+            POWER_SCHEDULE.shutdown()
         if LIVE is not None:
             LIVE.stop()
+        if WATCHER is not None:
+            WATCHER.shutdown(stop)
         ACTION_QUEUE.stop()
         httpd.shutdown()
         httpd.server_close()

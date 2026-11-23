@@ -173,6 +173,23 @@ class WorkspaceJobTests(unittest.TestCase):
         self.assertEqual(tm.ALIGN_JOBS[confirmed]["status"], "done")
         self.assertEqual(tm.ALIGN_JOBS[confirmed]["stashes"], [stash])
 
+    def test_reference_sync_exposes_warnings_and_stash_without_approval(self):
+        stash = {"path": "/repo", "branch": "old", "oid": "b" * 40}
+        warnings = ["octl may rebase local commits", "changes are stashed automatically"]
+        def sync(slot, action, progress=None, **options):
+            self.assertEqual(options, {"portal_sync": {"approved": None}})
+            for warning in warnings:
+                progress({"step": "sync", "label": "Warning", "warning": warning})
+            return {"clean": True, "stashes": [stash], "warnings": warnings}
+        with patch.object(tm.wm, "workspace_request", side_effect=sync), \
+                patch.object(tm, "apply_workspace_edit") as apply:
+            jid = tm.start_workspace_job("sync", "one")
+        apply.assert_not_called()
+        job = tm.ALIGN_JOBS[jid]
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["warnings"], warnings)
+        self.assertEqual(job["stashes"], [stash])
+
     def test_force_sync_rejects_return_approval_and_invalid_force(self):
         previous = {"kind": "workspace-action", "action": "free", "slot": "one",
                     "status": "approval_required",

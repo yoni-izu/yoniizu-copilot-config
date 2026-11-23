@@ -50,15 +50,25 @@ Three tiles:
     (separate cap, default 150, 0 disables), run timeout, review timeout and
     whether Explain/Ask may *read* Jira/GitHub. The routine's `ai` step toggle sits with
     the other step toggles.
-  - **Machines**: live-status targets (persistent ssh link) and the live update interval (5–300 s).
+  - **Machines**: live-status targets (persistent ssh link), live update interval
+    (5–300 s), and deadline-driven EC2 power checks:
+    - scheduled checks on/off (default on)
+    - lease-end grace (0–300 s, default 30 s)
+    - retry spacing (5–300 s, default 30 s)
+    - additional retries (0–10, default 3; 0 means only the first check)
+    - changes apply live on Save; these checks never start, stop or renew a VM
   - **Notifications**: master switch, the four kinds (action queue, machine jobs, AI,
     machine reachability) and the Windows toast fallback.
+  - **Automatic updates**: master switch, per-resource watch toggles, watcher,
+    stream and tab parameters (see [Notifications](#notifications)).
 - **Routine status**: timer active/enabled, next and last trigger, linger, last brief result, and any schedule problem.
 - **This browser**:
   - landing section (last visited or a fixed section)
   - clock 12/24 h/auto
   - compact tables
-  - action and VM poll intervals
+  - action queue, Machines live and Overview live refresh intervals: free-text durations
+    (`1.5s`, `90s`, `2m`, `1m30s`, a bare number = seconds) from 1 s to 24 h, or `off`;
+    stored as whole ms; invalid input is flagged and the saved value is kept
   - nav order and visibility
 
   Settings itself can never be hidden. These preferences are per browser and never reach the server.
@@ -321,7 +331,7 @@ live readings are not editable in this form. Static exports remain read-only.
 
 **Dedicated purpose** is persistent workspace-owner metadata, not a hold. Track
 defaults to **General**; legacy records without the field retain General behavior.
-Dedicated cards show an `<purpose> only` badge. The Workspaces **Purpose** filter
+Dedicated cards show a purpose badge. The Workspaces **Purpose** filter
 is multi-select (none means all), independent of grouping. Task choices and
 ad-hoc tags are filtered using owner-provided `allowed_uses`; server APIs recheck
 compatibility at execution and never accept client-supplied permissions.
@@ -332,6 +342,7 @@ compatibility at execution and never accept client-supplied permissions.
 | Review | Code-review tasks, review holds, outgoing source mirroring |
 | Development | Non-review tasks, development/debug/experiment holds, outgoing source mirroring |
 | Build root / Mirror | Incoming mirrors, build/test jobs and build/test holds; no ordinary task/review assignment |
+| Read-only | FW reference only; status and Sync, no task/ad-hoc hold, build/test, mirror, push or artifact/log writes |
 
 Build root and Mirror retain distinct names but share a policy. Review and
 Development slots may source delegated builds, not execute them. Automatic PLDM
@@ -342,6 +353,9 @@ no matching running/unverified delegated job, and, for portal edits, no conflict
 queued portal action. Queued actions revalidate assignment/selection on execution. No physical
 workspace is reclassified automatically. Generic remote commands are refused
 on dedicated destinations; the metadata is not an OS sandbox.
+Read-only cards show the actual deployed project and manifest revision from
+the latest local/remote status, separately from the configured repository
+baseline. They offer Sync but no occupancy or Free controls.
 
 **Stop tracking** opens a confirmation dialog with an unchecked **Override
 occupancy/mirror checks** option. `POST /api/ws-untrack/<slot>` accepts a boolean
@@ -363,6 +377,12 @@ stash-and-return safeguards below, then syncs to manifest revisions without
 occupying or releasing the workspace. Occupancy is checked again when the
 confirmed job executes. Mirrors retain normal Sync behavior and cannot be
 force-synced; network/authentication failures do not offer this override.
+Read-only Sync is the exception: it warns and automatically stashes staged,
+unstaged and untracked changes without a separate confirmation, then safely
+returns to the existing manifest revision. The action banner and history retain
+warnings, original branches and recoverable stash IDs; unsafe commits or
+changed/unknown manifests block the operation. `octl ws sync --no-plugins` may
+rebase local commits if remote history changes. Ignored files are not stashed.
 
 Workspace actions run as background `/api/align/<id>` jobs. Endpoints:
 `POST /api/ws-refresh` (local only), `POST /api/ws-check-vm` (remote only),
@@ -495,7 +515,7 @@ its full 100-observation window, counts are shown as a floor (`100+`). A member 
 never marked quiet.
 
 **Refresh.** While the Overview is visible it re-fetches all section payloads in parallel at the
-interval chosen in Settings (*Overview live refresh*: off, 30 s, 1 min or 5 min; default 1 min).
+interval chosen in Settings (*Overview live refresh*: off or any 1 s to 24 h duration; default 1 min).
 Polling pauses while the tab is hidden and resumes on return. A failed source leaves its card
 on the last good data.
 
@@ -877,12 +897,35 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   off 5→120 s when dropped, and the manual refresh and watchdog remain the fallback.
   Reachability transitions (after the first known state) raise notifications.
 - **Power memory** (owned by mctl, read by `vd.power_view()`): each EC2 card shows
-  *started … ago (auto|manual)* and the *predicted stop* (lease expiry) from
-  `~/.mctl/power/<instance-id>`, falling back to the `lease_expires_at` tag. A cached
-  `running` whose lease has passed is rendered *lease ended … ago — probably stopped;
-  auto-starts on next use* (`predicted_stopped`), never as live. `power_events` carries
+  *started … ago (auto|manual)* and a live *expected stop in …* countdown plus the
+  expected stop date/time from `~/.mctl/power/<instance-id>`, falling back to the
+  `lease_expires_at` tag. The countdown shares the existing browser stopwatch tick,
+  corrects for server clock skew, and does no network work. Only expanded cards
+  in the visible Machines section tick; returning from another section/hidden tab
+  recomputes from the absolute deadline. Idle countdowns do not enable job polling.
+  A passed deadline reads *expected stop time passed — status unconfirmed*: the
+  observed state and power controls remain unchanged until an actual observation.
+  Missing deadlines read *expected stop unavailable*. Static exports show only
+  the expected timestamp marked as a snapshot. Renewed deadlines update on the
+  existing cached payload/event path. `power_events` carries
   the newest entries of `~/.mctl/power.log`. Start/Stop (`POST /api/vm-power`) call
   `mctl vm start|stop <id>` so the power memory stays the single record.
+- **Deadline-driven power checks**: the managed server schedules an EC2-only
+  observation at expected lease end plus the Settings grace, independently of
+  open tabs. Before dispatch it re-reads owner power memory, so renewal moves the
+  deadline and stopped/removed instances cancel it. Pending/stopping transitions
+  receive bounded follow-up checks. Due checks share one `vd.portal_machines()`
+  call (`octl vm list`, no SSH/job probe); there is no fixed-interval external
+  EC2 poll. Local deadline reconciliation shares the watchdog cadence as an
+  upper bound on sleeping and also wakes when cached payloads/settings change.
+  VM operation locks exclude overlapping manual checks and workspace operations.
+  Failed/delayed transitions retry within the Settings budget; exhaustion keeps
+  cached observations and displays the error plus **Check VM status** guidance.
+  A new lease or successful explicit observation permits a new bounded check
+  sequence. Retry bookkeeping survives restart in private portal state, not a
+  second machine-state cache. Disabling scheduled checks leaves manual controls,
+  job monitoring, active-job keepalive and cached UI updates unchanged. Unknown
+  deadlines rely on manual/action observations rather than background EC2 polling.
 - **Lease keepalive**: each watchdog pass (`run_vm_watchdog`, 60 s) runs
   `vd.keepalive()` first: for every VM target with a confirmed-running job it calls
   `mctl -t <t> lease renew --if-below 10m` (no octl call unless a renewal is due).
@@ -1100,12 +1143,60 @@ the same Copilot session.
 
 ### Notifications
 
-`GET /api/events?since=<seq>` (polled by every open tab, also a presence heartbeat)
-returns new events plus the live-link and AI usage state. Kinds: action-queue results,
-delegated machine-job completions, AI answers and machine reachability changes, each
-switchable in Settings > Notifications. A tab shows them as browser notifications
-(in-page cards as fallback) and clicking one follows its deep link. When no tab has
-polled for 90 s the server raises a Windows toast through `powershell.exe` instead.
+**Settings > Automatic updates** (server-side `live_updates` group) controls this
+feature; defaults in brackets. Server keys apply on Save without a restart, and
+a silent `settings` event makes other open tabs adopt the client keys (their
+Settings revision is untouched, so an open form there still gets 409 on save):
+
+- master switch [on]: off idles the watcher thread and tabs ignore domain events;
+  Pending rows become Stopped. Changes made while off need Refresh.
+- per-resource watch toggles: Tasks, Workspaces, Bugs, PRs, RAID, Team,
+  Machines, CI triage [all on]. Re-enabled files start from a fresh baseline.
+- server: scan interval 1–60 s [2], quiet period 0–10000 ms [750], replay
+  buffer 50–2000 events [200], stream keepalive 5–40 s [20] (socket timeout
+  keepalive + 25 s), idle state push 15–600 s [60].
+- tabs: push stream vs polling [push], poll interval 2–60 s [5] (also the
+  stream-failure fallback), automatic section reload [on] (off: rows stay
+  Pending until Refresh), change pop-ups [on], history size 10–500 [50],
+  details per update 5–200 [50], reload batching delay 0–5000 ms [250].
+
+The **Updates** card immediately left of **Actions** opens an anchored dropdown
+with the latest updates observed in this tab (history size from Settings). Select a row for its timestamp (to the second),
+record/field details and a link to the affected section. Clear removes tab
+history only; dismiss, outside click and Escape close the dropdown without
+discarding data. History is not persisted across page reloads.
+
+Detected domain changes are shown as Pending until the affected section is
+loaded. Comparing its already-fetched payload against this tab's previous
+snapshot produces specific popup summaries and details (added/changed/removed
+records and displayed field changes). Revisions/timestamps alone do not produce
+change popups. Team messages expose only collection counts, never private
+record content; changes unsupported by the projection are described as a saved
+data reload rather than invented field changes. Hidden sections are not fetched
+solely for this history. Reload failures remain visible and can be retried with
+Refresh. There are no additional timers, owner writes or external scans.
+
+Open tabs use `GET /api/stream` (SSE) for event delivery and presence. Event IDs
+include a server-instance token and sequence number; reconnects replay from the
+in-memory replay window (Settings, default 200 events), while a restart or replay gap requests a data resync.
+The served page supplies its initial cursor so changes between page render and
+stream connection are replayed without an unnecessary initial data reload. The
+stream sends lightweight keepalives and a periodic live/AI state snapshot.
+`GET /api/events?since=<seq>` remains available as a fallback.
+
+Action-queue results, delegated machine-job completions, AI answers and machine
+reachability changes are switchable in Settings > Notifications. A tab shows
+them as browser notifications (in-page cards as fallback), and clicking one
+follows its deep link. When no tab has connected for 90 s the server raises a
+Windows toast through `powershell.exe` instead.
+
+For owner-managed portal resources, the server checks stat metadata for tracked
+domain databases and their SQLite WAL files every scan interval (default two seconds); it does not open
+or write those databases. Writes are coalesced into silent domain events. The
+currently visible affected section re-reads only its owner API, preserving
+filters and deferring while a dialog is open. Other sections reload their stale
+domains when opened. This applies to the served editable portal; the static
+export remains a snapshot. These signals are advisory, not a second data store.
 
 ### Jump palette, deep links and keyboard
 

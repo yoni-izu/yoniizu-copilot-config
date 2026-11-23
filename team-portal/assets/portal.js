@@ -584,7 +584,8 @@ function renderAlignDetail(job){
         <p>Restore the original branch, then apply the stash with <code>git stash apply --index &lt;stash-id&gt;</code>.</p>
         <ul>${job.stashes.map(s=>`<li><code>${esc(s.path)}</code> · ${esc(s.branch||"detached HEAD")}
           · <code>${esc(s.oid)}</code></li>`).join("")}</ul></details>`:"";
-    body.innerHTML=steps.map(wsStepRow).join("")
+    const warnings=(job.warnings||[]).map(w=>`<div class="ab-msg ab-bad">${esc(w)}</div>`).join("");
+    body.innerHTML=warnings+steps.map(wsStepRow).join("")
       +(running?"":(job.repos||[]).map(alignRepoRow).join(""))
       +(job.message?`<div class="ab-msg">${esc(wsErrorSummary(job.message))}</div>`:"")+review+stashes;
     return;
@@ -1451,6 +1452,8 @@ function wsCard(s){
   const reading=s.status||{};
   const mirror=reading.mirror;
   const occ=!!holder||!!mirror;
+  const reference=s.purpose==="read-only";
+  const deployed=reading.deployed_manifest||{};
   let bodyHtml;
   if(mirror){
     bodyHtml=`<div class="ws-task"><div class="t-title">Mirror of ${esc(mirror.source_path||"local workspace")}</div>
@@ -1458,6 +1461,9 @@ function wsCard(s){
       <code>${esc(mirror.source_id||"source ID unknown")}</code></div></div>`;
   }else if(!holder && wsUnknown(s)){
     bodyHtml=`<div class="ws-empty">Remote availability unverified — refresh this workspace before treating it as free.</div>`;
+  }else if(reference&&!holder){
+    bodyHtml=`<div class="ws-empty">Reference only — no task holds, edits, builds, tests or mirrors.
+      Sync automatically stashes local changes; octl sync may rebase local commits.</div>`;
   }else if(!holder){
     bodyHtml=`<div class="ws-empty">Free — no task or ad-hoc hold.</div>`;
   }else if(holder.type==="task"){
@@ -1468,7 +1474,11 @@ function wsCard(s){
   }
   let ctlHtml="";
   if(SERVED){
-    if(occ){
+    if(reference){
+      ctlHtml=`<div class="ws-actions">
+        <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
+        <span class="ws-msg"></span></div>`;
+    }else if(occ){
       ctlHtml=`<div class="ws-actions">
         <button class="link ws-free" data-slot="${esc(s.slot)}">${mirror?"Release mirror":"Set free"}</button>
         <button class="link ws-sync" data-slot="${esc(s.slot)}">⟳ Sync</button>
@@ -1513,7 +1523,7 @@ function wsCard(s){
       <button class="ws-mini ws-untrack" data-slot="${esc(s.slot)}" title="Stop tracking">\u2715</button>
     </span>${wsGroupMenu(s)}` : "";
   const purposeChip=s.purpose&&s.purpose!=="general"
-    ?`<span class="badge ws-purpose" title="Dedicated use only">${esc(wsPurposeLabel(s))} only</span>`:"";
+    ?`<span class="badge ws-purpose" title="Dedicated use only">${esc(wsPurposeLabel(s))}${reference?"":" only"}</span>`:"";
   return `<div class="ws-card ${occ?"occupied":"free"}${pinned?" special":""}" title="${esc(s.path||"")}">
     <div class="ws-head">
       <div class="ws-name"><span class="num${pinned?" special":""}">${esc(String(s.badge||s.slot))}</span>${headTitle}${revChip}${missing}</div>
@@ -1523,6 +1533,9 @@ function wsCard(s){
       <div class="ws-location"><span class="badge">${s.target?"Remote · "+esc(s.target):"Local"}</span>
         ${purposeChip}<code class="ws-id">${esc(s.id||"")}</code></div>
       <div class="ws-path">${esc(s.path||"")}</div>
+      ${reference?`<div class="ro-note">Deployed manifest: ${deployed.error?esc(deployed.error):
+        deployed.project&&deployed.revision?`${esc(deployed.project)} @ ${esc(deployed.revision)}`:
+        "not checked"} · repository baseline: ${esc(s.rev||"main")}</div>`:""}
       <div class="ro-note">Last checked: ${reading.checked?esc(formatPortalDate(reading.checked)):"never"}
         ${reading.checked?" · "+(reading.clean?"clean baseline":reading.exists===false?"missing":"not clean baseline"):""}</div>
       ${reading.error?`<div class="ws-error">Check/operation failed: ${esc(wsErrorSummary(reading.error))}. ${reading.checked?"Last successful reading retained.":"No successful reading yet."}</div>`:""}
@@ -3062,6 +3075,10 @@ function localDmyHm(ms){
   const p=n=>String(n).padStart(2,"0");
   return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
+function localDmyHms(ms){
+  const d=new Date(ms); if(isNaN(d)) return "unknown time";
+  return `${localDmyHm(ms)}:${String(d.getSeconds()).padStart(2,"0")}`;
+}
 function briefHtml(brief, nowMs, staleHours=26){
   const e=s=>(s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
   if(!brief) return {cap:"No daily maintenance run has completed yet. The timer runs daily at the time set in Settings.",
@@ -3199,7 +3216,7 @@ function renderOverview(){
   renderChanges();
   const asof=document.getElementById("ov-asof");
   if(asof) asof.textContent=(SERVED?"Live":"Snapshot")+" · "+localDmyHm(pulseLastFetch||Date.now())
-    +(SERVED&&prefs.pulsePollMs?" · refreshes every "+(prefs.pulsePollMs/1000)+" s while open":"");
+    +(SERVED&&prefs.pulsePollMs?" · refreshes every "+formatDuration(prefs.pulsePollMs)+" while open":"");
 }
 // Re-reads every saved payload the pulse needs. Pure reads: no Jira/GitHub
 // scans, no workspace probes, no machine contact.
@@ -3219,7 +3236,7 @@ async function refreshOverviewData(){
 let pulseTimer=null, pulseBusy=false;
 async function pulseTick(force){
   if(!SERVED||activeSection!=="overview"||document.hidden||pulseBusy) return;
-  if(!force&&Date.now()-pulseLastFetch<Math.max(5000,(prefs.pulsePollMs||60000)/2)) return;
+  if(!force&&Date.now()-pulseLastFetch<Math.max(1000,(prefs.pulsePollMs||60000)/2)) return;
   pulseBusy=true;
   try{ if(await refreshOverviewData()){ buildSections(); if(activeSection==="overview") renderOverview(); } }
   finally{ pulseBusy=false; }
@@ -3228,7 +3245,9 @@ function restartPulsePoll(){
   if(pulseTimer) clearInterval(pulseTimer);
   pulseTimer=SERVED&&prefs.pulsePollMs?setInterval(()=>pulseTick(true),prefs.pulsePollMs):null;
 }
-document.addEventListener("visibilitychange",()=>{ if(!document.hidden) pulseTick(false); });
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden){ pulseTick(false); scheduleDomainRefresh(); }
+});
 
 // ============================================================================
 // Portal section nav — Overview / Tasks / Workspaces / Bugs / PRs / Team
@@ -3272,8 +3291,41 @@ function savePortalLayout(changes){
 // Browser preferences (Settings section). Validated on read so a hand-edited
 // or older value can never break the page.
 const PREFS_KEY="team-portal-prefs-v1";
-const PREF_CHOICES={clock:["auto","12","24"], actionPollMs:[1000,1500,3000,5000,10000],
+const PREF_CHOICES={clock:["auto","12","24"]};
+// Refresh intervals are free-form: 0 (Off) or 1 s .. 24 h, stored as whole ms.
+// The presets are only datalist suggestions in Settings.
+const POLL_MIN_MS=1000, POLL_MAX_MS=24*3600*1000;
+const POLL_KEYS=["actionPollMs","vmPollMs","pulsePollMs"];
+const POLL_PRESETS={actionPollMs:[1000,1500,3000,5000,10000],
   vmPollMs:[5000,15000,30000,60000], pulsePollMs:[0,30000,60000,300000]};
+function validPollMs(v){
+  return typeof v==="number"&&Number.isInteger(v)&&(v===0||(v>=POLL_MIN_MS&&v<=POLL_MAX_MS));
+}
+// "90", "90s", "1.5s", "2m", "1m30s", "1h", "off" -> ms; 0 = Off; null = invalid.
+// A bare number is seconds. Out-of-range values are invalid, not clamped.
+function parseDuration(text){
+  const s=String(text==null?"":text).trim().toLowerCase().replace(/\s+/g,"");
+  if(!s) return null;
+  if(s==="off"||s==="0") return 0;
+  const units={h:3600000,m:60000,min:60000,mins:60000,s:1000,sec:1000,secs:1000};
+  let ms=0;
+  if(/^\d+(\.\d+)?$/.test(s)) ms=Number(s)*1000;
+  else{
+    const re=/(\d+(?:\.\d+)?)(h|mins?|m|secs?|s)/g;
+    let m, used=0;
+    while((m=re.exec(s))){ ms+=Number(m[1])*units[m[2]]; used+=m[0].length; }
+    if(used!==s.length) return null;
+  }
+  ms=Math.round(ms);
+  return validPollMs(ms)&&ms?ms:null;
+}
+// Inverse of parseDuration for display: 0 -> "Off", 1500 -> "1.5s", 90000 -> "1m30s".
+function formatDuration(ms){
+  if(!ms) return "Off";
+  const h=Math.floor(ms/3600000), m=Math.floor(ms%3600000/60000), s=ms%60000/1000;
+  const sec=s?String(Math.round(s*1000)/1000)+"s":"";
+  return (h?h+"h":"")+(m?m+"m":"")+sec||"0s";
+}
 const PREF_DEFAULTS={landing:"last", hidden:[], order:[], clock:"auto", compact:false,
   actionPollMs:1500, vmPollMs:15000, pulseHidden:[], pulseOrder:[], pulsePollMs:60000,
   vmHidden:[], vmPanelsHidden:[], machineTarget:""};
@@ -3287,7 +3339,8 @@ function readPrefs(raw, ids, cardIds=[]){
   if(Array.isArray(v.order)) out.order=[...new Set(v.order.filter(id=>ids.includes(id)))];
   if(Array.isArray(v.pulseHidden)) out.pulseHidden=[...new Set(v.pulseHidden.filter(id=>cardIds.includes(id)))];
   if(Array.isArray(v.pulseOrder)) out.pulseOrder=[...new Set(v.pulseOrder.filter(id=>cardIds.includes(id)))];
-  for(const k of ["clock","actionPollMs","vmPollMs","pulsePollMs"]) if(PREF_CHOICES[k].includes(v[k])) out[k]=v[k];
+  if(PREF_CHOICES.clock.includes(v.clock)) out.clock=v.clock;
+  for(const k of POLL_KEYS) if(validPollMs(v[k])) out[k]=v[k];
   if(typeof v.compact==="boolean") out.compact=v.compact;
   if(Array.isArray(v.vmHidden)) out.vmHidden=[...new Set(v.vmHidden.filter(id=>
     typeof id==="string"&&/^i-[0-9a-f]{8,17}$/.test(id)))];
@@ -3434,6 +3487,7 @@ function selectSection(id){
   // Leaving the VM section stops its stopwatch and its poll; renderVmlog()
   // restarts both on the way back in.
   if(id!=="vm") vmTimersStop();
+  scheduleDomainRefresh();
 }
 
 // ---- refresh: reload entry values in place, keeping filters/tab/sort/columns ----
@@ -4628,25 +4682,30 @@ function renderVmlog(){
   vmTimersSync();
   applyTableStandards(document.getElementById("sec-vm"));
 }
-// --- live elapsed -------------------------------------------------------
+// --- browser-local elapsed and power countdowns -------------------------
 // Two timers, with different jobs:
-//   vmTickTimer  repaints the elapsed figure every second (pure arithmetic,
-//                no network) so the card reads like a stopwatch;
+//   vmTickTimer  repaints elapsed figures and lease countdowns every second
+//                (pure arithmetic, no network);
 //   vmLiveTimer  re-reads /api/vm-jobs so the ticking STOPS when the job does.
-// The second one is not optional. A counter that keeps climbing is a strong
-// claim that the job is alive, and /api/vm-jobs is a local file read -- it
-// never probes a target -- so polling it while something runs costs nothing.
+// Job polling never probes a target; an idle VM countdown doesn't enable it.
 let vmTickTimer=null, vmLiveTimer=null;
 const VM_LIVE_POLL_MS=()=>prefs.vmPollMs;
 
 function vmTick(){
+  if(document.hidden||activeSection!=="vm"){ vmTimersStop(); return; }
   const els=document.querySelectorAll(".vm-el[data-start]");
-  if(!els.length){ vmTimersStop(); return; }
   const skew=vmSkew(), now=Date.now()/1000;
   els.forEach(e=>{
     const t0=parseFloat(e.dataset.start||"0");
     if(t0>0) e.textContent=vmElapsedText(now-skew-t0);
   });
+  document.querySelectorAll(".vm-stop[data-stop]").forEach(e=>{
+    const left=Number(e.dataset.stop)-now+skew;
+    e.textContent=vmStopText(left);
+    e.classList.toggle("warn",left>0&&left<3600);
+    e.classList.toggle("bad",left<=0);
+  });
+  vmTimersSync();
 }
 function vmTimersStop(){
   if(vmTickTimer){ clearInterval(vmTickTimer); vmTickTimer=null; }
@@ -4657,10 +4716,15 @@ function vmTimersStop(){
 function vmSignature(d){
   return (d&&d.jobs?d.jobs:[]).map(j=>j.id+":"+j.status+":"+j.checked+":"+j.lines
     +":"+j.stale).join("|")+"#"+((d&&d.last_refresh)||"")
-    +"#"+Object.entries((d&&d.live)||{}).map(([k,v])=>k+":"+v.state).join(",");
+    +"#"+Object.entries((d&&d.live)||{}).map(([k,v])=>k+":"+v.state).join(",")
+    +"#"+JSON.stringify((d&&d.machines||[]).map(m=>[m.id,m.state,m.stop_ts,m.started_ts,m.main]))
+    +"#"+(d&&d.machines_checked||"")+"#"+(d&&d.error||"")
+    +"#"+JSON.stringify(d&&d.power_schedule||{});
 }
+let vmLiveBusy=false;
 async function vmLivePoll(){
-  if(!SERVED||activeSection!=="vm"){ return; }
+  if(!SERVED||activeSection!=="vm"||vmLiveBusy){ return; }
+  vmLiveBusy=true;
   try{
     const r=await fetch("/api/vm-jobs",{cache:"no-store"});
     if(!r.ok) return;
@@ -4668,19 +4732,30 @@ async function vmLivePoll(){
     const changed=vmSignature(j)!==vmSignature(VMLOG);
     vmAdoptPayload(j);
     if(changed){ renderVmlog(); buildSections(); }
-    else if(!(VMLOG.running||[]).length) vmTimersStop();
+    else vmTimersSync();
   }catch(e){ /* a failed poll must not kill the view; the next tick retries */ }
+  finally{ vmLiveBusy=false; }
+}
+// A changed interval (or Off) applies at once instead of after the timer stops.
+function restartVmLivePoll(){
+  if(vmLiveTimer){ clearInterval(vmLiveTimer); vmLiveTimer=null; }
+  vmTimersSync();
 }
 // Started only when the server says something is CONFIRMED running -- the
 // payload's `running` already excludes readings that have gone unverified.
 function vmTimersSync(){
   // Only while the VM section is actually on screen: a stopwatch nobody can see
   // is just a timer that keeps the laptop awake.
-  const live=(VMLOG.running||[]).length>0&&activeSection==="vm";
-  if(document.hidden){ vmTimersStop(); return; }
-  if(live&&!vmTickTimer) vmTickTimer=setInterval(vmTick,1000);
-  if(live&&!vmLiveTimer) vmLiveTimer=setInterval(vmLivePoll,VM_LIVE_POLL_MS());
-  if(!live) vmTimersStop();
+  if(document.hidden||activeSection!=="vm"){ vmTimersStop(); return; }
+  const live=(VMLOG.running||[]).length>0;
+  const now=Date.now()/1000-vmSkew();
+  const countdown=SERVED&&Array.from(document.querySelectorAll(".vm-stop[data-stop]"))
+    .some(e=>Number(e.dataset.stop)>now);
+  const tick=countdown||(live&&document.querySelectorAll(".vm-el[data-start]").length>0);
+  if(tick&&!vmTickTimer) vmTickTimer=setInterval(vmTick,1000);
+  if(!tick&&vmTickTimer){ clearInterval(vmTickTimer); vmTickTimer=null; }
+  if(live&&!vmLiveTimer&&VM_LIVE_POLL_MS()) vmLiveTimer=setInterval(vmLivePoll,VM_LIVE_POLL_MS());
+  if(!live&&vmLiveTimer){ clearInterval(vmLiveTimer); vmLiveTimer=null; }
 }
 // A hidden tab need not tick or poll. Coming back recomputes from the absolute
 // start, so the figure is correct immediately rather than resuming where it
@@ -4784,6 +4859,8 @@ function renderVmMachines(){
     +'</section><section class="vm-panel" id="vm-machine-panel" aria-label="Machine card">'
     +vmPanelHead("machines","Machine",vmOtherTargets().length)
     +(vmFolded("machines")?"":vmTargetStrip())+'</section>';
+  if(VMLOG.power_schedule&&VMLOG.power_schedule.error)
+    box.insertAdjacentHTML("beforeend",'<p class="vm-t-err">'+esc(VMLOG.power_schedule.error)+'</p>');
   box.querySelectorAll("[data-vm-fold]").forEach(b=>b.addEventListener("click",()=>{
     const key=b.dataset.vmFold;
     vmFoldToggle(key);
@@ -4802,6 +4879,7 @@ function renderVmMachines(){
   vmBindTargetRefresh(box);
   vmBindTerms(box);
   vmBindActions(box);
+  vmTimersSync();
   if(SERVED&&!VMSSO.loaded) vmSsoPoll();
 }
 // Platform EC2 policy (devops-expert skill, references/vms-and-runners.md).
@@ -4856,17 +4934,26 @@ function vmProvision(target){
     +" (a stopped VM is started first). Output streams into a terminal window.")) return;
   termOpen({kind:"provision",target},"prov-"+target);
 }
-// Started / predicted stop from mctl's power memory. A cached "running" whose
-// lease has passed is shown as probably stopped -- the reaper beat the probe.
+// The deadline is a prediction, never a replacement for observed power state.
+function vmStopText(left){
+  return left>0?"expected stop in "+vmElapsedText(Math.ceil(left))
+    :"expected stop time passed \u2014 status unconfirmed";
+}
 function vmPowerLine(m){
-  if(m.predicted_stopped)
-    return '<span class="vm-lease bad" title="The cached state says running, but the lease ended '
-      +esc(m.stopped_ago_h||"")+' ago, so the instance has most likely been stopped. The next mctl action starts it again.">'
-      +'\u26a0 lease ended '+esc(m.stopped_ago_h||"")+' ago \u2014 probably stopped; auto-starts on next use</span>';
   const bits=[];
   if(m.started_ago_h) bits.push("started "+esc(m.started_ago_h)+" ago"+(m.started_by?" ("+esc(m.started_by)+")":""));
-  if(m.stop_in_h&&m.stop_ts) bits.push("predicted stop "+esc(new Date(m.stop_ts*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}))
-    +" (in "+esc(m.stop_in_h)+")");
+  if(["running","pending"].includes(m.state)){
+    const stop=m.stop_ts, date=new Date(stop*1000);
+    if(typeof stop==="number"&&Number.isFinite(stop)&&stop>0&&!isNaN(date)){
+      const when=localDmyHm(stop*1000).split(" ")[0]+" "
+        +date.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",
+          ...(prefs.clock==="auto"||!prefs.clock?{}:{hour12:prefs.clock==="12"})});
+      const left=stop-(Date.now()/1000-vmSkew());
+      bits.push(SERVED?'<span class="vm-stop'+(left<=0?" bad":left<3600?" warn":"")+'" data-stop="'+stop+'">'
+        +esc(vmStopText(left))+'</span> \u00b7 '+esc(when)
+        :esc("expected stop "+when+" (snapshot)"));
+    }else bits.push("expected stop unavailable");
+  }
   return bits.length?'<span class="vm-lease">'+bits.join(" \u00b7 ")+'</span>':"";
 }
 // A shell on the machine, in its own window: attaches to the persistent tmux
@@ -5099,10 +5186,7 @@ function vmBindTargetRefresh(box){
 function vmMachine(m){
   const on=m.state==="running", busy=["pending","stopping","shutting-down"].includes(m.state);
   const act=on?"stop":"start";
-  const lease=m.lease_left_h
-    ? '<span class="vm-lease'+(m.lease_left<=0?" bad":(m.lease_left<3600?" warn":""))+'"'
-      +(m.lease_left>0&&m.lease_left<3600?' title="Lease expires within the hour \u2014 extend it or the instance stops"':"")+'>lease '+esc(m.lease_left_h)
-      +(m.lease_left>0?" left":"")+'</span>' : "";
+  const powerCheck=((VMLOG.power_schedule||{}).instances||{})[m.id];
   const t=(VMLOG.target_state||[]).find(x=>x.name===m.target);
   const main=m.main
     ? '<span class="vm-main" title="Main VM: target vm \u2014 neo-ask and default delegation run here">Main</span>'
@@ -5119,7 +5203,8 @@ function vmMachine(m){
     ["Instance",esc(m.id)+' \u00b7 '+esc(m.type)+(m.ip?' \u00b7 '+esc(m.ip):"")],
     ["Target",m.target?'<b>'+esc(m.target)+'</b>':'<span class="vm-t-age">not tracked</span>'],
     ["Note",m.desc?esc(m.desc):""],
-    ["Power",[lease,vmPowerLine(m)].filter(Boolean).join(" \u00b7 ")],
+    ["Power",vmPowerLine(m)],
+    ["Power check",powerCheck&&powerCheck.error?'<span class="vm-t-err">'+esc(powerCheck.error)+'</span>':""],
     ["Jobs",vmJobsLine(t)],
     ["Error",t&&t.error?'<span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':""],
     ["Setup",t?vmProvBadge(t):""],
@@ -5822,7 +5907,8 @@ async function refreshData(){
   if(btn){ btn.disabled=true; btn.classList.add("spinning"); }
   try{
     if(activeSection==="team" && window.TeamUI){
-      await window.TeamUI.refresh();
+      const refreshed=await window.TeamUI.refresh();
+      if(refreshed) clearDomainStaleForSection("team");
       if(note) note.textContent="Saved team data refreshed; no external scans";
       return;
     }
@@ -5837,6 +5923,7 @@ async function refreshData(){
       if(!response.ok) throw new Error(data.error||"Could not reload saved workspace data");
       TASKS=data.tasks;
       WORKSPACES=data.workspaces;
+      clearDomainStaleForSection("ws");
       buildSections(); renderWorkspaces();
       if(note) note.textContent="Saved workspace data refreshed; live status not checked";
       return;
@@ -5873,6 +5960,7 @@ async function refreshData(){
     else if(activeSection==="vm") renderVmlog();
     else if(activeSection==="raid") renderRaid();
     else render();
+    clearDomainStaleForSection(activeSection);
     if(note){
       const now=new Date();
       const hh=String(now.getHours()).padStart(2,"0"), mm=String(now.getMinutes()).padStart(2,"0"), ss=String(now.getSeconds()).padStart(2,"0");
@@ -5892,8 +5980,169 @@ document.getElementById("refresh").addEventListener("click",refreshData);
 // granted). The poll doubles as the "a tab is open" heartbeat; with no tab the
 // server raises a Windows toast instead. The live ssh link reports a change
 // stamp here too, which re-reads the Machines section without a manual refresh.
-const NOTIFY={seq:null,timer:null,liveChanged:0,max:4};
-const NOTIFY_POLL_MS=5000;
+const NOTIFY={seq:null,instance:null,source:null,fallbackTimer:null,stateAt:0,liveChanged:0,max:4,
+  transport:"",pollMs:0};
+const NOTIFY_POLL_MS=()=>liveCfg().poll_interval_s*1000;
+const DOMAIN_SECTION={tasks:"work",workspaces:"ws",bugs:"bugs",prs:"prs",raid:"raid",
+  team:"team",delegation:"vm",pr_failures:"overview"};
+const DOMAIN_NAMES=Object.keys(DOMAIN_SECTION);
+const DOMAIN_STALE=new Set();
+const DOMAIN_GENERATION=new Map();
+let domainRefreshTimer=null, domainRefreshBusy=false, domainModalObserver=null;
+// ---- update summaries (pure projections; exclude private Team content) ----
+// Settings > Automatic updates; server-side keys are applied by portal.py.
+const LIVE_DEFAULTS={enabled:true,push_stream:true,poll_interval_s:5,auto_reload:true,
+  popups:true,history_limit:50,detail_limit:50,refresh_delay_ms:250};
+function liveCfg(){
+  let saved=null;
+  try{ saved=SETTINGS&&SETTINGS.settings&&SETTINGS.settings.live_updates; }catch(e){ /* not loaded yet */ }
+  return {...LIVE_DEFAULTS,...(saved||{})};
+}
+const UPDATE_LABELS={tasks:"Tasks",workspaces:"Workspaces",bugs:"Bugs",prs:"PRs",
+  raid:"RAID",team:"Team",delegation:"Machines",pr_failures:"Triage"};
+function updateProjection(domain, payload){
+  const records={};
+  const add=(id,label,fields)=>{
+    if(id===undefined||id===null||id==="") return;
+    records[String(id)]={label:String(label||id).slice(0,180),fields};
+  };
+  const fields=(row,names)=>Object.fromEntries(names.map(name=>[name,row[name]??null]));
+  if(domain==="tasks"){
+    for(const row of payload.tasks||payload||[])
+      add(row.id,`${row.id} ${row.title||""}`.trim(),
+        fields(row,["title","status","priority","category","cost_hours","jira","workspace"]));
+  }else if(domain==="prs"){
+    for(const row of payload.features||[]){
+      add(row.id,row.name||row.id,fields(row,["name","priority","pldm","complete"]));
+      for(const pr of row.prs||[])
+        add(`${row.id}/${pr.repo}#${pr.number}`,`${pr.repo}#${pr.number} ${pr.title||""}`.trim(),
+          fields(pr,["status","review","checks_pass","checks_fail","checks_pending","mergeable","draft"]));
+    }
+  }else if(domain==="bugs"){
+    for(const row of payload.bugs||[])
+      add(row.key,`${row.key} ${row.summary||""}`.trim(),
+        fields(row,["summary","status","priority","resolution","open"]));
+  }else if(domain==="raid"){
+    for(const row of payload.rows||[])
+      add(row.id,`${row.id} ${row.title||""}`.trim(),fields(row,["title","status","p","i","rag","due","closed"]));
+  }else if(domain==="delegation"){
+    for(const row of payload.jobs||[])
+      add(row.id,`${row.kind||"Job"} on ${row.target||""} (${row.id})`,
+        fields(row,["status","rc","phase","finished","stale"]));
+  }else if(domain==="workspaces"){
+    for(const row of payload.roster||[])
+      add(row.id||row.slot,row.label||row.slot||row.id,
+        {...fields(row,["label","purpose"]),
+          status:row.status&&typeof row.status==="object"
+            ?fields(row.status,["exists","clean","safe","mirror"]):row.status??null,
+          holder:payload.slots?.[row.slot]?.holder??null});
+  }else if(domain==="pr_failures"){
+    for(const row of payload.phenomena||[])
+      add(row.id,row.id,fields(row,["status","verdict","severity"]));
+  }else if(domain==="team"){
+    // Even in private mode, only collection counts enter the public update feed.
+    for(const name of ["members","assignments","items","meetings"])
+      add(name,name,{count:(payload[name]||[]).length});
+  }
+  return records;
+}
+function updateDiff(domain, before, after){
+  const details=[];
+  let added=0,changed=0,removed=0;
+  for(const [id,row] of Object.entries(after)){
+    if(!before[id]){ added++; details.push(`${row.label}: added`); continue; }
+    const changes=Object.keys(row.fields).filter(key=>
+      JSON.stringify(row.fields[key])!==JSON.stringify(before[id].fields[key]));
+    if(changes.length){
+      changed++;
+      details.push(`${row.label}: `+changes.map(key=>{
+        const display=value=>{
+          const text=value===null||value===undefined?"none":
+            typeof value==="object"?JSON.stringify(value):String(value);
+          return text.length>100?text.slice(0,97)+"...":text;
+        };
+        return `${key.replaceAll("_"," ")}: ${display(before[id].fields[key])} → ${display(row.fields[key])}`;
+      }).join("; "));
+    }
+  }
+  for(const [id,row] of Object.entries(before)){
+    if(!after[id]){ removed++; details.push(`${row.label}: removed`); }
+  }
+  const counts=[added?`${added} added`:"",changed?`${changed} changed`:"",removed?`${removed} removed`:""].filter(Boolean);
+  return {summary:`${UPDATE_LABELS[domain]}: ${counts.join(", ")||"saved data reloaded"}`,
+    details:details.length?details.slice(0,liveCfg().detail_limit):[domain==="team"
+      ?"Team records reloaded. Private content is not included in update messages."
+      :"No changes in the displayed fields; saved data was reloaded."],
+    omitted:Math.max(0,details.length-liveCfg().detail_limit),changed:added+changed+removed>0};
+}
+// ---- update history -----------------------------------------------------
+const UPDATES={rows:[],selected:null,open:false,next:0,baseline:new Map()};
+function setUpdatesOpen(open){
+  UPDATES.open=!!open;
+  if(UPDATES.open) setActionsOpen(false);
+  const panel=document.getElementById("updates-panel");
+  if(panel) panel.hidden=!UPDATES.open;
+  document.getElementById("updates-open")?.setAttribute("aria-expanded",String(UPDATES.open));
+}
+function renderUpdates(){
+  const opener=document.getElementById("updates-open");
+  if(!opener) return;
+  opener.hidden=!SERVED;
+  document.getElementById("updates-summary").textContent=UPDATES.rows[0]?.summary
+    ||(liveCfg().enabled?"No updates yet":"Automatic updates off");
+  if(!UPDATES.rows.some(row=>row.id===UPDATES.selected)) UPDATES.selected=UPDATES.rows[0]?.id||null;
+  document.getElementById("updates-list").innerHTML=
+    (UPDATES.rows.length?UPDATES.rows.map(row=>`<button type="button"
+      class="ab-queue-item${row.id===UPDATES.selected?" selected":""}" data-update-id="${row.id}"
+      aria-pressed="${row.id===UPDATES.selected}"><span>${esc(row.summary)}
+      <small class="muted">${esc(localDmyHms(row.at))}</small></span>
+      <b>${esc(row.state)}</b></button>`).join(""):'<div class="ab-queue-empty">No updates in this tab yet.</div>');
+  const selected=UPDATES.rows.find(row=>row.id===UPDATES.selected);
+  document.getElementById("updates-detail").innerHTML=selected?
+    `<b>${esc(selected.summary)}</b><div class="muted">${esc(localDmyHms(selected.at))}</div>
+     <ul>${selected.details.map(detail=>`<li>${esc(detail)}</li>`).join("")}</ul>
+     ${selected.omitted?`<div class="muted">${selected.omitted} more changes not listed.</div>`:""}
+     <button type="button" class="ab-link" data-update-section="${esc(DOMAIN_SECTION[selected.domain])}">Open ${esc(UPDATE_LABELS[selected.domain])}</button>`:"";
+}
+function observeDomainUpdate(domain){
+  const pending=UPDATES.rows.find(row=>row.domain===domain&&row.state==="Pending");
+  if(pending){ pending.at=Date.now(); return; }
+  UPDATES.rows.unshift({id:++UPDATES.next,domain,at:Date.now(),state:"Pending",
+    summary:`${UPDATE_LABELS[domain]}: update detected`,
+    details:[liveCfg().auto_reload?"Saved data changed. Details will be available when this section reloads."
+      :"Saved data changed. Use Refresh to load it (automatic reload is off in Settings)."],omitted:0});
+  UPDATES.rows.length=Math.min(liveCfg().history_limit,UPDATES.rows.length);
+}
+function finishDomainUpdate(domain,payload){
+  const projection=updateProjection(domain,payload);
+  const before=UPDATES.baseline.get(domain);
+  UPDATES.baseline.set(domain,projection);
+  const row=UPDATES.rows.find(row=>row.domain===domain&&["Pending","Failed"].includes(row.state));
+  if(!row) return;
+  const diff=before?updateDiff(domain,before,projection):
+    {summary:`${UPDATE_LABELS[domain]}: saved data loaded`,details:["No earlier snapshot available for comparison."],omitted:0,changed:false};
+  Object.assign(row,diff,{state:"Updated",at:Date.now()});
+  renderUpdates();
+  if(diff.changed&&liveCfg().popups) notifyShow({seq:row.id,title:diff.summary,body:diff.details.slice(0,2).join("\n"),
+    tone:"ok",link:"#"+DOMAIN_SECTION[domain]});
+}
+document.addEventListener("click",event=>{
+  if(event.target.closest("#updates-open")){ setUpdatesOpen(!UPDATES.open); return; }
+  if(event.target.closest("#updates-close")){ setUpdatesOpen(false); return; }
+  if(event.target.closest("#updates-clear")){
+    UPDATES.rows=[]; UPDATES.selected=null; renderUpdates(); return;
+  }
+  const row=event.target.closest("[data-update-id]");
+  if(row){ UPDATES.selected=Number(row.dataset.updateId); renderUpdates(); return; }
+  const link=event.target.closest("[data-update-section]");
+  if(link){ setUpdatesOpen(false); selectSection(link.dataset.updateSection); return; }
+  if(UPDATES.open&&!event.target.closest("#updates-anchor")) setUpdatesOpen(false);
+});
+document.addEventListener("keydown",event=>{
+  if(event.key==="Escape"&&UPDATES.open){
+    setUpdatesOpen(false); document.getElementById("updates-open")?.focus();
+  }
+});
 function notifyCard(ev){
   let stack=document.getElementById("notify-stack");
   if(!stack){
@@ -5922,6 +6171,60 @@ function notifyShow(ev){
   if(document.hidden&&notifyDesktop(ev)) return;
   notifyCard(ev);
 }
+function parseEventSeq(event){
+  const id=event.lastEventId||"";
+  if(id.includes(":")) NOTIFY.instance=id.slice(0,id.lastIndexOf(":"));
+  const raw=id.split(":").pop();
+  const seq=Number(raw);
+  return Number.isSafeInteger(seq)&&seq>=0?seq:null;
+}
+function streamState(state){
+  if(state.ai){ AI_USAGE=state.ai; aiSyncButton(); }
+  const changed=(state.live&&state.live.changed)||0;
+  if(changed>NOTIFY.liveChanged){
+    const first=!NOTIFY.liveChanged;
+    NOTIFY.liveChanged=changed;
+    if(!first&&activeSection==="vm") vmLivePoll();
+  }
+  if(Date.now()-NOTIFY.stateAt>60000){
+    NOTIFY.stateAt=Date.now();
+    rcLoadOpen();
+  }
+}
+function queueDomainRefresh(domains){
+  for(const domain of domains||[]){
+    if(!DOMAIN_SECTION[domain]) continue;
+    DOMAIN_STALE.add(domain);
+    DOMAIN_GENERATION.set(domain,(DOMAIN_GENERATION.get(domain)||0)+1);
+  }
+  scheduleDomainRefresh();
+}
+function notifyEvent(ev){
+  if(ev.kind==="settings"){ syncLiveSettings(); return; }
+  if(ev.kind==="domain"){
+    if(!liveCfg().enabled) return;
+    for(const domain of ev.domains||[]) if(UPDATE_LABELS[domain]) observeDomainUpdate(domain);
+    renderUpdates();
+    queueDomainRefresh(ev.domains||[]);
+    return;
+  }
+  notifyShow(ev);
+  if(ev.kind==="ai") rcLoadOpen();
+}
+function processStreamEvent(event){
+  const seq=parseEventSeq(event);
+  if(seq!==null&&NOTIFY.seq!==null&&seq<=NOTIFY.seq) return;
+  const ev=JSON.parse(event.data);
+  if(seq!==null) NOTIFY.seq=seq;
+  notifyEvent(ev);
+  if(ev.ai) streamState({ai:ev.ai});
+}
+function processReset(event){
+  const seq=parseEventSeq(event);
+  if(seq!==null) NOTIFY.seq=seq;
+  streamState(JSON.parse(event.data));
+  queueDomainRefresh(DOMAIN_NAMES);
+}
 async function notifyPoll(){
   if(!SERVED) return;
   try{
@@ -5929,24 +6232,212 @@ async function notifyPoll(){
     if(!r.ok) return;
     const j=await r.json();
     // First poll only learns the cursor: no replay of events from before load.
-    if(NOTIFY.seq!==null) (j.events||[]).forEach(notifyShow);
-    if((NOTIFY.seq!==null&&(j.events||[]).some(ev=>ev.kind==="ai"))||Date.now()-(NOTIFY.rcAt||0)>60000){
-      NOTIFY.rcAt=Date.now(); rcLoadOpen();
+    if(NOTIFY.seq!==null) (j.events||[]).forEach(ev=>{
+      if((ev.seq||0)>NOTIFY.seq){ NOTIFY.seq=ev.seq; notifyEvent(ev); }
+    });
+    else{
+      NOTIFY.seq=j.seq||0;
+      if(!window.PORTAL_EVENT_CURSOR) queueDomainRefresh(DOMAIN_NAMES);
     }
-    NOTIFY.seq=j.seq||0;
-    const changed=(j.live&&j.live.changed)||0;
-    if(changed>NOTIFY.liveChanged){
-      const first=!NOTIFY.liveChanged;
-      NOTIFY.liveChanged=changed;
-      if(!first&&activeSection==="vm") vmLivePoll();
-    }
-    if(j.ai){ AI_USAGE=j.ai; aiSyncButton(); }
+    streamState({live:j.live,ai:j.ai});
   }catch(e){ /* the next tick retries */ }
 }
 function notifyStart(){
-  if(NOTIFY.timer) return;
+  if(!SERVED) return;
+  for(const [domain,payload] of Object.entries({tasks:TASKS,workspaces:WORKSPACES,
+    bugs:BUGS,prs:PRS,raid:RAID,delegation:VMLOG,team:TEAMDATA,pr_failures:TRIAGE}))
+    UPDATES.baseline.set(domain,updateProjection(domain,payload));
+  renderUpdates();
+  const initial=window.PORTAL_EVENT_CURSOR;
+  if(initial&&typeof initial.instance==="string"&&Number.isSafeInteger(initial.seq)){
+    NOTIFY.seq=initial.seq; NOTIFY.instance=initial.instance;
+  }
+  if(!domainModalObserver&&typeof MutationObserver!=="undefined"){
+    domainModalObserver=new MutationObserver(records=>{
+      const selector=".ws-modal-ov,.team-dialog-overlay,.task-bulk-overlay,[role='dialog'][aria-modal='true']";
+      if(records.some(record=>[...record.removedNodes].some(node=>
+        node.nodeType===1&&(node.matches(selector)||node.querySelector(selector)))))
+        scheduleDomainRefresh();
+    });
+    domainModalObserver.observe(document.body,{childList:true,subtree:true});
+  }
+  notifyConnect();
+}
+function notifyStartPolling(){
+  if(NOTIFY.fallbackTimer) clearInterval(NOTIFY.fallbackTimer);
+  NOTIFY.pollMs=NOTIFY_POLL_MS();
   notifyPoll();
-  NOTIFY.timer=setInterval(notifyPoll,NOTIFY_POLL_MS);
+  NOTIFY.fallbackTimer=setInterval(notifyPoll,NOTIFY.pollMs);
+}
+// (Re)open the event transport chosen in Settings: push stream or polling.
+function notifyConnect(){
+  if(NOTIFY.source){ NOTIFY.source.close(); NOTIFY.source=null; }
+  if(NOTIFY.fallbackTimer){ clearInterval(NOTIFY.fallbackTimer); NOTIFY.fallbackTimer=null; }
+  const push=liveCfg().push_stream&&typeof EventSource!=="undefined";
+  NOTIFY.transport=push?"stream":"poll";
+  if(!push){ notifyStartPolling(); return; }
+  const cursor=NOTIFY.instance&&NOTIFY.seq!==null
+    ? `?since=${encodeURIComponent(NOTIFY.instance+":"+NOTIFY.seq)}` : "";
+  const source=new EventSource("/api/stream"+cursor);
+  NOTIFY.source=source;
+  source.onopen=()=>{
+    if(NOTIFY.fallbackTimer){ clearInterval(NOTIFY.fallbackTimer); NOTIFY.fallbackTimer=null; }
+  };
+  source.onmessage=event=>processStreamEvent(event);
+  source.addEventListener("hello",event=>{ parseEventSeq(event); streamState(JSON.parse(event.data)); });
+  source.addEventListener("state",event=>streamState(JSON.parse(event.data)));
+  source.addEventListener("reset",processReset);
+  source.onerror=()=>{ if(!NOTIFY.fallbackTimer) notifyStartPolling(); };
+}
+// Another tab saved settings: adopt only the live-update values. The revision
+// is left alone so an open Settings form here still gets a 409 on save.
+async function syncLiveSettings(){
+  try{
+    const r=await fetch("/api/settings",{cache:"no-store"});
+    if(!r.ok) return;
+    const data=await r.json();
+    if(SETTINGS&&SETTINGS.settings&&data.settings){
+      SETTINGS.settings.live_updates=data.settings.live_updates;
+      SETTINGS.settings.machines=data.settings.machines;
+    }
+    applyLiveSettings();
+  }catch(e){ /* next settings change retries */ }
+}
+function applyLiveSettings(){
+  if(!SERVED||!NOTIFY.transport) return;
+  const cfg=liveCfg();
+  const want=cfg.push_stream&&typeof EventSource!=="undefined"?"stream":"poll";
+  if(want!==NOTIFY.transport) notifyConnect();
+  else if(NOTIFY.fallbackTimer&&NOTIFY.pollMs!==NOTIFY_POLL_MS()) notifyStartPolling();
+  UPDATES.rows.length=Math.min(cfg.history_limit,UPDATES.rows.length);
+  if(!cfg.enabled){
+    for(const row of UPDATES.rows) if(row.state==="Pending")
+      Object.assign(row,{state:"Stopped",details:["Automatic updates were turned off. Use Refresh to load saved data."]});
+    DOMAIN_STALE.clear();
+  }
+  renderUpdates();
+  scheduleDomainRefresh();
+}
+function domainAffectsSection(domain, section){
+  return section==="overview"||DOMAIN_SECTION[domain]===section;
+}
+function clearDomainStaleForSection(section){
+  for(const domain of DOMAIN_STALE){
+    if(domainAffectsSection(domain,section)){
+      const payloads={tasks:TASKS,workspaces:WORKSPACES,bugs:BUGS,prs:PRS,raid:RAID,
+        delegation:VMLOG,team:section==="team"&&window.TeamUI?window.TeamUI.updateSummary():TEAMDATA,
+        pr_failures:TRIAGE};
+      finishDomainUpdate(domain,payloads[domain]);
+      DOMAIN_STALE.delete(domain);
+    }
+  }
+}
+function hasOpenEditor(){
+  return !!document.querySelector(".ws-modal-ov,.team-dialog-overlay,.task-bulk-overlay,[role='dialog'][aria-modal='true']");
+}
+function scheduleDomainRefresh(){
+  if(domainRefreshTimer) clearTimeout(domainRefreshTimer);
+  if(!liveCfg().auto_reload) return;
+  domainRefreshTimer=setTimeout(()=>{ domainRefreshTimer=null; refreshVisibleDomains(); },liveCfg().refresh_delay_ms);
+}
+async function portalJson(url){
+  const response=await fetch(url,{cache:"no-store"});
+  const data=await response.json();
+  if(!response.ok) throw new Error(data.error||`Could not reload ${url}`);
+  return data;
+}
+async function updateDomain(domain, section){
+  if(domain==="tasks"||domain==="workspaces"){
+    const data=await portalJson("/api/tasks");
+    if(domain==="tasks") finishDomainUpdate(domain,data);
+    else finishDomainUpdate(domain,data.workspaces||{});
+    TASKS=data.tasks||data;
+    if(data.workspaces) WORKSPACES=data.workspaces;
+  }else if(domain==="bugs"){
+    const [bugs,triage]=await Promise.all([portalJson("/api/bugs"),portalJson("/api/triage")]);
+    finishDomainUpdate(domain,bugs);
+    BUGS=bugs; TRIAGE=triage;
+  }else if(domain==="pr_failures"){
+    TRIAGE=await portalJson("/api/triage");
+    finishDomainUpdate(domain,TRIAGE);
+  }else if(domain==="prs"){
+    PRS=await portalJson("/api/prs");
+    finishDomainUpdate(domain,PRS);
+  }else if(domain==="raid"){
+    RAID=await portalJson("/api/raid");
+    finishDomainUpdate(domain,RAID);
+  }else if(domain==="delegation"){
+    const data=await portalJson("/api/vm-jobs");
+    finishDomainUpdate(domain,data);
+    vmAdoptPayload(data);
+  }else if(domain==="team"){
+    if(section==="team"&&window.TeamUI){
+      if(!await window.TeamUI.refresh()) throw new Error("Could not reload Team data");
+      finishDomainUpdate(domain,window.TeamUI.updateSummary());
+    }else{
+      const data=await portalJson("/api/team?audience=shared");
+      finishDomainUpdate(domain,data);
+      if(data.members) TEAMDATA=data;
+    }
+  }
+}
+function renderDomainUpdate(section){
+  if(section==="team") return;
+  if(section==="overview"){
+    pulseLastFetch=Date.now();
+    buildSections();
+    renderOverview();
+    return;
+  }
+  const filters=captureFilterState();
+  buildFilters();
+  restoreFilterState(filters);
+  buildBugFilters();
+  buildBugTabs();
+  buildSections();
+  document.getElementById("total").textContent=
+    `${TASKS.length} tasks · ${bugList().filter(b=>b.open).length} open bugs`;
+  if(section==="bugs") renderBugs();
+  else if(section==="work") render();
+  else if(section==="ws") renderWorkspaces();
+  else if(section==="prs") renderPrs();
+  else if(section==="vm") renderVmlog();
+  else if(section==="raid") renderRaid();
+}
+async function refreshVisibleDomains(){
+  if(!SERVED||document.hidden||domainRefreshBusy||hasOpenEditor()||!liveCfg().auto_reload) return;
+  const section=activeSection;
+  const domains=[...DOMAIN_STALE].filter(domain=>domainAffectsSection(domain,section));
+  if(!domains.length) return;
+  const generations=new Map(domains.map(domain=>[domain,DOMAIN_GENERATION.get(domain)||0]));
+  domainRefreshBusy=true;
+  let reschedule=false;
+  let succeeded=false;
+  try{
+    await Promise.all(domains.map(domain=>updateDomain(domain,section)));
+    succeeded=true;
+    for(const domain of domains){
+      if(DOMAIN_GENERATION.get(domain)===generations.get(domain)) DOMAIN_STALE.delete(domain);
+      else reschedule=true;
+    }
+    if(activeSection===section) renderDomainUpdate(section);
+    const note=document.getElementById("refresh-note");
+    if(note) note.textContent="Updated automatically";
+  }catch(error){
+    const note=document.getElementById("refresh-note");
+    if(note) note.textContent=`Automatic update failed: ${error.message}`;
+    for(const domain of domains){
+      const row=UPDATES.rows.find(row=>row.domain===domain&&row.state==="Pending");
+      if(row) Object.assign(row,{state:"Failed",summary:`${UPDATE_LABELS[domain]}: reload failed`,
+        details:[error.message,"Use Refresh to retry loading saved data."]});
+    }
+    renderUpdates();
+  }finally{
+    domainRefreshBusy=false;
+    if((reschedule||succeeded)
+       &&[...DOMAIN_STALE].some(domain=>domainAffectsSection(domain,activeSection))
+       &&!hasOpenEditor()&&!document.hidden) scheduleDomainRefresh();
+  }
 }
 let AI_USAGE={};
 
@@ -6287,8 +6778,8 @@ function scheduleDaysLabel(days){
 let actionPollTimer=null;
 function restartActionPoll(){
   if(!SERVED) return;
-  if(actionPollTimer) clearInterval(actionPollTimer);
-  actionPollTimer=setInterval(refreshActionQueue,prefs.actionPollMs);
+  if(actionPollTimer){ clearInterval(actionPollTimer); actionPollTimer=null; }
+  if(prefs.actionPollMs) actionPollTimer=setInterval(refreshActionQueue,prefs.actionPollMs);
 }
 let SETTINGS=BOOT.settings||null;
 let settingsMsg={text:"",tone:""};
@@ -6307,14 +6798,35 @@ const SETTING_GROUPS=[
     ["allow_jira_github_reads","Allow Jira / GitHub reads","read-only lookups during AI runs; the only GitHub write is posting an interactive review you confirmed"]]],
   ["machines","Machines",[
     ["live_targets","Live-status machines","comma-separated targets kept on a persistent ssh status link"],
-    ["live_interval_s","Live update interval","seconds between probes on the live link"]]],
+    ["live_interval_s","Live update interval","seconds between probes on the live link"],
+    ["power_checks","Check power at expected transitions","EC2 read only at lease end or during a pending transition; no SSH probes or power actions"],
+    ["power_grace_s","Lease-end grace","seconds after expected lease end before checking power"],
+    ["power_retry_s","Power-check retry spacing","seconds between bounded follow-up checks"],
+    ["power_retry_limit","Power-check retries","additional attempts after the first check; 0 disables retries"]]],
   ["notify","Notifications",[
     ["enabled","Pop-up notifications","master switch"],
     ["queue","Action queue","an action finished, failed or needs approval"],
     ["machine_jobs","Machine jobs","a build/test on a machine finished"],
     ["ai","AI runs","an AI answer, review draft or interactive-review start/submit/end"],
     ["reachability","Machine reachability","a live-status machine went down or came back"],
-    ["windows_toast","Windows toast when no tab is open","via powershell.exe from WSL"]]]];
+    ["windows_toast","Windows toast when no tab is open","via powershell.exe from WSL"]]],
+  ["live_updates","Automatic updates",[
+    ["enabled","Automatic updates","master switch: watch resource databases and update open tabs"],
+    ["tasks","Watch Tasks",""],["workspaces","Watch Workspaces",""],["bugs","Watch Bugs",""],
+    ["prs","Watch PRs",""],["raid","Watch RAID",""],["team","Watch Team",""],
+    ["delegation","Watch Machines","machine job log"],["pr_failures","Watch CI triage","Overview triage panel"],
+    ["scan_interval_s","Scan interval","seconds between database metadata checks (server)"],
+    ["quiet_ms","Quiet period","ms a database must stay unchanged before tabs are told (server)"],
+    ["replay_events","Replay buffer","events kept for tabs that reconnect; older gaps trigger a full resync (server)"],
+    ["push_stream","Push updates (stream)","off: tabs poll instead of keeping a stream open"],
+    ["keepalive_s","Stream keepalive","seconds of idle between stream keepalives"],
+    ["state_interval_s","Status refresh on stream","seconds between machine/AI status pushes on an idle stream"],
+    ["poll_interval_s","Poll interval","seconds; used when push is off or the stream fails"],
+    ["auto_reload","Reload sections automatically","off: changes are listed as Pending until you press Refresh"],
+    ["popups","Change pop-ups","show a pop-up for each detected change"],
+    ["history_limit","Updates history size","entries kept per tab"],
+    ["detail_limit","Details per update","record changes listed per entry"],
+    ["refresh_delay_ms","Reload delay","ms to batch bursts of changes before reloading"]]]];
 function settingField(group,[key,label,hint],values,dis){
   const v=values[key], def=((SETTINGS.defaults||{})[group]||{})[key];
   const id=`sg-${group}-${key}`;
@@ -6392,6 +6904,7 @@ async function saveGroupSettings(form){
         group_limits:data.group_limits,status:data.status};
       BOOT.settings=SETTINGS;
       groupsMsg={text:data.changed.length?`Saved ${data.changed.length} change(s)`:"No changes",tone:data.changed.length?"ok":""};
+      applyLiveSettings();
     }
   }catch(error){ groupsMsg={text:"Save failed: "+error.message,tone:"bad"}; }
   renderGroupSettings(); renderRoutineSettings();
@@ -6521,19 +7034,20 @@ function renderPrefs(){
   const order=navSections(SECTIONS,{...prefs,hidden:[]});
   const cards=pulseVisible(PortalPulse.cards({},Date.now()),prefs,true);
   const opt=(v,l,cur)=>`<option value="${esc(v)}"${String(v)===String(cur)?" selected":""}>${esc(l)}</option>`;
-  box.innerHTML=`<div class="set-prefs">
+  const durInput=k=>`<input type="text" class="set-dur" data-dur="${k}" value="${esc(formatDuration(prefs[k]))}"
+      list="set-dur-${k}" inputmode="text" spellcheck="false" autocomplete="off" size="8" aria-describedby="set-dur-hint">
+    <datalist id="set-dur-${k}">${["off",...POLL_PRESETS[k].filter(Boolean).map(formatDuration)]
+      .map(v=>`<option value="${esc(v)}"></option>`).join("")}</datalist>`;`<div class="set-prefs">
     <div class="set-col">
       <label class="set-row"><span class="set-lbl">Landing section</span>
         <select data-pref="landing">${opt("last","Last visited",prefs.landing)}${SECTIONS.map(s=>opt(s.id,s.label,prefs.landing)).join("")}</select></label>
       <label class="set-row"><span class="set-lbl">Clock</span>
         <select data-pref="clock">${opt("auto","Browser default",prefs.clock)}${opt("24","24-hour",prefs.clock)}${opt("12","12-hour",prefs.clock)}</select></label>
       <label class="set-row"><input type="checkbox" data-pref="compact"${prefs.compact?" checked":""}> <span>Compact tables</span></label>
-      <label class="set-row"><span class="set-lbl">Action queue refresh</span>
-        <select data-pref="actionPollMs">${PREF_CHOICES.actionPollMs.map(v=>opt(v,(v/1000)+" s",prefs.actionPollMs)).join("")}</select></label>
-      <label class="set-row"><span class="set-lbl">Machines live refresh</span>
-        <select data-pref="vmPollMs">${PREF_CHOICES.vmPollMs.map(v=>opt(v,(v/1000)+" s",prefs.vmPollMs)).join("")}</select></label>
-      <label class="set-row"><span class="set-lbl">Overview live refresh</span>
-        <select data-pref="pulsePollMs">${PREF_CHOICES.pulsePollMs.map(v=>opt(v,v?(v>=60000?(v/60000)+" min":(v/1000)+" s"):"Off",prefs.pulsePollMs)).join("")}</select></label>
+      <label class="set-row"><span class="set-lbl">Action queue refresh</span>${durInput("actionPollMs")}</label>
+      <label class="set-row"><span class="set-lbl">Machines live refresh</span>${durInput("vmPollMs")}</label>
+      <label class="set-row"><span class="set-lbl">Overview live refresh</span>${durInput("pulsePollMs")}</label>
+      <small id="set-dur-hint">Intervals: 1s to 24h, or off. Examples: 1.5s, 90s, 2m, 1m30s. Short Overview intervals re-fetch every section.</small>
       <div class="set-actions">
         <button type="button" class="btn" data-reset-layout>Reset layout (tiles, sidebar)</button>
         <button type="button" class="btn" data-reset-prefs>Reset preferences</button>
@@ -6558,9 +7072,30 @@ function renderPrefs(){
     savePrefs({[k]:v});
     if(k==="compact") document.body.classList.toggle("compact-tables",prefs.compact);
     if(k==="clock"&&window.__updateClock) window.__updateClock();
-    if(k==="actionPollMs") restartActionPoll();
-    if(k==="pulsePollMs") restartPulsePoll();
   }));
+  box.querySelectorAll("[data-dur]").forEach(el=>{
+    const k=el.dataset.dur;
+    const commit=()=>{
+      const ms=parseDuration(el.value);
+      if(ms===null){
+        el.setAttribute("aria-invalid","true");
+        el.title="Enter 1s to 24h (e.g. 1.5s, 90s, 2m, 1m30s) or off. Kept "+formatDuration(prefs[k])+".";
+        return;
+      }
+      el.removeAttribute("aria-invalid"); el.title="";
+      el.value=formatDuration(ms);
+      if(ms===prefs[k]) return;
+      savePrefs({[k]:ms});
+      if(k==="actionPollMs") restartActionPoll();
+      if(k==="vmPollMs") restartVmLivePoll();
+      if(k==="pulsePollMs"){ restartPulsePoll(); if(activeSection==="overview") renderOverview(); }
+    };
+    el.addEventListener("change",commit);
+    el.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); commit(); } });
+    el.addEventListener("input",()=>{
+      if(parseDuration(el.value)!==null){ el.removeAttribute("aria-invalid"); el.title=""; }
+    });
+  });
   box.querySelectorAll("[data-card-show]").forEach(el=>el.addEventListener("change",()=>{
     const id=el.dataset.cardShow;
     savePrefs({pulseHidden:el.checked?prefs.pulseHidden.filter(x=>x!==id):[...prefs.pulseHidden,id]});

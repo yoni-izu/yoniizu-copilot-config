@@ -317,6 +317,21 @@ class MutationTests(unittest.TestCase):
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["component"], "portal-settings")
 
+    def test_machine_settings_wake_power_scheduler_and_notify_other_tabs(self):
+        handler = self.handler("/api/settings", {"revision": "r",
+                                                 "settings": {"machines": {"power_checks": False}}})
+        with patch.object(portal.portal_settings, "save", return_value={
+                "changed": ["machines.power_checks: true -> false"], "applied": "", "revision": "n"}), \
+                patch.object(portal.portal_settings, "payload", return_value={"settings": {}}), \
+                patch.object(portal, "_journal_settings"), \
+                patch.object(portal, "LIVE", None), \
+                patch.object(portal, "POWER_SCHEDULE") as scheduler, \
+                patch.object(portal.EVENTS, "publish_settings") as notify:
+            status, _ = handler.do_POST()
+        self.assertEqual(status, 200)
+        scheduler.wake.set.assert_called_once()
+        notify.assert_called_once()
+
     def test_overview_brief_reads_missing_valid_and_corrupt_files(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

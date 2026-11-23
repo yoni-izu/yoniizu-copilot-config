@@ -58,6 +58,13 @@ owner modules, machine logs and `lib/domain_db.py` remain with their owners.
 Systemd's service registration and journal are managed by systemd.
 
 Python/owner-module edits require `systemctl --user restart task-dashboard`.
+The deadline-driven power scheduler starts/stops with that managed server.
+Its private `state/power-schedule.json` holds attempt budgets and deadlines only;
+do not delete it to retry a failed EC2 observation. Use **Check VM status** or
+wait for a renewed lease. Corrupt/unwritable scheduler state disables reliable
+automatic reconciliation and is surfaced on Machines; repair the storage issue
+before restarting. Settings > Machines can disable scheduled EC2 checks without
+affecting manual controls, job monitoring or lease keepalive.
 CSS/JS are loaded from disk with cache-busting; reload the page for asset-only
 changes. Verify readiness and check logs if startup fails. Do not mask failures
 with an empty dataset or claim a successful deploy from an accepted job alone.

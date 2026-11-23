@@ -74,6 +74,39 @@ class BusTest(unittest.TestCase):
         self.assertEqual(len(feed["events"]), events.KEEP)
         self.assertEqual(feed["events"][-1]["title"], f"e{events.KEEP + 19}")
 
+    def test_resize_keeps_newest_and_settings_signal_is_silent(self):
+        self.assertEqual(self.bus.publish_settings()["kind"], "settings")
+        self.wait_toasts(1)
+        self.assertEqual(self.toasts, [])
+        self.cfg["windows_toast"] = False
+        for i in range(10):
+            self.bus.publish("queue", f"e{i}")
+        self.bus.resize(3)
+        self.assertEqual([e["title"] for e in self.bus.since(0)["events"]], ["e7", "e8", "e9"])
+
+    def test_domain_events_are_batched_and_never_toasted(self):
+        event = self.bus.publish_domains(["team", "tasks", "team"])
+        self.assertEqual(event["domains"], ["tasks", "team"])
+        self.assertEqual(event["kind"], "domain")
+        self.wait_toasts(1)
+        self.assertEqual(self.toasts, [])
+
+    def test_stream_replays_events_and_resets_after_gap_or_restart(self):
+        cursor = self.bus.cursor()
+        self.bus.publish("queue", "one")
+        replay = self.bus.wait_after(cursor["instance"], cursor["seq"], 0)
+        self.assertFalse(replay["reset"])
+        self.assertEqual([event["title"] for event in replay["events"]], ["one"])
+
+        for i in range(events.KEEP):
+            self.bus.publish("queue", str(i))
+        gap = self.bus.wait_after(cursor["instance"], cursor["seq"], 0)
+        self.assertTrue(gap["reset"])
+
+        restarted = events.Bus(lambda: self.cfg, lambda t, b: None, self.clock)
+        reset = restarted.wait_after(cursor["instance"], cursor["seq"], 0)
+        self.assertTrue(reset["reset"])
+
     def test_toast_script_never_embeds_raw_text(self):
         script = events.toast_script("T'; Remove-Item x", "<b>&'\"")
         self.assertNotIn("Remove-Item", script)

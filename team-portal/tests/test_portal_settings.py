@@ -56,6 +56,36 @@ class SettingsTests(unittest.TestCase):
                 ps.save(bad, self.rev())
         self.assertFalse(ps.SETTINGS_PATH.exists())
 
+    def test_live_updates_validated_and_saved_without_touching_timer(self):
+        for bad in ({"scan_interval_s": 0}, {"quiet_ms": 10001}, {"tasks": "yes"},
+                    {"replay_events": 49}, {"unknown": True}):
+            with self.assertRaises(ps.SettingsError):
+                ps.validate({"live_updates": bad})
+        self.dropin.parent.mkdir(parents=True)
+        self.dropin.write_text("x")
+        result = ps.save({"live_updates": {"enabled": False, "poll_interval_s": 30}}, self.rev())
+        self.assertEqual(sorted(result["changed"]), ["live_updates.enabled: true -> false",
+                                                     "live_updates.poll_interval_s: 5 -> 30"])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(ps.load()["live_updates"]["enabled"])
+        self.assertTrue(ps.load()["live_updates"]["tasks"])
+
+    def test_power_schedule_settings_validated_without_touching_timer(self):
+        for bad in ({"power_checks": "yes"}, {"power_grace_s": -1},
+                    {"power_grace_s": 301}, {"power_retry_s": 4},
+                    {"power_retry_s": 301}, {"power_retry_limit": -1},
+                    {"power_retry_limit": 11}, {"power_retry_limit": True}):
+            with self.assertRaises(ps.SettingsError):
+                ps.validate({"machines": bad})
+        self.assertTrue(ps.load()["machines"]["power_checks"])
+        self.dropin.parent.mkdir(parents=True)
+        self.dropin.write_text("x")
+        ps.save({"machines": {"power_checks": False, "power_grace_s": 0,
+                              "power_retry_s": 10, "power_retry_limit": 0}}, self.rev())
+        self.assertFalse(ps.load()["machines"]["power_checks"])
+        self.assertEqual(ps.load()["machines"]["power_retry_limit"], 0)
+        self.assertEqual(self.calls, [])
+
     def test_time_change_writes_dropin_and_rearms_timer(self):
         result = ps.save({"routine": {"time": "06:30",
                                       "days": ["Thu", "Sun", "Mon", "Tue", "Wed"]}}, self.rev())

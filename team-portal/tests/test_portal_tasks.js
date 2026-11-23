@@ -24,6 +24,12 @@ function block(start, end) {
   return source.slice(offset, limit);
 }
 
+function installPowerHelpers(context){
+  context.vmSkewSec = 0;
+  vm.runInContext(block("function vmSkew(", "function vmLiveCard("), context);
+  vm.runInContext(block("function localDmyHm(", "function briefHtml("), context);
+}
+
 function harness() {
   const filters = {};
   const elements = {
@@ -233,8 +239,10 @@ function machineMenuHarness() {
       ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])),
     VMLOG: {target_state: [], machines: [], terminal_targets: ["vm", "other", "desk"], live: {}},
     setTimeout: () => 0, clearTimeout: () => {},
+    vmTimersSync: () => {},
     fetch: async () => ({ok: true, json: async () => ({logins: {}})}),
   });
+  installPowerHelpers(context);
   vm.runInContext(block("function vmStale(", "function vmTargetStrip("), context);
   vm.runInContext(block("function vmTargetStrip(", "// State of the persistent"), context);
   vm.runInContext(block("function vmLiveBadge(", "async function vmPower("), context);
@@ -720,6 +728,7 @@ test("machine cards show power memory, a predicted stop and provisioning", () =>
             target_state: [{name: "vm", provision: {recipes: [{recipe: "rtl", status: "fail", note: "x"}],
                                                     ok: false, failed: ["rtl"], todo: [], last_age_h: "1h"}}]},
   });
+  installPowerHelpers(context);
   vm.runInContext(block("function vmStale(", "function vmTargetStrip("), context);
   vm.runInContext(block("function vmTermBtn(", "function vmBindTerms("), context);
   vm.runInContext(block("function vmTargetBtn(", "function vmBindTargetRefresh("), context);
@@ -728,18 +737,141 @@ test("machine cards show power memory, a predicted stop and provisioning", () =>
   vm.runInContext(block("const VMSSO=", "async function vmSetMain("), context);
   context.prefs = {vmHidden: [], vmPanelsHidden: []};
   const m = {name: "me", id: "i-012e7b37b8bfe283b", type: "m7i", state: "running", target: "vm",
-             started_ago_h: "12m", started_by: "auto", stop_in_h: "18m", stop_ts: 1794928000};
+             started_ago_h: "12m", started_by: "auto", stop_in_h: "18m",
+             stop_ts: Math.floor(Date.now()/1000)+1080};
   const card = context.vmMachine(m);
   assert.match(card, /started 12m ago \(auto\)/);
-  assert.match(card, /predicted stop .* \(in 18m\)/);
+  assert.match(card, /expected stop in 18m 00s/);
   assert.match(card, /class="vm-prov bad"[^>]*>provision \u26a0 rtl|class="vm-prov bad"[^>]*>provision ⚠ rtl/);
   assert.match(card, /value="provision">Provision/);
-  const gone = context.vmMachine({...m, predicted_stopped: true, stopped_ago_h: "5m"});
-  assert.match(gone, /lease ended 5m ago/);
-  assert.doesNotMatch(gone, /predicted stop/);
+  const gone = context.vmMachine({...m, stop_ts: Math.floor(Date.now()/1000)-300,
+    predicted_stopped: true, stopped_ago_h: "5m"});
+  assert.match(gone, /expected stop time passed.*status unconfirmed/);
+  assert.match(gone, /class="vm-m-st">running/);
   context.VMLOG.target_state = [{name: "vm", provision: {recipes: []}}];
   assert.match(context.vmMachine(m), /unprovisioned/);
   assert.match(source, /termOpen\(\{kind:"provision"/);
+});
+
+function powerTickHarness(){
+  let now=1795350000000;
+  const timers=new Map();
+  let nextTimer=0;
+  const stops=[], jobs=[];
+  const document={hidden:false,addEventListener(){},
+    querySelectorAll:selector=>selector.startsWith(".vm-stop")?stops:jobs};
+  const context=vm.createContext({
+    Date:class extends Date { static now(){ return now; } },
+    document,SERVED:true,activeSection:"vm",VMLOG:{running:[]},prefs:{vmPollMs:5000,clock:"24"},
+    esc:s=>String(s),setInterval:(fn,ms)=>{ const id=++nextTimer; timers.set(id,{fn,ms}); return id; },
+    clearInterval:id=>timers.delete(id),fetch:()=>{ throw new Error("Countdown must not fetch"); },
+  });
+  installPowerHelpers(context);
+  vm.runInContext(block("function vmStopText(", "// A shell on the machine"),context);
+  vm.runInContext(block("let vmTickTimer=", "// Every \"open / tail\""),context);
+  const addStop=seconds=>{
+    const classes=new Set();
+    const element={dataset:{stop:String(seconds)},textContent:"",
+      classList:{toggle:(key,on)=>on?classes.add(key):classes.delete(key)}};
+    stops.push(element);
+    return {element,classes};
+  };
+  return {context,timers,stops,jobs,document,addStop,setNow:value=>now=value,now:()=>now};
+}
+
+test("Power countdown advances from the absolute deadline with skew and crosses zero honestly",()=>{
+  const h=powerTickHarness();
+  h.context.vmSkewSec=120;
+  const deadline=h.now()/1000-120+90;
+  const {element,classes}=h.addStop(deadline);
+  const machine={state:"running",stop_ts:deadline};
+  assert.match(h.context.vmPowerLine(machine),/expected stop in 1m 30s/);
+  h.context.vmTimersSync();
+  assert.equal(h.timers.size,1);
+  assert.equal([...h.timers.values()][0].ms,1000);
+  h.setNow(h.now()+31000);
+  h.context.vmTick();
+  assert.equal(element.textContent,"expected stop in 59s");
+  assert.ok(classes.has("warn"));
+  h.setNow(h.now()+59000);
+  h.context.vmTick();
+  assert.match(element.textContent,/expected stop time passed.*status unconfirmed/);
+  assert.ok(classes.has("bad"));
+  assert.equal(h.timers.size,0);
+});
+
+test("Idle VM countdowns pause for hidden tabs, collapsed cards and other sections without job polling",()=>{
+  const h=powerTickHarness();
+  const stop=h.addStop(h.now()/1000+120).element;
+  h.context.vmTimersSync();
+  assert.equal(h.timers.size,1);
+  h.document.hidden=true;
+  h.context.vmTick();
+  assert.equal(h.timers.size,0);
+  h.setNow(h.now()+30000);
+  h.document.hidden=false;
+  h.context.vmTick();
+  assert.equal(stop.textContent,"expected stop in 1m 30s");
+  assert.equal(h.timers.size,1);
+  h.stops.length=0;
+  h.context.vmTimersSync();
+  assert.equal(h.timers.size,0);
+  h.addStop(h.now()/1000+30);
+  h.context.activeSection="tasks";
+  h.context.vmTimersSync();
+  assert.equal(h.timers.size,0);
+});
+
+test("VM countdown ticking preserves job-status polling and survives the last job settling",()=>{
+  const h=powerTickHarness();
+  h.addStop(h.now()/1000+120);
+  h.jobs.push({dataset:{start:String(h.now()/1000-10)},textContent:""});
+  h.context.VMLOG.running=[{id:"job"}];
+  h.context.vmTimersSync();
+  assert.deepEqual([...h.timers.values()].map(t=>t.ms),[1000,5000]);
+  h.context.vmTick();
+  assert.equal(h.jobs[0].textContent,"10s");
+  h.context.VMLOG.running=[];
+  h.jobs.length=0;
+  h.context.vmTimersSync();
+  assert.deepEqual([...h.timers.values()].map(t=>t.ms),[1000]);
+});
+
+test("Power display handles renewals, invalid deadlines, stopped VMs and static export",()=>{
+  const h=powerTickHarness();
+  const machine={state:"running",stop_ts:h.now()/1000+60};
+  assert.match(h.context.vmPowerLine(machine),/expected stop in 1m 00s/);
+  assert.match(h.context.vmPowerLine({...machine,stop_ts:machine.stop_ts+120}),/expected stop in 3m 00s/);
+  for(const stop_ts of [null,undefined,NaN,Infinity,-1,"1795350060",1e30]){
+    const text=h.context.vmPowerLine({...machine,stop_ts});
+    assert.match(text,/expected stop unavailable/);
+    assert.doesNotMatch(text,/data-stop/);
+  }
+  assert.doesNotMatch(h.context.vmPowerLine({...machine,state:"stopped"}),/expected stop|data-stop/);
+  h.context.SERVED=false;
+  const text=h.context.vmPowerLine(machine);
+  assert.match(text,/expected stop \d{2}\/\d{2}\/\d{4}.*snapshot/);
+  assert.doesNotMatch(text,/data-stop/);
+  h.addStop(machine.stop_ts);
+  h.context.vmTimersSync();
+  assert.equal(h.timers.size,0);
+});
+
+test("Power-only changes and scheduler errors invalidate the cached Machines rendering",()=>{
+  const h=powerTickHarness();
+  const base={machines:[{id:"i-one",state:"running",stop_ts:1000}]};
+  for(const changed of [
+    {machines:[{id:"i-one",state:"running",stop_ts:2000}]},
+    {machines:[{id:"i-one",state:"stopped",stop_ts:null}]},
+    {power_schedule:{error:"disk full"}},
+    {error:"EC2 unavailable"},
+    {machines_checked:"2026-11-22T12:00:00"}]){
+    assert.notEqual(h.context.vmSignature({...base,...changed}),h.context.vmSignature(base));
+  }
+  const context=machineMenuHarness();
+  context.VMLOG.power_schedule={instances:{"i-one":{error:"SSO unavailable; automatic checks exhausted"}}};
+  const card=context.vmMachine({id:"i-one",name:"VM",state:"running"});
+  assert.match(card,/<dt>Power check<\/dt>.*SSO unavailable; automatic checks exhausted/);
 });
 
 test("target strip keeps a bound target whose instance octl no longer lists", () => {
@@ -919,6 +1051,7 @@ test("workspace top Refresh only reloads saved data and renders without a status
         workspaces: saved})};
     },
     buildSections() {}, renderWorkspaces() { rendered.push("workspaces"); },
+    clearDomainStaleForSection(section) { assert.equal(section,"ws"); },
     wsRefresh() { throw new Error("Live checks must not run"); },
   });
   vm.runInContext(block("async function refreshData()", 'document.getElementById("refresh").addEventListener'), context);
@@ -1050,6 +1183,10 @@ test("workspace action banner exposes pending approval and saved stash recovery"
   assert.match(els["align-body"].innerHTML,/git stash apply --index/);
   assert.match(els["align-body"].innerHTML,/\/repo\/&lt;one>/);
   assert.match(els["align-body"].innerHTML,/abc123/);
+  context.renderAlign({kind:"workspace-action",action:"sync",slot:"two",status:"running",
+    steps:[],repos:[],warnings:["automatic stash <warning>","octl may rebase"]});
+  assert.match(els["align-body"].innerHTML,/automatic stash &lt;warning>/);
+  assert.match(els["align-body"].innerHTML,/octl may rebase/);
 });
 
 function bannerHarness(jobs=[], storage={}) {
@@ -1460,6 +1597,26 @@ test("dedicated cards expose only compatible tasks and hold tags", () => {
   assert.match(build,/ws-occupy-task" disabled/);
   assert.match(build,/option value="build">build/);
   assert.match(build,/option value="test">test/);
+});
+
+test("read-only cards show deployed metadata and Sync without occupancy or Free controls", () => {
+  const context=vm.createContext({
+    WORKSPACES:{purposes:{"read-only":"Read-only"}},
+    SERVED:true,esc:String,wsHolder:()=>null,wsUnknown:()=>false,wsGroupMenu:()=>"",
+    activeTaskList:()=>[{id:"T-dev",category:"development",title:"Development"}],
+  });
+  vm.runInContext(block("function wsAllows(", "let wsPurposeFilter=")+
+    source.match(/const WS_ADHOC_TAGS=.*;/)[0]+
+    block("function wsCard(", "// Per-card group picker"),context);
+  const html=context.wsCard({slot:"reference",purpose:"read-only",allowed_uses:[],rev:"main",
+    status:{deployed_manifest:{project:"iridium",revision:"release-tag"}}});
+  assert.match(html,/>Read-only<\/span>/);
+  assert.match(html,/iridium @ release-tag/);
+  assert.match(html,/repository baseline: main/);
+  assert.match(html,/stashes local changes/);
+  assert.match(html,/may rebase local commits/);
+  assert.match(html,/class="link ws-sync"/);
+  assert.doesNotMatch(html,/ws-occupy-task|ws-occupy-adhoc|class="link ws-free"/);
 });
 
 test("workspace purpose filter matches any selected purpose and empty means all", () => {
@@ -1927,6 +2084,39 @@ test("pulse snapshot CLI prints values for the routine", () => {
   assert.equal(snap.values["raid.hot"], 1);
 });
 
+test("refresh intervals accept free-form durations from 1s to 24h or off", () => {
+  const context = vm.createContext({});
+  vm.runInContext(block("// --- browser prefs (pure", "// --- end browser prefs ---"), context);
+  const parse = context.parseDuration, fmt = context.formatDuration;
+  assert.equal(parse("1s"), 1000);
+  assert.equal(parse("1.5 s"), 1500);
+  assert.equal(parse("90"), 90000);
+  assert.equal(parse("2m"), 120000);
+  assert.equal(parse("1m30s"), 90000);
+  assert.equal(parse("0.5min"), 30000);
+  assert.equal(parse("1h"), 3600000);
+  assert.equal(parse("1440m"), 86400000);
+  assert.equal(parse("OFF"), 0);
+  assert.equal(parse("0"), 0);
+  for (const bad of ["", "0.5s", "1441m", "25h", "abc", "5x", "1m 30", "-5s", "1.s"])
+    assert.equal(parse(bad), null, bad);
+  assert.equal(fmt(0), "Off");
+  assert.equal(fmt(1500), "1.5s");
+  assert.equal(fmt(90000), "1m30s");
+  assert.equal(fmt(300000), "5m");
+  assert.equal(fmt(86400000), "24h");
+  for (const ms of [1000, 1500, 61001, 3723000, 86400000]) assert.equal(parse(fmt(ms)), ms);
+  const ids = ["overview", "settings"];
+  const p = context.readPrefs(JSON.stringify({actionPollMs: 2500, vmPollMs: 0, pulsePollMs: 7200000}), ids);
+  assert.equal(p.actionPollMs, 2500);
+  assert.equal(p.vmPollMs, 0);
+  assert.equal(p.pulsePollMs, 7200000);
+  const q = context.readPrefs(JSON.stringify({actionPollMs: 999, vmPollMs: 86400001, pulsePollMs: "30000"}), ids);
+  assert.equal(q.actionPollMs, 1500);
+  assert.equal(q.vmPollMs, 15000);
+  assert.equal(q.pulsePollMs, 60000);
+});
+
 test("browser prefs validate pulse cards and order visible cards", () => {
   const context = vm.createContext({});
   vm.runInContext(block("// --- browser prefs (pure", "// --- end browser prefs ---"), context);
@@ -1936,6 +2126,7 @@ test("browser prefs validate pulse cards and order visible cards", () => {
   assert.deepEqual([...p.pulseOrder], ["prs","tasks"]);
   assert.equal(p.pulsePollMs, 30000);
   assert.equal(context.readPrefs(JSON.stringify({pulsePollMs:7}), ids, cardIds).pulsePollMs, 60000);
+  assert.equal(context.readPrefs(JSON.stringify({pulsePollMs:0}), ids, cardIds).pulsePollMs, 0);
   assert.deepEqual([...context.readPrefs("{}", ids).pulseHidden], []);
   const cards = cardIds.map(id=>({id}));
   assert.deepEqual(context.pulseVisible(cards, p).map(c=>c.id), ["prs","tasks"]);

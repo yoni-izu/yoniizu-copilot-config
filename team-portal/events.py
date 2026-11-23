@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Portal notification events: an in-memory feed plus a Windows toast fallback.
+"""Portal notification and domain-change events.
 
-Producers (action queue completions, live machine status, AI runs) call
-``publish``. Open portal tabs poll ``GET /api/events?since=<seq>`` and raise
-browser notifications; every poll is also a presence heartbeat. When no tab has
-polled for ``PRESENCE_GRACE`` seconds the event is shown as a Windows toast via
-``powershell.exe`` (WSL), so a finished job is still noticed with the browser
-closed. The feed is deliberately volatile: events are notifications, not
-records; each owner keeps its own history.
+Open tabs consume the SSE stream; ``GET /api/events?since=<seq>`` remains a
+polling fallback and presence heartbeat. When no tab has connected for
+``PRESENCE_GRACE`` seconds, user-facing events may be shown as a Windows toast.
+Domain-change and settings signals are silent. The feed is volatile; each owner keeps its
+own history.
 """
 from __future__ import annotations
 
@@ -17,11 +15,12 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from typing import Callable
 from xml.sax.saxutils import escape
 
-KINDS = ("queue", "machine_jobs", "ai", "reachability")
+KINDS = ("queue", "machine_jobs", "ai", "reachability", "domain")
 PRESENCE_GRACE = 90.0  # background tabs may be throttled to one poll a minute
 KEEP = 200
 POWERSHELL_PATHS = ("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
@@ -34,9 +33,10 @@ class Bus:
     def __init__(self, settings: Callable[[], dict] | None = None,
                  toaster: Callable[[str, str], None] | None = None,
                  clock: Callable[[], float] = time.time):
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._events: deque[dict] = deque(maxlen=KEEP)
         self._seq = 0
+        self._instance = uuid.uuid4().hex
         self._seen = 0.0
         self._settings = settings or (lambda: {})
         self._toaster = toaster if toaster is not None else windows_toast
@@ -49,16 +49,52 @@ class Bus:
         cfg = self._settings() or {}
         if not cfg.get("enabled", True) or not cfg.get(kind, True):
             return None
-        with self._lock:
+        with self._condition:
             self._seq += 1
             event = {"seq": self._seq, "kind": kind, "title": title[:200],
                      "body": body[:600], "tone": tone, "link": link,
                      "at": self._clock()}
             self._events.append(event)
             tab_open = self._clock() - self._seen < PRESENCE_GRACE
-        if not tab_open and cfg.get("windows_toast", True):
+            self._condition.notify_all()
+        if kind != "domain" and not tab_open and cfg.get("windows_toast", True):
             threading.Thread(target=self._toast, args=(title, body), daemon=True).start()
         return event
+
+    def resize(self, keep: int) -> None:
+        """Change how many events are kept for reconnect replay."""
+        with self._condition:
+            if keep != self._events.maxlen:
+                self._events = deque(self._events, maxlen=keep)
+
+    def publish_settings(self) -> dict:
+        """Silent signal: open tabs re-read client-side update settings."""
+        with self._condition:
+            self._seq += 1
+            event = {"seq": self._seq, "kind": "settings", "title": "Settings changed",
+                     "body": "", "tone": "", "link": "", "at": self._clock()}
+            self._events.append(event)
+            self._condition.notify_all()
+            return event
+
+    def publish_domains(self, domains: list[str]) -> dict | None:
+        values = sorted(set(domains))
+        if not values:
+            return None
+        with self._condition:
+            self._seq += 1
+            labels = {"tasks": "Tasks", "team": "Team", "bugs": "Bugs",
+                      "workspaces": "Workspaces", "prs": "PRs", "raid": "RAID",
+                      "delegation": "Machines", "pr_failures": "Triage"}
+            names = ", ".join(labels.get(value, value) for value in values)
+            event = {"seq": self._seq, "kind": "domain", "domains": values,
+                     "title": f"{names}: saved data changed",
+                     "body": "Reload the affected section to see record changes.",
+                     "tone": "", "link": "",
+                     "at": self._clock()}
+            self._events.append(event)
+            self._condition.notify_all()
+            return event
 
     def _toast(self, title: str, body: str) -> None:
         try:
@@ -67,14 +103,33 @@ class Bus:
             pass
 
     def since(self, seq: int, heartbeat: bool = True) -> dict:
-        with self._lock:
+        with self._condition:
             if heartbeat:
                 self._seen = self._clock()
             events = [e for e in self._events if e["seq"] > seq]
             return {"seq": self._seq, "events": events}
 
+    def cursor(self) -> dict:
+        with self._condition:
+            self._seen = self._clock()
+            return {"instance": self._instance, "seq": self._seq}
+
+    def wait_after(self, instance: str, seq: int, timeout: float) -> dict:
+        with self._condition:
+            self._seen = self._clock()
+            if instance != self._instance or seq > self._seq:
+                return {"instance": self._instance, "seq": self._seq,
+                        "events": [], "reset": True}
+            if self._seq <= seq:
+                self._condition.wait(timeout)
+            self._seen = self._clock()
+            events = [event for event in self._events if event["seq"] > seq]
+            oldest = self._events[0]["seq"] if self._events else self._seq + 1
+            return {"instance": self._instance, "seq": self._seq, "events": events,
+                    "reset": seq < oldest - 1}
+
     def tab_open(self) -> bool:
-        with self._lock:
+        with self._condition:
             return self._clock() - self._seen < PRESENCE_GRACE
 
 

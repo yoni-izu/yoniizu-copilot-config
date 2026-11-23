@@ -64,6 +64,10 @@ DEFAULTS: dict[str, Any] = {
     "machines": {
         "live_targets": ["vm"],
         "live_interval_s": 15,
+        "power_checks": True,
+        "power_grace_s": 30,
+        "power_retry_s": 30,
+        "power_retry_limit": 3,
     },
     # Pop-up notifications (browser; Windows toast when no portal tab is open).
     "notify": {
@@ -74,13 +78,48 @@ DEFAULTS: dict[str, Any] = {
         "reachability": True,
         "windows_toast": True,
     },
+    # Automatic resource updates: domain DB watcher -> event stream -> tabs.
+    "live_updates": {
+        "enabled": True,
+        "tasks": True,
+        "workspaces": True,
+        "bugs": True,
+        "prs": True,
+        "raid": True,
+        "team": True,
+        "delegation": True,
+        "pr_failures": True,
+        "scan_interval_s": 2,
+        "quiet_ms": 750,
+        "replay_events": 200,
+        "push_stream": True,
+        "keepalive_s": 20,
+        "state_interval_s": 60,
+        "poll_interval_s": 5,
+        "auto_reload": True,
+        "popups": True,
+        "history_limit": 50,
+        "detail_limit": 50,
+        "refresh_delay_ms": 250,
+    },
 }
+LIVE_DOMAINS = ("tasks", "workspaces", "bugs", "prs", "raid", "team", "delegation",
+                "pr_failures")
 INT_RANGES = {"snapshot_keep": (1, 60), "queue_retention_days": (7, 365),
               "activity_window_hours": (1, 168), "brief_stale_hours": (1, 168)}
 GROUP_INT_RANGES = {"ai": {"daily_cap": (0, 500), "interactive_daily_cap": (0, 1000),
                            "timeout_s": (30, 1800),
                            "review_timeout_s": (300, 7200)},
-                    "machines": {"live_interval_s": (5, 300)}}
+                    "machines": {"live_interval_s": (5, 300),
+                                 "power_grace_s": (0, 300),
+                                 "power_retry_s": (5, 300),
+                                 "power_retry_limit": (0, 10)},
+                    "live_updates": {"scan_interval_s": (1, 60), "quiet_ms": (0, 10000),
+                                     "replay_events": (50, 2000), "keepalive_s": (5, 40),
+                                     "state_interval_s": (15, 600),
+                                     "poll_interval_s": (2, 60), "history_limit": (10, 500),
+                                     "detail_limit": (5, 200),
+                                     "refresh_delay_ms": (0, 5000)}}
 AI_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 SCHEDULE_KEYS = ("enabled", "time", "days")
@@ -180,7 +219,7 @@ def validate(data: Any) -> dict:
                 or any(not isinstance(v, bool) for v in steps.values()):
             raise SettingsError(f"routine.steps maps {', '.join(ROUTINE_STEPS)} to true/false")
     extra = {"routine": routine}
-    for group in ("ai", "machines", "notify"):
+    for group in ("ai", "machines", "notify", "live_updates"):
         values = data.get(group, {})
         if isinstance(values, dict) and LEGACY_KEYS.get(group):
             values = {k: v for k, v in values.items() if k not in LEGACY_KEYS[group]}
