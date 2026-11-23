@@ -18,6 +18,14 @@ def pr_metadata(commits=None, state="OPEN"):
 
 
 class ReviewSafetyTests(unittest.TestCase):
+    def test_jira_key_found_after_conventional_commit_prefix(self):
+        self.assertEqual(
+            tm.jira_key_from_title("feat(mng): [IPD2DSW-228] enable monitor"),
+            "IPD2DSW-228",
+        )
+        self.assertEqual(tm.jira_key_from_title("[IPD2DSW-227] add table"), "IPD2DSW-227")
+        self.assertIsNone(tm.jira_key_from_title("no key here"))
+
     def test_review_intake_never_requests_pr_body(self):
         data = {"title": "review", "author": {"login": "author"}, "headRefName": "branch"}
         for repo in ("ip.x.rtl", "ip.x.unknown", "ip.x.sw.fw"):

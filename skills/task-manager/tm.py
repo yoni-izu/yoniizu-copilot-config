@@ -680,11 +680,10 @@ def cmd_add_review(args: argparse.Namespace) -> int:
         if info.get("files_changed"):
             total_files += info["files_changed"]
         total_lines += (info.get("additions") or 0) + (info.get("deletions") or 0)
-        # Pull jira from title like "[XXX-123] ..."
-        if info.get("title"):
-            m = re.match(r"\s*\[([A-Z][A-Z0-9]+-\d+)\]", info["title"])
-            if m:
-                jira_keys.append(m.group(1))
+        # Pull jira from title like "[XXX-123] ..." or "feat(x): [XXX-123] ..."
+        key = jira_key_from_title(info.get("title"))
+        if key:
+            jira_keys.append(key)
 
     # Title
     if args.title:
@@ -1569,7 +1568,7 @@ FW_REPOS_FILE = REVIEW_MGR_REFS / "fw-repos.txt"
 def jira_key_from_title(title: str | None) -> str | None:
     if not title:
         return None
-    m = re.match(r"\s*\[([A-Z][A-Z0-9]+-\d+)\]", title)
+    m = re.search(r"\[([A-Z][A-Z0-9]+-\d+)\]", title)
     return m.group(1) if m else None
 
 
@@ -2011,8 +2010,7 @@ def cmd_re_review(args: argparse.Namespace) -> int:
                 # Narrow by JIRA key in PR title if possible
                 try:
                     info = fetch_pr_details(url)
-                    jira_m = re.match(r"\s*\[([A-Z][A-Z0-9]+-\d+)\]", info.get("title") or "")
-                    jira_key = jira_m.group(1) if jira_m else None
+                    jira_key = jira_key_from_title(info.get("title"))
                 except Exception:
                     jira_key = None
                 matched = (
