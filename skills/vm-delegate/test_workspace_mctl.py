@@ -1,5 +1,6 @@
 """Focused mctl tests: all transports and workspace tools are isolated stubs."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import shlex
@@ -9,7 +10,7 @@ import unittest
 import uuid
 
 
-MCTL = Path(__file__).resolve().parents[3] / "bin" / "mctl"
+MCTL = Path(__file__).resolve().parents[2] / "bin" / "mctl"
 
 
 class WorkspaceMctlTests(unittest.TestCase):
@@ -26,13 +27,27 @@ class WorkspaceMctlTests(unittest.TestCase):
                         PLDM_DB=str(self.home / "tasks/pldm.db"))
         self.env.pop("BASH_ENV", None)
 
-    def shell(self, code, *, real_policy=False):
-        stub = ("rlogin() { bash -c \"$1\"; }\n" if real_policy
-                else "workspace_policy_guard() { :; }\n")
+    def shell(self, code, *, real_policy=False, pass_fds=()):
+        stub = ("""
+workspace_policy_resolve() {
+  python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import wm
+resolve = lambda value: str(Path(value).expanduser().resolve())
+print(json.dumps({"path": resolve(sys.argv[2]),
+                  "records": [[r["id"], resolve(r["path"])] for r in wm.tracked().values()
+                              if r.get("target") == sys.argv[3]]}))
+PY
+}
+""" if real_policy else
+                "workspace_policy_guard() { :; }\nworkspace_request_purpose() { echo general; }\n")
         script = f"source <(sed '$d' {shlex.quote(str(MCTL))})\n" + stub + code
         return subprocess.run(
-            ["bash", "-c", script], env=self.env, text=True, capture_output=True,
-            timeout=15, check=False,
+            ["bash", "-c", script, str(MCTL)], env=self.env, text=True, capture_output=True,
+            timeout=15, check=False, pass_fds=pass_fds,
         )
 
     def test_start_job_archives_previous_run_with_timestamp_and_pid(self):
@@ -135,7 +150,9 @@ cmd_workspace """ + args)
         self.assertEqual(self.events.read_text(), "")
 
     def test_workspace_transport_streams_runtime_and_quotes_request(self):
-        body = "import json,sys\nprint(json.dumps(json.loads(sys.argv[1])))\n"
+        body = ("import json,os,sys\n"
+                "assert 'WM_LOCKED_WORKSPACE' not in os.environ and 'WM_LOCKED_FD' not in os.environ\n"
+                "print(json.dumps(json.loads(sys.argv[1])))\n")
         self.runtime_fixture(body)
         request = json.dumps({"path": "/slot/' ; $(touch BAD)\n", "rev": "main"})
         runtime = self.home / ".copilot/skills/workspace-manager/workspace_runtime.py"
@@ -148,6 +165,7 @@ rlogin_workspace """ + shlex.join([request, str(runtime)]))
         self.assertEqual(command[:3], ["bash", "-l", "-c"])
         self.assertEqual(command[4:], ["_", request])
         script = """umask 077
+unset WM_LOCKED_WORKSPACE WM_LOCKED_FD
 runtime_dir=$(mktemp -d) || exit 1
 cleanup() { rm -f -- "$runtime_dir/workspace_runtime.py"; rmdir -- "$runtime_dir"; }
 trap cleanup EXIT
@@ -161,7 +179,8 @@ python3 "$runtime_dir/workspace_runtime.py" "$1"
         tmpdir.mkdir()
         completed = subprocess.run(
             ["bash", str(script_path), request], input=body, capture_output=True, text=True,
-            env=dict(self.env, TMPDIR=str(tmpdir)), timeout=15, check=False,
+            env=dict(self.env, TMPDIR=str(tmpdir), WM_LOCKED_WORKSPACE="local",
+                     WM_LOCKED_FD="987"), timeout=15, check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), json.loads(request))
@@ -314,12 +333,7 @@ if not wm.STORE.exists():
     wm.save({"slots": {}, "tracked": {}, "groups": []})
 wm.track("/canonical/slot", target="lab", rev="a1_power_on")
 PY
-rlogin() {
-  case "$1" in
-    *'resolve=lambda p:'*) bash -c "$1" ;;
-    *) printf '/canonical/slot\\n' ;;
-  esac
-}
+rlogin() { printf '/canonical/slot\\n'; }
 cmd_workspace() {
   printf '{"ok":true,"status":{"id":"%s","path":"%s","exists":true,"safe":true,"clean":true}}\\n' "$3" "$2"
 }
@@ -400,6 +414,141 @@ PY
 """, real_policy=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_read_only_remote_workspace_sync_is_owner_derived_and_other_actions_fail(self):
+        setup = self.owner_fixture().split("\ncmd_workspace() {", 1)[0]
+        result = self.shell(setup + """
+wid=$(python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.vd.jobs = lambda: []
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.set_slot_fields(rec["slot"], {"purpose": "read-only"})[0]
+print(rec["id"])
+PY
+)
+rlogin_workspace() { printf '%s\\n' "$1" >> "$EVENTS"; printf '%s\\n' "$1"; }
+for action in free align; do
+  if cmd_workspace "$action" /canonical/slot "$wid" a1_power_on >/dev/null 2>&1; then exit 90; fi
+done
+if cmd_workspace mirror /canonical/slot "$wid" a1_power_on null >/dev/null 2>&1; then exit 91; fi
+if cmd_workspace sync /canonical/slot "$wid" a1_power_on '{"reference_sync":true}' >/dev/null 2>&1; then exit 92; fi
+cmd_workspace sync /canonical/slot "$wid" a1_power_on '{"portal_sync":{"approved":null}}'
+""", real_policy=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        request = json.loads(result.stdout)
+        self.assertIs(request["reference_sync"], True)
+        self.assertEqual(request["portal_sync"], {"approved": None})
+        self.assertEqual(len(self.events.read_text().splitlines()), 1)
+
+    def test_read_only_local_source_blocks_builds_and_artifact_writes_before_transport(self):
+        self.owner_fixture()
+        slot = self.home / "reference"
+        (slot / "fw").mkdir(parents=True)
+        setup = self.shell("""
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.save({"slots": {}, "tracked": {}, "groups": []})
+assert wm.track(os.path.expanduser("~/reference"), purpose="read-only")[0]
+PY
+""")
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        for command in ("cmd_build", "cmd_test ip/mng", "cmd_run true",
+                        "cmd_sh true", "cmd_wip diff", "cmd_pull_build", "cmd_pull_logs"):
+            with self.subTest(command=command):
+                result = self.shell("""
+T_NAME=lab
+find_ws() { echo "$HOME/reference/fw"; }
+workspace_remote_path() { echo unexpected-transport >> "$EVENTS"; echo /remote; }
+map_remote() { echo /remote; }
+_rsync_from() { echo unexpected-write >> "$EVENTS"; }
+""" + command, real_policy=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Read-only", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_read_only_commands_are_rejected_before_vm_wake(self):
+        setup = self.owner_fixture()
+        local = self.home / "reference"
+        local.mkdir()
+        result = self.shell(setup + """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import wm
+assert wm.track(os.path.expanduser("~/reference"), purpose="read-only")[0]
+PY
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("build", "test nohw", "run true", "sh true", "wip diff",
+                        "pull-build", "pull-logs", "mirror --sync", "release"):
+            with self.subTest(command=command):
+                result = self.shell("""
+select_target() { T_NAME=lab; T_KIND=vm; }
+ensure_vm_up() { echo unexpected-wake >> "$EVENTS"; }
+lease_topup() { echo unexpected-renewal >> "$EVENTS"; }
+find_ws() { echo "$HOME/reference/fw"; }
+map_remote() { echo unexpected-transport >> "$EVENTS"; }
+main """ + command, real_policy=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Read-only", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_remote_read_only_free_is_rejected_before_vm_wake(self):
+        setup = self.owner_fixture()
+        result = self.shell(setup + """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+wm.vd.jobs = lambda: []
+rec = wm.identity("/canonical/slot", "lab")
+assert wm.set_slot_fields(rec["slot"], {"purpose": "read-only"})[0]
+print(rec["id"])
+PY
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wid = result.stdout.strip()
+        result = self.shell("""
+select_target() { T_NAME=lab; T_KIND=vm; }
+ensure_vm_up() { echo unexpected-wake >> "$EVENTS"; }
+main workspace free /canonical/slot """ + wid + " main", real_policy=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Read-only", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
+    def test_allowed_build_wakes_and_renews_after_policy_checks(self):
+        result = self.shell("""
+select_target() { T_NAME=lab; T_KIND=vm; }
+ensure_vm_up() { echo wake >> "$EVENTS"; }
+lease_topup() { echo renew >> "$EVENTS"; }
+find_ws() { echo /local/fw; }
+map_remote() { echo /remote/fw; }
+workspace_remote_path() { echo /remote/fw; }
+workspace_log_finish() { :; }
+check_manifest_drift() { :; }
+resolve_project_name() { echo target; }
+start_job() { echo dispatch >> "$EVENTS"; }
+main build
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events.read_text().splitlines(), ["wake", "renew", "dispatch"])
+
+    def test_target_set_preserves_existing_command_and_invalidates_changed_login_cache(self):
+        result = self.shell("""
+cmd_target add lab old.example
+printf cached > "$MCTL_DIR/lab.ip"
+printf cached > "$MCTL_DIR/lab.home"
+cmd_target set lab --user sample --host new.example --bmc root@bmc.example
+test ! -e "$MCTL_DIR/lab.ip"
+test ! -e "$MCTL_DIR/lab.home"
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = (self.home / ".mctl/targets").read_text().splitlines()[-1].split()
+        self.assertEqual(row, ["lab", "remote", "sample", "new.example", "root@bmc.example"])
+
     def test_policy_rejection_prevents_build_test_and_generic_execution(self):
         for command in ("cmd_build", "cmd_test ip/mng", "cmd_run true",
                         "cmd_sh true", "cmd_wip diff"):
@@ -415,6 +564,40 @@ rlogin_cred() { echo unexpected-execution >> "$EVENTS"; }
                 self.assertEqual(result.returncode, 73, result.stderr)
                 self.assertIn("policy-denied", result.stderr)
         self.assertEqual(self.events.read_text(), "")
+
+    def test_internal_marker_does_not_skip_another_operation_lock(self):
+        setup = self.owner_fixture()
+        local = self.home / "reference"
+        local.mkdir()
+        result = self.shell(setup + """
+python3 - "$HOME/.copilot/skills/workspace-manager" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import wm
+assert wm.track(os.path.expanduser("~/reference"), purpose="read-only")[0]
+print(wm.identity(os.path.expanduser("~/reference"))["id"])
+PY
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wid = result.stdout.strip()
+        self.env["WM_LOCKED_WORKSPACE"] = wid
+        path = self.home / "tasks/workspace-state" / (wid + ".operation.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.shell('workspace_policy_guard "$HOME/reference" "" workspace-sync',
+                                real_policy=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("operation already running", result.stderr)
+            with path.open("a") as unrelated:
+                self.env["WM_LOCKED_FD"] = str(unrelated.fileno())
+                result = self.shell('workspace_policy_guard "$HOME/reference" "" workspace-sync',
+                                    real_policy=True, pass_fds=(unrelated.fileno(),))
+                self.assertNotEqual(result.returncode, 0)
+            self.env["WM_LOCKED_FD"] = str(lock.fileno())
+            result = self.shell('workspace_policy_guard "$HOME/reference" "" workspace-sync',
+                                real_policy=True, pass_fds=(lock.fileno(),))
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_policy_guards_resolve_home_relative_and_symlinked_sibling_paths(self):
         setup = self.owner_fixture()

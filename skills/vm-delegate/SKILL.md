@@ -68,11 +68,14 @@ every action can be run by hand with no AI involvement.
   Guards resolve physical paths, including home-relative paths and symlinks.
   If a tracked path is an alias, refresh its workspace status to reconcile the
   canonical identity before dispatch; do not register a duplicate to bypass it.
-  Use the structured `workspace sync`/`free` APIs for dedicated-target maintenance,
-  not `sh` to bypass policy. Dispatch holds the workspace policy lock; running
-  or unverified delegated jobs block repurposing after dispatch. Status, logs,
-  artifact retrieval and safe release remain available. No force flag bypasses
-  dedication. This is managed-tool policy, not an OS sandbox.
+  Read-only references cannot source or receive mirrors, run builds/tests or
+  generic commands, or receive pulled artifacts/logs. Use structured
+  `workspace sync` (not `free`) for them; other dedicated targets use the
+  corresponding guarded maintenance APIs, not `sh` to bypass policy.
+  Dispatch holds the workspace policy lock; running
+  or unverified delegated jobs block repurposing after dispatch. Status and
+  external job logs remain available. No force flag bypasses dedication.
+  This is managed-tool policy, not an OS sandbox.
 - **Prefer `mctl <sub>` over hand-rolled `ssh`.** Do not reconstruct the SSH /
   `nohup` / `rsync` incantations in the model — call the script. It already
   encodes every gotcha below.
@@ -103,7 +106,7 @@ every action can be run by hand with no AI involvement.
   `release`, `mctl wip …`) call `~/bin/wip` on the target. A fresh mirror may
   not have it yet — run `mctl provision [name]` once (its `wip` recipe deploys
   it, and redeploys whenever the local copy changes). Remote workspace-manager checks also require WIP to advertise
-  `forall-argv-v1` via `wip capabilities`; update an older target WIP before
+  `forall-argv-v1` and `scan-workspace-v1` via `wip capabilities`; update an older target WIP before
   those checks. To deploy by hand:
   ```bash
   ~/bin/wip-deploy "$(mctl -t <name> dest)"   # vm target ([user@]ip)
@@ -592,6 +595,10 @@ Portal `sync` accepts `{"portal_sync":{"approved":null}}` or the confirmed
 snapshot token for **Force sync** on free independent workspaces only. It
 uses the same safe stashing and revision-return flow without releasing the
 workspace; occupancy and mirror guards are not bypassed.
+For a tracked Read-only reference, `workspace sync` derives its behavior from
+the owner record, warns and automatically stashes local changes, and retains
+stash IDs for recovery. `octl ws sync` may rebase if remote history changes.
+The remote status includes its actual deployed project and manifest revision.
 
 The local portable `workspace-manager/workspace_runtime.py` is streamed as data
 to a private temporary file through a login-shell transport, with shell-quoted JSON:

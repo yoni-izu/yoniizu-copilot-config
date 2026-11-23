@@ -141,6 +141,18 @@ class MctlPowerProvisionTests(unittest.TestCase):
         head = "".join(f"# {k}: {v}\n" for k, v in {"desc": name, "where": "local", **meta}.items())
         (self.prov / "recipes" / f"{name}.sh").write_text(head + body)
 
+    def workspace(self):
+        root = self.root / "workspace"
+        (root / ".repo").mkdir(parents=True)
+        owner = self.root / "home/.copilot/skills/workspace-manager"
+        owner.mkdir(parents=True)
+        source = HERE.parent / "workspace-manager"
+        for name in ("wm.py", "workspace_runtime.py", "workspace_store.py"):
+            (owner / name).symlink_to(source / name)
+        self.env["WORKSPACES_DB"] = str(self.root / "home/tasks/workspaces.db")
+        self.env["WORKSPACES_LEGACY_JSON"] = str(self.root / "home/tasks/none.json")
+        return root
+
     # ---- power / lease -------------------------------------------------
     def test_lease_status_reads_octl_once_then_remembers(self):
         self.set_vm("running", 1200, "192.0.2.1")
@@ -157,7 +169,7 @@ class MctlPowerProvisionTests(unittest.TestCase):
         self.assertFalse([c for c in self.octl_calls() if "start" in c])
 
     def test_active_command_auto_starts_with_short_lease(self):
-        r = self.mctl("-t", "vm", "sh", "true")      # ssh never answers → wake times out
+        r = self.mctl("-t", "vm", "sh", "true", str(self.workspace()))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"OCTL vm start {IID} --lease 30m -w", self.octl_calls())
         mem = (self.mdir / "power" / IID).read_text()
@@ -167,7 +179,7 @@ class MctlPowerProvisionTests(unittest.TestCase):
 
     def test_autostart_can_be_disabled(self):
         self.env["MCTL_AUTOSTART"] = "0"
-        self.mctl("-t", "vm", "sh", "true")
+        self.mctl("-t", "vm", "sh", "true", str(self.workspace()))
         self.assertFalse([c for c in self.octl_calls() if "start" in c])
 
     def test_lease_renew_if_below_skips_a_fresh_lease(self):

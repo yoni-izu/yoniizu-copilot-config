@@ -78,24 +78,24 @@ def progress(step, label, **fields):
         pass
 
 
-def run(args, cwd, timeout=180, on_line=None):
+def run(args, cwd, timeout=180, on_line=None, *, pass_fds=()):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
                GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10")
     env.update(github_https_config())
     if on_line is not None:
-        return run_streaming(args, cwd, env, timeout, on_line)
+        return run_streaming(args, cwd, env, timeout, on_line, pass_fds=pass_fds)
     result = subprocess.run(args, cwd=cwd, env=env, text=True,
-                            capture_output=True, timeout=timeout)
+                            capture_output=True, timeout=timeout, pass_fds=pass_fds)
     if result.returncode:
         raise RuntimeError(f"{shlex.join(args[:4])}: "
                            f"{(result.stderr or result.stdout).strip()[-3000:]}")
     return result.stdout
 
 
-def run_streaming(args, cwd, env, timeout, on_line):
+def run_streaming(args, cwd, env, timeout, on_line, *, pass_fds=()):
     """Like run(), but feeds each output line (stdout+stderr) to on_line as it arrives."""
     proc = subprocess.Popen(args, cwd=cwd, env=env, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=pass_fds)
     expired = []
     timer = threading.Timer(timeout, lambda: (expired.append(True), proc.kill()))
     timer.start()
@@ -297,13 +297,45 @@ def repo_worker(payload):
 
 
 def roots(path):
+    def is_hdl(candidate):
+        return bool(re.search(r"(^|[._-])(rtl|hdl)(?=$|[._-])", candidate.name, re.I))
+
+    if is_hdl(path):
+        raise ValueError(f"RTL/HDL checkout is outside workspace-manager scope: {path}")
     if (path / ".repo/metadata.json").is_file():
         return [path]
     found = sorted(p for p in path.iterdir()
-                   if p.is_dir() and (p / ".repo/metadata.json").is_file())
+                   if not is_hdl(p) and p.is_dir() and (p / ".repo/metadata.json").is_file())
     if not found:
         raise ValueError(f"no .repo/metadata.json checkout in {path}")
     return found
+
+
+def deployed_manifest(path):
+    """Read the project and manifest revision actually deployed on this machine."""
+    if not path.is_dir():
+        return {"error": f"{path} does not exist"}
+    try:
+        checkouts = roots(path)
+    except ValueError as exc:
+        if "outside workspace-manager scope" in str(exc):
+            return {"error": str(exc)}
+        return {"error": f"no octl checkout (.repo/metadata.json) in {path}"}
+    seen = set()
+    for root in checkouts:
+        try:
+            meta = json.loads((root / ".repo/metadata.json").read_text())
+        except (OSError, ValueError) as exc:
+            return {"error": f"unreadable {root}/.repo/metadata.json: {exc}"}
+        project = meta.get("project") or (meta.get("init_args") or {}).get("project") or ""
+        revision = (meta.get("manifest_revision")
+                    or (meta.get("init_args") or {}).get("revision") or "")
+        seen.add((project, revision))
+    if len(seen) != 1:
+        return {"error": "checkouts in this slot deploy different manifests: " + ", ".join(
+            f"{project or '?'}@{revision or '?'}" for project, revision in sorted(seen))}
+    project, revision = seen.pop()
+    return {"project": project, "revision": revision, "roots": [str(root) for root in checkouts]}
 
 
 def manifest_repos(root, revision):
@@ -337,9 +369,15 @@ def manifest_repos(root, revision):
                 read(path.parent / node.attrib["name"], default)
             elif node.tag == "project":
                 rel = node.get("path") or node.attrib["name"]
+                name = node.attrib["name"]
+                if any(re.search(r"(^|[./_-])(rtl|hdl)(?=$|[./_-])", value, re.I)
+                       for value in (name, rel)):
+                    raise ValueError(f"RTL/HDL repository is outside workspace-manager scope: {name}")
                 repo = (root / rel).resolve()
                 if not repo.is_relative_to(root.resolve()):
                     raise ValueError(f"repository outside workspace: {rel}")
+                if re.search(r"(^|[./_-])(rtl|hdl)(?=$|[./_-])", str(repo), re.I):
+                    raise ValueError(f"RTL/HDL repository is outside workspace-manager scope: {rel}")
                 out[str(repo)] = {"revision": node.get("revision") or default}
             elif node.tag in {"extend-project", "remove-project", "submanifest"}:
                 raise ValueError(f"unsupported manifest element {node.tag}; refusing partial scan")
@@ -358,6 +396,8 @@ def repo_batch(root, repos, action="status", step=None, label=None, on_result=No
         raise ValueError(f"WIP lacks direct-argument support; update WIP on this machine: {exc}") from exc
     if "forall-argv-v1" not in capabilities:
         raise ValueError("WIP lacks direct-argument support; update WIP on this machine")
+    if "scan-workspace-v1" not in capabilities:
+        raise ValueError("WIP lacks scoped scanning; update WIP on this machine")
     # wip scan writes a shared state file in the slot; serialize sibling roots.
     lockdir = root.parent / ".wip"
     lockdir.mkdir(exist_ok=True)
@@ -370,13 +410,15 @@ def repo_batch(root, repos, action="status", step=None, label=None, on_result=No
         mode = statefile.stat().st_mode & 0o777 if previous is not None else 0o600
         scanned = None
         try:
-            run([wip, "scan"], root.parent, 180)
+            run([wip, "scan", "--workspace", root.name], root.parent, 180)
             scanned = statefile.read_bytes()
             payload = json.dumps({"repos": repos, "action": action})
+            descriptor = os.environ.get("WM_LOCKED_FD")
+            pass_fds = (int(descriptor),) if descriptor else ()
             output = run([wip, "forall", "ws", "--argv", sys.executable,
                           str(Path(__file__).resolve()), "--repo-worker", payload], root, 900,
                          repo_progress(root, len(repos), step, label, on_result)
-                         if step or on_result else None)
+                         if step or on_result else None, pass_fds=pass_fds)
         finally:
             if scanned is not None and statefile.read_bytes() != scanned:
                 raise ValueError("WIP state changed concurrently; newer state preserved")
@@ -436,6 +478,11 @@ def inspect(path, revision, step=None, label=None):
         repos = manifest_repos(root, revision)
         ignored = {".repo", ".west", ".cache", ".venv", "node_modules", "build", "build_artifacts"}
         for directory, dirs, files in os.walk(root):
+            hdl = [name for name in dirs
+                   if re.search(r"(^|[._-])(rtl|hdl)(?=$|[._-])", name, re.I)]
+            if hdl:
+                raise ValueError(f"RTL/HDL subtree is outside workspace-manager scope: "
+                                 f"{Path(directory) / hdl[0]}")
             dirs[:] = [name for name in dirs if name not in ignored]
             if ".git" in dirs or ".git" in files:
                 found = str(Path(directory).resolve())
@@ -447,6 +494,7 @@ def inspect(path, revision, step=None, label=None):
         if str(manifests.resolve()) not in repos:
             rows.append(repo_single(manifests, {"revision": "main"}))
     return {"exists": True, "checked": now(), "repos": rows,
+            "deployed_manifest": deployed_manifest(path),
             "clean": all(r["clean"] for r in rows),
             "safe": all(r["safe"] for r in rows),
             "reasons": [f"{r['path']}: {why}" for r in rows for why in r["reasons"]]}
@@ -549,6 +597,9 @@ def execute(request):
     action = request["action"]
     if action not in {"status", "sync", "free", "mirror", "align"}:
         raise ValueError(f"unsupported workspace action: {action}")
+    reference = "reference_sync" in request
+    if reference and (request["reference_sync"] is not True or action != "sync"):
+        raise ValueError("reference_sync requires true and a sync action")
     portal_approval = None
     for option, required_action in (("portal_free", "free"), ("portal_sync", "sync")):
         if option not in request:
@@ -564,6 +615,12 @@ def execute(request):
     disposable = "disposable" in request
     if disposable and (request["disposable"] is not True or action not in {"free", "sync"}):
         raise ValueError("disposable requires true and a free or sync action")
+    if reference and disposable:
+        raise ValueError("read-only sync cannot discard workspace changes")
+    if reference and portal_approval is not None:
+        if portal_approval["approved"] is not None:
+            raise ValueError("read-only sync does not accept a forced return approval")
+        portal_approval = None
     raw = request["path"]
     if not (raw.startswith("/") or raw.startswith("~/")):
         raise ValueError("workspace path must be absolute or home-relative")
@@ -585,6 +642,7 @@ def execute(request):
         changing_checkout = False
         stashes = []
         approval = None
+        warnings = []
         try:
             if not path.is_dir():
                 result = {"exists": False, "checked": now(), "clean": False,
@@ -605,6 +663,14 @@ def execute(request):
             else:
                 result = inspect(path, revision, "inspect", "Checking repositories")
                 mirror = state.get("mirror")
+                if reference:
+                    deployed = result["deployed_manifest"]
+                    if deployed.get("error"):
+                        raise ValueError(deployed["error"])
+                    if not deployed.get("project") or not deployed.get("revision"):
+                        raise ValueError("deployed project and manifest revision must be known before syncing")
+                    if mirror:
+                        raise ValueError("read-only sync cannot operate on a mirror")
                 if action in {"sync", "free", "align"}:
                     if action == "align" and mirror:
                         raise ValueError("cannot independently align a mirror")
@@ -620,6 +686,21 @@ def execute(request):
                     if disposable and failures:
                         raise ValueError("; ".join(f"{r['path']}: {r['error']}" for r in failures))
                     forced = False
+                    if reference:
+                        blockers = return_blockers(result)
+                        if blockers:
+                            raise ValueError("; ".join(blockers))
+                        warning = ("Read-only sync runs octl ws sync, which may rebase local commits "
+                                   "if remote history changes.")
+                        warnings.append(warning)
+                        progress("sync", "Warning: octl sync may rebase local commits", warning=warning)
+                        if not result["clean"]:
+                            forced = True
+                            if any(row.get("dirty") for row in result["repos"]):
+                                warning = ("Uncommitted and untracked changes will be stashed "
+                                           "automatically before read-only sync.")
+                                warnings.append(warning)
+                                progress("stash", "Warning: saving local changes before sync", warning=warning)
                     # Off-baseline branches with nothing to lose return without confirmation.
                     if portal_approval is not None and not disposable and not result["safe"]:
                         if failures:
@@ -693,6 +774,10 @@ def execute(request):
                                 run([octl, "ws", "sync", "--no-plugins"], root, 1200, octl_progress(label))
                                 if forced and manifest_repos(root, revision) != approved_manifests[root]:
                                     raise ValueError("manifest changed during sync; review the workspace before retrying")
+                                if reference and deployed_manifest(path) != deployed:
+                                    raise ValueError("deployed project or manifest revision changed during sync")
+                                if reference and manifest_repos(root, revision) != repos:
+                                    raise ValueError("manifest changed during sync; review the workspace before retrying")
                             after_rows = repo_batch(root, repos, "update", "update",
                                                     "Checking out target branches" + where)
                             failures = [f"{r['path']}: {r['error']}" for r in after_rows if r.get("error")]
@@ -704,7 +789,9 @@ def execute(request):
                             if not expected or matched != expected:
                                 raise ValueError("review repositories missing: " + ", ".join(expected - matched))
                         result = inspect(path, revision, "verify", "Verifying clean baseline")
-                        if action == "sync" and portal_approval is not None and not result["clean"]:
+                        if reference and result["deployed_manifest"] != deployed:
+                            raise ValueError("deployed project or manifest revision changed during sync")
+                        if action == "sync" and (portal_approval is not None or reference) and not result["clean"]:
                             raise RuntimeError("sync did not reach a clean manifest baseline")
                         if action == "free":
                             if not result["clean"]:
@@ -713,6 +800,8 @@ def execute(request):
                             atomic(marker, state)
             if stashes:
                 result["stashes"] = stashes
+            if warnings:
+                result["warnings"] = warnings
             result.update(id=wid, path=str(path), mirror=state.get("mirror"))
             response = {"ok": True, "status": result}
             if approval is not None:

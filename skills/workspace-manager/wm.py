@@ -35,6 +35,7 @@ from pathlib import Path
 # Constants
 # ----------------------------------------------------------------------------
 
+import workspace_runtime
 import workspace_store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "task-manager"))
@@ -51,7 +52,7 @@ ADHOC_TAGS = ["monitor", "debug", "development", "experiment", "other", "review"
 HOLDER_TYPES = ["task", "adhoc"]
 PURPOSES = {
     "general": "General", "review": "Review", "development": "Development",
-    "build-root": "Build root", "mirror": "Mirror",
+    "build-root": "Build root", "mirror": "Mirror", "read-only": "Read-only",
 }
 PURPOSE_USES = {
     "review": {"review", "adhoc:review", "mirror-source"},
@@ -59,6 +60,7 @@ PURPOSE_USES = {
                     "adhoc:experiment", "mirror-source"},
     "build-root": {"mirror", "build", "test", "adhoc:build", "adhoc:test"},
     "mirror": {"mirror", "build", "test", "adhoc:build", "adhoc:test"},
+    "read-only": set(),
 }
 
 TODAY = date.today().isoformat()
@@ -115,6 +117,31 @@ def require_use(slot: str, activity: str) -> None:
     if not allows(rec, activity):
         raise ValueError(f"workspace '{rec['slot']}' is dedicated to "
                          f"{PURPOSES[rec.get('purpose', 'general')]} and cannot be used for {activity}")
+
+
+def require_workspace_action(slot: str, action: str) -> None:
+    rec = record(slot)
+    normalized = action.removeprefix("workspace-")
+    if rec.get("purpose") == "read-only" and normalized not in {"status", "sync"}:
+        raise ValueError(f"workspace '{rec['slot']}' is dedicated to Read-only; "
+                         f"{action} is not allowed")
+
+
+def wip_policy_locks(path: str, internal_id: str = "") -> list[str]:
+    """Lock local tracked workspaces intersecting a WIP operation's scope."""
+    root = Path(path).expanduser().resolve()
+    locks = []
+    for slot, item in tracked().items():
+        if item.get("target"):
+            continue
+        candidate = Path(item["path"]).expanduser().resolve()
+        if not (root == candidate or root.is_relative_to(candidate) or candidate.is_relative_to(root)):
+            continue
+        rec = record(slot)
+        if rec["id"] != internal_id:
+            require_workspace_action(slot, "wip")
+        locks.append(str(_state_path(rec["id"], ".operation.lock")))
+    return sorted(locks)
 
 
 def require_task(slot: str, task_id: str) -> None:
@@ -310,6 +337,28 @@ def _state_path(wid: str, suffix: str = ".json") -> Path:
     return STORE.parent / "workspace-state" / (wid + suffix)
 
 
+def owns_operation_lock(wid: str, descriptor: str | None) -> bool:
+    try:
+        fd = int(descriptor or "")
+        path = _state_path(wid, ".operation.lock")
+        held = os.fstat(fd)
+        expected = path.stat()
+        if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+            return False
+        with path.open("r") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                return False
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def workspace_serialized(fn):
     @functools.wraps(fn)
     def wrapped(slot, *args, **kwargs):
@@ -324,11 +373,14 @@ def workspace_serialized(fn):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as e:
                 raise ValueError(f"workspace operation already running: {slot}") from e
+            fds = getattr(_LOCK_STATE, "workspace_fds", {})
             _LOCK_STATE.workspaces = held | {wid}
+            _LOCK_STATE.workspace_fds = {**fds, wid: f.fileno()}
             try:
                 return fn(slot, *args, **kwargs)
             finally:
                 _LOCK_STATE.workspaces = held
+                _LOCK_STATE.workspace_fds = fds
                 fcntl.flock(f, fcntl.LOCK_UN)
     return wrapped
 
@@ -391,10 +443,11 @@ def mirror_state(target: str, path: str, source_id: str, source_path: str,
 
 
 def _run_with_progress(args: list, timeout: int, progress, *,
-                       env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+                       env: dict[str, str] | None = None,
+                       pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
     """Run the runtime, forwarding its WS_PROGRESS stderr events to ``progress`` live."""
     proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env)
+                            env=env, pass_fds=pass_fds)
     stdout: list[str] = []
     reader = threading.Thread(target=lambda: stdout.append(proc.stdout.read()), daemon=True)
     reader.start()
@@ -429,6 +482,9 @@ def _run_with_progress(args: list, timeout: int, progress, *,
 def workspace_request(slot: str, action: str = "status", *, _adopted: bool = False,
                       progress=None, **options) -> dict:
     rec = record(slot)
+    require_workspace_action(slot, action)
+    if "reference_sync" in options:
+        raise ValueError("read-only sync is selected by workspace purpose, not by an option")
     if action == "align":
         require_use(slot, "review")
     elif action == "mirror" and options.get("mirror") is not None:
@@ -437,6 +493,8 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
         options["disposable"] = True
     request = {"id": rec["id"], "path": rec["path"], "rev": rec["rev"], "action": action}
     request.update(options)
+    if not rec.get("target") and action == "sync" and rec.get("purpose") == "read-only":
+        request["reference_sync"] = True
     portal_sync = options.get("portal_sync")
     approved_sync = isinstance(portal_sync, dict) and portal_sync.get("approved") is not None
     if action == "sync" and get_holder(slot) and (
@@ -455,11 +513,12 @@ def workspace_request(slot: str, action: str = "status", *, _adopted: bool = Fal
     try:
         timeout = 2400 if action != "status" else 180
         env, agent_error = vd.agent_env(recheck=True) if rec.get("target") else (None, "")
-        if rec.get("target"):
-            env = dict(env if env is not None else os.environ,
-                       WM_LOCKED_WORKSPACE=rec["id"])
-        r = (_run_with_progress(args, timeout, progress, env=env) if progress else
-             subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env))
+        fd = _LOCK_STATE.workspace_fds[rec["id"]]
+        env = dict(env if env is not None else os.environ, WM_LOCKED_WORKSPACE=rec["id"],
+                   WM_LOCKED_FD=str(fd))
+        r = (_run_with_progress(args, timeout, progress, env=env, pass_fds=(fd,)) if progress else
+             subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env,
+                            pass_fds=(fd,)))
         if r.returncode and not r.stdout.lstrip().startswith("{"):
             error = (r.stderr or r.stdout).strip()[-3000:] or f"exit {r.returncode}"
             if r.returncode == vd.SSH_FAIL_RC and agent_error:
@@ -545,6 +604,8 @@ def require_clean(slot: str) -> None:
 def guarded_occupancy(fn):
     @workspace_serialized
     def locked(slot, *args, **kwargs):
+        if record(slot).get("purpose") == "read-only":
+            require_use(slot, "occupancy")
         if kwargs.pop("_validated", False) is not True:
             require_clean(slot)
         result = fn(slot, *args, **kwargs)
@@ -802,30 +863,7 @@ def deployed_manifest(slot: str, d: dict | None = None) -> dict:
         root = slot_path(slot, d)
     except ValueError as exc:
         return {"error": str(exc)}
-    if not root.is_dir():
-        return {"error": f"{root} does not exist"}
-    if (root / ".repo/metadata.json").is_file():
-        roots = [root]
-    else:
-        roots = sorted(p for p in root.iterdir()
-                       if p.is_dir() and (p / ".repo/metadata.json").is_file())
-    if not roots:
-        return {"error": f"no octl checkout (.repo/metadata.json) in {root}"}
-    seen = set()
-    for r in roots:
-        try:
-            meta = json.loads((r / ".repo/metadata.json").read_text())
-        except (OSError, ValueError) as exc:
-            return {"error": f"unreadable {r}/.repo/metadata.json: {exc}"}
-        project = meta.get("project") or (meta.get("init_args") or {}).get("project") or ""
-        revision = (meta.get("manifest_revision")
-                    or (meta.get("init_args") or {}).get("revision") or "")
-        seen.add((project, revision))
-    if len(seen) != 1:
-        return {"error": "checkouts in this slot deploy different manifests: " + ", ".join(
-            f"{p or '?'}@{r or '?'}" for p, r in sorted(seen))}
-    project, revision = seen.pop()
-    return {"project": project, "revision": revision, "roots": [str(r) for r in roots]}
+    return workspace_runtime.deployed_manifest(root)
 
 
 def all_holders(d: dict | None = None) -> dict[str, dict]:
@@ -1284,8 +1322,13 @@ def cmd_purpose(args) -> int:
 
 def _workspace_cli(args, command) -> int:
     try:
+        def report(event):
+            if event.get("warning"):
+                print("[wm] warning: " + event["warning"], file=sys.stderr, flush=True)
+
         value = action_log(args.slot) if command == "log" else workspace_request(
-            args.slot, "status" if command == "refresh" else command)
+            args.slot, "status" if command == "refresh" else command,
+            progress=report if command == "sync" else None)
         print(json.dumps(value, indent=2))
         return 0
     except ValueError as e:

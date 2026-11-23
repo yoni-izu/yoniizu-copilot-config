@@ -18,9 +18,14 @@ checkout. [rtl-vm-policy](../rtl-vm-policy/SKILL.md) routes every RTL question t
 (`~/bin/neo-ask`); never read RTL via `wip`, Git or GitHub, and never
 transfer source or patches back to WSL. If Neo is unavailable,
 report the prerequisite. Normal FW and software CSR operations are unchanged.
-`~/bin/wip` is a separate executable and is not automatically hardened by
-changes to the plugin's bundled copy: preflight every manifest/snapshot scope,
-including mixed HDL, before invoking it.
+The tracked `~/bin/wip` rejects manifests explicitly declaring RTL/HDL, but
+preflight every manifest/snapshot scope, including mixed HDL, before invoking
+it. Older or independently installed remote copies may not have these checks.
+
+Tracked Read-only reference workspaces reject WIP mutations, snapshot loads,
+mode changes and arbitrary `forall` commands, including mixed `all` scopes.
+Use workspace-manager's guarded Sync instead. This is managed-tool policy, not
+an OS sandbox or a guard on independently run remote tools.
 
 Manage multi-repo workspaces using the `wip` CLI (`~/bin/wip`). It performs git
 operations across all repos in a single workspace (`ws`) or across every
@@ -85,8 +90,11 @@ cd <wip_root>
 wip scan <snapshot_name>
 ```
 
-There is no separate per-workspace scan — one `wip scan` at the root captures
-every workspace; target a single one later with the `ws` scope.
+To scan only one child checkout without touching siblings, use
+`wip scan --workspace <child-name>` from the WIP root. It replaces the scanned
+state with that one workspace; workspace-manager preserves/restores the prior
+state around its internal scoped scan. An unqualified scan still captures all
+eligible children.
 
 ## Save / Load / List (State Persistence)
 

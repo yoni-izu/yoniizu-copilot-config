@@ -79,7 +79,7 @@ class RegistryTests(unittest.TestCase):
                 self.assertEqual(row["allowed_uses"], wm.purpose_uses(purpose))
         for value in ("arbitrary", None, [], False):
             self.assertFalse(wm.set_slot_fields("one", {"purpose": value})[0])
-        self.assertEqual(wm.record("one")["purpose"], "mirror")
+        self.assertEqual(wm.record("one")["purpose"], "read-only")
 
     def test_tracking_validates_dedication_and_cli_can_edit_without_machine_access(self):
         extra = self.base / "review"
@@ -127,7 +127,7 @@ class RegistryTests(unittest.TestCase):
                     self.assertEqual(ok, wm.allows(wm.record("one"), "adhoc:" + tag), msg)
                     if ok:
                         wm.release("one", reset=False)
-        self.assertEqual(wm.record("one")["purpose"], "mirror")
+        self.assertEqual(wm.record("one")["purpose"], "read-only")
 
     def test_purpose_change_refuses_holds_mirrors_and_unverified_jobs_without_partial_edits(self):
         with patch.object(wm, "require_clean"):
@@ -156,6 +156,25 @@ class RegistryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "dedicated"):
                     wm.workspace_request("one", action, **options)
                 run.assert_not_called()
+
+    def test_read_only_request_allows_only_status_and_owner_selected_sync(self):
+        with patch.object(wm.vd, "jobs", return_value=[]):
+            self.assertTrue(wm.set_slot_fields("one", {"purpose": "read-only"})[0])
+        response = subprocess.CompletedProcess([], 0, json.dumps({
+            "ok": True, "status": {"clean": True, "path": str(self.local)}, "log": []}), "")
+        with patch.object(wm.subprocess, "run", return_value=response) as run:
+            wm.workspace_request("one", "sync", portal_sync={"approved": None})
+            request = json.loads(run.call_args.args[0][-1])
+            self.assertIs(request["reference_sync"], True)
+            self.assertNotIn("disposable", request)
+            run.reset_mock()
+            for action, options in (("free", {}), ("align", {}),
+                                    ("mirror", {"mirror": None})):
+                with self.subTest(action=action), self.assertRaisesRegex(ValueError, "Read-only"):
+                    wm.workspace_request("one", action, **options)
+            with self.assertRaisesRegex(ValueError, "workspace purpose"):
+                wm.workspace_request("one", "sync", reference_sync=True)
+            run.assert_not_called()
 
     def test_metadata_revision_guard_preserves_hold_and_rejects_unknown_group(self):
         with patch.object(wm, "workspace_request", return_value={"clean": True}):
@@ -217,8 +236,12 @@ class RegistryTests(unittest.TestCase):
                                          progress=(lambda event: None) if streaming else None)
                 agent.assert_called_once_with(recheck=True)
                 invoked, unused = (stream, run) if streaming else (run, stream)
-                self.assertEqual(invoked.call_args.kwargs["env"],
+                passed_env = invoked.call_args.kwargs["env"]
+                descriptor = int(passed_env["WM_LOCKED_FD"])
+                self.assertEqual({key: value for key, value in passed_env.items()
+                                  if key != "WM_LOCKED_FD"},
                                  dict(env, WM_LOCKED_WORKSPACE=wm.record(slot)["id"]))
+                self.assertEqual(invoked.call_args.kwargs["pass_fds"], (descriptor,))
                 unused.assert_not_called()
 
     def test_local_workspace_does_not_resolve_ssh_agent(self):
@@ -547,6 +570,154 @@ class RuntimeTests(unittest.TestCase):
 
     def portal_sync(self, approved=None):
         return self.execute("sync", portal_sync={"approved": approved})
+
+    def test_reference_sync_warns_then_stashes_and_reports_recoverable_work(self):
+        self.dev()
+        (self.repo / "file").write_text("staged\n")
+        self.git(self.repo, "add", "file")
+        (self.repo / "file").write_text("unstaged\n")
+        (self.repo / "new").write_text("untracked\n")
+        events = []
+        with patch.object(runtime, "progress",
+                          side_effect=lambda step, label, **fields: events.append((step, fields))):
+            result = self.execute("sync", reference_sync=True,
+                                  portal_sync={"approved": None})
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("approval_required", result)
+        self.assertTrue(result["status"]["clean"])
+        self.assertEqual(result["status"]["deployed_manifest"]["project"], "test")
+        self.assertEqual(result["status"]["deployed_manifest"]["revision"], "main")
+        self.assertTrue(any("rebase" in w for w in result["status"]["warnings"]))
+        warning = next(i for i, (_, fields) in enumerate(events)
+                       if "stashed automatically" in fields.get("warning", ""))
+        actual_stash = next(i for i, (step, fields) in enumerate(events)
+                            if step == "stash" and fields.get("detail", "").startswith("Saved stash"))
+        self.assertLess(warning, actual_stash)
+        stash = result["status"]["stashes"][0]
+        self.assertEqual(stash["branch"], "dev/test")
+        self.assertEqual(self.git(self.repo, "branch", "--show-current"), "main")
+        self.git(self.repo, "checkout", "dev/test")
+        self.git(self.repo, "stash", "apply", "--index", stash["oid"])
+        self.assertEqual(self.git(self.repo, "show", ":file"), "staged")
+        self.assertEqual((self.repo / "file").read_text(), "unstaged\n")
+        self.assertEqual((self.repo / "new").read_text(), "untracked\n")
+
+    def test_reference_sync_blocks_local_commits_and_unverifiable_manifest(self):
+        (self.repo / "file").write_text("local commit\n")
+        self.git(self.repo, "commit", "-am", "local commit")
+        (self.repo / "new").write_text("preserve")
+        result = self.execute("sync", reference_sync=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("local commits", result["error"])
+        self.assertEqual(self.git(self.repo, "stash", "list"), "")
+        self.assertFalse((self.home / "octl-calls").exists())
+        self.git(self.repo, "reset", "--soft", "origin/main")
+        meta = {"manifest": "test.xml", "manifest_revision": "a1_release"}
+        (self.root / ".repo/metadata.json").write_text(json.dumps(meta))
+        result = self.execute("sync", reference_sync=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("project and manifest revision must be known", result["error"])
+        self.assertEqual(self.git(self.repo, "stash", "list"), "")
+
+    def test_reference_sync_rechecks_dirty_content_before_stashing(self):
+        (self.repo / "file").write_text("before\n")
+        def mutate(step, label, **fields):
+            if step == "stash" and fields.get("warning"):
+                (self.repo / "file").write_text("concurrent change\n")
+        with patch.object(runtime, "progress", side_effect=mutate):
+            result = self.execute("sync", reference_sync=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("changed after approval", result["error"])
+        self.assertEqual((self.repo / "file").read_text(), "concurrent change\n")
+        self.assertEqual(self.git(self.repo, "stash", "list"), "")
+        self.assertFalse((self.home / "octl-calls").exists())
+
+    def test_reference_sync_failure_keeps_stash_id_and_reports_manifest_change(self):
+        (self.repo / "file").write_text("preserve me\n")
+        original = runtime.run
+        def changed_metadata(args, cwd, *rest, **kwargs):
+            output = original(args, cwd, *rest, **kwargs)
+            if args[1:4] == ["ws", "sync", "--no-plugins"]:
+                (self.root / ".repo/metadata.json").write_text(json.dumps({
+                    "manifest": "test.xml", "project": "test", "manifest_revision": "other"}))
+            return output
+        with patch.object(runtime, "run", side_effect=changed_metadata):
+            result = self.execute("sync", reference_sync=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("manifest revision changed", result["error"])
+        self.assertIn(self.git(self.repo, "rev-parse", "refs/stash"), result["error"])
+        self.assertIn("Saved work", result["error"])
+
+    def test_status_uses_metadata_revision_not_configured_repository_baseline(self):
+        (self.root / ".repo/metadata.json").write_text(json.dumps({
+            "manifest": "test.xml", "project": "test", "manifest_revision": "release-tag"}))
+        result = self.execute("status")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"]["deployed_manifest"]["revision"], "release-tag")
+        self.assertEqual(next(r for r in result["status"]["repos"] if r["path"] == str(self.repo))["revision"], "main")
+
+    def test_scoped_inspection_never_scans_an_rtl_sibling(self):
+        sibling = self.slot / "rtl" / ".repo"
+        sibling.mkdir(parents=True)
+        (sibling / "metadata.json").write_text("do not read")
+        calls = []
+        original = runtime.run
+        def capture(args, *rest, **kwargs):
+            calls.append(args)
+            return original(args, *rest, **kwargs)
+        with patch.object(runtime, "run", side_effect=capture):
+            result = self.execute("status")
+        self.assertTrue(result["ok"], result)
+        scans = [args for args in calls if args[1:2] == ["scan"]]
+        self.assertTrue(scans)
+        self.assertTrue(all(args[2:] == ["--workspace", "fw"] for args in scans))
+        self.assertEqual(result["status"]["deployed_manifest"]["roots"], [str(self.root)])
+
+    def test_manifest_declaring_rtl_is_refused_before_any_repository_worker(self):
+        manifest = self.manifests / "test.xml"
+        manifest.write_text('<manifest><default revision="main"/>'
+                            '<project name="ip.example.rtl" path="rtl-source"/></manifest>')
+        with patch.object(runtime, "repo_batch") as batch:
+            result = self.execute("status")
+        self.assertFalse(result["ok"])
+        self.assertIn("RTL/HDL repository", result["error"])
+        batch.assert_not_called()
+
+    def test_owner_sync_runs_internal_wip_worker_under_read_only_lock(self):
+        owner = self.home / ".copilot/skills/workspace-manager"
+        owner.mkdir(parents=True)
+        for name in ("wm.py", "workspace_runtime.py", "workspace_store.py"):
+            (owner / name).symlink_to(Path(__file__).parent / name)
+        store = self.home / "tasks/workspaces.db"
+        with patch.object(wm, "STORE", store), \
+                patch.object(wm.workspace_store, "LEGACY", self.home / "missing.json"), \
+                patch.dict(os.environ, {"WORKSPACES_DB": str(store),
+                                        "WORKSPACES_LEGACY_JSON": str(self.home / "missing.json")}):
+            wm.save({"slots": {}, "groups": [], "tracked": {"reference": {
+                "id": self.request["id"], "path": str(self.slot), "label": "reference",
+                "rev": "main", "purpose": "read-only"}}})
+            (self.repo / "file").write_text("keep\n")
+            events = []
+            reading = wm.workspace_request("reference", "sync", progress=events.append)
+        self.assertTrue(reading["clean"])
+        self.assertEqual(len(reading["stashes"]), 1)
+        self.assertTrue(any("automatically" in e.get("warning", "") for e in events))
+
+    def test_owner_review_sync_still_runs_disposable_worker_under_lock(self):
+        owner = self.home / ".copilot/skills/workspace-manager"
+        owner.mkdir(parents=True)
+        for name in ("wm.py", "workspace_runtime.py", "workspace_store.py"):
+            (owner / name).symlink_to(Path(__file__).parent / name)
+        store = self.home / "tasks/workspaces.db"
+        with patch.object(wm, "STORE", store), \
+                patch.object(wm.workspace_store, "LEGACY", self.home / "missing.json"), \
+                patch.dict(os.environ, {"WORKSPACES_DB": str(store),
+                                        "WORKSPACES_LEGACY_JSON": str(self.home / "missing.json")}):
+            wm.save({"slots": {}, "groups": [], "tracked": {"review": {
+                "id": self.request["id"], "path": str(self.slot), "label": "review",
+                "rev": "main", "purpose": "review"}}})
+            reading = wm.workspace_request("review", "sync")
+        self.assertTrue(reading["clean"])
 
     def test_portal_sync_stashes_work_and_returns_unexpected_branch_on_confirmation(self):
         self.dev()
@@ -917,8 +1088,8 @@ class RuntimeTests(unittest.TestCase):
         first = self.portal_free()
         original_run = runtime.run
 
-        def fail_after_stash(args, cwd, timeout=180, on_line=None):
-            output = original_run(args, cwd, timeout, on_line)
+        def fail_after_stash(args, cwd, timeout=180, on_line=None, *, pass_fds=()):
+            output = original_run(args, cwd, timeout, on_line, pass_fds=pass_fds)
             if args[1:3] == ["forall", "ws"] and json.loads(args[-1])["action"] == "stash":
                 raise RuntimeError("simulated failure after stashing")
             return output
@@ -1173,6 +1344,98 @@ class DeployedManifestTests(unittest.TestCase):
         self.assertIn("different manifests", wm.deployed_manifest("mix")["error"])
         with patch.object(wm, "slot_path", side_effect=ValueError("remote workspace paths")):
             self.assertIn("remote", wm.deployed_manifest("r")["error"])
+
+
+class WipPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.slot = self.base / "slot"
+        self.root = self.slot / "fw"
+        (self.root / "repo").mkdir(parents=True)
+        state = self.slot / ".wip/state"
+        state.parent.mkdir()
+        state.write_text("# WIP_INFO\nfw:demo=repo:main\n# WS_UPSTREAM_INFO\nfw=main\n")
+        owner = self.home / ".copilot/skills/workspace-manager"
+        owner.mkdir(parents=True)
+        for name in ("wm.py", "workspace_runtime.py", "workspace_store.py"):
+            (owner / name).symlink_to(Path(__file__).parent / name)
+        self.store = self.home / "tasks/workspaces.db"
+        self.env = dict(os.environ, HOME=str(self.home), WORKSPACES_DB=str(self.store),
+                        WORKSPACES_LEGACY_JSON=str(self.home / "missing.json"))
+        self.env.pop("WM_LOCKED_WORKSPACE", None)
+        self.store_patch = patch.object(wm, "STORE", self.store)
+        self.store_patch.start()
+        self.addCleanup(self.store_patch.stop)
+        legacy = patch.object(wm.workspace_store, "LEGACY", self.home / "missing.json")
+        legacy.start()
+        self.addCleanup(legacy.stop)
+        wm.save({"slots": {}, "groups": [], "tracked": {"slot": {
+            "id": "WS-L-" + "d" * 32, "path": str(self.slot), "label": "slot",
+            "rev": "main", "purpose": "read-only"}}})
+        self.wip = Path(__file__).resolve().parents[2] / "bin/wip"
+
+    def call(self, *args, cwd=None):
+        return subprocess.run([str(self.wip), *args], cwd=cwd or self.root,
+                              env=self.env, text=True, capture_output=True, timeout=30)
+
+    def test_mutations_and_arbitrary_commands_reject_mixed_and_single_scopes(self):
+        marker = self.base / "unexpected"
+        for args, cwd in ((("ws", "pull"), self.root),
+                          (("all", "checkout"), self.slot),
+                          (("ws", "push", "--yes", "--force-mirror"), self.root),
+                          (("forall", "ws", "--argv", "/usr/bin/touch", str(marker)), self.root)):
+            with self.subTest(args=args):
+                result = self.call(*args, cwd=cwd)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Read-only", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_wip_holds_owner_lock_before_general_workspace_mutation(self):
+        with patch.object(wm.vd, "jobs", return_value=[]):
+            self.assertTrue(wm.set_slot_fields("slot", {"purpose": "general"})[0])
+        lockpath = wm._state_path("WS-L-" + "d" * 32, ".operation.lock")
+        lockpath.parent.mkdir(parents=True, exist_ok=True)
+        with lockpath.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.call("ws", "checkout")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("operation already running", result.stderr)
+
+    def test_scoped_state_cannot_reach_reference_via_repository_symlink(self):
+        outside = self.base / "other"
+        root = outside / "fw"
+        root.mkdir(parents=True)
+        (root / "repo").symlink_to(self.root / "repo", target_is_directory=True)
+        state = outside / ".wip/state"
+        state.parent.mkdir()
+        state.write_text("# WIP_INFO\nfw:demo=repo:main\n# WS_UPSTREAM_INFO\nfw=main\n")
+        result = self.call("ws", "checkout", cwd=root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Read-only", result.stderr)
+
+    def test_internal_worker_marker_alone_cannot_bypass_read_only_policy(self):
+        self.env["WM_LOCKED_WORKSPACE"] = "WS-L-" + "d" * 32
+        marker = self.base / "executed"
+        interpreter = self.base / "python-fake"
+        interpreter.write_text("#!/bin/sh\ntouch " + str(marker) + "\n")
+        interpreter.chmod(0o755)
+        worker = self.home / ".copilot/skills/workspace-manager/workspace_runtime.py"
+        result = self.call("forall", "ws", "--argv", str(interpreter), str(worker),
+                           "--repo-worker", '{"action":"status"}', cwd=self.root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_scan_mode_change_cannot_bypass_reference_policy(self):
+        state = self.slot / ".wip/state"
+        original = state.read_bytes()
+        result = self.call("scan", "--mode", "author", cwd=self.slot)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Read-only", result.stderr)
+        self.assertEqual(state.read_bytes(), original)
 
 
 if __name__ == "__main__":

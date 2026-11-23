@@ -37,15 +37,17 @@ class TaskStoreTests(unittest.TestCase):
     def test_auto_assignment_skips_incompatible_dedicated_workspace(self):
         import tm
         args = tm.build_parser().parse_args(["add", "new work", "--workspace", "one"])
-        with patch.object(tm.wm, "normalize_slot", return_value="one"), \
-                patch.object(tm.wm, "get_holder", return_value=None), \
-                patch.object(tm.wm, "record", return_value={"purpose": "review"}), \
-                patch.object(tm.wm, "occupy_task") as occupy, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(tm.cmd_add(args), 0)
-        occupy.assert_not_called()
-        self.assertIn("dedicated to Review", output.getvalue())
-        self.assertEqual(store.load()["tasks"][0]["status"], "backlog")
+        for purpose, label in (("review", "Review"), ("read-only", "Read-only")):
+            with self.subTest(purpose=purpose), \
+                    patch.object(tm.wm, "normalize_slot", return_value="one"), \
+                    patch.object(tm.wm, "get_holder", return_value=None), \
+                    patch.object(tm.wm, "record", return_value={"purpose": purpose}), \
+                    patch.object(tm.wm, "occupy_task") as occupy, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(tm.cmd_add(args), 0)
+            occupy.assert_not_called()
+            self.assertIn("dedicated to " + label, output.getvalue())
+            self.assertEqual(store.load()["tasks"][-1]["status"], "backlog")
 
     def test_failed_assignment_does_not_claim_success_in_task_notes_or_summary(self):
         import tm

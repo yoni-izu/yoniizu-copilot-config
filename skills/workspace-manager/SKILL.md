@@ -66,14 +66,24 @@ to the same physical checkout on several hosts.
   checkout and reports why. For an active mirror it preserves development branch
   choices, syncs non-development repositories to manifest revisions and updates
   development branches from their matching origin branches. Dirty/local-only
-  work is never reset, rebased or silently discarded; updates are fast-forward
-  only. Failed/in-progress mirrors must be re-mirrored or freed, not synced.
+  work is never reset or silently discarded; the guarded return uses
+  fast-forward-only Git updates. `octl ws sync` may still rebase if remote
+  history changes. Failed/in-progress mirrors must be re-mirrored or freed, not synced.
   Portal Sync on a free independent workspace can request snapshot-bound
   **Force sync** approval for dirty/non-baseline checkouts via `portal_sync`.
   Approved Sync stashes changes and returns to manifest revisions with the
   same safeguards as Portal Free, but never releases or creates a hold.
   Occupancy is rechecked at execution; mirrors and network/authentication
   failures cannot use this override. Normal CLI Sync remains guarded.
+- **Read-only Sync** applies only to `purpose: read-only`, locally or remotely.
+  It warns before automatically stashing staged, unstaged and untracked work,
+  checks for unsafe target/detached commits, returns to the existing manifest's
+  repository revisions and runs `octl ws sync --no-plugins`. It never pushes,
+  discards, cleans or hard-resets. It verifies the result and reports the stash
+  IDs and original branches even on failure. Ignored files are not stashed.
+  `octl` uses `git pull --rebase`: a remote history change can rebase local
+  commits despite the preflight; `pull.ff=only` does not prevent this.
+  Changed/unknown manifests, failed stashes and unverifiable commits fail closed.
 - **Free** returns all repositories to their manifest revisions, then runs
   `octl ws sync --no-plugins` and verifies the result. Holder and mirror state
   clear only after success. Failures keep the reservation and are visible.
@@ -105,13 +115,15 @@ to the same physical checkout on several hosts.
   `force=True` bypasses only those two checks, preserving holds, saved readings,
   mirror state and history without touching the checkout or contacting a machine.
   Active-operation locks and workspace identity validation still apply.
-- **Deployed manifest** (`wm.deployed_manifest(slot)`, read-only, local slots)
+- **Deployed manifest** (`wm.deployed_manifest(slot)`, local slots, and the
+  `deployed_manifest` field of local/remote status)
   returns the `project` and `manifest_revision` actually deployed, read from the
   slot's `.repo/metadata.json` checkouts (the slot or its direct children), or an
   error when there is none or they disagree. The tracked `rev` is only a
   declaration; the portal's auto-review matches workspaces on this reading.
 
-The portable `workspace_runtime.py` uses `wip scan`/`wip forall ws --argv` for
+The portable `workspace_runtime.py` uses `wip scan --workspace NAME` and
+`wip forall ws --argv` for
 multi-repository operations, passes its named repository-worker arguments
 directly without shell evaluation, verifies complete manifest coverage, and checks
 each repository's result (the wip wrapper's exit status alone is insufficient).
@@ -120,8 +132,10 @@ changes are reported rather than overwritten. Undeclared source repositories
 and missing manifest repositories block checkout-changing actions.
 Only supported, fully resolved manifests are acted on; unsupported manifest
 elements fail explicitly. It must not be used for arbitrary shell commands.
-The local or remote WIP must advertise `forall-argv-v1`; older versions fail
-closed and need updating before workspace operations.
+The local or remote WIP must advertise `forall-argv-v1` and
+`scan-workspace-v1`; older versions fail closed and need updating before
+workspace operations. Scoped scans avoid unrelated or RTL sibling checkouts;
+manifests declaring RTL/HDL repositories fail before repository workers run.
 
 ### Mirror state and history
 
@@ -171,6 +185,7 @@ reclassified. Free/release does not clear dedication.
 | `development` | Non-review tasks, ad-hoc `development`/`debug`/`experiment` holds, outgoing source mirroring |
 | `build-root` | Incoming mirrors, build/test dispatch, ad-hoc `build`/`test` reservations |
 | `mirror` | Same policy as `build-root`, with a distinct display label |
+| `read-only` | Reference existing FW code only; status and managed Sync, no task/ad-hoc hold, build/test, mirror, push, generic execution or artifact/log writes into the checkout |
 
 Use `wm.py purpose SLOT` to inspect, or `wm.py purpose SLOT review` (etc.) to
 change. The portal exposes the same owner API in Track/Edit. Purpose changes
@@ -189,9 +204,12 @@ than disguising dedicated activity as an `other`/`experiment` hold.
 
 Supported `mctl` dispatch checks destination policy before side effects.
 Review/Development workspaces can be build sources, not build execution
-destinations. Generic `mctl run`/`sh`/`wip` operations require General targets;
-use structured workspace Sync/Free for dedicated-target maintenance. The
-policy is not an OS sandbox and does not prevent arbitrary terminal commands.
+destinations. Read-only workspaces cannot source or receive mirrors and cannot
+be used for builds/tests or artifact/log pulls. Generic `mctl run`/`sh`/`wip`
+operations require General targets; use structured workspace Sync (not Free)
+for read-only references. WIP rejects mutating and arbitrary-command scopes
+that intersect a local read-only workspace. The policy is not an OS sandbox
+and does not prevent arbitrary terminal commands or independently run remote tools.
 Agents must honor it for manual selection and execution as well.
 
 ## CLI cheatsheet

@@ -145,6 +145,8 @@ scan_workspace() {
 	# $1 = absolute path to a workspace dir. Populates wip_info/ws_upstream_info.
 	local ws_dir=$1 ws_name meta project manifest_file manifest_revision manifest_path
 	ws_name=$(basename "$ws_dir")
+	[[ ! "${ws_name,,}" =~ (^|[._-])(rtl|hdl)($|[._-]) ]] \
+		|| die "RTL/HDL workspaces are outside WIP scope: $ws_name"
 	meta="$ws_dir/.repo/metadata.json"
 	[[ -f "$meta" ]] || { echo "  skip $ws_name (no .repo/metadata.json)"; return 1; }
 
@@ -162,6 +164,35 @@ scan_workspace() {
 		fi
 		[[ -f "$manifest_path" ]] || { echo "  skip $ws_name (manifest $fname not found)"; return 1; }
 	fi
+
+	python3 - "$manifest_path" "$ws_dir/.repo/manifests" "$ws_dir" <<'PY' || die "refusing to scan an unsafe or RTL/HDL manifest: $manifest_path"
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+base = Path(sys.argv[2]).resolve()
+workspace = Path(sys.argv[3]).resolve()
+visited = set()
+def check(path):
+    path = path.resolve()
+    if not path.is_relative_to(base) or path in visited:
+        raise ValueError(f"invalid manifest include: {path}")
+    visited.add(path)
+    for item in ET.parse(path).getroot():
+        if item.tag == "include":
+            check(path.parent / item.attrib["name"])
+        elif item.tag == "project":
+            relative = item.get("path") or item.get("name", "")
+            candidate = (workspace / relative).resolve()
+            if not candidate.is_relative_to(workspace):
+                raise ValueError(f"repository outside workspace: {relative}")
+            for value in (item.get("name", ""), relative, str(candidate)):
+                if re.search(r"(^|[./_-])(rtl|hdl)(?=$|[./_-])", value, re.I):
+                    raise ValueError(f"RTL/HDL repository is outside WIP scope: {value}")
+    visited.remove(path)
+check(Path(sys.argv[1]))
+PY
 
 	local upstream
 	upstream=$(grep '<default' "$manifest_path" | sed -n 's/.*revision="\([^"]*\)".*/\1/p')
@@ -184,10 +215,13 @@ scan_workspace() {
 }
 
 cmd_scan() {
-	# args: [snapshot] [--mode author|mirror]
-	local snapshot="" set_mode=""
+	# args: [snapshot] [--mode author|mirror] [--workspace NAME]
+	local snapshot="" set_mode="" only_workspace=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+			--workspace) shift; only_workspace=${1:-}
+				[[ -n "$only_workspace" && "$only_workspace" != */* && "$only_workspace" != "." && "$only_workspace" != ".." ]] \
+					|| die "usage: wip scan --workspace <name>" ;;
 			--mode) shift; set_mode=${1:-}
 				[[ "$set_mode" == author || "$set_mode" == mirror ]] || die "usage: wip scan [snapshot] [--mode author|mirror]" ;;
 			--mode=*) set_mode=${1#*=}
@@ -196,26 +230,96 @@ cmd_scan() {
 		esac
 		shift
 	done
+	[[ -z "$snapshot" || -z "$only_workspace" ]] || die "a snapshot cannot be combined with --workspace"
 	if [[ -n "$snapshot" ]]; then
 		local src="$saved_dir/${snapshot}.wip"
 		[[ -f "$src" ]] || die "no saved snapshot: $snapshot"
 		read_state "$src"
 		wip_root="$PWD"
+		workspace_policy_guard all || return $?
 		[[ -n "$set_mode" ]] && wip_mode="$set_mode"
 		write_state "$wip_root/.wip/state"
 		echo "loaded snapshot '$snapshot' into $wip_root/.wip/state (mode: $(effective_mode))"
 		return
 	fi
 	wip_root="$PWD"
+	[[ -z "$set_mode" ]] || workspace_policy_guard all || return $?
 	echo "Scanning WIP dir: $(basename "$wip_root")"
 	wip_info=(); ws_upstream_info=(); wip_mode=""
 	[[ -n "$set_mode" ]] && wip_mode="$set_mode"
 	local d
-	for d in "$wip_root"/*/; do
-		[[ -d "$d/.repo" ]] && scan_workspace "${d%/}"
-	done
+	if [[ -n "$only_workspace" ]]; then
+		d="$wip_root/$only_workspace"
+		[[ -d "$d/.repo" ]] || die "workspace not found: $d"
+		scan_workspace "$d" || die "cannot scan workspace: $d"
+	else
+		for d in "$wip_root"/*/; do
+			[[ -d "$d/.repo" ]] && scan_workspace "${d%/}"
+		done
+	fi
 	write_state "$wip_root/.wip/state"
 	echo "State written to $wip_root/.wip/state (${#wip_info[@]} repos, ${#ws_upstream_info[@]} workspaces, mode: $(effective_mode))"
+}
+
+workspace_policy_check() {
+	local internal_id=$1 owner="$HOME/.copilot/skills/workspace-manager"; shift
+	[[ -f "$owner/wm.py" ]] || return 0
+	python3 - "$owner" "$internal_id" "$@" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+locks = {lock for path in sys.argv[3:] for lock in wm.wip_policy_locks(path, sys.argv[2])}
+for lock in sorted(locks):
+    print(lock)
+PY
+}
+
+workspace_policy_guard() {
+	local scope=$1 internal_id=${2:-} path="$wip_root" lock_paths lock_path fd wid key ws=""
+	if [[ "$scope" == ws ]]; then
+		ws=$(current_ws) || die "not inside a workspace under $wip_root"
+		path="$wip_root/$ws"
+	fi
+	local paths=("$path")
+	for key in "${!wip_info[@]}"; do
+		[[ "$scope" == ws && "${key%%:*}" != "$ws" ]] && continue
+		paths+=("$wip_root/${key%%:*}/${wip_info[$key]%%:*}")
+	done
+	lock_paths=$(workspace_policy_check "$internal_id" "${paths[@]}") || return $?
+	while IFS= read -r lock_path; do
+		[[ -n "$lock_path" ]] || continue
+		wid=$(basename "$lock_path" .operation.lock)
+		[[ "$wid" == "$internal_id" ]] && continue
+		mkdir -p -- "$(dirname "$lock_path")" || return $?
+		exec {fd}>"$lock_path" || return $?
+		flock -n "$fd" || { echo "workspace operation already running: $path" >&2; return 1; }
+	done <<< "$lock_paths"
+	workspace_policy_check "$internal_id" "${paths[@]}" >/dev/null
+}
+
+runtime_worker_id() {
+	[[ -n "${WM_LOCKED_WORKSPACE:-}" && $# -eq 4 && "${1##*/}" == python* \
+		&& "$3" == --repo-worker ]] || return 1
+	[[ "$(readlink -f "$2")" == "$(readlink -f "$HOME/.copilot/skills/workspace-manager/workspace_runtime.py")" ]] || return 1
+	python3 - "$HOME/.copilot/skills/workspace-manager" "$1" "$4" "$WM_LOCKED_WORKSPACE" <<'PY' || return 1
+import json
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+import wm
+if not os.path.samefile(sys.argv[2], sys.executable):
+    raise SystemExit(1)
+if not wm.owns_operation_lock(sys.argv[4], os.environ.get("WM_LOCKED_FD")):
+    raise SystemExit(1)
+data = json.loads(sys.argv[3])
+action = data.get("action")
+if action == "discard-update":
+    if wm.record(sys.argv[4]).get("purpose") != "review":
+        raise SystemExit(1)
+elif action not in {"status", "stash", "force-update", "update"}:
+    raise SystemExit(1)
+PY
+	printf '%s\n' "$WM_LOCKED_WORKSPACE"
 }
 
 # Show or set the working mode for the current WIP root.
@@ -231,6 +335,7 @@ cmd_mode() {
 		fi
 		return
 	fi
+	workspace_policy_guard all || return $?
 	case "$want" in
 		author|mirror) wip_mode="$want"; write_state "$wip_root/.wip/state"
 			echo "mode set to '$want' for $wip_root" ;;
@@ -360,6 +465,7 @@ run_action() {
 	if [[ "$action" == "depends-on" ]]; then
 		cmd_depends_on "$scope"; return
 	fi
+	workspace_policy_guard "$scope" || return $?
 
 	# mirror workspaces track the remote — pushing from one is almost always a
 	# mistake; require an explicit override.
@@ -419,6 +525,7 @@ cmd_load() {
 	[[ -f "$src" ]] || die "no saved snapshot: $name"
 	# Restore into the nearest WIP root, or seed one at $PWD if none exists yet.
 	locate_root || wip_root="$PWD"
+	workspace_policy_guard all || return $?
 	read_state "$src"
 	write_state "$wip_root/.wip/state"
 	echo "loaded '$name' into $wip_root/.wip/state (${#wip_info[@]} repos)"
@@ -485,6 +592,11 @@ cmd_forall() {
 	if [[ "${1:-}" == --argv ]]; then direct=yes; shift; else cmd="$*"; fi
 	[[ $# -gt 0 && -n "$1" ]] || die "usage: wip forall [ws|all] [--argv] <command>"
 	find_root
+	local internal_id=""
+	if [[ "$direct" == yes && "$scope" == ws ]]; then
+		internal_id=$(runtime_worker_id "$@") || internal_id=""
+	fi
+	workspace_policy_guard "$scope" "$internal_id" || return $?
 	local target_ws=""
 	[[ "$scope" == ws ]] && { target_ws=$(current_ws) || die "not inside a workspace under $wip_root"; }
 	local key ws_name path rp failed=0 matched=0
@@ -750,7 +862,7 @@ main() {
 		list)        cmd_list ;;
 		status)      cmd_status ;;
 		info)        cmd_info ;;
-		capabilities) printf '%s\n' 'forall-argv-v1' ;;
+		capabilities) printf '%s\n' 'forall-argv-v1' 'scan-workspace-v1' ;;
 		forall)      cmd_forall "$@" ;;
 		help|-h|--help) cmd_help "${1:-}" ;;
 		ws|all)
