@@ -4,6 +4,13 @@
 - **Status:** Verified from spec + FW
 - **Tags:** aer, pcie ep, error counters, pciecorrectableerrorcount, pciefatalerrorcount, pcienonfatalerrorcount, warning threshold, critical threshold, critical chip status, ras history, pdr initialization, telemetry attributes, pcieaerinfopart1, radm_fatal_err, radm_nonfatal_err, ras des, sei cause, per port, fw responsibility
 
+> **Correction (2026-11-22):** For A1 EP, two statements below in "Correct derivation" are wrong.
+> - `PEP_CTRL_CORE` SEI has **no** `RADM_FATAL_ERR` / `RADM_NONFATAL_ERR`. Those fields exist only
+>   in SE `DM_CTRL_CORE`, where they indicate error messages *received* from the link partner.
+> - The SEI cause latches are **level**-sensitive, not edge-latched.
+>
+> See [aer-severity-counters-hw-gap.md](aer-severity-counters-hw-gap.md).
+
 ## Scope / Question
 What is FW's actual responsibility for PCIe EP AER errors? Should FW maintain its own AER
 error counters, or is that redundant with the controller's RAS DES event counters?
