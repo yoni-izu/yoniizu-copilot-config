@@ -39,6 +39,8 @@
 #   mctl vm list                       Your EC2 instances and their targets
 #   mctl vm main [<id> [--user LOGIN]] Show / switch the Main VM (target 'vm');
 #                                      the previous one stays as target vm-<id6>
+#   mctl target set <name> [--user U|-] [--host H|-] [--bmc B|-]
+#                                      Edit a registered target in place
 #   mctl target rm  <name>             Remove a target
 #   mctl target add <name> <user@host> --bmc <[user@]bmc-host>
 #   mctl target bmc <name> <[user@]host|->
@@ -228,7 +230,7 @@ cmd_targets() {
 }
 
 cmd_target() {
-  local action=${1:?"usage: mctl target <add|bmc|rm> …"}; shift || true
+  local action=${1:?"usage: mctl target <add|set|bmc|rm> …"}; shift || true
   _seed_targets
   case "$action" in
     add)
@@ -272,6 +274,36 @@ cmd_target() {
         "$TARGETS_FILE" > "$TARGETS_FILE.tmp" && mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
       [[ "$bmc" == - ]] && ok "target '$name': BMC cleared" || ok "target '$name': BMC → $bmc"
       ;;
+    set|edit)
+      local usage="usage: mctl target set <name> [--user U|-] [--host H|-] [--bmc [user@]host|-]"
+      local name=${1:?"$usage"}; shift || true
+      local line; line=$(_target_line "$name")
+      [[ -n "$line" ]] || die "unknown target '$name' (see: mctl targets)"
+      local n k u h b; read -r n k u h b _ <<<"$line"; [[ -n "$b" ]] || b=-
+      local nu=$u nh=$h nb=$b
+      [[ $# -gt 0 ]] || die "$usage"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --user) nu=${2:?"--user needs a login or -"}; shift 2;;
+          --host) nh=${2:?"--host needs a host, instance id or -"}; shift 2;;
+          --bmc)  nb=${2:?"--bmc needs a host or -"}; shift 2;;
+          *) die "$usage";;
+        esac
+      done
+      [[ "$nu" == - || "$nu" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,63}$ ]] || die "not a valid login: $nu"
+      if [[ "$k" == vm ]]; then
+        [[ "$nb" == - ]] || die "target '$name' is a VM; VMs have no BMC"
+        [[ "$nh" == - || "$nh" =~ ^i-[0-9a-f]{8,17}$ ]] || die "not an instance id: $nh"
+      else
+        [[ "$nh" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || die "not a valid host: $nh"
+        [[ "$nb" == - ]] || _valid_bmc "$nb"
+      fi
+      awk -v n="$name" -v u="$nu" -v h="$nh" -v b="$nb" 'BEGIN{OFS="\t"}
+        (NF && $1==n){ if(b=="-") print $1,$2,u,h; else print $1,$2,u,h,b; next } {print}' \
+        "$TARGETS_FILE" > "$TARGETS_FILE.tmp" && mv "$TARGETS_FILE.tmp" "$TARGETS_FILE"
+      [[ "$nu" == "$u" && "$nh" == "$h" ]] || _forget_caches "$name"
+      ok "target '$name' updated (user=$nu host=$nh bmc=$nb)"
+      ;;
     rm|remove|del)
       local name=${1:?"usage: mctl target rm <name>"}
       grep -vE "^[[:space:]]*$name[[:space:]]" "$TARGETS_FILE" > "$TARGETS_FILE.tmp" || true
@@ -279,7 +311,7 @@ cmd_target() {
       [[ -s "$DEFAULT_FILE" && "$(cat "$DEFAULT_FILE")" == "$name" ]] && rm -f "$DEFAULT_FILE"
       ok "target '$name' removed"
       ;;
-    *) die "unknown 'target' action: $action (add|rm|bmc)";;
+    *) die "unknown 'target' action: $action (add|set|rm|bmc)";;
   esac
 }
 
