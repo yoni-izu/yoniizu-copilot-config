@@ -1718,7 +1718,7 @@ function wsTrackDialog(){
     </div>
     <label>Group<select id="wstk-group"><option value="">— ungrouped —</option>${groupOpts}</select></label>
     <label>Dedicated purpose<select id="wstk-purpose">${wsPurposeOptions("general")}</select></label>
-    <p class="ro-note">General allows any use. Review, Development, Build root and Mirror restrict this workspace to their designated work.</p>
+    <p class="ro-note">General allows any use. Review, Development, Build root, Mirror and Read-only restrict this workspace to their designated work.</p>
     <div class="ws-modal-act">
       <span class="ws-modal-msg"></span>
       <button class="ws-modal-cancel">Cancel</button>
