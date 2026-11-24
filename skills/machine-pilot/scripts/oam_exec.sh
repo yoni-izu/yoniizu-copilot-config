@@ -6,13 +6,15 @@
 # on ELS100: `ssh -tt -p 220<n> root@<bmc>`. Driving the consoles from the BMC
 # itself does NOT work — see the private machine-pilot pitfalls reference.
 #
-#   oam_exec.sh [-b BMC] [-o OUTDIR] [-d LIST] [-w SECS] [-t SECS] 'cmd' ['cmd'...]
+#   oam_exec.sh [-b BMC] [-o OUTDIR] [-d LIST] [-w SECS] [-t SECS] [-p] 'cmd' ['cmd'...]
 #
 #   -b BMC     BMC host/IP           (default from private station config or $BMC)
 #   -o OUTDIR  capture directory     (default ~/.pilot/evidence/oam-exec/<UTC>)
 #   -d LIST    OAMs, e.g. "0 3 5"    (default 0..7)
 #   -w SECS    settle after each cmd (default 5)
 #   -t SECS    ssh timeout per OAM   (default 40; raise for slow dumps)
+#   -p         drive all OAM consoles in parallel (each is its own BMC port,
+#              so wall time is one -t instead of N x -t)
 #
 # Long/slow sweeps should be launched detached so a VPN drop cannot interrupt:
 #   job run -t sweep "oam_exec.sh -o ~/evidence/x 'dwc_ep_ctl link_status'"
@@ -26,17 +28,19 @@ OUT=""
 OAMS="0 1 2 3 4 5 6 7"
 SETTLE=5
 TMO=40
+PAR=0
 PWFILE=${PILOT_BMC_PW:-$HOME/.pilot/bmc.pw}
 
-while getopts ":b:o:d:w:t:h" o; do
+while getopts ":b:o:d:w:t:ph" o; do
 	case "$o" in
 	b) BMC=$OPTARG ;;
 	o) OUT=$OPTARG ;;
 	d) OAMS=$OPTARG ;;
 	w) SETTLE=$OPTARG ;;
 	t) TMO=$OPTARG ;;
+	p) PAR=1 ;;
 	h)
-		sed -n '2,22p' "$0"
+		sed -n '2,23p' "$0"
 		exit 0
 		;;
 	*)
@@ -75,16 +79,15 @@ export SSHPASS
 printf '# oam_exec %s  bmc=%s  oams=[%s]\n' "$(date -u +%FT%TZ)" "$BMC" "$OAMS" >"$OUT/_meta.txt"
 printf '# cmd: %s\n' "$@" >>"$OUT/_meta.txt"
 
-silent=()
-for n in $OAMS; do
-	f="$OUT/oam$n.txt"
+capture() {
+	local n=$1 f="$OUT/oam$1.txt"
 	{
 		# The shell does not print a prompt unprompted; two CRs wake it.
 		printf '\r'
 		sleep 2
 		printf '\r'
 		sleep 1
-		for c in "$@"; do
+		for c in "${CMDS[@]}"; do
 			printf '%s\r' "$c"
 			sleep "$SETTLE"
 		done
@@ -93,7 +96,21 @@ for n in $OAMS; do
 		-o LogLevel=ERROR -o ConnectTimeout=10 \
 		-p "220$n" "root@$BMC" 2>&1 |
 		sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r' >"$f"
+}
 
+CMDS=("$@")
+for n in $OAMS; do
+	if [[ $PAR -eq 1 ]]; then
+		capture "$n" &
+	else
+		capture "$n"
+	fi
+done
+wait
+
+silent=()
+for n in $OAMS; do
+	f="$OUT/oam$n.txt"
 	sz=$(/usr/bin/wc -c <"$f" 2>/dev/null || echo 0)
 	# A live shell echoes the command and replies; a wedged one yields ~nothing.
 	if [[ $sz -lt 64 ]]; then
