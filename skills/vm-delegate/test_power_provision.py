@@ -246,6 +246,51 @@ class MctlPowerProvisionTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("own: already in place", r.stderr)
 
+    def test_tmux_install_failure_and_postcheck_reach_provision_status(self):
+        recipe = (HERE / "provision/recipes/tmux.sh").read_text().replace(
+            "# where: remote", "# where: local", 1)
+        (self.prov / "recipes/tmux.sh").write_text(recipe)
+        (self.prov / "lists/machine.list").write_text("tmux\n")
+        bin_ = self.root / "bin"
+        commands = {
+            "id": '#!/bin/sh\nprintf "1000\\n"\n',
+            "sudo": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$SUDO_CALLS"\n'
+                    '[ "$1" = "-A" ] || exit 80\nshift\n'
+                    '[ "$ALLOW_SUDO" = "1" ] || { echo "sudo unavailable" >&2; exit 1; }\n'
+                    'exec "$@"\n',
+            "apt-get": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$APT_CALLS"\n'
+                       '[ "$INSTALL_WORKS" = "1" ] && : > "$TMUX_READY"\nexit 0\n',
+            "tmux": '#!/bin/sh\n[ -f "$TMUX_READY" ] || exit 1\nprintf "tmux test\\n"\n',
+        }
+        for name, script in commands.items():
+            path = bin_ / name
+            path.write_text(script)
+            path.chmod(0o755)
+        self.env.update(SUDO_CALLS=str(self.root / "sudo-calls"),
+                        APT_CALLS=str(self.root / "apt-calls"),
+                        TMUX_READY=str(self.root / "tmux-ready"),
+                        ALLOW_SUDO="0", INSTALL_WORKS="0")
+
+        result = self.mctl("-t", "dsk61", "provision", "--only", "tmux")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("system package installation failed", result.stderr)
+        with patch.object(vd, "PROVISION_STATE", self.mdir / "provision"):
+            self.assertEqual(vd.provision_status("dsk61")["failed"], ["tmux"])
+        self.assertIn("-A env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux",
+                      (self.root / "sudo-calls").read_text())
+
+        self.env["ALLOW_SUDO"] = "1"
+        result = self.mctl("-t", "dsk61", "provision", "--only", "tmux")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("check still fails after install", result.stderr)
+        self.env["INSTALL_WORKS"] = "1"
+        result = self.mctl("-t", "dsk61", "provision", "--only", "tmux")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tmux: installed", result.stderr)
+        result = self.mctl("-t", "dsk61", "provision", "--only", "tmux")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tmux: already in place", result.stderr)
+
 
 class ShippedRecipesTests(unittest.TestCase):
     """The tracked default lists only name recipes that exist and parse."""
@@ -266,6 +311,42 @@ class ShippedRecipesTests(unittest.TestCase):
             text = f.read_text()
             self.assertIn("check()", text, n)
             self.assertIn("install()", text, n)
+
+    def test_tmux_recipe_supports_system_managers_and_missing_privileges(self):
+        recipe = self.PROV / "recipes/tmux.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_ = root / "bin"
+            bin_.mkdir()
+            (bin_ / "env").symlink_to("/usr/bin/env")
+            ident = bin_ / "id"
+            ident.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_UID"\n')
+            ident.chmod(0o755)
+            env = {"PATH": str(bin_), "TEST_UID": "0", "CAPTURE": str(root / "capture")}
+            for name in ("apt-get", "dnf", "yum"):
+                manager = bin_ / name
+                manager.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$CAPTURE"\n')
+                manager.chmod(0o755)
+                result = subprocess.run(["/bin/bash", "-c", '. "$1"; install', "test", str(recipe)],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / "capture").read_text().strip(), "install -y tmux")
+                manager.unlink()
+            result = subprocess.run(["/bin/bash", "-c", '. "$1"; install', "test", str(recipe)],
+                                    env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no supported system package manager", result.stderr)
+            (bin_ / "apt-get").write_text("#!/bin/sh\nexit 0\n")
+            (bin_ / "apt-get").chmod(0o755)
+            result = subprocess.run(["/bin/bash", "-c", '. "$1"; install', "test", str(recipe)],
+                                    env={**env, "TEST_UID": "1000"}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires root or non-interactive sudo -A", result.stderr)
+            ident.write_text("#!/bin/sh\nexit 1\n")
+            result = subprocess.run(["/bin/bash", "-c", '. "$1"; install', "test", str(recipe)],
+                                    env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot determine effective user", result.stderr)
 
 
 if __name__ == "__main__":

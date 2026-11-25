@@ -235,7 +235,7 @@ remembers every start/renew/stop in `~/.mctl/power/<instance-id>`
 
 | List | Default for | Recipes |
 |---|---|---|
-| `lists/machine.list` | `kind=remote` (lab desktops/servers) | `creds git wip copilot btop` (`dirs` is optional: `--only dirs`) |
+| `lists/machine.list` | `kind=remote` (lab desktops/servers) | `creds git wip copilot btop tmux` (`dirs` is optional: `--only dirs`) |
 | `lists/vm.list` | `kind=vm` | `include machine.list` + `octl_update neo rtl` |
 | `lists/neo.list` | — | `neo rtl` |
 
@@ -262,6 +262,10 @@ mctl provision vm --status           # last result per recipe
 - Results: `~/.mctl/provision/<target>.state` (TSV, latest per recipe — shown
   on the portal card) and a full log per run in `~/.mctl/provision/logs/`.
   The portal's **⚙ Provision** button runs it live in a terminal window.
+- The `tmux` recipe uses the target's system package manager and needs root or
+  working non-interactive `sudo -A`. Install it on each machine, even when
+  user-home tools are shared over NFS; failures and failed checks are reported
+  in the provisioning state and log.
 - `mctl setup` is an alias of `provision`; `mctl setup-machine` keeps the old
   credentials-only copy (`setup_machine.sh`).
 - To add a prerequisite once and for all: drop a recipe in `recipes/`, add its
