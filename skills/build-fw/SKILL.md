@@ -145,7 +145,9 @@ reusing an existing image does not satisfy this request.
 2. Run `octl ws clean` in the actual build workspace before building, **and
    wipe `zephyr_apps/*/build` plus every `twister-out*`**. `octl ws clean` leaves
    Twister output behind, and stale syscall headers there broke two rebuilds.
-   On the VM, `mctl build --pristine` does this. Follow the
+   On the VM, the current `mctl build --pristine` does **not** do this: it forwards the flag to
+   `octl` (`ERROR: unknown flag: --pristine`). Instead run `mctl sh 'octl ws clean; rm -rf
+   zephyr_apps/*/build; find . -maxdepth 4 -type d -name "twister-out*" -prune -exec rm -rf {} +'`. Follow the
    clean + sync requirement below, restore the intended source state after sync,
    and verify it before proceeding. Pristine refers to generated build outputs;
    it does **not** mean switching the source to `main` or a manifest baseline.
@@ -293,6 +295,7 @@ one costs a wasted round trip; check them up front.
 | Gotcha | Symptom | Do this instead |
 | --- | --- | --- |
 | `mctl build` takes the **workspace** as its first positional arg | `mctl build proj_infra --with-deps` → `cd: proj_infra: No such file or directory`, then a stray `octl ws build --parallel --with-deps` launches outside any ws and dies with `must be run from within a workspace directory` (harmless, but logged under a bare `~/.mctl/jobs/build.*`) | Always pass the ws first: `mctl build . proj_infra --with-deps` |
+| Unfiltered `proj_infra --with-deps` builds **every** board of every dep (host tools, a2, palladium, onix; ~93 targets in tools alone) | Long build for one ASIC image | For a single A1 ASIC image add `--args "platform=arm variant=asic"` (honoured by the Zephyr apps + tools + proj_infra post-build; `fla_rom` ignores it but is seconds). The build then ends `rc=1` at proj_infra **SaveBuildArtifacts** (rsync of a2 `palladium_dual_die/*_crc32.bin`) — benign for flashing: the image `proj_infra/build/arm/asic/bin/flash_bf/spi_flash_image_arm_asic.bin` is already fresh. Verify its mtime + a code marker string before using it (2026-11-24) |
 | `octl ws build` rejects the starfile/project name for proj_infra | `octl ws build project.iridium.sw.fw.infra --with-deps` → `building projects: unexpected error, requested repo is not in the graph` | Use the repo **path**: `octl ws build proj_infra --with-deps --parallel` (verified: resolves the graph and builds deps) |
 | `octl ws clean` deletes `build_artifacts` **then** runs each starfile's clean task, which `load()`s `build_artifacts/opt/atl/devops/common.star` | `ERROR: executing clean: ip.infra.val.sve: ... cannot load build_artifacts/opt/atl/devops/common.star: no such file` | Benign — the artifacts are already gone. `octl ws sync` does **not** restore `common.star`; the next `octl ws build` re-extracts all CI artifacts (incl. `devops-configuration-ci`) first, so just build |
 | `octl ws sync` resets every repo to its manifest baseline | After the mandatory clean+sync, the dev branches are gone and the build would silently use baseline source | Re-apply branches **after** sync (`mctl mirror`, or `git checkout -B <br> origin/<br>` per repo) and re-check `git log -1` on the target |
