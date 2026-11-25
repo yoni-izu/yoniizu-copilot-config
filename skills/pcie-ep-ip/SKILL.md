@@ -11,6 +11,10 @@ argument-hint: 'Ask a question about PCIe EP IP design, registers, PHY, or contr
 
 # PCIe EP IP Documentation Q&A
 
+For a production MSI-X trigger API, first read the source-free
+[verified software addressing constraints](./knowledge/msix-trigger-software-contract-2026-11-25.md).
+The SV helper's global-control-base expression is not a verified gateway address.
+
 For a chip-wide or cross-IP architecture question, use `hw-arch` for the
 system picture and this skill for the PCIe EP-specific details.
 
