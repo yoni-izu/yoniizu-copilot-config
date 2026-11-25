@@ -218,6 +218,17 @@ load` instead when you are **not** on the BMC (remote, over Redfish).
 > `fw_boot_sts → done` check. If the update fails or hangs, read
 > `journalctl -u orchestrator` on the BMC before re-running.
 
+> **Pitfall — device must be READY, and "done" is not proof.** `bmccli flash
+> update` silently skips a device that is not `READY` in `bmccli device status`
+> (the orchestrator journal shows `-110`), while the command itself looks
+> successful. Check every target is `READY` first, then confirm each device in
+> `journalctl -u orchestrator` and with `bmccli flash version -d <N>` (devices
+> are numbered from 0; `-d 8` on an 8-device tray is invalid). To re-flash a
+> wedged device, use `bmccli device reset-hold a1 assert -d <N>` and then
+> `release -d <N>`, which takes it through `OFF` back to `READY`. A device can
+> report `INIT_FAILED` after a reset-hold cycle even though its flash read-back
+> is correct; a full tray power cycle clears it.
+
 ---
 
 ## Standalone CLI (same client, no fw_ctl)
