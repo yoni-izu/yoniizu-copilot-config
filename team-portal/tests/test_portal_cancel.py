@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -45,10 +46,15 @@ class QueueCancelTests(Base):
 
     def setUp(self):
         super().setUp()
+        p = patch.object(portal.portal_settings, "load",
+                         lambda: {"ai": self.cfg, "notify": {"status_updates": True}})
+        p.start()
+        self.addCleanup(p.stop)
         self.queue = ActionQueue(self.root / "actions.db", portal.execute_and_notify,
                                  portal.ALIGN_JOBS, portal.ALIGN_LOCK,
                                  resources=portal.action_resources,
-                                 interrupt=portal.interrupt_action, max_workers=2)
+                                 interrupt=portal.interrupt_action,
+                                 on_transition=portal.notify_action, max_workers=2)
         p = patch.object(portal, "ACTION_QUEUE", self.queue)
         p.start()
         self.addCleanup(p.stop)
@@ -92,7 +98,7 @@ class QueueCancelTests(Base):
         self.assertEqual(run["status"], "error")
         self.assertIn("cancelled before it started", run["error"])
 
-    def test_running_ai_is_interrupted_and_finishes_cancelled_without_notification(self):
+    def test_running_ai_is_interrupted_and_notifies_cancelled_not_failed(self):
         entered = threading.Event()
 
         def fake(argv, **kw):
@@ -106,11 +112,15 @@ class QueueCancelTests(Base):
             self.assertIn(ident, portal.AI_CANCEL)
             self.assertEqual(portal.cancel_action(ident)["status"], "cancelling")
             job = self.wait_status(ident, {"cancelled", "error", "done"})
+            self.queue.stop()
+            self.queue.join()
         self.assertEqual(job["status"], "cancelled")
         self.assertIn(ai.CANCELLED_ERROR, job["message"])
         self.assertEqual(self.store.get(run_id)["error"], ai.CANCELLED_ERROR)
         self.assertNotIn(ident, portal.AI_CANCEL)
-        self.published.assert_not_called()
+        titles = [call.args[1] for call in self.published.call_args_list]
+        self.assertEqual(titles, [f"Explain Machines {state}"
+                                  for state in ("queued", "started", "cancelling", "cancelled")])
 
     def test_running_action_without_an_interrupt_point_is_refused(self):
         entered, release = threading.Event(), threading.Event()
@@ -159,12 +169,11 @@ class SettleTests(Base):
             self.assertTrue(event.is_set())
         self.assertFalse(portal.interrupt_action(job))
 
-    def test_cancelled_failure_is_not_published_as_a_failure(self):
+    def test_normalized_cancellation_is_published_as_cancelled(self):
         with patch.object(portal.EVENTS, "publish") as publish:
-            portal.notify_action({"kind": "ai", "status": "error", "cancel_requested": "t"})
-            publish.assert_not_called()
-            portal.notify_action({"kind": "ai", "status": "error"})
+            portal.notify_action({"kind": "ai", "status": "cancelled", "cancel_requested": "t"})
             publish.assert_called_once()
+            self.assertEqual(publish.call_args.args[1:4], ("AI cancelled", "", "warn"))
 
 
 class VmCancelTests(unittest.TestCase):
@@ -189,7 +198,8 @@ class VmCancelTests(unittest.TestCase):
         cancel = Mock(return_value={"jobs": [], "acted": "cancelled build ws",
                                     "cancel": {"result": "CANCELLED"}})
         job = {"kind": "vm-cancel", "vm_job": "j1", "target": "lab1"}
-        with patch.object(portal, "vd", SimpleNamespace(portal_cancel=cancel)):
+        with patch.object(portal, "vd", SimpleNamespace(portal_cancel=cancel)), \
+                patch.object(portal, "observe_machine_jobs"):
             portal.run_vm_cancel(job)
             cancel.assert_called_once_with("j1")
             self.assertEqual(job["status"], "done")
@@ -304,6 +314,83 @@ class EndpointTests(unittest.TestCase):
         with patch.object(portal, "vd", None), self.assertRaises(portal.terminal.TermError):
             portal.term_spec({"kind": "shell", "target": "vm"})
 
+    def test_workspace_terminal_resolves_owner_and_confirms_read_only_for_both_launchers(self):
+        ident = "WS-R-" + "a" * 32
+        record = {"id": ident, "path": "~/trusted 'directory", "target": "desk",
+                  "purpose": "read-only", "label": "reference"}
+        request = {"kind": "workspace", "workspace": ident, "target": "evil",
+                   "path": "/client/chosen"}
+        fake = SimpleNamespace(targets=lambda: ["desk"], agent_env=lambda: ({}, None))
+        cfg = {"terminals": {"wt_window": "portal", "wt_distro": "", "max_sessions": 24}}
+        launch = Mock(return_value={"panes": 1})
+        with patch.object(portal, "vd", fake), \
+                patch.object(portal.wm, "record", return_value=record) as lookup, \
+                patch.object(portal.portal_settings, "load", return_value=cfg), \
+                patch.object(portal.terminal, "issue_token", return_value="token") as issue, \
+                patch.object(portal.terminal, "wt_launch", launch):
+            for value in (None, False, "true", 1):
+                status, response = handler("/api/term/open", {**request, "read_only_confirmed": value}).do_POST()
+                self.assertEqual(status, 400)
+                self.assertIn("Read-only", response["error"])
+            request["read_only_confirmed"] = True
+            status, response = handler("/api/term/open", request).do_POST()
+            self.assertEqual((status, response["token"]), (200, "token"))
+            browser_spec = issue.call_args[0][0]
+            self.assertEqual(browser_spec["target"], "desk")
+            self.assertIn("trusted ", browser_spec["argv"][-1])
+            self.assertNotIn("/client/chosen", browser_spec["argv"][-1])
+            self.assertNotIn("evil", browser_spec["argv"])
+            self.assertEqual(portal.term_launch({"panes": [request]}, "127.0.0.1")["panes"], 1)
+            self.assertEqual(launch.call_args[0][0][0], browser_spec)
+            self.assertEqual(lookup.call_args[0], (ident,))
+
+            lookup.return_value = {**record, "id": "WS-R-" + "b" * 32}
+            with self.assertRaisesRegex(portal.terminal.TermError, "identity"):
+                portal.term_spec(request)
+            lookup.side_effect = ValueError("workspace is not tracked")
+            with self.assertRaisesRegex(portal.terminal.TermError, "not tracked"):
+                portal.term_spec(request)
+
+    def test_workspace_terminal_uses_real_owner_records_and_legacy_local_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            legacy = projects / portal.wm.DEFAULT_PROJECT / "legacy"
+            local = root / "tracked workspace"
+            legacy.mkdir(parents=True)
+            local.mkdir()
+            store = root / "workspaces.db"
+            with patch.object(portal.wm, "STORE", store), \
+                    patch.object(portal.wm, "PROJECTS_ROOT", projects), \
+                    patch.object(portal.wm, "_seed_tracked", return_value={}), \
+                    patch.object(portal.wm.workspace_store, "DB_PATH", store), \
+                    patch.object(portal.wm.workspace_store, "LEGACY", root / "no-legacy.json"), \
+                    patch.object(portal, "vd", None):
+                ok, _, slot = portal.wm.track(str(local), purpose="read-only")
+                self.assertTrue(ok)
+                ident = portal.wm.record(slot)["id"]
+                request = {"kind": "workspace", "workspace": ident}
+                with self.assertRaisesRegex(portal.terminal.TermError, "Read-only"):
+                    portal.term_spec(request)
+                spec = portal.term_spec({**request, "read_only_confirmed": True, "path": "/wrong"})
+                self.assertEqual(spec["argv"][-2], str(local))
+
+                ident = "WS-L-" + "c" * 32
+                snapshot = portal.wm.load()
+                snapshot["tracked"]["legacy"] = {"id": ident, "label": "legacy"}
+                portal.wm.save(snapshot)
+                spec = portal.term_spec({"kind": "workspace", "workspace": ident})
+                self.assertEqual(spec["argv"][-2], str(legacy))
+
+                with patch.object(portal.wm, "machine_targets", return_value=["desk"]), \
+                        patch.object(portal, "vd", SimpleNamespace(targets=lambda: ["desk"])):
+                    ok, _, remote_slot = portal.wm.track("~/remote", target="desk")
+                    self.assertTrue(ok)
+                    remote_id = portal.wm.record(remote_slot)["id"]
+                    spec = portal.term_spec({"kind": "workspace", "workspace": remote_id})
+                    self.assertEqual(spec["target"], "desk")
+                    self.assertIn('"$HOME"/\'remote\'', spec["argv"][-1])
+
     def test_bmc_terminal_needs_a_registered_bmc(self):
         fake = SimpleNamespace(targets=lambda: ["vm", "desk"], target_bmcs=lambda: {"desk": "bmc-desk"})
         with patch.object(portal, "vd", fake):
@@ -311,6 +398,47 @@ class EndpointTests(unittest.TestCase):
             for target in ("vm", "gone", ""):
                 with self.assertRaises(portal.terminal.TermError):
                     portal.term_spec({"kind": "bmc", "target": target})
+
+    def test_uart_consoles_come_from_pilot_and_are_cached(self):
+        fake = SimpleNamespace(targets=lambda: ["srv12"])
+        out = json.dumps({"consoles": [{"id": "bmc2200", "label": "OAM 0"}], "hint": ""})
+        run = Mock(return_value=SimpleNamespace(returncode=0, stdout=out, stderr=""))
+        portal._UART_CACHE.clear()
+        self.addCleanup(portal._UART_CACHE.clear)
+        with patch.object(portal, "vd", fake), patch.object(portal.subprocess, "run", run), \
+                patch.object(portal.terminal, "PILOT", Path("/bin/true")):
+            spec = portal.term_spec({"kind": "uart", "target": "srv12", "console": "bmc2200"})
+            self.assertEqual(spec["argv"][1:], ["-t", "srv12", "uart", "attach", "bmc2200"])
+            self.assertEqual(portal.uart_consoles("srv12")["consoles"][0]["label"], "OAM 0")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args[0][0][1:], ["-t", "srv12", "--json", "uart", "consoles"])
+            with self.assertRaises(portal.terminal.TermError):
+                portal.term_spec({"kind": "uart", "target": "srv12", "console": "bmc2201"})
+            with self.assertRaises(portal.terminal.TermError):
+                portal.uart_consoles("gone")
+            run.return_value = SimpleNamespace(returncode=1, stdout="", stderr="no station")
+            with self.assertRaisesRegex(portal.terminal.TermError, "no station"):
+                portal.uart_consoles("srv12", fresh=True)
+
+    def test_term_launch_validates_panes_and_is_local_only(self):
+        fake = SimpleNamespace(targets=lambda: ["vm"], agent_env=lambda: ({"SSH_AUTH_SOCK": "/s"}, None))
+        cfg = {"terminals": {"wt_window": "portal", "wt_distro": "", "max_sessions": 24}}
+        launch = Mock(return_value={"panes": 2, "window": "portal", "layout": "rows"})
+        with patch.object(portal, "vd", fake), patch.object(portal.terminal, "wt_launch", launch), \
+                patch.object(portal.portal_settings, "load", return_value=cfg), \
+                patch.dict(portal.os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}):
+            panes = [{"kind": "shell", "target": "vm"}, {"kind": "shell", "target": "vm", "session": "portal-2"}]
+            self.assertEqual(portal.term_launch({"panes": panes, "layout": "rows"}, "127.0.0.1")["panes"], 2)
+            specs, layout, window, distro, env = launch.call_args[0]
+            self.assertEqual((layout, window, distro, env), ("rows", "portal", "Ubuntu", {"SSH_AUTH_SOCK": "/s"}))
+            self.assertIn("-s portal-2 ", specs[1]["argv"][-1])
+            with self.assertRaises(PermissionError):
+                portal.term_launch({"panes": panes}, "10.0.0.5")
+            with self.assertRaises(portal.terminal.TermError):
+                portal.term_launch({"panes": [{"kind": "shell", "target": "gone"}]}, "127.0.0.1")
+            with self.assertRaises(portal.terminal.TermError):
+                portal.term_launch({"layout": "grid"}, "127.0.0.1")
+            self.assertEqual(launch.call_count, 1)
 
     def test_legacy_terminal_targets_setting_is_ignored_not_rejected(self):
         out = portal.portal_settings.validate(

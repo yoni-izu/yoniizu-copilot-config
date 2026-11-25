@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from _thread import LockType
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ class ActionQueue:
                  jobs: dict[str, dict], lock: LockType, *,
                  resources: Callable[[dict], set[str]] | None = None,
                  interrupt: Callable[[dict], bool] | None = None,
+                 on_transition: Callable[[dict], None] | None = None,
                  max_workers: int = 3):
         if not isinstance(max_workers, int) or isinstance(max_workers, bool) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
@@ -47,6 +49,10 @@ class ActionQueue:
         self.max_workers = max_workers
         self._running: dict[str, frozenset[str]] = {}
         self._workers: set[threading.Thread] = set()
+        self._on_transition = on_transition
+        self._notifications: deque[dict] = deque()
+        self._notifier: threading.Thread | None = None
+        recovered = []
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._connect() as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS actions (
@@ -60,8 +66,34 @@ class ActionQueue:
                                message="Interrupted by portal restart; not retried. "
                                        "Check external state before submitting again.")
                     self._write(conn, job)
+                    recovered.append(copy.deepcopy(job))
                 with self.lock:
                     self.jobs[ident] = job
+        for job in recovered:
+            self._transition(job)
+
+    def _transition(self, job: dict, status: str | None = None) -> None:
+        if self._on_transition is not None:
+            snapshot = copy.deepcopy(job)
+            if status:
+                snapshot["status"] = status
+            with self._condition:
+                self._notifications.append(snapshot)
+                self._condition.notify_all()
+
+    def _notify(self) -> None:
+        assert self._on_transition is not None
+        while True:
+            with self._condition:
+                while not self._notifications:
+                    if self._stopping and not self._workers:
+                        return
+                    self._condition.wait()
+                job = self._notifications.popleft()
+            try:
+                self._on_transition(job)
+            except Exception:
+                logging.exception("Portal notification failed for action %s", job["id"])
 
     @contextmanager
     def _connect(self):
@@ -89,6 +121,7 @@ class ActionQueue:
                              (job["id"], "queued", json.dumps(job)))
             with self.lock:
                 self.jobs[job["id"]] = job
+            self._transition(job)
             self._condition.notify_all()
             return job["id"]
 
@@ -102,6 +135,7 @@ class ActionQueue:
                 job.update(status="done", message=message, approval=None, current=None)
             with self._connect() as conn, self.lock:
                 self._write(conn, job)
+            self._transition(job)
         return True
 
     def cancel(self, ident: str) -> str:
@@ -128,6 +162,9 @@ class ActionQueue:
                                      "wait for it to finish")
                 with self.lock:
                     job.update(cancel_requested=stamp(), current="Cancelling\u2026")
+                    with self._connect() as conn:
+                        self._write(conn, {**job, "status": "running"})
+                    self._transition(job, "cancelling")
                 return "cancelling"
             if status not in {"queued", "approval_required"}:
                 raise ValueError(f"action is already {status}")
@@ -140,6 +177,7 @@ class ActionQueue:
                                     else "Cancelled instead of approving"))
             with self._connect() as conn, self.lock:
                 self._write(conn, job)
+            self._transition(job)
             self._condition.notify_all()
         return "cancelled"
 
@@ -201,6 +239,10 @@ class ActionQueue:
                 raise RuntimeError("Action worker already started")
             self._thread = threading.Thread(target=self._work, name="portal-action-queue",
                                             daemon=True)
+            if self._on_transition is not None:
+                self._notifier = threading.Thread(target=self._notify,
+                                                  name="portal-action-notifications", daemon=True)
+                self._notifier.start()
             self._thread.start()
 
     def stop(self) -> None:
@@ -216,6 +258,8 @@ class ActionQueue:
             workers = list(self._workers)
         for worker in workers:
             worker.join(max(0, deadline - time.monotonic()))
+        if self._notifier is not None:
+            self._notifier.join(max(0, deadline - time.monotonic()))
 
     def _claims(self, job: dict) -> frozenset[str]:
         claims = self._resources(job) if self._resources else {"*"}
@@ -244,6 +288,7 @@ class ActionQueue:
             with self._condition:
                 self._failure = f"Action queue stopped: {error}. Repair storage and restart the portal."
                 self._stopping = True
+                self._condition.notify_all()
 
     def _work_loop(self) -> None:
         while True:
@@ -251,6 +296,7 @@ class ActionQueue:
                 if self._stopping:
                     return
                 ready = []
+                transitions = []
                 with self._connect() as conn:
                     rows = conn.execute(
                         "SELECT id FROM actions WHERE state='queued' ORDER BY sequence"
@@ -267,6 +313,7 @@ class ActionQueue:
                                 job.update(status="error", finished=stamp(), current=None,
                                            message=f"Cannot resolve action resources: {error}")
                                 self._write(conn, job)
+                                transitions.append(copy.deepcopy(job))
                             continue
                         blockers = [key for key, held in {**self._running, **earlier}.items()
                                     if conflicts(claims, held)]
@@ -282,9 +329,12 @@ class ActionQueue:
                             job.pop("waiting_reason", None)
                             job.update(status="running", started=stamp())
                             self._write(conn, job)
+                            transitions.append(copy.deepcopy(job))
                         self._running[ident] = claims
                         ready.append(job)
                 # Commit running states before starting any external side effects.
+                for snapshot in transitions:
+                    self._transition(snapshot)
                 for job in ready:
                     worker = threading.Thread(target=self._run, args=(job,),
                                               name=job["id"], daemon=True)
@@ -305,16 +355,17 @@ class ActionQueue:
             logging.exception("Portal action %s failed", job["id"])
             with self.lock:
                 job.update(status="error", message=str(error), current=None)
-        with self.lock:
-            if job.get("cancel_requested") and job["status"] == "error":
-                job.update(status="cancelled", current=None,
-                           message="Cancelled while running"
-                           + (f" ({job['message']})" if job.get("message") else ""))
         with self._condition:
+            with self.lock:
+                if job.get("cancel_requested") and job["status"] == "error":
+                    job.update(status="cancelled", current=None,
+                               message="Cancelled while running"
+                               + (f" ({job['message']})" if job.get("message") else ""))
             try:
                 with self._connect() as conn, self.lock:
                     job["finished"] = stamp()
                     self._write(conn, job)
+                self._transition(job)
             except Exception as error:
                 logging.exception("Portal action result could not be persisted")
                 self._failure = f"Action queue stopped: {error}. Repair storage and restart the portal."

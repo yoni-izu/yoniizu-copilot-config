@@ -28,6 +28,34 @@ function harness(){
   return {context,elements,popups};
 }
 
+test("job status notifications reuse event delivery and deduplicate stream replay",()=>{
+  const notifications=[], context=vm.createContext({
+    NOTIFY:{seq:0,instance:null},notifyShow:event=>notifications.push(event),
+    rcLoadOpen(){},syncLiveSettings(){},liveCfg:()=>({enabled:true}),
+    UPDATE_LABELS:{},renderUpdates(){},queueDomainRefresh(){},
+  });
+  vm.runInContext(block("function parseEventSeq(", "function streamState("),context);
+  vm.runInContext(block("function notifyEvent(", "function processReset("),context);
+  for(const [seq,status] of [[1,"running"],[2,"cancelled"],[2,"cancelled"]])
+    context.processStreamEvent({lastEventId:`server:${seq}`,
+      data:JSON.stringify({kind:"machine_jobs",title:`Build ${status}`,link:"#vm"})});
+  assert.deepEqual(notifications.map(row=>row.title),["Build running","Build cancelled"]);
+});
+
+test("Notifications Settings renders a live nonterminal toggle",()=>{
+  const context=vm.createContext({esc:String,termPresets:()=>[],termSettings:()=>({}),
+    SETTINGS:{defaults:{notify:{status_updates:true}}}});
+  vm.runInContext(block("const SETTING_GROUPS=", "let groupsMsg="),context);
+  const html=vm.runInContext(`settingField("notify",
+    SETTING_GROUPS.find(([group])=>group==="notify")[2].find(([key])=>key==="status_updates"),
+    {status_updates:true},"")`,context);
+  assert.match(html,/type="checkbox"/);
+  assert.match(html,/data-g="notify"/);
+  assert.match(html,/data-k="status_updates"/);
+  assert.match(html,/ checked/);
+  assert.match(html,/Nonterminal status updates/);
+});
+
 test("update timestamps include seconds",()=>{
   const context=vm.createContext({});
   vm.runInContext(block("function localDmyHm(","function briefHtml("),context);

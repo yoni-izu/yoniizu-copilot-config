@@ -250,6 +250,139 @@ function machineMenuHarness() {
   return context;
 }
 
+test("SAT card shows mapped ownership, cards and firmware telemetry with escaped values", () => {
+  const context = machineMenuHarness();
+  context.snapshot = {
+    target: "desk", setup: "<setup>", requested_at: "2026-01-02T03:04:05Z",
+    device: {ok: true, data: {state: "alloc-in-use", cards_count: 2,
+      current: {assignee: ['<img src=x onerror="bad">'], end: Math.floor(Date.now()/1000)+3600}}},
+    cards: {ok: true, data: [{name: "<card>", serial: '"serial"', type: "Modular"}]},
+    firmware: {ok: true, data: {oam_a1: {versions: [{version: "<v1>", build: "build-1",
+      parts: [{board: "board-a", label: "OAM0"}, {board: "board-a", label: "OAM1"}]}],
+      not_available: ["OAM2"]}}},
+  };
+  vm.runInContext('VM_SAT.set("desk",{status:"ready",data:snapshot})', context);
+  const html = context.vmSatContent("desk");
+  assert.match(html, /Owner<\/dt>.*&lt;img src=x onerror=&quot;bad&quot;&gt;/);
+  assert.match(html, /&lt;card&gt;.*&quot;serial&quot;.*Modular/);
+  assert.match(html, /host inventory reports 2; details may be incomplete/);
+  assert.match(html, /<h4>OAM A1<\/h4>.*Version<\/dt><dd>&lt;v1&gt;/s);
+  assert.match(html, /Build<\/dt><dd>build-1/);
+  assert.match(html, /Parts<\/dt><dd>OAM0, OAM1/);
+  assert.match(html, /Board<\/dt><dd>board-a/);
+  assert.match(html, /OAM A1 \u00b7 not available.*OAM2/);
+  assert.doesNotMatch(html, /\[object Object\]/);
+  assert.match(html, /snapshot only; refresh before use/);
+  assert.match(html, /telemetry, not a hardware read/);
+  assert.doesNotMatch(html, /<img|<card>|<v1>/);
+});
+
+test("SAT ownership and partial failures never imply a machine is free", () => {
+  const context = machineMenuHarness();
+  const owner = current => context.vmSatOwner({ok: true, data: {current, state: "alloc-available"}});
+  assert.match(owner(null), /No current allocation reported.*availability unverified/);
+  assert.match(context.vmSatOwner({ok: true, data: {}}), /Unknown.*did not report/);
+  assert.match(owner({assignee: []}), /Unknown.*no valid assignees/);
+  assert.match(owner({assignee: ["someone"], end: 1}), /allocation ended; ownership unverified/);
+  assert.match(context.vmSatOwner({ok: false, error: "HTTP 403"}), /Unknown: HTTP 403/);
+  assert.match(context.vmSatCards({ok: false, error: "cards denied"}, {ok: false}), /Unavailable: cards denied/);
+  assert.match(context.vmSatFirmware({ok: false, error: "TLS failed"}), /Unavailable: TLS failed/);
+  assert.match(context.vmSatFirmware({ok: true, data: {new_schema: "<unknown>"}}),
+    /format is unrecognized.*&lt;unknown&gt;/s);
+});
+
+test("SAT card loads asynchronously once per selected machine and supports explicit refresh", async () => {
+  const context = machineMenuHarness(), requests = [];
+  const slot = {dataset: {target: "desk"}, innerHTML: "", querySelector: () => null};
+  context.document = {getElementById: id => id === "vm-sat" ? slot : null};
+  context.activeSection = "vm";
+  let release;
+  context.fetch = (url, options) => {
+    requests.push({url, options});
+    return new Promise(resolve => { release = resolve; });
+  };
+  const box = {querySelector: selector => selector === "#vm-sat" ? slot : null};
+  context.vmSatBind(box);
+  context.vmSatBind(box);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/api/vm-sat?target=desk");
+  assert.equal(requests[0].options.cache, "no-store");
+  assert.match(slot.innerHTML, /Loading SAT details/);
+  release({ok: false, status: 503, json: async () => ({error: "no SAT setup mapped"})});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(slot.innerHTML, /no SAT setup mapped.*ownership unverified/);
+  context.vmSatBind(box);
+  assert.equal(requests.length, 1);
+  const refresh = context.vmSatLoad("desk");
+  assert.equal(requests.length, 2);
+  release({ok: false, status: 503, json: async () => ({error: "token not found"})});
+  await refresh;
+  assert.match(slot.innerHTML, /token not found.*ownership unverified/);
+});
+
+test("SAT refresh does not paint a different selected machine or survive a target edit", async () => {
+  const context = machineMenuHarness();
+  const slot = {dataset: {target: "desk"}, innerHTML: "", querySelector: () => null};
+  const note = {textContent: ""};
+  context.document = {getElementById: id => id === "vm-sat" ? slot : note};
+  context.vmAdoptPayload = () => {};
+  context.renderVmlog = () => {};
+  context.buildSections = () => {};
+  vm.runInContext(block("async function vmTargetPost(", "async function vmRemoveTarget("), context);
+  let release;
+  context.fetch = url => url === "/api/vm-target"
+    ? Promise.resolve({ok: true, json: async () => ({targets: [], message: "Saved"})})
+    : new Promise(resolve => { release = resolve; });
+  const pending = context.vmSatLoad("desk");
+  slot.dataset.target = "other";
+  slot.innerHTML = "Other machine";
+  await context.vmTargetPost({action: "edit", name: "desk"});
+  release({ok: true, json: async () => ({target: "desk", device: {}, cards: {}, firmware: {}})});
+  await pending;
+  assert.equal(slot.innerHTML, "Other machine");
+  assert.equal(vm.runInContext('VM_SAT.has("desk")', context), false);
+});
+
+test("SAT details stay read-only in static exports and do not appear on VM targets", async () => {
+  const context = machineMenuHarness();
+  let requested = false;
+  context.fetch = async () => { requested = true; };
+  context.SERVED = false;
+  assert.match(context.vmSatMarkup("desk"), /Live SAT details require the served portal/);
+  assert.doesNotMatch(context.vmSatMarkup("desk"), /vm-sat-refresh/);
+  await context.vmSatLoad("desk");
+  assert.equal(requested, false);
+  context.SERVED = true;
+  context.VMLOG.target_state = [{name: "vm-gone", instance: "i-gone", kind: "vm"}];
+  assert.doesNotMatch(context.vmTargetStrip(), /id="vm-sat"/);
+  context.VMLOG.target_state = [{name: "desk", kind: "remote"}];
+  assert.match(context.vmTargetStrip(), /id="vm-sat"/);
+});
+
+test("SAT column folds to its header and keeps the fold across repaints", () => {
+  const context = machineMenuHarness();
+  context.VMLOG.target_state = [{name: "desk", kind: "remote"}];
+  vm.runInContext('VM_SAT.set("desk",{status:"error",error:"down"})', context);
+  assert.match(context.vmTargetStrip(), /class="vm-mc-split"><div class="vm-mc-main">.*id="vm-sat"/s);
+  assert.match(context.vmSatContent("desk"), /vm-sat-fold" aria-expanded="true".*SAT unavailable: down/s);
+  const handlers = {}, classes = new Set();
+  const button = cls => ({addEventListener: (_, fn) => { handlers[cls] = fn; }, focus() {}});
+  const split = {classList: {toggle: (c, on) => on ? classes.add(c) : classes.delete(c)}};
+  const slot = {dataset: {target: "desk"}, innerHTML: "", parentElement: split,
+    querySelector: sel => button(sel)};
+  context.document = {getElementById: id => id === "vm-sat" ? slot : null};
+  context.savePrefs = patch => Object.assign(context.prefs, patch);
+  context.vmSatBindSlot(slot);
+  handlers[".vm-sat-fold"]();
+  assert.ok(classes.has("sat-folded"));
+  assert.match(slot.innerHTML, /aria-expanded="false"/);
+  assert.doesNotMatch(slot.innerHTML, /SAT unavailable/);
+  assert.match(context.vmTargetStrip(), /vm-mc-split sat-folded/);
+  handlers[".vm-sat-fold"]();
+  assert.ok(!classes.has("sat-folded"));
+  assert.match(slot.innerHTML, /SAT unavailable: down/);
+});
+
 test("SSO login is offered on tracked targets and disabled on a stopped VM", () => {
   const context = machineMenuHarness();
   const running = context.vmMachine({name: "Main", id: "i-main", type: "m7i", state: "running", target: "vm", main: true});
@@ -399,6 +532,19 @@ test("lab targets offer native menus and escape labels", () => {
   assert.doesNotMatch(selected, /class="vm-actions"[^>]*data-target="desk"/);
   context.prefs.machineTarget = "no-longer-registered";
   assert.match(context.vmTargetStrip(), /<option value="desk" selected>/);
+});
+
+test("terminal buttons carry a launcher menu with the exact pane spec", () => {
+  const context = machineMenuHarness();
+  context.VMLOG.target_state = [{name: "desk", instance: "", bmc: "bmc-desk"}];
+  const html = context.vmTargetStrip();
+  const specs = [...html.matchAll(/class="term-more"[^>]*data-term="([^"]*)"/g)]
+    .map(m => JSON.parse(m[1].replace(/&quot;/g, '"')));
+  assert.deepEqual(specs, [{kind: "shell", target: "desk"}, {kind: "bmc", target: "desk"}]);
+  assert.doesNotMatch(context.vmMachine({name: "Other", id: "i-o", type: "m7i", state: "stopped", target: "other"}),
+                      /term-more/);
+  context.SERVED = false;
+  assert.doesNotMatch(context.vmTargetStrip(), /term-more/);
 });
 
 test("lab machine cards offer a BMC terminal and Edit details; VMs have no BMC", () => {
@@ -872,6 +1018,17 @@ test("Power-only changes and scheduler errors invalidate the cached Machines ren
   context.VMLOG.power_schedule={instances:{"i-one":{error:"SSO unavailable; automatic checks exhausted"}}};
   const card=context.vmMachine({id:"i-one",name:"VM",state:"running"});
   assert.match(card,/<dt>Power check<\/dt>.*SSO unavailable; automatic checks exhausted/);
+});
+
+test("provisioning failures invalidate the Machines card without a machine status change",()=>{
+  const {context}=powerTickHarness();
+  const state=status=>({target_state:[{name:"vm",provision:{
+    recipes:[{recipe:"tmux",status,note:status==="fail"?"install exited 1":""}]}}]});
+  assert.notEqual(context.vmSignature(state("ok")),context.vmSignature(state("fail")));
+  const badge=machineMenuHarness().vmProvBadge({provision:{ok:false,failed:["tmux"],
+    recipes:[{recipe:"tmux",status:"fail",note:"install exited 1"}]}});
+  assert.match(badge,/provision ⚠ tmux/);
+  assert.match(badge,/tmux: fail — install exited 1/);
 });
 
 test("target strip keeps a bound target whose instance octl no longer lists", () => {
@@ -1617,6 +1774,95 @@ test("read-only cards show deployed metadata and Sync without occupancy or Free 
   assert.match(html,/may rebase local commits/);
   assert.match(html,/class="link ws-sync"/);
   assert.doesNotMatch(html,/ws-occupy-task|ws-occupy-adhoc|class="link ws-free"/);
+});
+
+test("workspace cards offer both terminal launchers only when the backend supports them",()=>{
+  const context=vm.createContext({
+    WORKSPACES:{workspace_terminals:true,purposes:{"read-only":"Read-only"}},
+    SERVED:true,esc:value=>String(value).replaceAll("&","&amp;").replaceAll('"',"&quot;"),
+    wsHolder:()=>null,wsUnknown:()=>false,wsGroupMenu:()=>"",activeTaskList:()=>[],
+  });
+  vm.runInContext(block("function wsAllows(", "let wsPurposeFilter=")+
+    source.match(/const WS_ADHOC_TAGS=.*;/)[0]+
+    block("function termMoreBtn(", "function vmTermBtn(")+
+    block("function wsCard(", "// Per-card group picker"),context);
+  for(const [purpose,target] of [["general",""],["general","desk"],["read-only","desk"]]){
+    const id=(target?"WS-R-":"WS-L-")+"a".repeat(32);
+    const html=context.wsCard({id,slot:"example",purpose,target,status:{}});
+    assert.match(html,new RegExp('class="ws-mini ws-term" data-wsid="'+id+'"'));
+    assert.match(html,/class="term-more"/);
+    if(target) assert.match(html,/does not start or renew a VM/);
+  }
+  context.WORKSPACES.workspace_terminals=false;
+  assert.doesNotMatch(context.wsCard({id:"WS-L-"+"a".repeat(32),slot:"one",status:{}}),/ws-term/);
+  context.WORKSPACES.workspace_terminals=true;
+  context.SERVED=false;
+  assert.doesNotMatch(context.wsCard({id:"WS-L-"+"a".repeat(32),slot:"one",status:{}}),/ws-term/);
+});
+
+test("read-only workspace warning gates both launchers and carries confirmation",()=>{
+  const id="WS-L-"+"a".repeat(32), warnings=[], opened=[], alerts=[];
+  const rows=[{id,purpose:"read-only"}];
+  let approved=false;
+  const context=vm.createContext({
+    SERVED:true,wsRoster:()=>rows,termDefaultHow:()=>"popup",
+    confirm:text=>{ warnings.push(text); return approved; },
+    alert:text=>alerts.push(text),
+    termPopup:(params,name)=>{ opened.push({how:"popup",params,name}); },
+    termLaunchWt:panes=>{ opened.push({how:"wt",params:panes[0]}); return Promise.resolve(); },
+    notifyCard:()=>assert.fail("Unexpected launcher failure"),
+  });
+  vm.runInContext(block("function termOpen(", "function termMenu("),context);
+  const request={kind:"workspace",workspace:id};
+  context.termOpen(request,"ws","popup");
+  assert.equal(opened.length,0);
+  approved=true;
+  context.termOpen(request,"ws","popup");
+  context.termOpen(request,"ws","wt");
+  assert.deepEqual(opened.map(x=>x.how),["popup","wt"]);
+  assert.ok(opened.every(x=>x.params.read_only_confirmed===true && x.params.workspace===id));
+  assert.ok(warnings.every(text=>text.includes("not sandboxed")));
+  rows.length=0;
+  context.termOpen(request,"ws","popup");
+  assert.match(alerts[0],/no longer tracked/);
+});
+
+test("workspace card terminal button opens the selected stable identity",()=>{
+  const id="WS-L-"+"a".repeat(32), calls=[];
+  const button={dataset:{wsid:id},addEventListener:(_event,handler)=>handler()};
+  const context=vm.createContext({
+    box:{querySelectorAll:selector=>selector===".ws-term[data-wsid]"?[button]:[]},
+    termOpen:(params,name)=>calls.push({params,name}),
+  });
+  vm.runInContext(block('  box.querySelectorAll(".ws-term[data-wsid]")',
+    '  box.querySelectorAll(".ws-edit")'),context);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].params.kind,"workspace");
+  assert.equal(calls[0].params.workspace,id);
+  assert.equal(calls[0].name,"ws-"+id);
+});
+
+test("browser workspace terminal forwards its identity and warning confirmation",async()=>{
+  const calls=[], element={className:"",textContent:"",hidden:false,addEventListener(){}};
+  class FakeTerminal {
+    loadAddon(){} open(){} onData(){} focus(){} reset(){}
+  }
+  const id="WS-R-"+"b".repeat(32);
+  const context=vm.createContext({
+    URLSearchParams,location:{search:"?kind=workspace&workspace="+id+"&read_only_confirmed=true"},
+    document:{getElementById:()=>element},window:{addEventListener(){}},
+    Terminal:FakeTerminal,FitAddon:{FitAddon:class {fit(){}}},
+    fetch:async(_url,options)=>{
+      calls.push(JSON.parse(options.body));
+      return {ok:false,status:400,json:async()=>({error:"test stop"})};
+    },
+  });
+  const terminalSource=fs.readFileSync(path.join(__dirname,"..","assets","term.js"),"utf8");
+  vm.runInContext(terminalSource,context);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].workspace,id);
+  assert.equal(calls[0].read_only_confirmed,true);
 });
 
 test("workspace purpose filter matches any selected purpose and empty means all", () => {

@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import portal  # noqa: E402
+import events as portal_events  # noqa: E402
 from test_portal_cancel import handler  # noqa: E402
 
 IMG = {"directory": "/s/iridium/topic/arm/asic", "valid": True, "project": "iridium",
@@ -31,9 +32,18 @@ def fake_vd(**over):
 class FlashStartTests(unittest.TestCase):
     def setUp(self):
         self.vd = fake_vd()
+        rows = {}
+        def start_job(*args, **kwargs):
+            rows["flash-srv22-x"] = {"status": "running", "kind": "flash",
+                                   "target": "srv22", "ws": "flash image", "rc": None}
+            return {"job": {"id": "flash-srv22-x", "target": "srv22"}}
+        self.vd.start_local_job.side_effect = start_job
+        observer = portal_events.JobTransitions(lambda: rows, portal.notify_machine_job)
+        observer.observe()
         for name, val in (("vd", self.vd),
                           ("flash_images", lambda: {"images": [IMG, BAD], "root": "/s"}),
-                          ("EVENTS", Mock()), ("_flash_watch", lambda job: None)):
+                          ("EVENTS", Mock()), ("MACHINE_NOTIFICATIONS", observer),
+                          ("_flash_watch", lambda job: None)):
             p = patch.object(portal, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -71,6 +81,7 @@ class FlashStartTests(unittest.TestCase):
 
     def test_running_job_conflict(self):
         self.vd.start_local_job.return_value = {"error": "already running", "job_id": "j"}
+        self.vd.start_local_job.side_effect = None
         with self.assertRaises(FileExistsError):
             self.start()
 

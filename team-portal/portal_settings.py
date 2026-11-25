@@ -69,6 +69,16 @@ DEFAULTS: dict[str, Any] = {
         "power_retry_s": 30,
         "power_retry_limit": 3,
     },
+    # Machine terminals: where a terminal opens and the console grid's limits.
+    "terminals": {
+        "launcher": "windows_terminal",
+        "wt_window": "portal",
+        "wt_distro": "",
+        "max_sessions": 24,
+        "idle_close_min": 30,
+        "uart_shared_confirm": True,
+        "presets": [],
+    },
     # Pop-up notifications (browser; Windows toast when no portal tab is open).
     "notify": {
         "enabled": True,
@@ -77,6 +87,7 @@ DEFAULTS: dict[str, Any] = {
         "ai": True,
         "reachability": True,
         "windows_toast": True,
+        "status_updates": True,
     },
     # Automatic resource updates: domain DB watcher -> event stream -> tabs.
     "live_updates": {
@@ -114,6 +125,7 @@ GROUP_INT_RANGES = {"ai": {"daily_cap": (0, 500), "interactive_daily_cap": (0, 1
                                  "power_grace_s": (0, 300),
                                  "power_retry_s": (5, 300),
                                  "power_retry_limit": (0, 10)},
+                    "terminals": {"max_sessions": (8, 64), "idle_close_min": (0, 480)},
                     "live_updates": {"scan_interval_s": (1, 60), "quiet_ms": (0, 10000),
                                      "replay_events": (50, 2000), "keepalive_s": (5, 40),
                                      "state_interval_s": (15, 600),
@@ -124,6 +136,14 @@ AI_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 SCHEDULE_KEYS = ("enabled", "time", "days")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+LAUNCHERS = ("windows_terminal", "browser")
+WT_WINDOW_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+WSL_DISTRO_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]{0,63})?$")
+PRESET_NAME_RE = re.compile(r"^[^\x00-\x1f]{1,40}$")
+PANE_KINDS = {"shell": {"target", "session"}, "bmc": {"target"}, "uart": {"target", "console"}}
+PANE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+MAX_PRESETS, MAX_PRESET_PANES = 30, 16
+PRESET_LAYOUTS = ("grid", "rows", "columns")
 
 _LOCK = threading.Lock()
 
@@ -219,7 +239,7 @@ def validate(data: Any) -> dict:
                 or any(not isinstance(v, bool) for v in steps.values()):
             raise SettingsError(f"routine.steps maps {', '.join(ROUTINE_STEPS)} to true/false")
     extra = {"routine": routine}
-    for group in ("ai", "machines", "notify", "live_updates"):
+    for group in ("ai", "machines", "terminals", "notify", "live_updates"):
         values = data.get(group, {})
         if isinstance(values, dict) and LEGACY_KEYS.get(group):
             values = {k: v for k, v in values.items() if k not in LEGACY_KEYS[group]}
@@ -233,8 +253,12 @@ def _validate_group(group: str, values: Any) -> dict:
     unknown = set(values) - set(DEFAULTS[group])
     if unknown:
         raise SettingsError(f"unknown {group} setting(s): {', '.join(sorted(unknown))}")
+    if group == "terminals":
+        _validate_terminals(values)
     for key, value in values.items():
         default = DEFAULTS[group][key]
+        if group == "terminals" and key in ("launcher", "wt_window", "wt_distro", "presets"):
+            continue
         if isinstance(default, bool):
             if not isinstance(value, bool):
                 raise SettingsError(f"{group}.{key} must be true or false")
@@ -251,6 +275,50 @@ def _validate_group(group: str, values: Any) -> dict:
                                   or not AI_MODEL_RE.match(values["model"])):
             raise SettingsError("ai.model must be a model id such as fusion")
     return values
+
+
+def _validate_terminals(values: dict) -> None:
+    if "launcher" in values and values["launcher"] not in LAUNCHERS:
+        raise SettingsError("terminals.launcher must be windows_terminal or browser")
+    if "wt_window" in values and (not isinstance(values["wt_window"], str)
+                                  or not WT_WINDOW_RE.match(values["wt_window"])):
+        raise SettingsError("terminals.wt_window must be 1-32 letters, digits, - or _")
+    if "wt_distro" in values and (not isinstance(values["wt_distro"], str)
+                                  or not WSL_DISTRO_RE.match(values["wt_distro"])):
+        raise SettingsError("terminals.wt_distro must be a WSL distro name or empty (auto)")
+    if "presets" in values:
+        values["presets"] = validate_presets(values["presets"])
+
+
+def validate_presets(presets: Any) -> list:
+    """Named console pane sets: [{name, layout, panes:[{kind, target, ...}]}]."""
+    if not isinstance(presets, list) or len(presets) > MAX_PRESETS:
+        raise SettingsError(f"terminals.presets must be a list of at most {MAX_PRESETS}")
+    out, names = [], set()
+    for item in presets:
+        if not isinstance(item, dict) or set(item) - {"name", "layout", "panes"}:
+            raise SettingsError("each preset is {name, layout, panes}")
+        name = item.get("name")
+        if not isinstance(name, str) or not PRESET_NAME_RE.match(name.strip()) \
+                or name.strip() in names:
+            raise SettingsError("preset names must be distinct, 1-40 characters")
+        layout = item.get("layout", "grid")
+        if layout not in PRESET_LAYOUTS:
+            raise SettingsError(f"preset {name}: layout must be grid, rows or columns")
+        panes = item.get("panes")
+        if not isinstance(panes, list) or not 1 <= len(panes) <= MAX_PRESET_PANES:
+            raise SettingsError(f"preset {name}: 1-{MAX_PRESET_PANES} panes")
+        clean = []
+        for pane in panes:
+            kind = pane.get("kind") if isinstance(pane, dict) else None
+            if kind not in PANE_KINDS or set(pane) - {"kind"} - PANE_KINDS[kind] \
+                    or any(not isinstance(v, str) or not PANE_VALUE_RE.match(v)
+                           for k, v in pane.items() if k != "kind") or "target" not in pane:
+                raise SettingsError(f"preset {name}: invalid pane {json.dumps(pane)[:80]}")
+            clean.append(dict(pane))
+        names.add(name.strip())
+        out.append({"name": name.strip(), "layout": layout, "panes": clean})
+    return out
 
 
 def on_calendar(routine: dict) -> str:

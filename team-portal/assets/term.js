@@ -5,6 +5,10 @@
   "use strict";
   const params=new URLSearchParams(location.search);
   const spec={kind:params.get("kind")||"shell", target:params.get("target")||"", job:params.get("job")||""};
+  if(spec.kind==="workspace"){
+    spec.workspace=params.get("workspace")||"";
+    spec.read_only_confirmed=params.get("read_only_confirmed")==="true";
+  }
   const statusEl=document.getElementById("term-status");
   const titleEl=document.getElementById("term-title");
   const againBtn=document.getElementById("term-again");

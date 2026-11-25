@@ -56,6 +56,18 @@ class SettingsTests(unittest.TestCase):
                 ps.save(bad, self.rev())
         self.assertFalse(ps.SETTINGS_PATH.exists())
 
+    def test_notification_status_updates_apply_without_touching_timer(self):
+        self.assertTrue(ps.load()["notify"]["status_updates"])
+        for value in ("yes", 1, None):
+            with self.assertRaises(ps.SettingsError):
+                ps.validate({"notify": {"status_updates": value}})
+        self.dropin.parent.mkdir(parents=True)
+        self.dropin.write_text("x")
+        ps.save({"notify": {"status_updates": False}}, self.rev())
+        self.assertFalse(ps.load()["notify"]["status_updates"])
+        self.assertTrue(ps.load()["notify"]["queue"])
+        self.assertEqual(self.calls, [])
+
     def test_live_updates_validated_and_saved_without_touching_timer(self):
         for bad in ({"scan_interval_s": 0}, {"quiet_ms": 10001}, {"tasks": "yes"},
                     {"replay_events": 49}, {"unknown": True}):
@@ -84,6 +96,31 @@ class SettingsTests(unittest.TestCase):
                               "power_retry_s": 10, "power_retry_limit": 0}}, self.rev())
         self.assertFalse(ps.load()["machines"]["power_checks"])
         self.assertEqual(ps.load()["machines"]["power_retry_limit"], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_terminal_settings_and_presets_validated(self):
+        self.assertEqual(ps.load()["terminals"]["launcher"], "windows_terminal")
+        pane = {"kind": "shell", "target": "vm", "session": "portal"}
+        for bad in ({"launcher": "xterm"}, {"wt_window": "a b"}, {"wt_distro": "-d"},
+                    {"max_sessions": 7}, {"idle_close_min": 481}, {"uart_shared_confirm": 1},
+                    {"presets": [{"name": "x", "layout": "diag", "panes": [pane]}]},
+                    {"presets": [{"name": "x", "panes": []}]},
+                    {"presets": [{"name": "x", "panes": [{"kind": "shell", "target": "vm;rm"}]}]},
+                    {"presets": [{"name": "x", "panes": [{"kind": "bmc", "target": "vm", "console": "a"}]}]},
+                    {"presets": [{"name": "x", "panes": [{"kind": "uart"}]}]},
+                    {"presets": [{"name": "x", "panes": [pane]}, {"name": "x", "panes": [pane]}]}):
+            with self.assertRaises(ps.SettingsError, msg=bad):
+                ps.validate({"terminals": bad})
+        presets = [{"name": "srv12 OAMs", "layout": "grid",
+                    "panes": [{"kind": "uart", "target": "srv12", "console": "bmc2200"}, pane]}]
+        self.dropin.parent.mkdir(parents=True)
+        self.dropin.write_text("x")
+        ps.save({"terminals": {"launcher": "browser", "presets": presets}}, self.rev())
+        saved = ps.load()["terminals"]
+        self.assertEqual(saved["launcher"], "browser")
+        self.assertEqual(saved["presets"], presets)
+        ps.save({"terminals": {"presets": []}}, self.rev())
+        self.assertEqual(ps.load()["terminals"]["presets"], [])
         self.assertEqual(self.calls, [])
 
     def test_time_change_writes_dropin_and_rearms_timer(self):

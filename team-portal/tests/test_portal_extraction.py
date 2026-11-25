@@ -117,6 +117,16 @@ class ExtractionTests(unittest.TestCase):
         self.assertRegex(served, r'src="/assets/portal\.js\?v=\d+"')
         self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
 
+    def test_sat_machine_details_are_included_in_static_and_served_assets(self):
+        with patch.object(portal.wm, "load", return_value={}), \
+                patch.object(portal, "boot_payload", return_value="{}"):
+            static = portal.render_dashboard_html([], inline=True)
+            served = portal.render_dashboard_html([], inline=False)
+        self.assertIn("Live SAT details require the served portal.", static)
+        self.assertIn(".vm-sat-head", static)
+        self.assertRegex(served, r'src="/assets/portal\.js\?v=\d+"')
+        self.assertRegex(served, r'href="/assets/portal\.css\?v=\d+"')
+
     def test_team_notes_disclosure_assets_in_served_and_static_html(self):
         with patch.object(portal.wm, "load", return_value={}), \
                 patch.object(portal, "boot_payload", return_value="{}"):

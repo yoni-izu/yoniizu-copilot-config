@@ -57,8 +57,20 @@ Three tiles:
     - retry spacing (5–300 s, default 30 s)
     - additional retries (0–10, default 3; 0 means only the first check)
     - changes apply live on Save; these checks never start, stop or renew a VM
+  - **Terminals** (applies on Save, no restart):
+    - default launcher: `windows_terminal` (default) or `browser`; every terminal
+      button's `▾` offers the other one
+    - Windows Terminal window name (`wt -w <name>`, default `portal`; `new` = always a new window)
+    - WSL distro (empty = the distro the portal runs in)
+    - max open sessions (8–64, default 24): browser panes and pop-ups
+    - console idle close (0–480 min, default 30; 0 = never), the browser console's starting value
+    - confirm shared input to UART (default on)
+    - console presets: a read-only list with Delete; presets are created in Machines ›
+      `⊞ Console`. Each is `{name, layout: grid|rows|columns, panes:[≤16]}`, a pane being
+      `{kind:"shell", target, session?}`, `{kind:"bmc", target}` or `{kind:"uart", target, console}`.
+      At most 30 presets; names are distinct, 1–40 characters.
   - **Notifications**: master switch, the four kinds (action queue, machine jobs, AI,
-    machine reachability) and the Windows toast fallback.
+    machine reachability), nonterminal status updates (default on), and the Windows toast fallback.
   - **Automatic updates**: master switch, per-resource watch toggles, watcher,
     stream and tab parameters (see [Notifications](#notifications)).
 - **Routine status**: timer active/enabled, next and last trigger, linger, last brief result, and any schedule problem.
@@ -288,8 +300,8 @@ or not interruptible, 200 `{status, job}` with status `cancelled` or
 becomes `interrupted`). A running job is only interruptible at a copilot call
 (`ai`, `online-review`, and `review-chat` turns/previews/opens — never a
 `submit`, which posts to GitHub): the process is killed, the job carries
-`cancel_requested`, shows *cancelling*, then finishes `cancelled` without a
-failure notification. Every other running kind (scans, workspace actions,
+`cancel_requested`, shows *cancelling*, then announces `cancelled`, not failure.
+Every other running kind (scans, workspace actions,
 alignment, PLDM, auto-review, machine refresh) returns 409 because stopping it
 mid-way could leave external state half-applied. AI budget is not refunded.
 Pending jobs survive server restarts in the private portal queue database.
@@ -328,6 +340,17 @@ the workspace owner's metadata API. Revision is locked while occupied or
 mirrored; purpose is also locked while held or mirrored. Label, badge and group remain editable. Saving metadata does not run
 a checkout, Sync or status check. Paths, machine targets, IDs, occupancy and
 live readings are not editable in this form. Static exports remain read-only.
+
+Every served local or remote card also has a compact **>_** terminal button
+and a launcher-choice menu. The server resolves the stable ID through the
+workspace owner; the browser cannot choose the path or target. A separate tmux
+session starts at that card's displayed root and survives closing the terminal;
+reattaching preserves the session's current directory. Local and remote hosts
+need tmux. A remote launch never starts or renews a VM, so a stopped VM fails
+explicitly and an existing lease may expire during the session. Read-only cards
+require a warning confirmation for either launcher: this is a workspace policy,
+not a filesystem sandbox. Before a server restart, the new button remains hidden
+if the running backend does not advertise workspace-terminal support.
 
 **Dedicated purpose** is persistent workspace-owner metadata, not a hold. Track
 defaults to **General**; legacy records without the field retain General behavior.
@@ -764,6 +787,35 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   lab-machine cards, power on EC2 cards, ↻ refresh, ⋯ Actions), then a key/value
   body (Instance, Target, BMC, Power, Jobs, Error, Setup, …; empty rows omitted) and the SSO status slot. A folded
   card shows only its title row.
+- An expanded lab-machine card shows a read-only **SAT** snapshot in a column
+  to the right of the main details (about a third of the card width; stacked
+  below on narrow screens): current
+  allocation assignees, card details, and firmware telemetry. A chevron button
+  in the SAT header collapses the column to its header (the main details widen)
+  and expands it again; the state persists as `machine-sat` in
+  `prefs.vmPanelsHidden` and loading/refresh continue while collapsed. It never labels a
+  failed, stale, missing, or empty allocation as free. Telemetry is not a direct
+  hardware read; the requested time and any partial endpoint failures remain
+  visible. Firmware versions render as labeled Version, Build, Parts and Board
+  fields; SAT's `parts` array is split into unique part labels and board names.
+  The original firmware payload remains available in a collapsed details block.
+  visible. **↻ Refresh** is explicit; selecting a lab machine fetches once
+  asynchronously per browser session, independently of `/api/vm-jobs` polling.
+  Static exports show that live SAT is unavailable. The existing **Setup** row
+  continues to mean provisioning status, not SAT hardware.
+- `GET /api/vm-sat?target=<mctl target>` accepts registered remote targets only,
+  runs `pilot -t <target> sat details` without contacting the machine, and
+  returns the selected setup's per-section results with `Cache-Control: no-store`.
+  The SAT device name is the mctl target's host name, lowercased without a
+  domain (`SA-DSK61-CSR` → `sa-dsk61-csr`), so no mapping is needed. An optional machine-pilot `sat_setup` override
+  (`pilot stations set <target> sat_setup=<SAT-device-name>`) handles
+  exceptions; when an override's station and mctl hosts disagree, the lookup
+  fails rather than attributing another machine's ownership (fix with
+  `host=<login@host>`). Credentials and a trusted SAT CA are configured as
+  described in the [SAT skill](../../skills/sat/SKILL.md). The managed service
+  must itself receive `SSL_CERT_FILE` if the approved CA is not installed in the
+  system trust store; a shell-only environment is insufficient. API/TLS failures
+  are shown, never converted into empty successful records.
 - The native **⋯ Actions** select (`field-sizing: content`, max 18ch; the popup
   sizes itself to its options) contains Provision, Set as main (non-main EC2),
   Add tracking (untracked EC2), SSO login and Edit details… (every tracked
@@ -889,7 +941,44 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   `portal` (`tmux new -A`), so closing the window only detaches and reopening resumes.
   `POST /api/term/open` validates the request and returns a one-time token (120 s TTL)
   naming a server-built spec; nothing sent over the socket can change what runs. At
-  most 8 sessions; `GET /api/term/active` lists them. The socket checks Origin.
+  most *Settings › Terminals › Max open sessions* (default 24); `GET /api/term/active`
+  lists them. The socket checks Origin.
+- **Launcher choice**: workspace terminals, `>_ Terminal`, `>_ BMC`, the log buttons and Provision open in the
+  *Settings › Terminals › Default launcher*: a **Windows Terminal window** (default) or
+  the browser pop-up above. Terminal, BMC and log buttons have a `▾` menu (arrow keys, Escape)
+  offering both. Windows Terminal: `POST /api/term/launch {panes:[spec…], layout}`
+  (Origin-checked; 409 unless the request comes from loopback, as WT opens on the portal
+  PC) validates every pane through the same `term_spec` and runs `wt.exe -w <window>
+  new-tab …` with each pane running `wsl.exe [-d distro] --cd ~ --exec python3
+  terminal.py --run <id>`. `<id>` names a one-time 0600 spec file in
+  `~/.copilot-private/team-portal/state/term-launch/` (argv, title, `SSH_AUTH_SOCK` only;
+  expires after 120 s, deleted on first read), so no command line crosses the
+  Linux→wt→wsl quoting boundary. WT panes are not tracked in `/api/term/active` and do
+  not count against the session limit. Any launch failure (no `wt.exe`, interop off,
+  non-local client) shows a notification card and falls back to the pop-up. Static
+  exports offer the pop-up only (and no `▾`).
+- **`⊞ Console`** (Machines toolbar) builds a multi-pane console: per registered target,
+  0–4 shell panes (tmux sessions `portal`, `portal-2`…`portal-4`, so they are
+  independent), the BMC (when set), and UART consoles listed on demand by
+  `GET /api/term/uart?target=` (`pilot -t <target> --json uart consoles`; machine-pilot
+  owns the console registry, cached 60 s; `fresh=1` bypasses). A UART pane runs `pilot -t
+  <target> uart attach <id>`, which must be a listed id. Layout grid / rows / columns;
+  at most 16 panes; presets are selected, saved (by name, replacing a same-named one) via
+  `POST /api/settings`. **Open in**:
+  - **Windows Terminal**: one new tab of split panes (`split-pane -H` rows, then `-V`
+    columns with equal fractions). Broadcast is WT's own *Toggle broadcast input*
+    (Ctrl+Shift+B in the user's WT keybindings); the portal cannot enable it.
+  - **Browser grid** — `/console?c=<json {panes, layout, title}>` (`assets/console.js`),
+    SAT-style: one `/api/term/open` token and `/ws/term` socket per pane (connections
+    staggered 150 ms). Toolbar: connected count, idle close (minutes without output or
+    input; 0 = never), Grid/Rows/Columns, font A−/A+, Select All / Connected / None,
+    **Shared input** (amber banner listing the receiving panes; keys typed in a selected
+    pane go to every selected connected pane; typing in an unselected pane stays local),
+    Save logs (a store-only zip of every pane's scrollback, built in the browser),
+    Reconnect dropped, Disconnect all (confirm). Per pane: select box, status dot, title,
+    SHARED badge, maximize, clear, download log, reconnect, close. UART panes start
+    unselected; including a UART pane in shared input asks first (Settings toggle).
+    Leaving the page with connected panes asks the browser's leave confirmation.
 - **Live status link**: each live target (Settings > Machines) keeps one long-lived
   `mctl -t <target> jobs-watch <interval>` ssh session that streams a jobs probe every
   interval; each block is reconciled through `vd.refresh(preprobed=…)`. The machine card
@@ -936,7 +1025,9 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   **Provision** entry in Actions. After a confirm it opens the browser terminal with
   `{"kind": "provision", "target": T}`; the server builds the spec
   `mctl -t T provision` (T must be a registered mctl target), so the default list
-  for that target runs live and finished recipes are skipped.
+  for that target runs live and finished recipes are skipped. The default list
+  includes a per-machine system tmux package; failures appear in the badge,
+  tooltip and provisioning log.
 - **EC2 budget note**: the power strip states the cost model (instances bill while
   running; stop idle VMs) and links the Grafana cost dashboard. A lease countdown under
   one hour gets the `warn` style.
@@ -1184,11 +1275,27 @@ stream connection are replayed without an unnecessary initial data reload. The
 stream sends lightweight keepalives and a periodic live/AI state snapshot.
 `GET /api/events?since=<seq>` remains available as a fallback.
 
-Action-queue results, delegated machine-job completions, AI answers and machine
+Action-queue transitions, delegated machine-job status changes, AI answers and machine
 reachability changes are switchable in Settings > Notifications. A tab shows
 them as browser notifications (in-page cards as fallback), and clicking one
 follows its deep link. When no tab has connected for 90 s the server raises a
 Windows toast through `powershell.exe` instead.
+
+**Nonterminal status updates** is on by default. Turn it off to suppress queued,
+started/running, cancelling and unknown/unconfirmed notifications while retaining
+outcomes and approval prompts under the existing master/category switches.
+Successful background machine refreshes and ordinary chat turns/previews remain
+quiet, including their queued/running updates; their failures and cancellations
+are still announced. Settings apply to new events on Save without a restart.
+
+Queue results are announced after persistence and cancellation normalization.
+Machine jobs are deduplicated by stable job ID and observed status across live
+links, refresh, watchdog, cancellation, delegation changes and local flash watchers.
+The initial machine snapshot is silent so historical completions do not replay.
+Existing monitor cadence applies; unobserved intermediate states cannot be
+reconstructed, and unknown/unconfirmed is never reported as successful completion.
+Baselines advance while notifications are muted. Observation state and event
+history remain volatile; restart/replay gaps resync data, not replay old outcomes.
 
 For owner-managed portal resources, the server checks stat metadata for tracked
 domain databases and their SQLite WAL files every scan interval (default two seconds); it does not open

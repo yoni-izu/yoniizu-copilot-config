@@ -133,6 +133,28 @@ class Bus:
             return self._clock() - self._seen < PRESENCE_GRACE
 
 
+class JobTransitions:
+    """Volatile, serialized observations; the first snapshot is historical."""
+
+    def __init__(self, read: Callable[[], dict], publish: Callable[[str, dict], None]):
+        self._read = read
+        self._publish = publish
+        self._statuses: dict[str, str] | None = None
+        self._lock = threading.Lock()
+
+    def observe(self) -> None:
+        with self._lock:
+            rows = self._read()
+            current = {ident: row["status"] for ident, row in rows.items()}
+            previous = self._statuses
+            self._statuses = current
+            if previous is None:
+                return
+            for ident, row in rows.items():
+                if previous.get(ident) != row["status"]:
+                    self._publish(ident, row)
+
+
 def _powershell() -> str | None:
     found = shutil.which("powershell.exe")
     if found:

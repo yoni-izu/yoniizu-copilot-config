@@ -53,6 +53,78 @@ class QueueTests(unittest.TestCase):
             time.sleep(.01)
         self.fail(f"Action reading did not match: {job}")
 
+    def test_transition_callbacks_are_ordered_snapshots_outside_queue_locks(self):
+        notifications = []
+        jobs = {}
+        def notify(job):
+            self.assertTrue(queue.lock.acquire(timeout=1))
+            queue.lock.release()
+            queue.snapshot()
+            notifications.append(job)
+            job["message"] = "callback mutation"
+        def execute(job):
+            job.update(status="done", message="result")
+        queue = self.queue(execute, jobs, on_transition=notify)
+        ident = queue.enqueue({"kind": "test"})
+        queue.start()
+        self.wait_done(queue, 1)
+        queue.stop()
+        queue.join()
+        self.assertEqual([job["status"] for job in notifications], ["queued", "running", "done"])
+        self.assertEqual(jobs[ident]["message"], "result")
+        self.assertIsNotNone(notifications[-1]["finished"])
+
+    def test_cancelled_and_recovered_transitions_do_not_replay_history(self):
+        queue = self.queue(lambda job: None)
+        cancelled = queue.enqueue({"kind": "test"})
+        queue.cancel(cancelled)
+        interrupted = queue.enqueue({"kind": "test"})
+        with sqlite3.connect(self.path) as conn:
+            job = dict(queue.jobs[interrupted], status="running")
+            conn.execute("UPDATE actions SET state='running',job=? WHERE id=?",
+                         (json.dumps(job), interrupted))
+        notifications = []
+        recovered = self.queue(lambda job: self.fail("replayed"), on_transition=notifications.append)
+        recovered.start()
+        recovered.stop()
+        recovered.join()
+        self.assertEqual([(j["id"], j["status"]) for j in notifications], [(interrupted, "error")])
+
+    def test_queued_cancellation_and_approval_settlement_notify_once(self):
+        notifications = []
+        queue = self.queue(lambda job: job.update(status="approval_required"),
+                           on_transition=notifications.append)
+        cancelled = queue.enqueue({"kind": "test"})
+        queue.cancel(cancelled)
+        approval = queue.enqueue({"kind": "test"})
+        queue.start()
+        self.wait_done(queue, 2)
+        self.assertTrue(queue.settle(approval, "superseded"))
+        self.assertFalse(queue.settle(approval, "again"))
+        queue.stop()
+        queue.join()
+        self.assertEqual([j["status"] for j in notifications if j["id"] == cancelled],
+                         ["queued", "cancelled"])
+        self.assertEqual([j["status"] for j in notifications if j["id"] == approval],
+                         ["queued", "running", "approval_required", "done"])
+
+    def test_notification_failure_does_not_fail_or_reexecute_action(self):
+        executions = []
+        def notify(job):
+            raise ValueError("notification unavailable")
+        def execute(job):
+            executions.append(job["id"])
+            job["status"] = "done"
+        queue = self.queue(execute, on_transition=notify)
+        ident = queue.enqueue({"kind": "test"})
+        with self.assertLogs(level="ERROR"):
+            queue.start()
+            self.wait_done(queue, 1)
+            queue.stop()
+            queue.join()
+        self.assertEqual(executions, [ident])
+        self.assertEqual(queue.jobs[ident]["status"], "done")
+
     def test_independent_actions_overlap_and_running_is_durable_before_execution(self):
         release = threading.Event()
         self.addCleanup(release.set)
@@ -319,7 +391,8 @@ class QueueTests(unittest.TestCase):
     def test_result_storage_failure_stops_dispatch_and_is_explicit(self):
         def execute(job):
             job["status"] = "done"
-        queue = self.queue(execute)
+        notifications = []
+        queue = self.queue(execute, on_transition=notifications.append)
         first = queue.enqueue({"kind": "test"})
         later = queue.enqueue({"kind": "test"})
         write = queue._write
@@ -336,6 +409,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(queue.jobs[first]["status"], "error")
         self.assertIn("could not be persisted", queue.jobs[first]["message"])
         self.assertEqual(queue.jobs[later]["status"], "queued")
+        self.assertNotIn("done", [job["status"] for job in notifications])
         with self.assertRaises(RuntimeError):
             queue.enqueue({"kind": "test"})
 
@@ -443,6 +517,8 @@ class QueueTests(unittest.TestCase):
 
     def test_running_cancel_interrupts_and_finishes_cancelled(self):
         entered, stop = threading.Event(), threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
         self.addCleanup(stop.set)
         interrupted = []
         def interrupt(job):
@@ -455,16 +531,23 @@ class QueueTests(unittest.TestCase):
             entered.set()
             if job["kind"] == "ai":
                 stop.wait(5)
+                self.assertTrue(release.wait(5), "cancel completion was not released")
                 job.update(status="error", message="copilot killed")
             else:
                 job["status"] = "done"
-        queue = self.queue(execute, interrupt=interrupt)
+        notifications = []
+        queue = self.queue(execute, interrupt=interrupt, on_transition=notifications.append)
         ident = queue.enqueue({"kind": "ai"})
         queue.start()
         self.assertTrue(entered.wait(2))
         self.assertEqual(queue.cancel(ident), "cancelling")
         self.assertEqual(queue.cancel(ident), "cancelling")
+        release.set()
         self.wait_done(queue, 1)
+        queue.stop()
+        queue.join()
+        self.assertEqual([job["status"] for job in notifications],
+                         ["queued", "running", "cancelling", "cancelled"])
         self.assertEqual(interrupted, [ident])
         job = queue.jobs[ident]
         self.assertEqual(job["status"], "cancelled")

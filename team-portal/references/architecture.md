@@ -66,9 +66,10 @@ routine's `PRAGMA integrity_check`, which opens `~/tasks/*.db` with
   occupy/free via the workspace actions, draft registration via `tm.py review-draft`, and
   task notes via `tm`'s transaction. Posting to GitHub happens only in an interactive
   review's submit run, after the user confirmed its preview, under a dedicated profile.
-- **Terminal** (`terminal.py`, `assets/term.js`) is an in-process WebSocket↔pty bridge
-  around `mctl -t <target> term`. Machine access and tmux state stay with the machine
-  tooling; the portal holds no session state across restarts (tmux keeps the remote side).
+- **Terminal** (`terminal.py`, `assets/term.js`) is an in-process WebSocket↔pty bridge.
+  Workspace terminals resolve owner IDs to local roots or registered remote targets;
+  remote access uses `mctl -t <target> term` without auto-start. Separate tmux
+  sessions retain state on their respective machines across portal restarts.
 - **Live link** (`live_status.py`) is one `mctl jobs-watch` ssh session per target;
   readings still land in `delegation.db` only through `vd.refresh(preprobed=…)`.
 - **Domain change watcher** (`domain_watch.py`) checks only stat metadata for the

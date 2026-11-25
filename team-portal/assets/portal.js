@@ -1515,7 +1515,13 @@ function wsCard(s){
     ? `<span class="ws-rev" title="pinned revision / manifest">${esc(s.rev)}</span>` : "";
   const missing = s.exists===false
     ? `<span class="ws-rev ws-missing" title="${esc(s.path||"")}">missing</span>` : "";
+  const wsTerm = WORKSPACES.workspace_terminals ? (s.id
+    ? `<span class="term-split"><button type="button" class="ws-mini ws-term" data-wsid="${esc(s.id)}"
+        title="Open a terminal in this workspace${s.target?"; does not start or renew a VM":""}" aria-label="Open terminal for ${esc(s.label||s.slot)}">&gt;_</button>${
+        termMoreBtn({kind:"workspace",workspace:s.id},"ws-"+s.id,"the workspace terminal")}</span>`
+    : `<button type="button" class="ws-mini ws-term" disabled title="Workspace identity unavailable; refresh the roster">&gt;_</button>`) : "";
   const tools = SERVED ? `<span class="ws-cardtools">
+      ${wsTerm}
       <button class="ws-mini ws-edit" data-slot="${esc(s.slot)}" title="Edit workspace" aria-label="Edit ${esc(s.label||s.slot)}">Edit</button>
       <button class="ws-mini ws-refresh" data-slot="${esc(s.slot)}" title="Refresh ${s.target?"remote":"local"} workspace status" aria-label="Refresh ${esc(s.label||s.slot)} status">&#8635;</button>
       <button class="ws-mini ws-log" data-slot="${esc(s.slot)}" title="Action log" aria-label="Action log for ${esc(s.label||s.slot)}">&#9776;</button>
@@ -1868,6 +1874,8 @@ function renderWorkspaces(){
   // roster: track / untrack / group
   const trackBtn=box.querySelector(".ws-track-btn");
   if(trackBtn) trackBtn.addEventListener("click",wsTrackDialog);
+  box.querySelectorAll(".ws-term[data-wsid]").forEach(b=>b.addEventListener("click",()=>
+    termOpen({kind:"workspace",workspace:b.dataset.wsid},"ws-"+b.dataset.wsid)));
   box.querySelectorAll(".ws-edit").forEach(b=>b.addEventListener("click",()=>wsEditDialog(b.dataset.slot)));
   box.querySelectorAll(".ws-refresh, .ws-refresh-local, .ws-check-vm").forEach(b=>b.addEventListener("click",async()=>{
     b.disabled=true;
@@ -3345,7 +3353,7 @@ function readPrefs(raw, ids, cardIds=[]){
   if(Array.isArray(v.vmHidden)) out.vmHidden=[...new Set(v.vmHidden.filter(id=>
     typeof id==="string"&&/^i-[0-9a-f]{8,17}$/.test(id)))];
   if(Array.isArray(v.vmPanelsHidden)) out.vmPanelsHidden=[...new Set(v.vmPanelsHidden.filter(id=>
-    ["vms","machines","machine-card"].includes(id)))];
+    ["vms","machines","machine-card","machine-sat"].includes(id)))];
   if(typeof v.machineTarget==="string") out.machineTarget=v.machineTarget;
   return out;
 }
@@ -4718,6 +4726,7 @@ function vmSignature(d){
     +":"+j.stale).join("|")+"#"+((d&&d.last_refresh)||"")
     +"#"+Object.entries((d&&d.live)||{}).map(([k,v])=>k+":"+v.state).join(",")
     +"#"+JSON.stringify((d&&d.machines||[]).map(m=>[m.id,m.state,m.stop_ts,m.started_ts,m.main]))
+    +"#"+JSON.stringify((d&&d.target_state||[]).map(t=>[t.name,(t.provision||{}).recipes]))
     +"#"+(d&&d.machines_checked||"")+"#"+(d&&d.error||"")
     +"#"+JSON.stringify(d&&d.power_schedule||{});
 }
@@ -4802,7 +4811,8 @@ function vmBindActions(box){
   vmSsoBind(box);
 }
 // Folding: EC2 ids fold single VM cards (prefs.vmHidden); "vms"/"machines" fold
-// a whole panel and "machine-card" the machine card (prefs.vmPanelsHidden).
+// a whole panel, "machine-card" the machine card and "machine-sat" its SAT
+// column (prefs.vmPanelsHidden).
 function vmFoldList(key){ return /^i-/.test(key)?"vmHidden":"vmPanelsHidden"; }
 function vmFolded(key){ return prefs[vmFoldList(key)].includes(key); }
 function vmFoldToggle(key){
@@ -4879,6 +4889,7 @@ function renderVmMachines(){
   vmBindTargetRefresh(box);
   vmBindTerms(box);
   vmBindActions(box);
+  vmSatBind(box);
   vmTimersSync();
   if(SERVED&&!VMSSO.loaded) vmSsoPoll();
 }
@@ -4903,7 +4914,7 @@ function vmTargetStrip(){
         +esc(x.name)+(x.instance?" (VM target)":"")+'</option>').join("")+'</select>'
     :'<h4>'+esc(t.name)+'</h4>';
   const title='<span class="vm-dot '+(t.error?"bad":t.checked?"ok":"")+'"></span>'+pick+vmLiveBadge(t.name);
-  const body=vmKv([
+  const main=vmKv([
     ["Jobs",vmJobsLine(t)],
     ["Flash",vmFlashLine(t)],
     ["Instance",t.instance?esc(t.instance):""],
@@ -4911,8 +4922,217 @@ function vmTargetStrip(){
     ["Error",t.error?'<span class="vm-t-err">\u26a0 '+esc(t.error)+'</span>':""],
     ["Setup",vmProvBadge(t)],
   ])+vmSsoSlot(t.name);
+  const body=!t.instance&&t.kind!=="vm"
+    ?'<div class="vm-mc-split'+(vmFolded("machine-sat")?" sat-folded":"")+'">'
+      +'<div class="vm-mc-main">'+main+'</div>'+vmSatMarkup(t.name)+'</div>'
+    :main;
   return vmCard({key:"machine-card",label:t.name,cls:t.error?"bad":"",title,body,
     tools:vmTermBtn(t.name,true)+vmBmcBtn(t)+vmFlashBtn(t)+vmTargetBtn(t.name)+vmActions(t.name,"",false,true)});
+}
+const VM_SAT=new Map();
+function vmSatText(value){
+  return typeof value==="string"||typeof value==="number" ? String(value) : JSON.stringify(value);
+}
+function vmSatError(text){
+  return '<span class="vm-t-err">'+esc(text)+'</span>';
+}
+function vmSatOwner(section){
+  if(!section.ok) return vmSatError("Unknown: "+section.error);
+  const d=section.data;
+  if(!d||typeof d!=="object"||!Object.prototype.hasOwnProperty.call(d,"current"))
+    return vmSatError("Unknown: SAT did not report the current allocation");
+  const state=d.state?' \u00b7 SAT state: '+esc(d.state):"";
+  if(d.current===null) return 'No current allocation reported'+state+' \u00b7 availability unverified';
+  const c=d.current;
+  if(!c||typeof c!=="object"||!Array.isArray(c.assignee)||!c.assignee.length
+      ||c.assignee.some(x=>typeof x!=="string"||!x.trim()))
+    return vmSatError("Unknown: SAT allocation has no valid assignees")+state;
+  let when="";
+  if(typeof c.end==="number"&&Number.isFinite(c.end)&&c.end>0){
+    const end=new Date(c.end*1000);
+    if(!isNaN(end)){
+      when=' \u00b7 until '+esc(localDmyHm(end.getTime()));
+      if(c.end<=Date.now()/1000) when+=' \u00b7 allocation ended; ownership unverified';
+    }
+  }
+  if(!when) when=' \u00b7 end time unknown';
+  if(typeof c.start==="number"&&c.start>Date.now()/1000)
+    when+=' \u00b7 allocation has not started; ownership unverified';
+  return esc(c.assignee.join(", "))+when+state;
+}
+function vmSatRaw(label, data){
+  return '<details class="vm-sat-raw"><summary>'+esc(label)+'</summary><pre>'
+    +esc(JSON.stringify(data,null,2))+'</pre></details>';
+}
+function vmSatCards(section, device){
+  if(!section.ok) return vmSatError("Unavailable: "+section.error);
+  const cards=section.data;
+  if(!Array.isArray(cards)) return vmSatError("Unavailable: unrecognized SAT card list");
+  const count=cards.length, inventory=device.ok&&device.data&&device.data.cards_count;
+  let out=count+" card detail"+(count===1?"":"s")+" reported";
+  if(Number.isInteger(inventory)&&inventory>=0&&inventory!==count)
+    out+=' \u00b7 host inventory reports '+inventory+'; details may be incomplete';
+  if(count){
+    out+='<ul class="vm-sat-list">'+cards.map((card,i)=>{
+      if(!card||typeof card!=="object"||Array.isArray(card))
+        return '<li>Card '+(i+1)+': '+esc(vmSatText(card))+'</li>';
+      const label=card.name||card.serial||("Card "+(i+1));
+      const fields=[["serial",card.serial&&card.serial!==label?card.serial:null],
+        ["bay",card.bay],["type",card.type],["chip",card.chip_status],
+        ["corner",card.corner],["UUID",card.uuid]]
+        .filter(([,v])=>v!==null&&v!==undefined&&v!=="")
+        .map(([k,v])=>esc(k)+": "+esc(vmSatText(v)));
+      return '<li>'+esc(vmSatText(label))+(fields.length?' \u00b7 '+fields.join(" \u00b7 "):"")+'</li>';
+    }).join("")+'</ul>'+vmSatRaw("All reported card fields",cards);
+  }
+  return out;
+}
+function vmSatFirmware(section){
+  if(!section.ok) return vmSatError("Unavailable: "+section.error);
+  const data=section.data;
+  if(data===null||data===undefined) return "No firmware telemetry reported for this setup";
+  const rows=[];
+  let recognized=false;
+  const componentNames={
+    bmc:"BMC",oam_a1:"OAM A1",oam_cpld:"OAM CPLD",pcie_rt:"PCIe Retimer",
+    pcie_sw:"PCIe Switch",ubb_pri_cpld:"UBB Primary CPLD",ubb_sec_cpld:"UBB Secondary CPLD"
+  };
+  function field(name,value){
+    if(value===null||value===undefined||value==="") return "";
+    return '<div><dt>'+esc(name)+'</dt><dd>'+esc(vmSatText(value))+'</dd></div>';
+  }
+  function partFields(parts){
+    if(!Array.isArray(parts)) return {labels:[],boards:[]};
+    const labels=[],boards=[];
+    parts.forEach(part=>{
+      if(part&&typeof part==="object"&&!Array.isArray(part)){
+        if(part.label!==null&&part.label!==undefined&&part.label!=="") labels.push(vmSatText(part.label));
+        if(part.board!==null&&part.board!==undefined&&part.board!=="") boards.push(vmSatText(part.board));
+      }else if(part!==null&&part!==undefined&&part!=="") labels.push(vmSatText(part));
+    });
+    return {labels:[...new Set(labels)],boards:[...new Set(boards)]};
+  }
+  function walk(node,path,depth){
+    if(depth>8||!node||typeof node!=="object") return;
+    if(Array.isArray(node)){
+      node.forEach((value,i)=>walk(value,path.concat(String(i+1)),depth+1));
+      return;
+    }
+    const component=path.map(key=>componentNames[key]||key.replaceAll("_"," "))
+      .join(" / ")||"Firmware";
+    if(Array.isArray(node.versions)){
+      recognized=true;
+      if(!node.versions.length){
+        rows.push('<section class="vm-sat-fw-item"><h4>'+esc(component)
+          +'</h4><p>No firmware versions reported</p></section>');
+      }
+      node.versions.forEach(entry=>{
+        if(!entry||typeof entry!=="object"||Array.isArray(entry)){
+          rows.push('<section class="vm-sat-fw-item"><h4>'+esc(component)+'</h4>'
+            +'<p>'+esc("Unrecognized version entry: "+vmSatText(entry))+'</p></section>');
+          return;
+        }
+        const parts=partFields(entry.parts);
+        const details=field("Version",entry.version||entry.label)
+          +field("Build",entry.build)
+          +field("Parts",parts.labels.length?parts.labels.join(", "):null)
+          +field("Board",parts.boards.length?parts.boards.join(", "):null);
+        rows.push('<section class="vm-sat-fw-item"><h4>'+esc(component)+'</h4>'
+          +(details?'<dl class="vm-sat-fw-fields">'+details+'</dl>'
+            :'<p>Version not reported</p>')+'</section>');
+      });
+    }
+    for(const key of ["not_available","error","errors","failure","failures"]){
+      const v=node[key];
+      if(v&&(!Array.isArray(v)||v.length)&&
+          (typeof v!=="object"||Array.isArray(v)||Object.keys(v).length)){
+        recognized=true;
+        const value=Array.isArray(v)?v.map(vmSatText).join(", "):vmSatText(v);
+        rows.push('<section class="vm-sat-fw-item vm-sat-fw-notice"><h4>'+esc(component)
+          +' \u00b7 '+esc(key.replaceAll("_"," "))+'</h4><p>'+esc(value)+'</p></section>');
+      }
+    }
+    Object.entries(node).forEach(([key,value])=>{
+      if(!["versions","not_available","error","errors","failure","failures"].includes(key))
+        walk(value,path.concat(key),depth+1);
+    });
+  }
+  walk(data,[],0);
+  const summary=recognized?rows.join("")
+    :vmSatError("SAT firmware format is unrecognized; inspect the reported data");
+  return summary+vmSatRaw("All reported firmware fields",data);
+}
+function vmSatContent(target){
+  const state=VM_SAT.get(target), open=!vmFolded("machine-sat");
+  const fold='<button type="button" class="vm-sat-fold" aria-expanded="'+open+'"'
+    +' title="'+(open?"Collapse":"Expand")+' SAT details"'
+    +' aria-label="'+(open?"Collapse":"Expand")+' SAT details">'+vmChev(open)+'</button>';
+  const refresh=SERVED?'<button type="button" class="vm-sat-refresh"'
+    +(state&&state.status==="loading"?' disabled':"")
+    +' title="Refresh read-only SAT data for '+esc(target)+'">\u21bb'+(open?" Refresh":"")+'</button>':"";
+  let head='<div class="vm-sat-head">'+fold+'<strong>SAT</strong>'+refresh+'</div>';
+  if(!open) return head;
+  if(!SERVED) return head+'<p class="vm-sat-note">Live SAT details require the served portal.</p>';
+  if(!state||state.status==="loading")
+    return head+'<p class="vm-sat-note" role="status">Loading SAT details\u2026</p>';
+  if(state.status==="error")
+    return head+'<p class="vm-sat-note" role="status">'+vmSatError("SAT unavailable: "+state.error)
+      +' \u00b7 ownership unverified</p>';
+  const d=state.data;
+  const when=localDmyHm(Date.parse(d.requested_at));
+  head+='<p class="vm-sat-note">Setup '+esc(d.setup)+' \u00b7 requested '+esc(when)
+    +' \u00b7 snapshot only; refresh before use. Firmware is telemetry, not a hardware read.</p>';
+  return head+vmKv([["Owner",vmSatOwner(d.device)],["Cards",vmSatCards(d.cards,d.device)],
+                    ["Firmware",vmSatFirmware(d.firmware)]]);
+}
+function vmSatMarkup(target){
+  return '<section id="vm-sat" class="vm-sat" data-target="'+esc(target)
+    +'" aria-live="polite" aria-label="SAT inventory for '+esc(target)+'">'+vmSatContent(target)+'</section>';
+}
+function vmSatBindSlot(slot){
+  const button=slot.querySelector(".vm-sat-refresh");
+  if(button) button.addEventListener("click",()=>vmSatLoad(slot.dataset.target));
+  const fold=slot.querySelector(".vm-sat-fold");
+  if(fold) fold.addEventListener("click",()=>{
+    vmFoldToggle("machine-sat");
+    const split=slot.parentElement;
+    if(split&&split.classList) split.classList.toggle("sat-folded",vmFolded("machine-sat"));
+    vmSatPaint(slot.dataset.target);
+    const again=slot.querySelector(".vm-sat-fold");
+    if(again) again.focus();
+  });
+}
+function vmSatPaint(target){
+  const slot=document.getElementById("vm-sat");
+  if(!slot||slot.dataset.target!==target) return;
+  slot.innerHTML=vmSatContent(target);
+  vmSatBindSlot(slot);
+}
+async function vmSatLoad(target){
+  if(!SERVED||(VM_SAT.get(target)||{}).status==="loading") return;
+  const request={status:"loading"};
+  VM_SAT.set(target,request);
+  vmSatPaint(target);
+  try{
+    const response=await fetch("/api/vm-sat?target="+encodeURIComponent(target),{cache:"no-store"});
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.error||"HTTP "+response.status);
+    if(data.target!==target||!data.device||!data.cards||!data.firmware)
+      throw new Error("SAT returned an invalid machine snapshot");
+    if(VM_SAT.get(target)!==request) return;
+    VM_SAT.set(target,{status:"ready",data});
+  }catch(error){
+    if(VM_SAT.get(target)!==request) return;
+    VM_SAT.set(target,{status:"error",error:String(error.message||error)});
+  }
+  vmSatPaint(target);
+}
+function vmSatBind(box){
+  const slot=box.querySelector("#vm-sat");
+  if(!slot||!slot.dataset||!slot.dataset.target) return;
+  vmSatBindSlot(slot);
+  if(SERVED&&activeSection==="vm"&&!VM_SAT.has(slot.dataset.target))
+    vmSatLoad(slot.dataset.target);
 }
 // Result of the last `mctl provision` on a target (latest per recipe).
 function vmProvBadge(t){
@@ -4958,11 +5178,18 @@ function vmPowerLine(m){
 }
 // A shell on the machine, in its own window: attaches to the persistent tmux
 // session "portal" (so work survives closing the window), bash otherwise.
+// The \u25be next to a terminal button: choose Windows Terminal or the pop-up.
+function termMoreBtn(params,name,label){
+  return '<button type="button" class="term-more" aria-haspopup="menu" data-term="'
+    +esc(JSON.stringify(params))+'" data-name="'+esc(name||"")+'"'
+    +' title="Open '+esc(label||"this terminal")+' in\u2026" aria-label="Open '+esc(label||"terminal")+' in\u2026">\u25be</button>';
+}
 function vmTermBtn(name,on){
   if(!(VMLOG.terminal_targets||[]).includes(name)) return "";
-  return '<button class="vm-term" data-target="'+esc(name)+'"'+(on?"":" disabled")
+  return '<span class="term-split"><button class="vm-term" data-target="'+esc(name)+'"'+(on?"":" disabled")
     +' title="'+(on?"Open a terminal on "+esc(name)+" (tmux session \u201cportal\u201d)"
-      :esc(name)+" is not running")+'">&gt;_ Terminal</button>';
+      :esc(name)+" is not running")+'">&gt;_ Terminal</button>'
+    +(on&&SERVED?termMoreBtn({kind:"shell",target:name},"term-"+name,"the terminal on "+name):"")+'</span>';
 }
 // State of the persistent ssh status link (Settings \u203a Machines \u203a live).
 function vmLiveBadge(name){
@@ -4978,9 +5205,10 @@ function vmLiveBadge(name){
 // Lab machines only (EC2 VMs have no BMC); the server resolves the BMC host.
 function vmBmcBtn(t){
   if(t.instance) return "";
-  return '<button class="vm-bmc" data-target="'+esc(t.name)+'"'+(t.bmc&&SERVED?"":" disabled")
+  return '<span class="term-split"><button class="vm-bmc" data-target="'+esc(t.name)+'"'+(t.bmc&&SERVED?"":" disabled")
     +' title="'+(t.bmc?"Open an ssh terminal on "+esc(t.name)+"\u2019s BMC ("+esc(t.bmc)+")"
-      :"No BMC set \u2014 use \u22ef \u203a Edit details\u2026")+'">&gt;_ BMC</button>';
+      :"No BMC set \u2014 use \u22ef \u203a Edit details\u2026")+'">&gt;_ BMC</button>'
+    +(t.bmc&&SERVED?termMoreBtn({kind:"bmc",target:t.name},"bmc-"+t.name,t.name+"\u2019s BMC"):"")+'</span>';
 }
 function vmBindTerms(box){
   box.querySelectorAll(".vm-term").forEach(b=>b.addEventListener("click",()=>
@@ -5347,6 +5575,7 @@ async function vmTargetPost(body){
     headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const j=await r.json();
   if(!r.ok||!Array.isArray(j.targets)) throw new Error(j.error||"Machine tracking failed");
+  if(body.name) VM_SAT.delete(body.name);
   vmAdoptPayload(j); renderVmlog(); buildSections();
   document.getElementById("vm-refresh-note").textContent=j.message;
   return j;
@@ -5563,6 +5792,7 @@ function vmLogLink(j){
     +' data-id="'+esc(j.id)+'"'
     +' title="'+esc(what)+'">'
     +(live?'<span class="spin">\u21bb</span> tail':'\u2317 open')+'</button>'
+    +(j.id&&SERVED?termMoreBtn({kind:"log",job:j.id},"log-"+j.id,"this log"):"")
     +(meta?'<span class="vm-logmeta">'+meta+'</span>':"");
 }
 
@@ -5574,12 +5804,227 @@ function vmLogLink(j){
 function termUrl(params){
   return "/term?"+new URLSearchParams(params).toString();
 }
-function termOpen(params,name){
-  if(!SERVED){ alert("Serve the portal to open a terminal"); return null; }
-  const w=window.open(termUrl(params),name||"",
-    "popup=yes,width=1100,height=700");
+// Where a terminal opens: "wt" = a real Windows Terminal window on this PC
+// (POST /api/term/launch), "popup" = the browser pop-up. No `how` follows
+// Settings \u203a Terminals \u203a Default launcher; every button's \u25be offers both.
+function termSettings(){ return ((SETTINGS||{}).settings||{}).terminals||{}; }
+function termDefaultHow(){ return termSettings().launcher==="browser"?"popup":"wt"; }
+function termPopup(params,name){
+  const w=window.open(termUrl(params),name||"","popup=yes,width=1100,height=700");
   if(!w) alert("The browser blocked the terminal window \u2014 allow pop-ups for this page.");
   return w;
+}
+async function termLaunchWt(panes,layout){
+  const r=await fetch("/api/term/launch",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({panes,layout:layout||"grid"})});
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.error||("HTTP "+r.status));
+  return data;
+}
+function termOpen(params,name,how){
+  if(!SERVED){ alert("Serve the portal to open a terminal"); return null; }
+  if(params.kind==="workspace"){
+    const workspace=wsRoster().find(s=>s.id===params.workspace);
+    if(!workspace){ alert("Workspace is no longer tracked; refresh the roster."); return null; }
+    if(workspace.purpose==="read-only"){
+      if(!confirm("This is a Read-only reference workspace. The terminal is not sandboxed.\n\n"
+        +"Do not modify files, push, build, test, or mirror from it.")) return null;
+      params={...params,read_only_confirmed:true};
+    }
+  }
+  how=how||termDefaultHow();
+  if(how!=="wt") return termPopup(params,name);
+  termLaunchWt([params]).catch(error=>{
+    notifyCard({seq:Date.now(),title:"Windows Terminal did not open",
+      body:error.message+" \u2014 opening the browser pop-up instead.",tone:"bad"});
+    termPopup(params,name);
+  });
+  return null;
+}
+function termMenu(anchor){
+  document.querySelectorAll(".term-menu").forEach(m=>m.remove());
+  let params; try{ params=JSON.parse(anchor.dataset.term); }catch(_){ return; }
+  const name=anchor.dataset.name, def=termDefaultHow();
+  const menu=document.createElement("div");
+  menu.className="term-menu"; menu.setAttribute("role","menu");
+  menu.innerHTML=[["wt","\u29c9 Windows Terminal window"],["popup","\u2610 Browser pop-up"]]
+    .map(([how,lbl])=>'<button type="button" role="menuitem" data-how="'+how+'">'+lbl
+      +(how===def?' <small>(default)</small>':"")+'</button>').join("");
+  document.body.appendChild(menu);
+  const r=anchor.getBoundingClientRect();
+  menu.style.left=Math.min(window.innerWidth-menu.offsetWidth-8,r.left+window.scrollX)+"px";
+  menu.style.top=(r.bottom+window.scrollY+2)+"px";
+  const close=()=>{ menu.remove(); document.removeEventListener("click",outside,true); anchor.focus(); };
+  const outside=e=>{ if(!menu.contains(e.target)) close(); };
+  setTimeout(()=>document.addEventListener("click",outside,true),0);
+  menu.addEventListener("keydown",e=>{
+    const items=[...menu.querySelectorAll("button")], i=items.indexOf(document.activeElement);
+    if(e.key==="Escape"){ e.preventDefault(); close(); }
+    else if(e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault();
+      items[(i+(e.key==="ArrowDown"?1:items.length-1))%items.length].focus(); }
+  });
+  menu.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>{
+    close(); termOpen(params,name,b.dataset.how); }));
+  menu.querySelector("button").focus();
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest&&e.target.closest(".term-more");
+  if(b&&!b.disabled){ e.preventDefault(); e.stopPropagation(); termMenu(b); }
+});
+// ---- Multi-pane console (Machines › ⊞ Console) ---------------------------
+// Panes: {kind:"shell",target,session} | {kind:"bmc",target} | {kind:"uart",target,console}.
+// Opens as Windows Terminal split panes (POST /api/term/launch; broadcast with
+// WT's own Ctrl+Shift+B) or as the browser grid at /console with Shared input.
+const TERM_MAX_PANES=16;
+function termPaneLabel(p){
+  if(p.kind==="shell") return p.target+(p.session&&p.session!=="portal"?" #"+p.session.replace(/^portal-/,""):"");
+  if(p.kind==="bmc") return p.target+" BMC";
+  return p.target+" "+(p.label||p.console);
+}
+function termPresets(){ const p=termSettings().presets; return Array.isArray(p)?p:[]; }
+async function termSavePresets(presets){
+  const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({revision:SETTINGS.revision,settings:{terminals:{presets}}})});
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok){ if(r.status===409) await loadSettings(); throw new Error(data.error||("HTTP "+r.status)); }
+  SETTINGS={settings:data.settings,defaults:data.defaults,revision:data.revision,limits:data.limits,
+    group_limits:data.group_limits,status:data.status};
+  BOOT.settings=SETTINGS;
+}
+function consoleBrowserOpen(panes,layout,title){
+  const q=encodeURIComponent(JSON.stringify({panes,layout,title:title||""}));
+  const w=window.open("/console?c="+q,"","popup=yes,width=1500,height=950");
+  if(!w) alert("The browser blocked the console window \u2014 allow pop-ups for this page.");
+  return w;
+}
+async function consoleOpen(panes,layout,how,title){
+  if(how!=="wt") return consoleBrowserOpen(panes,layout,title);
+  try{ await termLaunchWt(panes,layout); }
+  catch(error){
+    notifyCard({seq:Date.now(),title:"Windows Terminal did not open",
+      body:error.message+" \u2014 opening the browser console instead.",tone:"bad"});
+    consoleBrowserOpen(panes,layout,title);
+  }
+}
+async function consoleSettingsReady(){ if(!(SETTINGS&&SETTINGS.settings&&SETTINGS.settings.terminals)) await loadSettings(); }
+async function consoleDialog(){
+  if(!SERVED){ alert("Serve the portal to open a console"); return; }
+  await consoleSettingsReady();
+  const targets=(VMLOG.terminal_targets||[]).slice().sort();
+  const bmcs={}; (VMLOG.target_state||[]).forEach(t=>{ if(t.bmc) bmcs[t.name]=t.bmc; });
+  const previousFocus=document.activeElement, dialog=document.createElement("dialog");
+  dialog.className="ws-modal con-dialog";
+  dialog.setAttribute("aria-labelledby","con-title");
+  const uart={};          // target -> {consoles, hint, error, loading}
+  const sel={};           // target -> {shells:n, bmc:bool, uart:Set(id)}
+  targets.forEach(t=>sel[t]={shells:0,bmc:false,uart:new Set()});
+  let layout="grid", how=termDefaultHow(), busy=false;
+  dialog.innerHTML='<form><h3 id="con-title">\u229e Multi-pane console</h3>'
+    +'<div class="con-body"></div>'
+    +'<div class="ws-modal-act"><span class="ws-modal-msg" role="status" aria-live="polite"></span>'
+    +'<button type="button" class="ws-modal-cancel">Cancel</button>'
+    +'<button type="submit" class="primary">Open</button></div></form>';
+  document.body.appendChild(dialog);
+  const form=dialog.querySelector("form"), body=dialog.querySelector(".con-body"),
+        msg=dialog.querySelector(".ws-modal-msg"), submit=form.querySelector('[type="submit"]');
+  const close=()=>{ if(!busy) dialog.close(); };
+  dialog.addEventListener("close",()=>{ dialog.remove(); previousFocus?.focus(); });
+  dialog.addEventListener("keydown",e=>{ e.stopPropagation(); if(e.key==="Escape"){ e.preventDefault(); close(); } });
+  dialog.querySelector(".ws-modal-cancel").addEventListener("click",close);
+  const panes=()=>{
+    const out=[];
+    targets.forEach(t=>{ const s=sel[t];
+      for(let i=1;i<=s.shells;i++) out.push({kind:"shell",target:t,session:i===1?"portal":"portal-"+i});
+      if(s.bmc) out.push({kind:"bmc",target:t});
+      ((uart[t]||{}).consoles||[]).forEach(c=>{ if(s.uart.has(c.id)) out.push({kind:"uart",target:t,console:c.id,label:c.label}); });
+    });
+    return out;
+  };
+  function draw(){
+    const ps=termPresets(), list=panes();
+    body.innerHTML=(ps.length?'<label class="con-row"><span class="set-lbl">Preset</span><select name="preset">'
+        +'<option value="">\u2014 choose \u2014</option>'+ps.map(p=>'<option>'+esc(p.name)+'</option>').join("")
+        +'</select><small>fills in the panes, layout below</small></label>':"")
+      +'<table class="con-tbl"><thead><tr><th scope="col">Machine</th><th scope="col" title="tmux sessions portal, portal-2\u2026">Shells</th>'
+      +'<th scope="col">BMC</th><th scope="col">UART consoles</th></tr></thead><tbody>'
+      +targets.map(t=>{ const s=sel[t], u=uart[t];
+        const ucell=!u?'<button type="button" class="btn" data-uart="'+esc(t)+'">List\u2026</button>'
+          :u.loading?'<span class="ro-note">reading\u2026</span>'
+          :u.error?'<span class="vm-t-err" title="'+esc(u.error)+'">\u26a0 '+esc(u.error.slice(0,60))+'</span>'
+          :!u.consoles.length?'<span class="ro-note" title="'+esc(u.hint)+'">none registered</span>'
+          :u.consoles.map(c=>'<label class="chip"><input type="checkbox" data-uc="'+esc(t)+'" value="'+esc(c.id)+'"'
+            +(s.uart.has(c.id)?" checked":"")+'> '+esc(c.label)+'</label>').join(" ");
+        return '<tr><th scope="row">'+esc(t)+'</th>'
+          +'<td><input type="number" min="0" max="4" step="1" value="'+s.shells+'" data-sh="'+esc(t)+'" aria-label="Shell panes on '+esc(t)+'"></td>'
+          +'<td>'+(bmcs[t]?'<input type="checkbox" data-bmc="'+esc(t)+'"'+(s.bmc?" checked":"")+' aria-label="BMC of '+esc(t)+'" title="'+esc(bmcs[t])+'">':'\u2014')+'</td>'
+          +'<td>'+ucell+'</td></tr>';
+      }).join("")+'</tbody></table>'
+      +'<div class="con-row"><span class="set-lbl">Layout</span>'
+      +["grid","rows","columns"].map(l=>'<label class="chip"><input type="radio" name="layout" value="'+l+'"'+(l===layout?" checked":"")+'> '+l+'</label>').join(" ")+'</div>'
+      +'<div class="con-row"><span class="set-lbl">Open in</span>'
+      +'<label class="chip"><input type="radio" name="how" value="wt"'+(how==="wt"?" checked":"")+'> \u29c9 Windows Terminal (split panes; Ctrl+Shift+B broadcasts)</label> '
+      +'<label class="chip"><input type="radio" name="how" value="popup"'+(how!=="wt"?" checked":"")+'> \u2610 Browser grid (Shared input)</label></div>'
+      +'<div class="con-row"><span class="set-lbl">Save as preset</span><input type="text" name="pname" maxlength="40" placeholder="e.g. srv12 OAMs">'
+      +'<button type="button" class="btn" data-psave>Save preset</button></div>'
+      +'<p class="ro-note">'+list.length+' pane(s)'+(list.length>TERM_MAX_PANES?' \u2014 at most '+TERM_MAX_PANES:"")
+      +(list.some(p=>p.kind==="uart")?' \u00b7 UART input reaches the device; shared input starts off for UART panes':"")+'</p>';
+    submit.disabled=!list.length||list.length>TERM_MAX_PANES;
+    body.querySelectorAll("[data-sh]").forEach(i=>i.addEventListener("change",()=>{
+      sel[i.dataset.sh].shells=Math.max(0,Math.min(4,parseInt(i.value,10)||0)); draw(); }));
+    body.querySelectorAll("[data-bmc]").forEach(i=>i.addEventListener("change",()=>{ sel[i.dataset.bmc].bmc=i.checked; draw(); }));
+    body.querySelectorAll("[data-uc]").forEach(i=>i.addEventListener("change",()=>{
+      const u=sel[i.dataset.uc].uart; i.checked?u.add(i.value):u.delete(i.value); draw(); }));
+    body.querySelectorAll('[name="layout"]').forEach(i=>i.addEventListener("change",()=>{ layout=i.value; }));
+    body.querySelectorAll('[name="how"]').forEach(i=>i.addEventListener("change",()=>{ how=i.value; }));
+    body.querySelectorAll("[data-uart]").forEach(b=>b.addEventListener("click",()=>loadUart(b.dataset.uart)));
+    const pre=body.querySelector('[name="preset"]');
+    if(pre) pre.addEventListener("change",()=>applyPreset(ps.find(p=>p.name===pre.value)));
+    body.querySelector("[data-psave]").addEventListener("click",savePreset);
+  }
+  async function loadUart(t,keep){
+    uart[t]={loading:true}; draw();
+    try{
+      const r=await fetch("/api/term/uart?target="+encodeURIComponent(t));
+      const data=await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(data.error||("HTTP "+r.status));
+      uart[t]={consoles:data.consoles||[],hint:data.hint||""};
+    }catch(error){ uart[t]={error:error.message,consoles:[]}; }
+    if(keep) keep.forEach(id=>{ if(uart[t].consoles.some(c=>c.id===id)) sel[t].uart.add(id); });
+    draw();
+  }
+  function applyPreset(p){
+    if(!p) return;
+    targets.forEach(t=>sel[t]={shells:0,bmc:false,uart:new Set()});
+    const want={}, missing=[];
+    p.panes.forEach(x=>{
+      if(!sel[x.target]){ missing.push(x.target); return; }
+      if(x.kind==="shell") sel[x.target].shells=Math.min(4,sel[x.target].shells+1);
+      else if(x.kind==="bmc") sel[x.target].bmc=!!bmcs[x.target];
+      else (want[x.target]=want[x.target]||[]).push(x.console);
+    });
+    layout=p.layout||"grid";
+    msg.textContent=missing.length?"Not registered any more: "+[...new Set(missing)].join(", "):"";
+    draw();
+    Object.entries(want).forEach(([t,ids])=>loadUart(t,ids));
+  }
+  async function savePreset(){
+    const name=(body.querySelector('[name="pname"]').value||"").trim(), list=panes();
+    if(!name||!list.length){ msg.textContent="Choose panes and a name first."; return; }
+    const clean=list.map(({label,...p})=>p);
+    try{
+      await termSavePresets(termPresets().filter(p=>p.name!==name).concat([{name,layout,panes:clean}]));
+      msg.textContent="Saved preset \u201c"+name+"\u201d."; draw();
+    }catch(error){ msg.textContent="Save failed: "+error.message; }
+  }
+  form.addEventListener("submit",async e=>{
+    e.preventDefault();
+    const list=panes(); if(!list.length) return;
+    busy=true; submit.disabled=true; msg.textContent=how==="wt"?"Opening Windows Terminal\u2026":"";
+    await consoleOpen(list,layout,how,"");
+    busy=false; dialog.close();
+  });
+  draw();
+  dialog.showModal();
 }
 function vmLogOpen(target,tag,kind,live,id){
   if(!id) return;
@@ -5666,6 +6111,7 @@ async function checkVms(){
   }
 }
 document.getElementById("vm-vms").addEventListener("click",checkVms);
+document.getElementById("vm-console")?.addEventListener("click",()=>consoleDialog());
 document.getElementById("vm-add")?.addEventListener("click",()=>vmAddDialog());
 document.getElementById("vm-target").addEventListener("change",e=>{
   vmTargets=msVals(e.target); vmTarget=vmTargets.length===1?vmTargets[0]:""; renderVmlog();
@@ -6803,11 +7249,21 @@ const SETTING_GROUPS=[
     ["power_grace_s","Lease-end grace","seconds after expected lease end before checking power"],
     ["power_retry_s","Power-check retry spacing","seconds between bounded follow-up checks"],
     ["power_retry_limit","Power-check retries","additional attempts after the first check; 0 disables retries"]]],
+  ["terminals","Terminals",[
+    ["launcher","Default launcher","where \u201c>_ Terminal\u201d, BMC and log buttons open; every button\u2019s \u25be offers the other",
+      [["windows_terminal","Windows Terminal window"],["browser","Browser pop-up"]]],
+    ["wt_window","Windows Terminal window name","wt -w <name>: launches add tabs to this window; \u201cnew\u201d always opens a new window"],
+    ["wt_distro","WSL distro","empty = the distro the portal runs in"],
+    ["max_sessions","Max open sessions","browser panes plus pending launches"],
+    ["idle_close_min","Console idle close","minutes without output or input before a browser console disconnects; 0 = never"],
+    ["uart_shared_confirm","Confirm shared input to UART","ask before Shared input types into a UART console"],
+    ["presets","Console presets","saved multi-pane layouts; create them in Machines \u203a \u229e Console"]]],
   ["notify","Notifications",[
     ["enabled","Pop-up notifications","master switch"],
-    ["queue","Action queue","an action finished, failed or needs approval"],
-    ["machine_jobs","Machine jobs","a build/test on a machine finished"],
+    ["queue","Action queue","an action changes status, finishes, fails, is cancelled or needs approval"],
+    ["machine_jobs","Machine jobs","a machine job starts, changes status, finishes, fails or is cancelled"],
     ["ai","AI runs","an AI answer, review draft or interactive-review start/submit/end"],
+    ["status_updates","Nonterminal status updates","queued, running, cancelling and unconfirmed status; outcomes and approval prompts remain enabled when off"],
     ["reachability","Machine reachability","a live-status machine went down or came back"],
     ["windows_toast","Windows toast when no tab is open","via powershell.exe from WSL"]]],
   ["live_updates","Automatic updates",[
@@ -6827,9 +7283,23 @@ const SETTING_GROUPS=[
     ["history_limit","Updates history size","entries kept per tab"],
     ["detail_limit","Details per update","record changes listed per entry"],
     ["refresh_delay_ms","Reload delay","ms to batch bursts of changes before reloading"]]]];
-function settingField(group,[key,label,hint],values,dis){
+function settingField(group,[key,label,hint,options],values,dis){
   const v=values[key], def=((SETTINGS.defaults||{})[group]||{})[key];
   const id=`sg-${group}-${key}`;
+  if(options)
+    return `<label class="set-row"><span class="set-lbl">${esc(label)}</span>
+      <select id="${id}" data-g="${group}" data-k="${key}"${dis}>${options.map(([o,t])=>
+        `<option value="${esc(o)}"${o===v?" selected":""}>${esc(t)}</option>`).join("")}</select>
+      <small>${esc(hint)}</small></label>`;
+  if(group==="terminals"&&key==="presets"){
+    const ps=Array.isArray(v)?v:[];
+    return `<div class="set-row"><span class="set-lbl">${esc(label)}</span>
+      ${ps.length?`<ul class="term-presets">${ps.map(pr=>`<li><b>${esc(pr.name)}</b>
+        <small>${esc(pr.layout)} \u00b7 ${pr.panes.length} pane(s): ${esc(pr.panes.map(termPaneLabel).join(", "))}</small>
+        <button type="button" class="btn" data-preset-del="${esc(pr.name)}"${dis}>Delete</button></li>`).join("")}</ul>`
+        :`<small>None saved.</small>`}
+      <small>${esc(hint)}</small></div>`;
+  }
   if(typeof def==="boolean")
     return `<label class="set-row"><input type="checkbox" id="${id}" data-g="${group}" data-k="${key}"${v?" checked":""}${dis}>
       <span>${esc(label)}${hint?`<small>${esc(hint)}</small>`:""}</span></label>`;
@@ -6866,6 +7336,13 @@ function renderGroupSettings(values){
     </div></form>`;
   const form=document.getElementById("set-groups-form");
   form.addEventListener("submit",ev=>{ ev.preventDefault(); saveGroupSettings(form); });
+  form.querySelectorAll("[data-preset-del]").forEach(b=>b.addEventListener("click",async()=>{
+    if(!confirm("Delete console preset \u201c"+b.dataset.presetDel+"\u201d?")) return;
+    try{ await termSavePresets(termPresets().filter(p=>p.name!==b.dataset.presetDel));
+      groupsMsg={text:"Preset deleted",tone:"ok"}; }
+    catch(error){ groupsMsg={text:error.message,tone:"bad"}; }
+    renderGroupSettings();
+  }));
   form.querySelector("[data-groups-defaults]").addEventListener("click",()=>{
     groupsMsg={text:"Defaults filled in \u2014 Save to apply.",tone:""};
     renderGroupSettings(SETTINGS.defaults);

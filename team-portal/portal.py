@@ -10,6 +10,7 @@ HTML template/rendering, payload aggregation, the HTTP server and its jobs.
 """
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -516,6 +517,7 @@ __STYLES__
         <select id="vm-target" data-filter><option value="">All targets</option></select>
         <label class="chip"><input type="checkbox" id="vm-livefirst" checked> Live on top</label>
         <button id="vm-add" class="btn">+ Add machine</button>
+        <button id="vm-console" class="btn" title="Open several machine shells, BMCs and UART consoles at once: Windows Terminal split panes or a browser grid with shared input (broadcast).">&#8862; Console</button>
         <button id="vm-vms" class="btn" title="Query `octl vm list` for the power state, lease and IP of every EC2 instance. Does not touch the targets over ssh.">&#9741; Check VM status</button>
         <button id="vm-sync" class="btn" title="Mirror VM and lab-machine job logs into ~/.mctl/jobs. Each target keeps only the newest log per workspace and overwrites it on the next run, so syncing makes an old log openable later.">&#8595; Sync logs</button>
         <button id="vm-refresh" class="btn primary" title="Refresh job state and logs for every VM and lab-machine target, then re-read EC2 power state. One ssh round trip per machine plus an octl call. No model, no tokens.">&#8635; Refresh status</button>
@@ -799,7 +801,7 @@ def ws_ui_payload(wd: dict, *, cached_only: bool = False) -> dict:
     canonical = ([r["slot"] for r in roster if not r["target"]
                   and r["rev"] == "main" and r["exists"] and wm.allows(r, "build")]
                  if cached_only else viable_slots())
-    return dict(wd, canonical=canonical, purposes=wm.PURPOSES,
+    return dict(wd, canonical=canonical, purposes=wm.PURPOSES, workspace_terminals=True,
                 purpose_uses={p: wm.purpose_uses(p) for p in wm.PURPOSES},
                 roster=roster, groups=wm.groups(wd), targets=wm.machine_targets())
 
@@ -808,7 +810,8 @@ ASSETS = Path(__file__).resolve().parent / "assets"
 ASSET_TYPES = {".css": "text/css; charset=utf-8",
                ".js": "application/javascript; charset=utf-8"}
 # Every servable asset, by exact name, so a crafted path cannot escape.
-ASSET_NAMES = ("portal.css", "pulse.js", "portal.js", "team.js", "term.js", "aichat.js", "flash.js",
+ASSET_NAMES = ("portal.css", "pulse.js", "portal.js", "team.js", "term.js", "console.js",
+               "aichat.js", "flash.js",
                "vendor/xterm.js", "vendor/xterm.css", "vendor/addon-fit.js")
 
 
@@ -854,6 +857,91 @@ def render_term_page() -> str:
             f'<script src="/assets/term.js?v={v}"></script></body></html>')
 
 
+def render_console_page() -> str:
+    """The multi-pane console window (xterm.js grid + assets/console.js)."""
+    v = asset_stamp()
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Portal console</title>'
+            f'<link rel="stylesheet" href="/assets/vendor/xterm.css?v={v}">'
+            f'<link rel="stylesheet" href="/assets/portal.css?v={v}"></head>'
+            '<body class="console-page"><header class="con-bar" id="con-bar"></header>'
+            '<div class="con-banner" id="con-banner" role="status" aria-live="polite" hidden></div>'
+            '<main class="con-grid" id="con-grid" aria-label="Console panes"></main>'
+            f'<script src="/assets/vendor/xterm.js?v={v}"></script>'
+            f'<script src="/assets/vendor/addon-fit.js?v={v}"></script>'
+            f'<script src="/assets/console.js?v={v}"></script></body></html>')
+
+
+_UART_CACHE: dict[str, tuple[float, dict]] = {}
+UART_CACHE_S = 60.0
+
+
+def uart_consoles(target: str, fresh: bool = False) -> dict:
+    """``pilot -t <target> --json uart consoles`` (machine-pilot owns the registry)."""
+    if vd is None or target not in vd.targets():
+        raise terminal.TermError(f"'{target}' is not a registered mctl target")
+    hit = _UART_CACHE.get(target)
+    if hit and not fresh and time.time() - hit[0] < UART_CACHE_S:
+        return hit[1]
+    if not terminal.PILOT.exists():
+        raise terminal.TermError("machine-pilot (pilot) is not installed")
+    try:
+        out = subprocess.run([str(terminal.PILOT), "-t", target, "--json", "uart", "consoles"],
+                             capture_output=True, text=True, timeout=15, check=False)
+        data = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise terminal.TermError(f"pilot uart consoles failed: {e}") from e
+    if not isinstance(data, dict) or not isinstance(data.get("consoles"), list):
+        raise terminal.TermError("pilot uart consoles failed: "
+                                 + (out.stderr or out.stdout or "").strip()[-200:])
+    body = {"target": target, "consoles": [c for c in data["consoles"] if isinstance(c, dict)],
+            "hint": str(data.get("hint") or "")}
+    _UART_CACHE[target] = (time.time(), body)
+    return body
+
+
+def sat_machine_payload(target: str) -> dict:
+    """Read a registered lab target's SAT snapshot (SAT name = target host name) through machine-pilot."""
+    if vd is None:
+        raise RuntimeError("vm-delegate is not installed")
+    try:
+        row = vd.target_rows().get(target)
+    except OSError as exc:
+        raise RuntimeError(f"mctl target registry is unavailable: {exc}") from exc
+    if not row or row.get("kind") != "remote":
+        raise ValueError("SAT details require a registered lab-machine target")
+    if not terminal.PILOT.exists():
+        raise RuntimeError("machine-pilot is not installed")
+    try:
+        out = subprocess.run([str(terminal.PILOT), "-t", target, "sat", "details"],
+                             capture_output=True, text=True, timeout=50, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("SAT lookup timed out; ownership is unverified") from exc
+    except OSError as exc:
+        raise RuntimeError(f"machine-pilot could not be started: {exc}") from exc
+    if not out.stdout.strip():
+        raise RuntimeError((out.stderr or "SAT lookup returned no data").strip()[-500:])
+    try:
+        data = json.loads(out.stdout)
+    except ValueError as exc:
+        raise RuntimeError("machine-pilot returned invalid SAT data") from exc
+    if (not isinstance(data, dict) or not isinstance(data.get("setup"), str)
+            or not isinstance(data.get("requested_at"), str)
+            or not isinstance(data.get("complete"), bool)
+            or any(not isinstance(data.get(key), dict)
+                   or not isinstance(data[key].get("ok"), bool)
+                   or ("data" not in data[key] if data[key]["ok"]
+                       else not isinstance(data[key].get("error"), str))
+                   for key in ("device", "cards", "firmware"))):
+        raise RuntimeError("machine-pilot returned an invalid SAT snapshot")
+    if data["complete"] != all(data[key]["ok"] for key in ("device", "cards", "firmware")):
+        raise RuntimeError("machine-pilot returned inconsistent SAT section status")
+    if out.returncode and data["complete"]:
+        raise RuntimeError("machine-pilot failed after returning a SAT snapshot")
+    return {"target": target, **data}
+
+
 def term_spec(data: dict) -> dict:
     """Validate a /api/term/open request into a terminal spec."""
     if not isinstance(data, dict):
@@ -862,7 +950,29 @@ def term_spec(data: dict) -> dict:
     if kind == "shell":
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
-        return terminal.shell_spec(str(data.get("target") or ""), vd.targets())
+        return terminal.shell_spec(str(data.get("target") or ""), vd.targets(),
+                                   str(data.get("session") or terminal.TMUX_SESSION))
+    if kind == "workspace":
+        ident = data.get("workspace")
+        if not isinstance(ident, str) or not terminal.WORKSPACE_ID_RE.fullmatch(ident):
+            raise terminal.TermError("invalid workspace id")
+        try:
+            workspace = wm.record(ident)
+        except ValueError as error:
+            raise terminal.TermError(str(error)) from error
+        if workspace.get("id") != ident:
+            raise terminal.TermError("workspace identity does not match the tracked record")
+        if not workspace.get("path") and not workspace.get("target"):
+            workspace["path"] = str(wm.slot_path(workspace["slot"]))
+        if workspace.get("purpose") == "read-only" and data.get("read_only_confirmed") is not True:
+            raise terminal.TermError("confirm the Read-only workspace warning before opening a terminal")
+        if workspace.get("target") and vd is None:
+            raise terminal.TermError("vm-delegate is not installed")
+        return terminal.workspace_spec(workspace, vd.targets() if workspace.get("target") else [])
+    if kind == "uart":
+        target = str(data.get("target") or "")
+        return terminal.uart_spec(target, str(data.get("console") or ""),
+                                  uart_consoles(target)["consoles"])
     if kind == "log":
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
@@ -875,7 +985,22 @@ def term_spec(data: dict) -> dict:
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
         return terminal.bmc_spec(str(data.get("target") or ""), vd.target_bmcs())
-    raise terminal.TermError("kind must be shell, bmc, log or provision")
+    raise terminal.TermError("kind must be workspace, shell, uart, bmc, log or provision")
+
+
+def term_launch(data: dict, client: str) -> dict:
+    """POST /api/term/launch: open validated panes in Windows Terminal on this PC."""
+    if client not in ("127.0.0.1", "::1"):
+        raise PermissionError("Windows Terminal opens on the portal PC; use the browser here")
+    if not isinstance(data, dict) or not isinstance(data.get("panes"), list):
+        raise terminal.TermError("send {panes:[...], layout}")
+    specs = [term_spec(p) for p in data["panes"]]
+    cfg = portal_settings.load()["terminals"]
+    env = vd.agent_env()[0] if vd is not None else os.environ
+    return terminal.wt_launch(specs, str(data.get("layout") or "grid"), cfg["wt_window"],
+                              cfg["wt_distro"] or os.environ.get("WSL_DISTRO_NAME", ""),
+                              {"SSH_AUTH_SOCK": env.get("SSH_AUTH_SOCK", "")}
+                              if env.get("SSH_AUTH_SOCK") else {})
 
 
 def asset_stamp() -> str:
@@ -2260,6 +2385,7 @@ def run_vm_refresh(job: dict) -> None:
             job["current"] = f"probing {only}" if only else "probing targets"
         try:
             res = vd.refresh(only)
+            observe_machine_jobs()
         except Exception as e:                                 # noqa: BLE001
             with ALIGN_LOCK:
                 job.update(status="error", finished=tm.NOW, current=None, message=str(e))
@@ -2327,8 +2453,9 @@ def run_vm_watchdog(stop: _threading.Event) -> None:
             continue
         try:
             vd.watchdog()
+            observe_machine_jobs()
         except Exception:                                      # noqa: BLE001
-            pass                 # a sweep that fails must not kill the loop
+            logging.exception("Portal machine watchdog failed")
         finally:
             VM_REFRESH_LOCK.release()
 
@@ -2379,11 +2506,57 @@ SSO_LOGINS = sso_login.SsoLogins(
     env_for=lambda: vd.agent_env(recheck=True)[0] if vd is not None else dict(os.environ))
 LIVE_STATE = {"changed": 0.0}
 JOB_DONE_WORDS = {"passed": ("\u2713 passed", "ok"), "failed": ("\u2717 failed", "bad"),
-                  "died": ("\u2717 died", "bad")}
+                  "died": ("\u2717 died", "bad"), "cancelled": ("cancelled", "warn")}
+
+
+def machine_notification_snapshot() -> dict:
+    rows = vd.job_statuses() if vd is not None else {}
+    for ident, row in rows.items():
+        if row["kind"] == "flash":
+            job = vd._job_by_id(ident)
+            if job:
+                row.update(vd.local_status(job))
+    return rows
+
+
+def notify_machine_job(ident: str, row: dict) -> None:
+    status = row["status"]
+    if status not in {*JOB_DONE_WORDS, "running", "unknown"}:
+        return
+    LIVE_STATE["changed"] = time.time()
+    if status not in JOB_DONE_WORDS and not portal_settings.load()["notify"]["status_updates"]:
+        return
+    word, tone = JOB_DONE_WORDS.get(status, (status, "warn" if status == "unknown" else ""))
+    title = f"{row['kind'].capitalize()} {word} on {row['target']}"
+    body = row["ws"] + (f" \u00b7 rc={row['rc']}" if row["rc"] not in (None, 0) else "")
+    link = "#vm"
+    if row["kind"] == "flash":
+        word, tone = {"running": ("started", ""), "passed": ("verified", "ok"),
+                      "cancelled": ("cancelled", "warn"), "unknown": ("unconfirmed", "warn")}.get(
+            status, ("NOT verified" if row.get("rc") == 2 else status, "bad"))
+        title, body = f"Flash {word} \u00b7 {row['target']}", row.get("last_line") or body
+        link = f"/flash?id={ident}"
+    EVENTS.publish("machine_jobs", title, body, tone, link)
+
+
+MACHINE_NOTIFICATIONS = events.JobTransitions(machine_notification_snapshot, notify_machine_job)
+
+
+def observe_machine_jobs() -> None:
+    try:
+        MACHINE_NOTIFICATIONS.observe()
+    except Exception:
+        logging.exception("Portal machine notification observation failed")
+
+
+def publish_domain_changes(domains: list[str]) -> None:
+    EVENTS.publish_domains(domains)
+    if "delegation" in domains:
+        observe_machine_jobs()
 
 
 def live_block(target: str, text: str) -> None:
-    """Reconcile one jobs-watch block; notify on running -> settled."""
+    """Reconcile one jobs-watch block and observe status transitions."""
     if vd is None:
         return
     rows = vd.parse_probe(text)
@@ -2395,6 +2568,7 @@ def live_block(target: str, text: str) -> None:
         before = vd.job_statuses()
         vd.refresh(only=target, sync=False, preprobed={target: rows})
         after = vd.job_statuses()
+        observe_machine_jobs()
     finally:
         VM_REFRESH_LOCK.release()
     changed = [jid for jid, row in after.items()
@@ -2405,11 +2579,7 @@ def live_block(target: str, text: str) -> None:
     for jid in changed:
         row, prev = after[jid], (before.get(jid) or {}).get("status")
         if prev == "running" and row["status"] in JOB_DONE_WORDS:
-            word, tone = JOB_DONE_WORDS[row["status"]]
             settled = True
-            EVENTS.publish("machine_jobs", f"{row['kind'].capitalize()} {word} on {row['target']}",
-                           f"{row['ws']}" + (f" \u00b7 rc={row['rc']}" if row["rc"] not in (None, 0) else ""),
-                           tone, "#vm")
     if settled:
         # Keep a local copy of the finished log before the slot is reused.
         threading.Thread(target=lambda: vd.sync_logs(target), daemon=True).start()
@@ -3671,35 +3841,34 @@ def action_title(job: dict) -> str:
 
 
 def notify_action(job: dict) -> None:
-    """Queue completion -> notification (AI kinds report under 'ai')."""
+    """Persisted queue transition -> notification (AI kinds report under 'ai')."""
     status = job.get("status")
-    if status not in {"done", "error", "approval_required"}:
+    if status not in {"queued", "running", "cancelling", "done", "error",
+                      "approval_required", "cancelled"}:
         return
-    if job.get("cancel_requested") and status == "error":
-        return  # the user stopped it; the queue records it as cancelled
-    if status == "done" and job.get("kind") == "vm-refresh":
+    nonterminal = status in {"queued", "running", "cancelling"}
+    if nonterminal and not portal_settings.load()["notify"]["status_updates"]:
+        return
+    if job.get("kind") == "vm-refresh" and status not in {"error", "cancelled"}:
         return
     # Chat replies show up in the open panel; only failures pop up.
-    if (status == "done" and job.get("kind") == "review-chat"
+    if (status not in {"error", "cancelled"} and job.get("kind") == "review-chat"
             and job.get("op") in {"turn", "preview"}):
         return
     label = action_title(job)
     kind = "ai" if job.get("kind") in {"ai", "auto-review", "online-review",
                                        "review-chat"} else "queue"
-    text = {"done": "finished", "error": "failed",
+    text = {"queued": "queued", "running": "started", "cancelling": "cancelling",
+            "cancelled": "cancelled", "done": "finished", "error": "failed",
             "approval_required": "needs approval"}[status]
     EVENTS.publish(kind, f"{label} {text}", (job.get("message") or "")[:300],
-                   {"done": "ok", "error": "bad"}.get(status, "warn"),
+                   {"done": "ok", "error": "bad", "cancelled": "warn",
+                    "approval_required": "warn"}.get(status, ""),
                    job.get("link") or "")
 
 
 def execute_and_notify(job: dict, store_lock=None) -> None:
-    try:
-        execute_action(job, store_lock)
-    except Exception as error:
-        notify_action({**job, "status": "error", "message": str(error)})
-        raise
-    notify_action(job)
+    execute_action(job, store_lock)
 
 
 def start_vm_cancel_job(job_id: str) -> str:
@@ -3723,6 +3892,7 @@ def run_vm_cancel(job: dict) -> None:
     with ALIGN_LOCK:
         job["current"] = f"stopping job on {job['target']}"
     res = vd.portal_cancel(job["vm_job"])
+    observe_machine_jobs()
     result = {k: res.get(k) for k in ("cancel", "acted", "error") if res.get(k)}
     with ALIGN_LOCK:
         job.update(current=None, result=result,
@@ -3843,9 +4013,7 @@ def flash_start(payload: dict) -> dict:
         raise FileExistsError(res["error"]) if res.get("job_id") else ValueError(res["error"])
     job = res["job"]
     LIVE_STATE["changed"] = time.time()
-    EVENTS.publish("machine_jobs", f"Flash started \u00b7 {target}",
-                   f"{method}: {name} \u2192 OAM {','.join(map(str, oams))}", "",
-                   f"/flash?id={job['id']}")
+    observe_machine_jobs()
     threading.Thread(target=_flash_watch, args=(job,), daemon=True,
                      name=f"flash-watch-{job['id']}").start()
     return {"job": job["id"], "target": target}
@@ -3863,10 +4031,7 @@ def _flash_watch(job: dict) -> None:
         if st["status"] == "running":
             continue
         LIVE_STATE["changed"] = time.time()
-        word, tone = {"passed": ("verified", "ok"), "cancelled": ("cancelled", "warn")}.get(
-            st["status"], ("NOT verified" if st.get("rc") == 2 else st["status"], "bad"))
-        EVENTS.publish("machine_jobs", f"Flash {word} \u00b7 {job.get('target')}",
-                       (st.get("last_line") or "")[:300], tone, f"/flash?id={job['id']}")
+        observe_machine_jobs()
         return
 
 
@@ -4312,7 +4477,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            if self.path.startswith("/api/team") or self.path in ("/", "/index.html"):
+            if (self.path.startswith(("/api/team", "/api/vm-sat"))
+                    or self.path in ("/", "/index.html")):
                 self.send_header("Cache-Control", "no-store")
             if self.path.startswith("/review-drafts/"):
                 self.send_header("Cache-Control", "no-store")
@@ -4422,6 +4588,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
             route = urlparse(self.path).path
             if route == "/term":
                 return self._send(200, render_term_page(), "text/html; charset=utf-8")
+            if route == "/console":
+                return self._send(200, render_console_page(), "text/html; charset=utf-8")
+            if route == "/api/term/uart":
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    body = uart_consoles(q.get("target", [""])[0], q.get("fresh", [""])[0] == "1")
+                except terminal.TermError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps(body, ensure_ascii=False))
+            if route == "/api/vm-sat":
+                target = parse_qs(urlparse(self.path).query).get("target", [""])[0]
+                try:
+                    body = sat_machine_payload(target)
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                except RuntimeError as e:
+                    return self._send(503, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps(body, ensure_ascii=False))
             if route == "/flash":
                 return self._send(200, render_flash_page(), "text/html; charset=utf-8")
             if route in ("/api/flash/images", "/api/flash/status"):
@@ -4811,11 +4995,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
                 try:
                     spec = term_spec(payload)
-                    token = terminal.issue_token(spec)
+                    token = terminal.issue_token(
+                        spec, limit=portal_settings.load()["terminals"]["max_sessions"])
                 except terminal.TermError as e:
                     return self._send(400, json.dumps({"error": str(e)}))
                 return self._send(200, json.dumps({"token": token, "title": spec["title"],
                                                    "kind": spec["kind"]}, ensure_ascii=False))
+
+            if self.path == "/api/term/launch":
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://{self.headers.get('Host')}":
+                    return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
+                try:
+                    result = term_launch(payload, self.client_address[0])
+                except PermissionError as e:
+                    return self._send(409, json.dumps({"error": str(e)}))
+                except terminal.TermError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, json.dumps({"ok": True, **result}))
 
             if self.path == "/api/settings":
                 origin = self.headers.get("Origin")
@@ -5296,10 +5493,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     PID_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     httpd = Server(("127.0.0.1", args.port), Handler)
+    if vd is not None:
+        observe_machine_jobs()
     ACTION_QUEUE = ActionQueue(
         STATE_DIR / "action-queue.db",
         lambda job: execute_and_notify(job, lock), ALIGN_JOBS, ALIGN_LOCK,
-        resources=action_resources, interrupt=interrupt_action, max_workers=4)
+        resources=action_resources, interrupt=interrupt_action,
+        on_transition=notify_action, max_workers=4)
     ACTION_QUEUE.start()
     PID_FILE.write_text(str(os.getpid()))
 
@@ -5310,7 +5510,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     worker = threading.Thread(target=httpd.serve_forever, daemon=True)
     worker.start()
     global WATCHER
-    WATCHER = domain_watch.Watcher(Path.home() / "tasks", EVENTS.publish_domains)
+    WATCHER = domain_watch.Watcher(Path.home() / "tasks", publish_domain_changes)
     apply_live_updates()
     threading.Thread(target=WATCHER.run, args=(stop,), daemon=True,
                      name="portal-domain-watch").start()

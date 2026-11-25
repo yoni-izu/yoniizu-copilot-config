@@ -226,6 +226,16 @@ Do not click refresh/scan/action buttons during a read-only smoke test.
 - **Terminal**: `/term` needs the portal served; pop-ups must be allowed. A closed
   window leaves the remote tmux session `portal` running (`tmux kill-session -t portal`
   on the machine to end it). The `mctl term` subcommand is what runs.
+- **Windows Terminal launcher**: needs WSL interop (`/proc/sys/fs/binfmt_misc/WSLInterop`)
+  and `wt.exe` under `/mnt/c/Users/*/AppData/Local/Microsoft/WindowsApps/`; it works
+  from the systemd user service even though its PATH lacks `/mnt/c`. Each pane runs
+  `terminal.py --run <id>`; a pane that prints "launch expired or already used" was
+  opened more than 120 s after the launch or replayed. `wsl.exe --exec` skips the
+  login profile, so the runner prepends `~/.local/bin` and `~/bin` to PATH; without
+  them `mctl` cannot find `octl` ("cannot read the state of i-… (SSO?)"). Leftover files in
+  `state/term-launch/` are swept on the next launch. Any failure falls back to the
+  browser pop-up; switch the default in Settings › Terminals. Console shell panes use
+  tmux sessions `portal-2`…`portal-4` besides `portal`.
 - **Live link**: `GET /api/events` → `live.links.<target>.state`
   (`connected` / `reconnecting` / `down`, with `error` and `retry_at`). A restart
   reconnects automatically; the link never starts a stopped VM.
