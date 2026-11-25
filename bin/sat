@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Read-only client for the SAT v1 API."""
+import argparse
+import json
+import os
+import re
+import ssl
+import stat
+import sys
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+
+
+DEFAULT_URL = "https://sat.elmnt.local"
+DEFAULT_TOKEN_FILE = "~/.copilot-private/sat/token"
+DEFAULT_CA_FILE = "~/.copilot-private/sat/ca.pem"
+MAX_LIMIT = 1000
+MAX_PAGES = 100
+
+
+class SatError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def api_origin(url):
+    parts = urlsplit(url)
+    if parts.scheme not in ("https", "http") or not parts.hostname:
+        raise SatError("SAT_URL must be an absolute http(s) URL")
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise SatError("SAT_URL must not contain credentials, query, or fragment")
+    if parts.path not in ("", "/"):
+        raise SatError("SAT_URL must be an origin without a path prefix")
+    origin_key(parts)
+    if parts.scheme == "http" and parts.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise SatError("SAT_URL must use HTTPS except for a loopback test server")
+    return parts
+
+
+def origin_key(parts):
+    try:
+        return parts.scheme, parts.hostname, parts.port
+    except ValueError:
+        raise SatError("SAT URL has an invalid port")
+
+
+def load_token():
+    token = os.environ.get("SAT_TOKEN", "").strip()
+    if token:
+        return validate_token(token)
+
+    path = os.path.expanduser(os.environ.get("SAT_TOKEN_FILE", DEFAULT_TOKEN_FILE))
+    try:
+        info = os.stat(path)
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise SatError("SAT token file permissions are too broad; set it to 0600")
+        with open(path, encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+    except FileNotFoundError:
+        raise SatError("SAT token not found; set SAT_TOKEN or create %s with mode 0600" % path)
+    except OSError as exc:
+        raise SatError("cannot read SAT token file %s: %s" % (path, exc))
+    return validate_token(token)
+
+
+def validate_token(token):
+    if not token.startswith("sat_pat_") or re.search(r"\s", token):
+        raise SatError("SAT token is empty or has an invalid format")
+    return token
+
+
+def tls_context():
+    """System trust, unless a SAT-only pinned certificate file is configured."""
+    explicit = os.environ.get("SAT_CA_FILE", "").strip()
+    path = os.path.expanduser(explicit or DEFAULT_CA_FILE)
+    if not os.path.exists(path):
+        if explicit:
+            raise SatError("SAT_CA_FILE not found: %s" % path)
+        return ssl.create_default_context()
+    try:
+        # Loads only this file: the pinned SAT certificate replaces the system
+        # store for SAT requests and is never added to global trust.
+        return ssl.create_default_context(cafile=path)
+    except (OSError, ssl.SSLError) as exc:
+        raise SatError("cannot load SAT CA file %s: %s" % (path, exc))
+
+
+def parse_params(values):
+    params = []
+    for value in values:
+        if "=" not in value:
+            raise SatError("query parameters must be KEY=VALUE: %s" % value)
+        key, val = value.split("=", 1)
+        if not key:
+            raise SatError("query parameter names cannot be empty")
+        params.append((key, val))
+    return params
+
+
+def api_request(base_url, token, url, timeout):
+    base = api_origin(base_url)
+    target = urlsplit(url)
+    if target.username or target.password or target.fragment:
+        raise SatError("refusing a SAT URL with credentials or a fragment")
+    if origin_key(target) != origin_key(base):
+        raise SatError("refusing to send SAT credentials to a different origin")
+    if base.scheme == "https" and target.scheme != "https":
+        raise SatError("refusing an HTTPS-to-HTTP SAT redirect")
+    if not target.path.startswith("/api/v1/"):
+        raise SatError("SAT API path must start with /api/v1/")
+
+    request = Request(url, headers={
+        "Accept": "application/json",
+        "Authorization": "Bearer " + token,
+        "User-Agent": "copilot-sat-client/1",
+    })
+    try:
+        opener = build_opener(
+            HTTPSHandler(context=tls_context()),
+            NoRedirectHandler(),
+        )
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read()
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+            return payload, response.headers.get("Link", "")
+    except HTTPError as exc:
+        request_id = exc.headers.get("X-Request-Id", "")
+        retry_after = exc.headers.get("Retry-After", "")
+        detail = ""
+        try:
+            error = json.loads(exc.read().decode("utf-8"))
+            detail = error.get("error") or error.get("code") or ""
+        except (ValueError, AttributeError, UnicodeDecodeError):
+            pass
+        message = "SAT API HTTP %d" % exc.code
+        if detail:
+            message += ": " + str(detail)
+        if request_id:
+            message += " (request id %s)" % request_id
+        if retry_after:
+            message += " (retry after %s seconds)" % retry_after
+        raise SatError(message, status=exc.code)
+    except (URLError, TimeoutError, ssl.SSLError, OSError) as exc:
+        raise SatError("SAT API request failed: %s" % exc)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SatError("SAT API returned invalid JSON: %s" % exc)
+
+
+def next_link(link_header, current_url):
+    match = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link_header)
+    return urljoin(current_url, match.group(1)) if match else None
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def api_get(base_url, token, path, params=(), timeout=15, all_pages=False):
+    base = api_origin(base_url)
+    root = urlunsplit((base.scheme, base.netloc, base.path.rstrip("/"), "", ""))
+    url = urljoin(root + "/", path.lstrip("/"))
+    if params:
+        url += "?" + urlencode(params)
+
+    seen = set()
+    items = []
+    page_count = 0
+    while url:
+        if url in seen:
+            raise SatError("SAT pagination repeated a page URL")
+        seen.add(url)
+        page_count += 1
+        if page_count > MAX_PAGES:
+            raise SatError("SAT pagination exceeded %d pages" % MAX_PAGES)
+
+        payload, link_header = api_request(base_url, token, url, timeout)
+        if all_pages:
+            if not isinstance(payload, list):
+                raise SatError("--all-pages requires SAT list responses to be JSON arrays")
+            items.extend(payload)
+        else:
+            return payload
+
+        url = next_link(link_header, url)
+        if url:
+            target = urlsplit(url)
+            if origin_key(target) != origin_key(base):
+                raise SatError("refusing a pagination link to a different origin")
+            if not target.path.startswith("/api/v1/"):
+                raise SatError("refusing a pagination link outside /api/v1/")
+    return items
+
+
+def add_list_options(parser):
+    parser.add_argument("--limit", type=int, help="page size (SAT maximum: 1000)")
+    parser.add_argument("--cursor", help="SAT pagination cursor")
+    parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                        help="additional API query parameter; may be repeated")
+    parser.add_argument("--all-pages", action="store_true", help="follow SAT Link pagination")
+
+
+def add_get_parser(subparsers, name, path, aliases=()):
+    parser = subparsers.add_parser(name, aliases=list(aliases))
+    parser.set_defaults(api_path=path)
+    add_list_options(parser)
+    return parser
+
+
+def setup_details(base_url, token, name, timeout):
+    """Fetch one setup's inventory, cards and firmware without hiding partial failures."""
+    device_path = "/api/v1/devices/" + quote(name, safe="")
+    checked_at = datetime.now(timezone.utc).isoformat()
+    blocked = None
+
+    def read(path, transform, all_pages=False):
+        nonlocal blocked
+        if blocked:
+            return {"ok": False, "error": "Not requested: " + blocked}
+        try:
+            data = api_get(base_url, token, path, timeout=timeout, all_pages=all_pages)
+            return {"ok": True, "data": transform(data)}
+        except SatError as exc:
+            error = str(exc).replace(token, "[REDACTED]")
+            if exc.status in (401, 429):
+                blocked = error
+            return {"ok": False, "error": error}
+
+    def device(data):
+        if not isinstance(data, dict) or data.get("name") != name:
+            raise SatError("SAT returned an unexpected setup record")
+        result = {key: data[key] for key in ("name", "state", "current", "cards_count")
+                  if key in data}
+        if isinstance(result.get("current"), dict):
+            current = result["current"]
+            result["current"] = {key: current[key] for key in ("assignee", "start", "end")
+                                 if key in current}
+        return result
+
+    def cards(data):
+        if not isinstance(data, list):
+            raise SatError("SAT returned an unexpected card list")
+        return data
+
+    def firmware(data):
+        if not isinstance(data, dict) or not isinstance(data.get("setups"), dict):
+            raise SatError("SAT returned an unexpected firmware telemetry response")
+        return data["setups"].get(name)
+
+    sections = {
+        "device": read(device_path, device),
+        "cards": read(device_path + "/cards", cards, all_pages=True),
+        "firmware": read("/api/v1/component-update/firmware", firmware),
+    }
+    return {"setup": name, "requested_at": checked_at,
+            "complete": all(section["ok"] for section in sections.values()), **sections}
+
+
+def parser_for():
+    parser = argparse.ArgumentParser(
+        prog="sat",
+        description="Read SAT inventory, allocations, workflow and power status (read-only).",
+        epilog=("Credentials: SAT_TOKEN or ~/.copilot-private/sat/token (0600). "
+                "Pinned SAT certificate: SAT_CA_FILE or ~/.copilot-private/sat/ca.pem. "
+                "TLS verification is always enabled."),
+    )
+    parser.add_argument("--timeout", type=int, default=os.environ.get("SAT_TIMEOUT", "15"),
+                        help="request timeout in seconds (1-60)")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("me", help="show the authenticated SAT user").set_defaults(api_path="/api/v1/me")
+    add_get_parser(commands, "devices", "/api/v1/devices", aliases=("setups", "list"))
+    for name in ("setup", "device"):
+        command = commands.add_parser(name, help="inspect one SAT setup")
+        command.add_argument("name")
+        command.set_defaults(api_path="/api/v1/devices/{name}")
+
+    command = commands.add_parser("details", help="read one setup's inventory, cards and firmware")
+    command.add_argument("name")
+
+    for name, path in (
+        ("allocations", "/api/v1/allocations"),
+        ("workflows", "/api/v1/workflows"),
+        ("workflow-runs", "/api/v1/workflows/runs"),
+        ("pipelines", "/api/v1/pipelines"),
+        ("pipeline-runs", "/api/v1/pipelines/runs"),
+        ("power-actions", "/api/v1/power-actions"),
+        ("power-off-notices", "/api/v1/power-off-notices"),
+    ):
+        add_get_parser(commands, name, path)
+
+    for name, path in (
+        ("allocation", "/api/v1/allocations/{id}"),
+        ("workflow-run", "/api/v1/workflows/runs/{id}"),
+        ("pipeline-run", "/api/v1/pipelines/runs/{id}"),
+    ):
+        command = commands.add_parser(name)
+        command.add_argument("id")
+        command.set_defaults(api_path=path)
+
+    for name, path in (
+        ("power-rows", "/api/v1/devices/{name}/power-rows"),
+        ("power-history", "/api/v1/devices/{name}/power-history"),
+    ):
+        command = commands.add_parser(name)
+        command.add_argument("name")
+        command.set_defaults(api_path=path)
+
+    command = commands.add_parser("get", help="GET a documented /api/v1 path")
+    command.add_argument("path", help="path beginning /api/v1/ (no query string)")
+    add_list_options(command)
+    return parser
+
+
+def command_path(args):
+    if args.command == "get":
+        path = args.path
+        if not path.startswith("/api/v1/") or "?" in path or "#" in path:
+            raise SatError("GET path must start with /api/v1/ and contain no query or fragment")
+        return path
+
+    path = args.api_path
+    for field in ("name", "id"):
+        if hasattr(args, field):
+            path = path.replace("{" + field + "}", quote(getattr(args, field), safe=""))
+    return path
+
+
+def main(argv=None):
+    parser = parser_for()
+    args = parser.parse_args(argv)
+    if not 1 <= args.timeout <= 60:
+        parser.error("--timeout must be between 1 and 60 seconds")
+    token = ""
+    try:
+        params = parse_params(getattr(args, "param", []))
+        if getattr(args, "limit", None) is not None:
+            if not 1 <= args.limit <= MAX_LIMIT:
+                raise SatError("--limit must be between 1 and %d" % MAX_LIMIT)
+            params.append(("limit", str(args.limit)))
+        if getattr(args, "cursor", None):
+            params.append(("cursor", args.cursor))
+
+        token = load_token()
+        base_url = os.environ.get("SAT_URL", DEFAULT_URL)
+        if args.command == "details":
+            payload = setup_details(base_url, token, args.name, args.timeout)
+        else:
+            payload = api_get(base_url, token, command_path(args), params, args.timeout,
+                              getattr(args, "all_pages", False))
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if args.command != "details" or payload["complete"] else 1
+    except SatError as exc:
+        error = str(exc).replace(token, "[REDACTED]") if token else str(exc)
+        print("sat: " + error, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

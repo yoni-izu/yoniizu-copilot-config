@@ -7,8 +7,9 @@ usage: pilot [-t STATION|mctl-target|user@host] [-v] [--json] CMD [ARGS]
   probe                             one-screen summary: alloc, devices+link, setup guess, serial, nfs, bmc, dmesg
   devices                           our devices only (lspci -d 208b: + 1d0f:, via sysfs)
   dmesg [--grep RE] [--tail N] [--since 'HH:MM'|'Mon D HH:MM'] [--save TOPIC]
-  uart ports | capture [PORT] [SECS] [--topic T] | console [OAM] | bmc-ls | bmc-pull (--file F | --oam N) [--topic T]
+  uart ports | capture [PORT] [SECS] [--topic T] | console [OAM] | consoles [--json] | attach ID | bmc-ls | bmc-pull (--file F | --oam N) [--topic T]
   bmc versions | fru [BMC_DC_SCM|EA100_UBB]      (observe-class BMC verbs; password typed by the user)
+  sat <read command...>                 SAT inventory, allocation, workflow and power status
   run 'CMD' [--tail N] [--detach TAG]   status TAG
   ws                                octl workspaces on the host (manifest, version, revision; * = integration)
   exec 'STAR-CMD' [--ws PATH] [--tail N]   cd WS && octl ws exec 'STAR-CMD'; WS defaults to the integration ws (touch-class)
@@ -62,15 +63,15 @@ def load_stations():
         for line in STATIONS.read_text().splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
-            f = (line.split("\t") + [""] * 7)[:7]
-            rows[f[0]] = dict(zip(["station", "host", "type", "bmc", "uart", "notes", "verified"], f))
+            f = (line.split("\t") + [""] * 8)[:8]
+            rows[f[0]] = dict(zip(["station", "host", "type", "bmc", "uart", "notes", "verified", "sat_setup"], f))
     return rows
 
 
 def save_stations(rows):
     STATIONS.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     head = [l for l in STATIONS.read_text().splitlines() if l.startswith("#")] if STATIONS.exists() else []
-    body = ["\t".join(r[k] for k in ["station", "host", "type", "bmc", "uart", "notes", "verified"]) for r in rows.values()]
+    body = ["\t".join(r.get(k, "") for k in ["station", "host", "type", "bmc", "uart", "notes", "verified", "sat_setup"]) for r in rows.values()]
     STATIONS.write_text("\n".join(head + body) + "\n")
 
 
@@ -238,8 +239,52 @@ def uart_location(row, port=None):
     return None, port or "/dev/ttyACM0"
 
 
+BMC_UART_NAMES = {range(0, 8): "OAM %d", range(8, 10): "PCIe SW %d", range(10, 12): "SDB %d"}
+
+
+def uart_consoles(row, station):
+    """Live console endpoints from the registry: [{id, label, port, via, bmc|host}].
+
+    Interactive sessions (BMC obmc-console over ssh -p 22NN, or minicom on a tty);
+    not captures, so the one-reader rule for tty ports is enforced by minicom's lock."""
+    u = ((row or {}).get("uart") or "").strip()
+    out = []
+    if u.startswith("bmc:"):
+        bmc = (row or {}).get("bmc") or ""
+        m = re.fullmatch(r"(\d{4})(?:-(\d{4}))?", u[4:])
+        if not bmc or bmc == "-" or not m:
+            return out
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        for p in range(max(lo, 2200), min(hi, 2211) + 1):
+            n = p - 2200
+            fmt, base = next((f, r.start) for r, f in BMC_UART_NAMES.items() if n in r)
+            out.append({"id": "bmc%d" % p, "label": fmt % (n - base), "port": p, "via": "bmc", "bmc": bmc})
+    elif u and u != "?":
+        other_host, port = uart_location(row)
+        out.append({"id": "tty-" + port.rsplit("/", 1)[-1], "label": port, "port": port, "via": "tty",
+                    "host": other_host or (row or {}).get("host") or ""})
+    return out
+
+
 def cmd_uart(a, host, station, row):
     sub = a.args[0] if a.args else "ports"
+    if sub == "consoles":
+        items = uart_consoles(row, station)
+        if a.json:
+            print(json.dumps({"station": station, "consoles": items,
+                              "hint": "" if items else "no live UART in the registry; set: pilot stations set %s uart=bmc:2200-2207 (or <nuc>:/dev/ttyACM0)" % station}))
+        else:
+            print("\n".join("%-10s %-12s %s" % (c["id"], c["label"], c.get("bmc") or c.get("host")) for c in items)
+                  or "no live UART registered for %s" % station)
+        return
+    if sub == "attach":
+        cid = a.args[1] if len(a.args) > 1 else die("uart attach ID (see: uart consoles)")
+        c = next((c for c in uart_consoles(row, station) if c["id"] == cid), None) or die("unknown console %s for %s" % (cid, station))
+        argv = (["ssh", "-tt", "-p", str(c["port"]), "root@" + c["bmc"]] if c["via"] == "bmc"
+                else ["ssh", "-t", c["host"], "minicom", "-D", c["port"]])
+        print("%s %s — %s (%s)" % (station, c["label"], " ".join(argv),
+                                  "exit ~." if c["via"] == "bmc" else "exit Ctrl-A X"), flush=True)
+        os.execvp(argv[0], argv)
     if sub == "ports":
         rc, out, _ = ssh_text(host, r'''for n in /dev/ttyACM* /dev/ttyUSB*; do [ -e "$n" ] || continue; id=$(ls -l /dev/serial/by-id/ 2>/dev/null | awk -v b="$(basename $n)" '$NF ~ b"$"{print $9}'); sp=$(stty -F "$n" -a 2>/dev/null | grep -oE 'speed [0-9]+' | cut -d" " -f2); printf '%s %s baud=%s %s\n' "$n" "${id:-?}" "${sp:-?}" "$(stat -c %A "$n")"; done; echo "locks: $(ls /var/lock/LCK..tty* /run/lock/LCK..tty* 2>/dev/null | tr '\n' ' ')"; echo "holders: $(pgrep -af '(^|/| )(minicom|screen|picocom|socat|tio)( |$)' | grep -vE 'pgrep|bash -c' | tr '\n' ';')"''')
         print(out.strip() or "no serial nodes on %s" % host)
@@ -285,7 +330,7 @@ def cmd_uart(a, host, station, row):
                                      "-o", "ControlPersist=300", "root@%s:/var/log/%s" % (bmc, f), str(d / ("bmc_" + f))]).returncode
                 print("%s -> %s rc=%d" % (f, d / ("bmc_" + f), rc))
     else:
-        die("uart: ports | capture [PORT] [SECS] | console [OAM] | bmc-ls | bmc-pull")
+        die("uart: ports | capture [PORT] [SECS] | console [OAM] | consoles | attach ID | bmc-ls | bmc-pull")
 
 
 def cmd_bmc(a, host, station, row):
@@ -481,22 +526,67 @@ def cmd_stations(a):
     rows = load_stations()
     if a.args and a.args[0] == "set":
         key = a.args[1] if len(a.args) > 1 else die("stations set STATION k=v ...")
-        r = rows.setdefault(key, dict(station=key, host="?", type="?", bmc="?", uart="?", notes="", verified=""))
+        mapped_host = mctl_target(key) if any(kv.startswith("sat_setup=") for kv in a.args[2:]) else None
+        r = rows.setdefault(key, dict(station=key, host=mapped_host or "?", type="?", bmc="?",
+                                      uart="?", notes="", verified="", sat_setup=""))
         for kv in a.args[2:]:
             k, v = kv.split("=", 1)
             k in r or die("unknown field %s" % k)
+            if k == "sat_setup" and v not in ("", "-") and not re.fullmatch(r"[A-Za-z0-9._-]+", v):
+                die("sat_setup must be a SAT device name; use '-' to clear it")
+            if k == "sat_setup" and v == "-":
+                v = ""
             r[k] = v
         r["verified"] = utc("%Y-%m-%d")
         save_stations(rows)
-        print("updated %s: %s" % (key, "  ".join("%s=%s" % (k, r[k]) for k in ["host", "type", "bmc", "uart"])))
+        print("updated %s: %s" % (key, "  ".join("%s=%s" % (k, r[k]) for k in ["host", "type", "bmc", "uart", "sat_setup"])))
         return
     for r in rows.values():
-        print("%-6s %-7s %-29s bmc=%-17s uart=%-15s %s" % (r["station"], r["type"], r["host"], r["bmc"], r["uart"], r["notes"][:60]))
+        print("%-6s %-7s %-29s bmc=%-17s uart=%-15s sat=%-20s %s" % (
+            r["station"], r["type"], r["host"], r["bmc"], r["uart"], r.get("sat_setup") or "-", r["notes"][:60]))
+
+
+def cmd_sat(a, row=None):
+    local_cli = Path(__file__).resolve().parents[3] / "bin" / "sat"
+    sat_args = list(a.args)
+    if sat_args in (["setup"], ["device"], ["details"]) and getattr(a, "target", None):
+        if row and row.get("sat_setup"):
+            target_host = mctl_target(a.target) if sat_args == ["details"] else None
+            station_host = row.get("host", "")
+            if target_host and ("@" not in station_host or
+                                target_host.rsplit("@", 1)[-1].rstrip(".").lower() !=
+                                station_host.rsplit("@", 1)[-1].rstrip(".").lower()):
+                die("SAT mapping for %s does not match its mctl host; update the station host and mapping"
+                    % a.target)
+            sat_args.append(row["sat_setup"])
+        else:
+            # SAT device names are the mctl target's host name (e.g. SA-DSK61-CSR -> sa-dsk61-csr);
+            # sat_setup is only an override.
+            host = mctl_target(a.target) or (row or {}).get("host", "")
+            name = (host.rsplit("@", 1)[-1].split(".", 1)[0] if "@" in host else a.target).lower()
+            re.fullmatch(r"[a-z0-9._-]+", name) or die(
+                "%s is not a valid SAT device name; set pilot stations set %s sat_setup=<SAT-device-name>"
+                % (name, a.target))
+            sat_args.append(name)
+    argv = ([sys.executable, str(local_cli)] if local_cli.is_file() else ["sat"]) + sat_args
+    try:
+        result = subprocess.run(argv, check=False)
+    except FileNotFoundError:
+        die("SAT CLI is unavailable; install it with ~/.copilot/bin/install.sh")
+    if result.returncode:
+        sys.exit(result.returncode)
 
 
 # ---------------------------------------------------------------- main
 def main():
     global VERBOSE
+    raw_args = sys.argv[1:]
+    sat_index = 2 if len(raw_args) >= 3 and raw_args[0] in ("-t", "--target") else 0
+    if len(raw_args) > sat_index and raw_args[sat_index] == "sat":
+        row = resolve(raw_args[1])[2] if sat_index == 2 else None
+        target = raw_args[1] if sat_index == 2 else None
+        return cmd_sat(argparse.Namespace(args=raw_args[sat_index + 1:], target=target), row)
+
     ap = argparse.ArgumentParser(prog="pilot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-t", "--target")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -518,6 +608,8 @@ def main():
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     VERBOSE = a.verbose
+    if a.cmd == "sat":
+        return cmd_sat(a)
     if a.cmd == "stations":
         return cmd_stations(a)
     if a.cmd == "pitfall":

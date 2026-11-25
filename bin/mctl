@@ -32,6 +32,7 @@
 #
 # Usage:
 #   mctl targets                       List configured targets
+#   mctl sat <SAT read command...>     Read SAT inventory and operation status
 #   mctl target add <name> <user@host> Register a remote (kind=remote) machine
 #   mctl dest                          Print the target's ssh destination ([user@]host)
 #   mctl target add <name> --vm [user] [instance-id]
@@ -2254,6 +2255,12 @@ main() {
   # Registry/lifecycle commands that don't need a live connection first.
   case "$sub" in
     targets)       cmd_targets "$@"; return ;;
+    sat)
+      local sat_cli
+      sat_cli="$(dirname "$(readlink -f "$0")")/sat"
+      [[ -x "$sat_cli" ]] || die "SAT CLI is missing: $sat_cli"
+      exec "$sat_cli" "$@"
+      ;;
     target)        cmd_target "$@"; return ;;
     use)           cmd_use "$@"; return ;;
     vm)            cmd_vm "$@"; return ;;

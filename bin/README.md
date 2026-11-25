@@ -11,6 +11,7 @@ is unclear.
 | `wip`, `wip-deploy` | Multi-repo workspace operations and remote installation |
 | `mctl`, `vmctl`, `setup_machine.sh` | Machine delegation and compatibility helpers |
 | `lsctl`, `bmcjob` | Local lab console and BMC job clients |
+| `sat` | Read-only client for SAT inventory, allocation, workflow and power status APIs |
 | `fw-deploy` | Launcher for `skills/fw-deploy/scripts/fw_deploy.py` |
 
 The local `bmcjob` client is different from the BMC-side script in

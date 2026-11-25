@@ -15,6 +15,7 @@ FILES=(
 	"bin/lsctl:lsctl"
 	"bin/bmcjob:bmcjob"
 	"bin/fw-deploy:fw-deploy"
+	"bin/sat:sat"
 	"bin/cli-local-config.sh:cli-local-config.sh"
 	"bin/completions/wip.bash:completions/wip.bash"
 )

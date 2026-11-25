@@ -1,7 +1,7 @@
 ---
 name: machine-pilot
-description: "Pilot lab stations via the `pilot` CLI: log into lab hosts and BMCs, identify devices, classify the setup, run commands/tests, collect dmesg and UART, and navigate lab NFS. Use when: pilot a lab station, identify its setup or devices, collect host/UART evidence, run an approved test, check allocation, or review lab pitfalls. Flashing→fw-flasher, NFS publish→fw-deploy, root cause→bug-triage."
-argument-hint: "<station|host> and the action — probe | devices | dmesg | uart … | run '<cmd>' | nfs … | evidence <topic> | memoir | pitfall"
+description: "Pilot lab stations via the `pilot` CLI: log into lab hosts and BMCs, identify devices, classify the setup, run commands/tests, collect dmesg and UART, navigate lab NFS, and query SAT inventory/allocation status. Use when: pilot a lab station, identify its setup or devices, collect host/UART evidence, run an approved test, check SAT allocation, or review lab pitfalls. Flashing→fw-flasher, NFS publish→fw-deploy, root cause→bug-triage."
+argument-hint: "<station|host> and the action — probe | devices | dmesg | uart … | sat <read command> | run '<cmd>' | nfs … | evidence <topic> | memoir | pitfall"
 ---
 
 > **Portal handoff:** For Team Portal/dashboard questions, feature requests,
@@ -25,7 +25,9 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
 
 1. `rtk proxy pilot stations` — the private registry
    (`~/.copilot-private/skills/machine-pilot/references/stations.tsv`):
-   host, declared type, BMC, UART path, notes. `pilot stations set <st> k=v` to fix it.
+   host, declared type, BMC, UART path, notes. `pilot stations set <st> k=v` to fix it;
+   optionally override the SAT setup name (defaults to the mctl target's host name, lowercased) with `sat_setup=<SAT-device-name>`.
+   SAT inventory and allocation lookups: `pilot sat devices` and `pilot sat allocations`.
 2. `~/.copilot-private/skills/machine-pilot/references/memoir.md` — only the `### <station>` section you fly.
 3. `~/.copilot-private/skills/machine-pilot/references/pitfalls.md` — skim headings; read the theme you touch.
 4. Cookbooks on demand: `~/.copilot-private/skills/machine-pilot/references/setups.md`
@@ -39,6 +41,9 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
 - **Allocation first.** `probe` shows `alloc=<user>` from `/etc/motd` (SAT). Allocated to
   someone else → observe-only unless the user says go. A `holders=` entry (someone's
   `fw_ctl`/`minicom`/test) means the device is in use — same rule.
+  When SAT credentials are configured, use `pilot sat allocations` to cross-check
+  current reservations. An API error or inaccessible setup means ownership is
+  unverified, not free.
 - **Action classes:** *observe* (`probe devices dmesg uart ports|capture nfs bmc versions|fru`)
   is free; *touch* (writing on NFS, `run` of anything that changes state, sending UART input,
   detached jobs) needs approval; *disturb* (reset, power/48 V cycle, mux GPIOs, flash/stream)
@@ -84,7 +89,7 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
 |---|---|
 | 0 Ground | `pilot stations`; memoir section; pitfalls headings. `pilot -t <st> session open <topic>` for non-trivial work. |
 | 1 Probe | `pilot -t <st> probe` → host, alloc, `k/8` devices with link health (`!` = degraded/untrained), setup guess, serial, holders, NFS, BMC names, dmesg hits. Compare guess vs declared type; a mismatch or a missing OAM is a finding. |
-| 2 Act | `devices` · `dmesg [--since HH:MM] [--grep RE] [--tail N] [--save T]` · `uart ports\|capture [PORT] [SECS]\|console [OAM]\|bmc-ls\|bmc-pull` · `bmc versions\|fru` · `run '<cmd>' [--detach TAG]` / `status TAG` · `ws` / `exec '<star-cmd>' [--ws P]` · `nfs deployments\|notes\|hash\|ls`. Start a UART capture **before** the event you want to see. |
+| 2 Act | `devices` · `dmesg [--since HH:MM] [--grep RE] [--tail N] [--save T]` · `uart ports\|capture [PORT] [SECS]\|console [OAM]\|consoles [--json]\|attach ID\|bmc-ls\|bmc-pull` · `bmc versions\|fru` · `run '<cmd>' [--detach TAG]` / `status TAG` · `ws` / `exec '<star-cmd>' [--ws P]` · `nfs deployments\|notes\|hash\|ls`. Start a UART capture **before** the event you want to see. |
 | 2b Tray fan-out | Same shell command on every OAM: `oam_exec [-d "0 3 5"] '<cmd>' ['<cmd>'…]` → one `oam<N>.txt` per device + `_meta.txt`; marks `-- SILENT` devices and prints the reset to fix them. Wrap in `job` for anything slow. ([detached-ops.md](./references/detached-ops.md)) |
 | 3 Evidence | `pilot -t <st> evidence <topic> [--bmc] [--oam N] [--tty PORT --secs S]` → prints the dir + sizes. |
 | 4 Report | station · type (declared/observed) · `k/8` + BDFs/vid/link · driver state · what ran + rc · evidence path · anomalies · *observed* vs *inferred* · suggested next skill. |
@@ -96,3 +101,29 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
 NFS) · `bug-triage` (root-cause from the evidence dir) · `vm-delegate` (`mctl` targets, mirror
 workspaces, `mctl test`) · `build-fw` · `pldm` (emulation, not lab) · `iridium-prj`,
 `pcie-ep-ip`, `su-ip`, `csr-bot`, `ras-manageability` (what a reading *means*).
+
+### SAT-backed inventory and ownership
+
+Install the shared `sat` CLI with `~/.copilot/bin/install.sh`. Read-only queries
+are available as `pilot sat <sat-command>` or `mctl sat <sat-command>`; for
+example, `pilot sat devices --param state=alloc-available` and `pilot sat
+allocations`. `pilot sat setup <name>` retrieves one setup. SAT uses a personal
+API token from `SAT_TOKEN` or `~/.copilot-private/sat/token` (mode `0600`);
+TLS verification stays enabled. The API identifies the token owner and enforces
+that user's SAT permissions.
+
+SAT device names are the `mctl` target's host name, lowercased without a
+domain (target `dsk61` → host `SA-DSK61-CSR` → SAT `sa-dsk61-csr`), so
+`pilot -t <target> sat setup` and `pilot -t <target> sat details` need no mapping; an explicit name always takes
+precedence. For exceptions only, override with
+`pilot stations set <station> sat_setup=<SAT-device-name>`; a newly overridden
+mctl target inherits its registered host, and if an existing station host
+differs from the mctl host, `sat details` refuses the mismatch until corrected.
+The portal uses this same read-only details command for the selected lab machine.
+
+Use the API's allocation data alongside the host's probe before touching a
+station. A SAT lookup failure or inaccessible setup is **unknown ownership**,
+not evidence that the station is free; do not infer availability from an empty
+or stale result. The CLI currently performs GET requests only. Allocate/release,
+workflow launches and power actions remain in the SAT UI until their request
+schemas and confirmation rules are verified.
