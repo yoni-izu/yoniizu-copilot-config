@@ -2,9 +2,10 @@
 
 Verified 2026-11-25 against the software workspace at
 `/home/yoniizu/projects/iridium/three/fw`. This note contains software facts
-only, not HDL excerpts or an assertion of hardware delivery.
+and explicitly attributed, source-free Neo findings, not HDL excerpts or an
+assertion of hardware delivery.
 
-## Addressing blocker
+## Addressing correction (implemented)
 
 Do not promote the existing SV helper's address expression into production.
 
@@ -26,12 +27,12 @@ Do not promote the existing SV helper's address expression into production.
   control base plus the register offset. Existing SV code is therefore not
   sufficient addressing evidence for a new production operation.
 
-The existing PIW device does not expose the MSI-X control-fabric gateway as a
-named register range: see `proj_infra/soc/dts/a1/a1_hsi.dtsi:2659-2681`,
-`proj_infra/soc/dts/a2/a2_hsi.dtsi:53-89`, and the config initializer in
-`ip/pcie/ep/drivers/el_piw/el_piw.c:2548-2561`.
-Correct project-agnostic production wiring needs a DT-provided gateway mapping,
-not a hardcoded displacement or a dependency on another device's mailbox.
+The user explicitly approved extending the original EP-only scope to the
+PCIe binding/configuration and A1/A2 project DTS mapping. Both host PIW nodes
+now expose the gateway instance as the optional `msix_gw_regs` named range;
+the PIW config initializer derives its address and `has_msix_gw` capability
+from DT. Older configurations without this range return `-ENOTSUP`.
+There is no hardcoded displacement or dependency on another device's mailbox.
 
 ## Encoding and success contract
 
@@ -47,17 +48,61 @@ not a hardcoded displacement or a dependency on another device's mailbox.
   `a2/1_4_0_1p4_1047`. Each exposes the generated gateway offset and DWC
   doorbell field aliases. No generated source was hand-edited.
 - `ip/pcie/ep/include/el_pcie.h:29-41` makes register writes through a
-  void-returning helper. A future trigger API can promise that a write was
+  void-returning helper. The trigger API promises that a write was
   issued, not bus-error detection or interrupt delivery.
+
+## Neo hardware evidence and limitations
+
+Source-free Neo follow-ups on 2026-11-25 confirmed:
+
+- The gateway uses only vector bits 10:0, not the controller doorbell's
+  PF/VF payload fields. VF-active comes from control AWUSER metadata bit 7.
+- The configured PF count is one, so the gateway selects PF0. An aligned
+  32-bit write at gateway offset zero supplies the low vector bits.
+- The gateway's MSI-X enable, vector-index mask, security policy and
+  coalescing remain platform prerequisites, not trigger-API setup.
+
+Evidence: `ip.pcie.rtl`, `piw_macro/rtl/msix_gw_handler.v`
+(`msix_gw_handler`, A1 `iridium` 3afb411, lines 241, 291-301, 394;
+A2 98f0e9f0, lines 244, 294-304, 399);
+`piw_macro/rtl/piw_pkg.v` (`msix_ctrl_wdata_t`, A1 lines 142-144,
+A2 lines 145-147); `piw_macro/rtl/piw_lbw_ctrl.v`
+(A1 lines 2287-2293); `global_defines.v` (`EL_N_PF`, A1 line 57,
+A2 line 73). The first handler query used A1 mirror HEAD d5be1ef7;
+the follow-up explicitly checked A1's frozen `iridium` ref instead.
+
+Neo traced the CM7 source metadata as zero by default, unless per-region
+attribute overrides change it (`ip.armcpu.rtl`, `cpu_addr_extnd.v`,
+A1 `iridium` 588c20e lines 282-289, A2 de913df lines 295-299).
+It did **not** complete the ELBI, PTuC/MuC or intervening FIU-override trace.
+Do not treat those upstream paths as independently verified. The API requires
+normal VF-inactive firmware transaction metadata and does not change it.
+A2 mirror evidence was from the 2026-11-22 snapshot, without refresh.
 
 ## Implementation status
 
-The proposed vector-only host-EP/PF0 production API was not implemented during
-this verification. The approved plan's SV-derived addressing premise failed
-verification before firmware edits. The requested EP-worktree-only scope does
-not include the project DTS mapping needed for a correct implementation.
+Implemented in the approved workspace, uncommitted:
 
-Revalidate routing and transaction metadata through Neo before implementation;
-do not infer effective PF/VF selection from the controller's payload fields
-alone. No firmware builds, firmware tests, or hardware delivery checks were
-run.
+- Public syscall/dispatch contract: `ip/pcie/ep/include/el_pcie_ep.h`.
+- Endpoint-to-PIW production dispatch:
+  `ip/pcie/ep/drivers/el_pcie_ep/el_pcie_ep_msix.c`.
+- Ownership-gated PIW operation: `ip/pcie/ep/include/el_piw_api.h`;
+  single-write implementation: `ip/pcie/ep/drivers/el_piw/el_piw_msix.c`.
+- Optional binding: `ip/pcie/ep/dts/bindings/pcie_ep/el,pcie-ep-piw.yaml`.
+- Project mappings: `proj_infra/soc/dts/{a1/a1_hsi,a2/a2_hsi}.dtsi`.
+- Focused behavioral coverage: `ip/pcie/ep/drivers/el_pcie_ep/tests/test.c`,
+  compiling the actual operation sources with test-only host/I/O seams.
+- Contract and CI requirements: `ip/pcie/ep/docs/msix-trigger.md`.
+
+The API enforces existing ownership, rejects unencodable vectors rather than
+truncating, targets only the host PIW, and issues one write without reading,
+polling, waiting, configuring MSI-X or changing masks/security/coalescing.
+The general SV helpers remain unchanged.
+
+Static architecture checks found no new errors/warnings (92 existing
+conditional-compilation findings in edited legacy headers/sources remain
+unchanged). Worktree checkpatch, clang-format, whitespace and Zephyr binding
+validation passed. The read-only firmware review's sole CMake source-list
+formatting finding was corrected. No firmware builds, firmware tests, VM
+builds, or hardware delivery checks were run; CI must compile and exercise
+the supported CSR selections before runtime verification is claimed.
