@@ -2,7 +2,7 @@
 """fw-flash: discover flash paths on a lab machine and flash an image onto its OAMs.
 
 Every machine is an mctl target (``mctl -t T dest`` for the host, ``mctl -t T bmc``
-for its BMC). Four delivery methods, each verified by READ-BACK, never by exit code:
+for its BMC). Delivery methods use READ-BACK, not the write tool's exit code:
 
 * ``bmc``      ``bmccli flash update`` on the tray BMC (queued in the orchestrator
                daemon); progress is the daemon's ``journalctl -u orchestrator``;
@@ -12,6 +12,8 @@ for its BMC). Four delivery methods, each verified by READ-BACK, never by exit c
 * ``spi-ftdi`` ``fw_ctl flash write --transport ftdi-spi`` on the host.
 * ``spi-bmc``  ``fwloader -m flash -d /dev/mtd/soc-nv-flash`` on the BMC; read-back
                is a flash dump compared (SHA-256 over the image length) with the image.
+* ``redfish``  A1 whole-tray OEM upload + UpdateA1 over verified HTTPS (CLI only).
+               Reports written, not verified, until a separate boot check.
 
 ``discover`` is read-only. ``run`` prints a human log on stdout (the job log the
 portal shows, including every orchestrator journal line) and, with ``--events``,
@@ -25,23 +27,29 @@ completion evidence is ``unverified``, never a false success.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import http.client
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 METHODS = ("bmc", "pcie", "spi-ftdi", "spi-bmc")
+CLI_METHODS = (*METHODS, "redfish")
 METHOD_LABELS = {"bmc": "BMC (bmccli flash update)", "pcie": "PCIe (fw_ctl)",
-                 "spi-ftdi": "SPI over FTDI (fw_ctl)", "spi-bmc": "SPI from the BMC (fwloader MTD)"}
+                 "spi-ftdi": "SPI over FTDI (fw_ctl)", "spi-bmc": "SPI from the BMC (fwloader MTD)",
+                 "redfish": "Redfish (A1 whole tray)"}
 FW_CTL_DIR = "/opt/atl/fw/scripts"
 FW_CTL_SETUP = FW_CTL_DIR + "/fw_ctl/setup_fw_ctl_env.sh"
 BMC_MTD = "/dev/mtd/soc-nv-flash"
@@ -56,10 +64,28 @@ FLASHY_RE = re.compile(r"flash|nor|update|program|fwu|erase|write|fpt", re.I)
 TIMEOUT = 30 * 60
 POLL = float(os.environ.get("FW_FLASH_POLL", "3"))
 WRITTEN = ("written",)
+REDFISH_TASKS = "/redfish/v1/TaskService/Tasks"
+REDFISH_INVENTORY = "/redfish/v1/UpdateService/FirmwareInventory"
+REDFISH_CHASSIS = "/redfish/v1/Chassis"
+REDFISH_UPLOAD = "/redfish/v1/UpdateService/Oem/EL/FirmwareUpload/A1"
+REDFISH_UPDATE = "/redfish/v1/UpdateService/Actions/Oem/ELUpdateService.UpdateA1"
+REDFISH_IMAGE = "/tmp/a1_update.img"
+REDFISH_LOCK = "/tmp/fw-flash-redfish.lock"
+REDFISH_TASK_ID = r"(?:(?:OAM_)?(?:TASK_)?\d+)"
+REDFISH_TERMINAL = {"Completed", "Exception", "Killed", "Cancelled", "Canceled",
+                    "Interrupted"}
+REDFISH_WRITTEN = re.compile(r"\[spi_flash:\d+\].*\bflash (?:update|write|programming) "
+                             r"(?:done|completed|succeeded|successful)\b", re.I)
 
 
 class FlashError(Exception):
     pass
+
+
+class RedfishHTTPError(FlashError):
+    def __init__(self, method: str, path: str, status: int):
+        super().__init__(f"Redfish {method} {path}: HTTP {status}")
+        self.status = status
 
 
 class Cancelled(Exception):
@@ -100,6 +126,130 @@ def host_sh(target, script, dest=None, **kw):
     dest = dest or host_dest(target)
     return sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
                "-o", "ServerAliveInterval=15", dest, script], **kw)
+
+
+def redfish_host(target: str) -> str:
+    rc, out, err = sh([mctl(), "targets"], timeout=30)
+    if rc:
+        raise FlashError(f"cannot read the mctl target registry ({_last_error(err, rc)})")
+    for line in out.splitlines():
+        row = line.lstrip("* ").split()
+        if len(row) == 5 and row[:2] == [target, "remote"]:
+            host = row[4].rsplit("@", 1)[-1]
+            if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]*", host):
+                return host
+    raise FlashError("Redfish requires a registered mctl target name with a BMC hostname")
+
+
+class Redfish:
+    def __init__(self, host: str, ca: str | None):
+        user, password = os.environ.get("BMC_USER"), os.environ.get("BMC_PASSWORD")
+        if not user or not password or ":" in user:
+            raise FlashError("set BMC_USER and BMC_PASSWORD from the approved credential store")
+        self.host = host
+        self.auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        try:
+            self.context = ssl.create_default_context()
+            if ca:
+                self.context.load_verify_locations(cafile=Path(ca).expanduser())
+        except OSError as e:
+            raise FlashError(f"cannot load Redfish TLS trust: {e}") from e
+
+    def request(self, method, path, *, body=None, headers=None, timeout=30):
+        conn = http.client.HTTPSConnection(self.host, context=self.context, timeout=timeout)
+        try:
+            conn.request(method, path, body=body, headers={
+                "Authorization": self.auth, "Accept": "application/json", **(headers or {})})
+            resp = conn.getresponse()
+            if not 200 <= resp.status < 300:
+                raise RedfishHTTPError(method, path, resp.status)
+            raw, location = resp.read(), resp.getheader("Location")
+        except (OSError, http.client.HTTPException) as e:
+            raise FlashError(f"Redfish {method} {path}: {e}") from e
+        finally:
+            conn.close()
+        # A successful action can return no JSON; locate its task via TaskService.
+        try:
+            data = json.loads(raw) if raw.strip() else None
+        except (ValueError, UnicodeError):
+            data = None
+        if method == "GET" and not isinstance(data, dict):
+            raise FlashError(f"Redfish GET {path}: expected a JSON object")
+        return data, location
+
+    def members(self, path, *, timeout=30):
+        body, _ = self.request("GET", path, timeout=timeout)
+        rows = body.get("Members")
+        if (not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows)
+                or body.get("Members@odata.nextLink") or body.get("@odata.nextLink")
+                or body.get("Members@odata.count", len(rows)) != len(rows)):
+            raise FlashError(f"Redfish {path}: incomplete or invalid collection")
+        return rows
+
+    @staticmethod
+    def member_name(row):
+        ref = row.get("@odata.id")
+        return ref.rstrip("/").rsplit("/", 1)[-1] if isinstance(ref, str) else ""
+
+    def slots(self) -> set[int]:
+        fitted = {}
+        for row in self.members(REDFISH_INVENTORY):
+            name = self.member_name(row)
+            match = re.fullmatch(r"OAM(\d*)_XDPE0", name, re.I)
+            if not match:
+                continue
+            idx = int(match[1] or "0")
+            if idx in fitted:
+                raise FlashError(f"Redfish inventory repeated OAM {idx}")
+            if "Version" not in row:
+                row, _ = self.request("GET", f"{REDFISH_INVENTORY}/{name}")
+            version = row.get("Version")
+            if not isinstance(version, str) or not version.strip():
+                raise FlashError(f"Redfish inventory has no VR version for OAM {idx}")
+            fitted[idx] = version.strip().upper() not in ("NA", "N/A")
+        if fitted:
+            return {idx for idx, present in fitted.items() if present}
+        return {int(match[1]) for row in self.members(REDFISH_CHASSIS)
+                if (match := re.fullmatch(r"OAM_(\d+)", self.member_name(row), re.I))}
+
+    def task_ids(self, *, timeout=30) -> set[str]:
+        ids = {self.member_name(row) for row in self.members(REDFISH_TASKS, timeout=timeout)}
+        if any(not re.fullmatch(REDFISH_TASK_ID, tid, re.I) for tid in ids):
+            raise FlashError("Redfish task queue returned an unrecognized task ID")
+        return ids
+
+    def task(self, tid, *, timeout=30):
+        body, _ = self.request("GET", f"{REDFISH_TASKS}/{tid}", timeout=timeout)
+        return body
+
+    def idle_tasks(self) -> set[str]:
+        ids = self.task_ids()
+        for tid in sorted(ids, key=lambda x: int(x.rsplit("_", 1)[-1]), reverse=True):
+            state = self.task(tid).get("TaskState")
+            if not isinstance(state, str) or state not in REDFISH_TERMINAL:
+                raise FlashError(f"Redfish task queue not idle: {tid} ({state})")
+        return ids
+
+    def returned_task(self, body, location, before) -> str | None:
+        refs = [location, body.get("@odata.id") if isinstance(body, dict) else None]
+        found = set()
+        for ref in refs:
+            if not isinstance(ref, str) or not ref:
+                continue
+            try:
+                url = urlsplit(ref)
+            except ValueError as e:
+                raise FlashError("invalid Redfish task reference") from e
+            host = self.host.lower()
+            if (url.scheme or url.netloc) and (
+                    url.scheme != "https" or url.netloc.lower() not in (host, f"{host}:443")):
+                raise FlashError("Redfish returned a task reference outside the registered BMC")
+            match = re.fullmatch(rf"{REDFISH_TASKS}/({REDFISH_TASK_ID})/?", url.path, re.I)
+            if match:
+                found.add(match[1])
+        if len(found) > 1 or found & before:
+            raise FlashError("Redfish returned conflicting or pre-existing task references")
+        return next(iter(found), None)
 
 
 # ----------------------------------------------------------------- parsing
@@ -357,15 +507,20 @@ class JournalFollower:
 
     def stop(self, grace: float = 2.0):
         time.sleep(grace)                       # let the tail of the journal arrive
-        if self.proc and self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        if self.proc:
+            if self.proc.poll() is None:
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+            self.thread.join(timeout=2)
+            if not self.thread.is_alive():
+                self.proc.stdout.close()
 
 
 class Runner:
@@ -373,7 +528,7 @@ class Runner:
         self.a, self.rep = args, rep
         self.target = args.target
         self.image = Path(args.image).expanduser().resolve()
-        self.oams = sorted(set(args.oams))
+        self.oams = sorted(set(args.oams or ()))
         self.job = re.sub(r"[^A-Za-z0-9_.-]", "_", args.job_id or time.strftime("%Y%m%d-%H%M%S"))
         self.expected = self.sha = ""
         self.size = 0
@@ -405,7 +560,10 @@ class Runner:
         if self.a.sha256 and self.sha != self.a.sha256.lower():
             raise FlashError(f"image SHA-256 {self.sha} != expected {self.a.sha256}")
         self.size = self.image.stat().st_size
-        self.expected = self.a.expect or image_version(self.image)
+        stamped = image_version(self.image) if self.a.method == "redfish" or not self.a.expect else ""
+        if self.a.method == "redfish" and (not stamped or (self.a.expect and self.a.expect != stamped)):
+            raise FlashError("Redfish requires an embedded build ID matching any supplied --expect")
+        self.expected = self.a.expect or stamped
         self.rep.say(f"size {self.size} bytes, sha256 {self.sha}")
         if not self.expected:
             raise FlashError("no build ID (X.Y.Z-DDMMYYYY-HHMMSS) found in the image; "
@@ -414,9 +572,10 @@ class Runner:
         self.rep.emit("image", sha256=self.sha, size=self.size, expected=self.expected,
                       path=str(self.image))
 
-    def preflight_bmc(self, required=True):
+    def preflight_bmc(self, required=True, info=None):
         self.rep.step("preflight", "BMC: device state and current build per OAM")
-        info = probe_bmc(self.target)
+        if info is None:
+            info = probe_bmc(self.target)
         if not info.get("ok"):
             if required:
                 raise FlashError(f"BMC: {info.get('error')}")
@@ -427,11 +586,15 @@ class Runner:
             o = known.get(i)
             if o is None:
                 raise FlashError(f"OAM {i} is not reported by the BMC (known: {sorted(known)})")
+            state = o.get("state", "")
             self.result[i]["before"] = o.get("build", "")
-            self.mark(i, "ready", f"state {o.get('state') or '?'}, build {o.get('build') or '?'}",
+            self.mark(i, "ready", f"state {state or '?'}, build {o.get('build') or '?'}",
                       before=o.get("build", ""))
-            if o.get("state") not in ("READY", "") and not self.a.force:
-                raise FlashError(f"OAM {i} is {o.get('state')}, not READY (flash-idle); "
+            if self.a.method in ("bmc", "redfish") and state == "INIT_FAILED":
+                self.rep.say(f"OAM {i}: warning: INIT_FAILED (BMC init incomplete); "
+                             "verifying the actual flash result", oam=i)
+            elif state not in ("READY", "") and not self.a.force:
+                raise FlashError(f"OAM {i} is {state}, not READY (flash-idle); "
                                  "re-run with --force to override")
         return info
 
@@ -453,20 +616,25 @@ class Runner:
         self.rep.emit("upload", pct=100)
         return rimg
 
-    def readback_bmc(self) -> dict[int, list[str]]:
+    def live_fpt_builds(self, i: int) -> tuple[list[str], str]:
+        rc, text, _ = bmc_sh(self.target, f"bmccli flash version -f -d {i} 2>&1", timeout=120)
+        return (parse_dev_kv(text).get(i, {}).get("builds", []) if rc == 0 else []), text
+
+    def readback_bmc(self, *, require_three=False) -> dict[int, list[str]]:
         out = {}
         for i in self.oams:
             if self.result[i]["state"] == "failed":
                 continue
             text = ""
             for attempt in range(1, 11):
-                rc, text, _ = bmc_sh(self.target, f"bmccli flash version -f -d {i} 2>&1", timeout=120)
-                if rc == 0 and "build=" in text:
+                builds, text = self.live_fpt_builds(i)
+                if builds and (not require_three or len(builds) >= 3):
                     break
                 self.rep.say(f"OAM {i}: live read-back not ready ({text.strip()[:120]}); "
                              f"retry {attempt}/10")
-                time.sleep(POLL * 2)
-            out[i] = parse_dev_kv(text).get(i, {}).get("builds", [])
+                if attempt < 10:
+                    time.sleep(POLL * 2)
+            out[i] = builds
             self.rep.say(f"OAM {i}: read-back (live, -f) builds {out[i] or '[none]'}")
         return out
 
@@ -515,6 +683,164 @@ class Runner:
         for i in pending:
             self.mark(i, "failed", "did not return to READY within 600s after reset")
 
+    # ---- method: redfish (A1 whole tray)
+    def preflight_redfish(self, client: Redfish):
+        info = probe_bmc(self.target)
+        if not info.get("ok"):
+            raise FlashError(f"BMC: {info.get('error')}")
+        shell_slots = {o["index"] for o in info["oams"] if o.get("state")}
+        slots = client.slots()
+        if shell_slots != slots or len(slots) != self.a.expect_oams:
+            raise FlashError(f"whole-tray inventory mismatch: expected {self.a.expect_oams}, "
+                             f"Redfish {sorted(slots)}, BMC shell {sorted(shell_slots)}")
+        self.oams = sorted(slots)
+        self.result = {i: {"state": "pending"} for i in self.oams}
+        self.preflight_bmc(info=info)
+
+    def wait_redfish(self, client: Redfish, tid: str | None, before: set[str], deadline: float):
+        discover_until = min(deadline, time.monotonic() + 10)
+        while tid is None and (remaining := discover_until - time.monotonic()) > 0:
+            candidates, unresolved = [], False
+            for i in client.task_ids(timeout=remaining) - before:
+                remaining = discover_until - time.monotonic()
+                if remaining <= 0:
+                    unresolved = True
+                    break
+                try:
+                    if client.task(i, timeout=remaining).get("Name") == "UpdateA1":
+                        candidates.append(i)
+                except RedfishHTTPError as e:
+                    if e.status != 404:
+                        raise
+                    unresolved = True
+            if len(candidates) > 1:
+                raise FlashError("multiple new UpdateA1 tasks; cannot identify this update")
+            if candidates and not unresolved:
+                tid = candidates[0]
+            else:
+                time.sleep(min(POLL, max(0, discover_until - time.monotonic())))
+        if tid is None:
+            raise FlashError("UpdateA1 accepted but its task could not be identified")
+        last, missing_since = None, None
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                task = client.task(tid, timeout=min(30, remaining))
+            except RedfishHTTPError as e:
+                if e.status != 404:
+                    raise
+                if missing_since is None:
+                    missing_since = time.monotonic()
+                if time.monotonic() - missing_since >= 30:
+                    raise
+            else:
+                missing_since = None
+                if task.get("Name") not in (None, "UpdateA1"):
+                    raise FlashError(f"Redfish task {tid} is not UpdateA1")
+                state, pct, status = (task.get(k) for k in ("TaskState", "PercentComplete", "TaskStatus"))
+                if (state, pct, status) != last:
+                    self.rep.say(f"Redfish task {tid}: {state}, progress {pct}, status {status}")
+                    last = state, pct, status
+                if isinstance(state, str) and state in REDFISH_TERMINAL:
+                    return tid, state, status
+            time.sleep(min(POLL, max(0, deadline - time.monotonic())))
+        raise FlashError(f"Redfish UpdateA1 task {tid} did not finish within {self.a.timeout}s")
+
+    def verify_redfish(self, prior, journal):
+        self.rep.step("verify", "all three live FPT copies on every OAM must match the image")
+        completed, failures = set(), {}
+        for i, kind, line, _ in journal:
+            if kind == "fail":
+                failures[i] = line[-200:]
+            elif kind == "done" and REDFISH_WRITTEN.search(line) and not re.search(
+                    r"\b(?:skip(?:ped)?|no[- ]op|no (?:changes?|updates?|writes?)"
+                    r"(?: needed| required)?)\b", line, re.I):
+                completed.add(i)
+        expected = [self.expected] * 3
+        for i, builds in self.readback_bmc(require_three=True).items():
+            if i in failures:
+                self.mark(i, "failed", failures[i], after=",".join(builds))
+            elif builds != expected:
+                self.mark(i, "failed", f"three matching FPT copies required; got {builds}",
+                          after=",".join(builds))
+            elif i in completed or (len(prior[i]) == 3 and len(set(prior[i])) == 1
+                                     and prior[i] != expected):
+                self.mark(i, "written", f"three FPT copies match {self.expected}; boot not verified",
+                          pct=100, after=self.expected, reason="boot not verified")
+            else:
+                self.mark(i, "unverified", "FPTs match, but no per-OAM write evidence was observed",
+                          after=self.expected, reason="no per-OAM write evidence")
+
+    def run_redfish(self):
+        host = redfish_host(self.target)
+        client = Redfish(host, self.a.redfish_ca)
+        self.preflight_redfish(client)
+        self.rep.say(f"Redfish {host}: whole-tray scope, OAMs {self.oams}")
+        client.idle_tasks()
+        rc, _, err = bmc_sh(self.target, f"mkdir -m 700 {REDFISH_LOCK}", timeout=30)
+        if rc:
+            raise FlashError(f"cannot acquire Redfish staging lock {REDFISH_LOCK} "
+                             f"({_last_error(err, rc)})")
+        uncertain = False
+        try:
+            client.idle_tasks()
+            prior = {i: self.live_fpt_builds(i)[0] for i in self.oams}
+            for i, builds in prior.items():
+                consistent = len(builds) == 3 and len(set(builds)) == 1
+                self.result[i]["before"] = builds[0] if consistent else ""
+            self.rep.step("upload", f"{self.image.name} -> {host}:{REDFISH_IMAGE}")
+            try:
+                with self.image.open("rb") as image:
+                    uncertain = True
+                    client.request("POST", REDFISH_UPLOAD, body=image, timeout=600, headers={
+                        "Content-Type": "application/octet-stream", "Content-Length": str(self.size)})
+                    uncertain = False
+            except OSError as e:
+                raise FlashError(f"cannot open or read image {self.image}: {e}") from e
+            follower = JournalFollower(self.target, self.rep)
+            follower.start()
+            try:
+                before = client.idle_tasks()
+                if redfish_host(self.target).lower() != host.lower():
+                    raise FlashError("the mctl BMC registration changed during staging")
+                rc, out, err = bmc_sh(self.target, f"sha256sum {REDFISH_IMAGE}", timeout=120)
+                tokens = out.split()
+                got = tokens[0] if tokens else ""
+                if rc:
+                    raise FlashError(f"cannot read Redfish staged image SHA-256 ({_last_error(err, rc)})")
+                if got != self.sha:
+                    raise FlashError(f"Redfish staged image SHA-256 {got or '?'} != {self.sha}")
+                self.rep.emit("upload", pct=100)
+                follower.drain()
+                self.writing = uncertain = True
+                self.rep.step("write", "Redfish UpdateA1 (all OAMs)")
+                deadline = time.monotonic() + self.a.timeout
+                body, location = client.request("POST", REDFISH_UPDATE, body=b"{}", headers={
+                    "Content-Type": "application/json"}, timeout=min(30, self.a.timeout))
+                for i in self.oams:
+                    self.mark(i, "queued", "Redfish accepted the whole-tray update", pct=0)
+                tid, state, status = self.wait_redfish(
+                    client, client.returned_task(body, location, before), before, deadline)
+                uncertain = False
+                if state != "Completed" or status not in (None, "OK", "Warning"):
+                    raise FlashError(f"Redfish task {tid} failed: {state}, status {status}")
+            finally:
+                follower.stop()
+            self.verify_redfish(prior, follower.drain())
+        finally:
+            try:
+                if redfish_host(self.target).lower() != host.lower():
+                    raise FlashError(f"the mctl BMC registration changed; inspect {REDFISH_LOCK} "
+                                     f"on {host} and verify the original tray")
+                if uncertain:
+                    self.rep.say(f"Redfish outcome uncertain; retained {REDFISH_LOCK}. "
+                                 "Check the task queue and orchestrator journal before retrying.")
+                else:
+                    rc, _, err = bmc_sh(self.target, f"rmdir {REDFISH_LOCK}", timeout=30)
+                    if rc:
+                        self.rep.say(f"could not release {REDFISH_LOCK}: {_last_error(err, rc)}")
+            finally:
+                self.writing = False
+
     # ---- method: bmc
     def run_bmc(self):
         self.preflight_bmc()
@@ -547,7 +873,8 @@ class Runner:
 
     def monitor_bmc(self, follower: JournalFollower):
         """Wait for every queued OAM to settle. The orchestrator journal decides the
-        outcome; a device that left READY and came back also counts as written."""
+        outcome; a device that left READY and came back also counts as written.
+        INIT_FAILED alone is neither a write failure nor a write transition."""
         active = {i for i in self.oams if self.result[i]["state"] == "queued"}
         left_ready: set[int] = set()
         last: dict[int, str] = {}
@@ -575,6 +902,8 @@ class Runner:
                 if state != last.get(i):
                     last[i] = state
                     self.rep.say(f"OAM {i}: device state {state}", oam=i)
+                if state == "INIT_FAILED":
+                    continue
                 if state != "READY":
                     left_ready.add(i)
                     if self.result[i]["state"] == "queued":
@@ -709,13 +1038,15 @@ class Runner:
 
     def run(self) -> int:
         self.rep.emit("start", target=self.target, method=self.a.method, oams=self.oams,
-                      image=str(self.image), force=self.a.force, reset_verify=self.a.reset_verify)
+                      image=str(self.image), force=self.a.force, reset_verify=self.a.reset_verify,
+                      **({"all_oams": True} if self.a.method == "redfish" else {}))
+        scope = "all OAMs" if self.a.method == "redfish" else f"OAMs {self.oams}"
         self.rep.say(f"flash {self.image.name} -> {self.target} via {METHOD_LABELS[self.a.method]}, "
-                     f"OAMs {self.oams}")
+                     f"{scope}")
         try:
             self.check_image()
             {"bmc": self.run_bmc, "pcie": self.run_fw_ctl, "spi-ftdi": self.run_fw_ctl,
-             "spi-bmc": self.run_spi_bmc}[self.a.method]()
+             "spi-bmc": self.run_spi_bmc, "redfish": self.run_redfish}[self.a.method]()
         except Cancelled:
             self.rep.step("cancelled", "stopped before any flash write")
             for i in self.oams:
@@ -729,9 +1060,13 @@ class Runner:
                     self.result[i].update(state="failed", reason=str(e))
             self.rep.emit("result", ok=False, error=str(e), oams=self.result)
             return 1
-        ok = all(r["state"] == "verified" for r in self.result.values())
+        ok = bool(self.result) and all(r["state"] == "verified" for r in self.result.values())
         summary = ", ".join(f"OAM {i}: {r['state']}" for i, r in self.result.items())
-        self.rep.step("done", ("ALL VERIFIED: " if ok else "NOT VERIFIED: ") + summary)
+        deferred = self.a.method == "redfish" and all(r["state"] == "written"
+                                                     for r in self.result.values())
+        outcome = ("ALL VERIFIED" if ok else
+                   "WRITTEN, BOOT NOT VERIFIED" if deferred else "NOT VERIFIED")
+        self.rep.step("done", f"{outcome}: {summary}")
         self.rep.emit("result", ok=ok, oams=self.result, expected=self.expected)
         return 0 if ok else 2
 
@@ -745,16 +1080,21 @@ def parser():
     d.add_argument("--json", action="store_true")
     r = sub.add_parser("run", help="flash + read-back verify (+ optional reset/boot verify)")
     r.add_argument("--target", required=True)
-    r.add_argument("--method", required=True, choices=METHODS)
+    r.add_argument("--method", required=True, choices=CLI_METHODS)
     r.add_argument("--image", required=True)
-    r.add_argument("--oam", dest="oams", type=int, action="append", required=True,
-                   help="0-based OAM index; repeat for several")
+    scope = r.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--oam", dest="oams", type=int, action="append",
+                       help="0-based OAM index; repeat for several (not Redfish)")
+    scope.add_argument("--all-oams", action="store_true", help="entire tray (Redfish only)")
+    r.add_argument("--expect-oams", type=int, help="required tray OAM count for Redfish")
+    r.add_argument("--redfish-ca", help="PEM trust file for Redfish TLS (default: system trust)")
     r.add_argument("--sha256", help="refuse unless the image hashes to this")
     r.add_argument("--expect", help="build ID read-back must show (default: read from the image)")
     r.add_argument("--force", action="store_true",
-                   help="flash a non-READY OAM and pass --force/-f to the write tool")
+                   help="override blocking OAM state checks and force direct flash writes; "
+                        "not needed for INIT_FAILED with --method bmc")
     r.add_argument("--reset-verify", action="store_true",
-                   help="after read-back, reset each OAM and prove the new build runs")
+                   help="reset each OAM and check the new build (not supported for Redfish)")
     r.add_argument("--events", help="append JSON-lines progress events to this file")
     r.add_argument("--job-id", help="name of the remote staging directory")
     r.add_argument("--timeout", type=int, default=TIMEOUT)
@@ -762,7 +1102,8 @@ def parser():
 
 
 def main(argv=None):
-    a = parser().parse_args(argv)
+    p = parser()
+    a = p.parse_args(argv)
     if a.command == "discover":
         res = discover(a.target)
         if a.json:
@@ -773,11 +1114,28 @@ def main(argv=None):
             for o in v.get("oams") or []:
                 print(f"          {o['label']:12} {o.get('state', ''):10} {o.get('build', '')}")
         return 0
+    if a.method == "redfish":
+        if not a.all_oams or not a.expect_oams or a.expect_oams < 1:
+            p.error("redfish requires --all-oams and a positive --expect-oams")
+        if not a.sha256 or not re.fullmatch(r"[a-fA-F0-9]{64}", a.sha256):
+            p.error("redfish requires --sha256 with the expected 64-digit image SHA-256")
+        if a.force or a.reset_verify or a.timeout <= 0:
+            p.error("redfish requires a positive --timeout and does not support --force or "
+                    "--reset-verify (verify boot separately)")
+    elif a.all_oams or a.expect_oams is not None or a.redfish_ca is not None:
+        p.error("--all-oams, --expect-oams and --redfish-ca are only for redfish")
     if a.method == "spi-bmc" and len(set(a.oams)) != 1:
         print("fw-flash: spi-bmc writes the single soc-nv-flash MTD; pass exactly one --oam",
               file=sys.stderr)
         return 2
-    return Runner(a, Reporter(a.events)).run()
+    runner = Runner(a, Reporter(a.events))
+    if a.method != "redfish":
+        return runner.run()
+    previous = signal.signal(signal.SIGINT, runner._on_term)
+    try:
+        return runner.run()
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,12 @@
-# Sled BMC over Redfish — `fw_ctl bmc …` (asic only)
+# Sled BMC over Redfish — `fw_ctl` and `fw-flash` (asic only)
 
-The newest out-of-band flashing path: program the SPI flash of **every A1 chip
+An out-of-band flashing path: program the SPI flash of **every A1 chip
 on a sled in one command**, from any machine with network reach to the BMC. No
 PCIe link, no USB cable, no lab-host login required for the *load* itself.
 
-Added in `fw_ctl` 2.x (`fw_ctl/bmc_cmds.py` on top of the stdlib-only
-`scripts/bmc` Redfish client). Verified live against a compatible sled BMC with
-`fw_ctl 2.3.0`.
+`fw_ctl bmc load` was added in `fw_ctl` 2.x and verified live against a
+compatible sled BMC with `fw_ctl 2.3.0`. The separate `fw-flash` CLI method
+below also checks the staged file's checksum before submitting the update.
 
 > **This is still a flash.** Everything in
 > [verification.md](./verification.md) applies — the BMC gives you a cleaner
@@ -47,8 +47,58 @@ export BMC_PASSWORD=...              # load from your approved credential store
 The BMC is a **network peer**, so `bmc` verbs work on any `--interface`. Only
 `bmc load --boot` needs `pcie` (it boots the chips over PCIe afterwards).
 
-TLS is not verified by default (`--verify` in the standalone `python3 -m bmc`
-CLI). Never put the password on a command line or in a logged script — export it.
+The standalone `python3 -m bmc` CLI uses `--verify` to enable TLS verification;
+`fw-flash --method redfish` always verifies TLS. Never put the password on a
+command line or in a logged script.
+
+---
+
+## Direct A1 Redfish update with `fw-flash`
+
+Based on the lab runbook [A1 FW update via Redfish](https://elementlabs.atlassian.net/wiki/spaces/ITLabs/pages/1673822279/A1+FW+update+via+Redfish).
+Use this method when you want the direct Redfish update with an explicit
+checksum check on the BMC. It requires HTTPS and BMC shell access through the
+same registered `mctl` target. **Every fitted OAM is affected.** For selected
+OAMs, use `--method bmc` instead. Confirm the whole-tray reservation, the
+image provenance and build, the published SHA-256, and the expected OAM count
+before starting. Do not mix this method with other update tools on the tray.
+
+Load `BMC_USER` and `BMC_PASSWORD` into the environment from the approved
+credential store. The registered hostname must match the BMC's certificate.
+Omit `--redfish-ca` if the system already trusts its issuer; otherwise pass the
+approved PEM trust file. There is no insecure TLS override.
+
+```bash
+fw-flash run --target TARGET --method redfish --all-oams --expect-oams N \
+    --image /absolute/path/to/spi_flash_image_arm_asic.bin --sha256 EXPECTED_SHA256 \
+    --redfish-ca /path/to/lab-trust.pem
+```
+
+1. The flasher compares the Redfish slot inventory with BMC shell discovery
+   and checks that the Redfish task queue is idle. `INIT_FAILED` alone is
+   advisory; it does not prove a write failed or succeeded.
+2. It posts the binary image to `FirmwareUpload/A1`, verifies the SHA-256 of
+   `/tmp/a1_update.img` on the BMC, and only then submits `UpdateA1`.
+3. It follows the update's own Redfish task and logs `journalctl -fu orchestrator`
+   as `[journal]`. After the task finishes, it reads all three live FPT copies
+   on every OAM. A matching build that was already present is not by itself
+   confirmation of a new write.
+4. **`WRITTEN, BOOT NOT VERIFIED` (exit 2)** means the write and read-back
+   checks passed but the CLI did not reset the tray. Check the per-OAM result
+   when exit 2 instead says **`NOT VERIFIED`**. Do not use `--reset-verify`,
+   `--force`, or `--oam` with this method.
+
+Finish with a separately approved fresh reset and [boot verification](./verification.md#c3-boot-it-and-watch-fw_boot_sts)
+on every OAM. Use the correct reset procedure for the board and die count.
+Check `host_lib boot fw-sts` for `done`, verify the running build with
+`host_lib rom-status version`, and confirm the PCIe variant. Do not reissue
+the update just to verify boot.
+
+The CLI uses `/tmp/fw-flash-redfish.lock` on the BMC to serialize its own
+jobs. If a request may still be in progress, it retains the lock instead of
+retrying. Check the task queue and [orchestrator journal](#debugging-from-inside-the-bmc--journalctl--u-orchestrator)
+on the original BMC. Only remove the lock after confirming no upload or update
+is active. The lock does not coordinate manual uploads or other flash tools.
 
 ---
 
@@ -218,16 +268,15 @@ load` instead when you are **not** on the BMC (remote, over Redfish).
 > `fw_boot_sts → done` check. If the update fails or hangs, read
 > `journalctl -u orchestrator` on the BMC before re-running.
 
-> **Pitfall — device must be READY, and "done" is not proof.** `bmccli flash
-> update` silently skips a device that is not `READY` in `bmccli device status`
-> (the orchestrator journal shows `-110`), while the command itself looks
-> successful. Check every target is `READY` first, then confirm each device in
-> `journalctl -u orchestrator` and with `bmccli flash version -d <N>` (devices
-> are numbered from 0; `-d 8` on an 8-device tray is invalid). To re-flash a
-> wedged device, use `bmccli device reset-hold a1 assert -d <N>` and then
-> `release -d <N>`, which takes it through `OFF` back to `READY`. A device can
-> report `INIT_FAILED` after a reset-hold cycle even though its flash read-back
-> is correct; a full tray power cycle clears it.
+> **Pitfall: `INIT_FAILED` is not a flash verdict.** The lab BMC-to-device
+> handshake often remains incomplete. For example, on an otherwise eligible
+> OAM reporting `INIT_FAILED`, submit the normal per-OAM update without adding
+> a reset-hold or force override. A queued request or zero exit code can mask
+> a skipped write (e.g. a `PrepFwUpdate` timeout); confirm completion for each
+> OAM in `journalctl -u orchestrator` and check `bmccli flash version -f -d <N>`.
+> If two images share a build ID, also compare their FPT UUIDs where available.
+> If the journal confirms a skip or failure, diagnose it before retrying;
+> reset-hold is a separately approved recovery action, not preflight.
 
 ---
 

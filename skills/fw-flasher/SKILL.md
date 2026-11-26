@@ -62,7 +62,9 @@ Are you flashing out-of-band through the BMC (no host PCIe link)?
 │       See references/bmc-redfish.md "bmccli".
 │    2. fw_ctl bmc load   — drive the BMC remotely over Redfish
 │       (references/bmc-redfish.md), when you are not on the BMC shell.
-│    3. fwloader BMC build — MTD flash / SPI-Slave stream, lowest level
+│    3. fw-flash --method redfish — direct A1 whole-tray Redfish update
+│       with staged checksum and per-OAM read-back; verify boot separately.
+│    4. fwloader BMC build — MTD flash / SPI-Slave stream, lowest level
 │       (references/fwloader-cli.md "BMC" + references/projects/<p>.md).
 └── NO (lab host with PCIe/USB to the SoC)
     ├── Interactive / one-off in the lab, want auto image-resolution,
@@ -146,6 +148,11 @@ Preconditions and hazards (details in
   `/dev/mtd/soc-nv-flash`, not a bare `/dev/mtdN` number that can shift between
   boots. `bmccli flash update` selects the device for you (`-d <device|all>`) —
   prefer it.
+- **BMC-managed flash: `INIT_FAILED` is advisory.** The full BMC-to-device
+  initialization handshake often does not complete on lab trays. That state
+  alone is not a reason to block `bmccli flash update`, force the write, or
+  reset-hold the OAM. Verify the actual update and live read-back per OAM;
+  investigate a skipped or failed write before retrying.
 
 ## Scripted flashing: `fw-flash` (used by the Team Portal)
 
@@ -162,10 +169,15 @@ fw-flash run --target srv22 --method bmc --image IMG --sha256 SHA --oam 1 --oam 
   `journalctl -u orchestrator`, which is streamed into the log as `[journal]`),
   `pcie` / `spi-ftdi` (`fw_ctl` on the host; needs fw_ctl + passwordless sudo),
   `spi-bmc` (`fwloader` on the `soc-nv-flash` MTD, one part, verified by dump SHA).
-- Gates: image SHA-256 must match `--sha256`; every OAM READY unless `--force`;
-  staged image re-hashed on the BMC. Read-back is mandatory (`flash version -f`);
-  an OAM is `verified` only with write evidence AND every FPT build equal to the
-  image build. `--reset-verify` resets and checks the booted build.
+- CLI-only: [`redfish`](./references/bmc-redfish.md#direct-a1-redfish-update-with-fw-flash)
+  writes the **entire A1 tray**. Requires `--all-oams --expect-oams N --sha256 SHA`
+  and trusted TLS. It does not reset the tray: a confirmed write and read-back
+  reports **written, boot not verified** (exit 2) until the operator verifies boot.
+- Gates: image SHA-256 must match `--sha256`, and the staged image is re-hashed
+  on the BMC. For `--method bmc`, `INIT_FAILED` warns and proceeds without
+  `--force`; other preflight state checks are unchanged. Read-back is mandatory
+  (`flash version -f`); a matching build ID that was already present is not
+  proof of a new write. `--reset-verify` resets and checks the booted build.
 - Exit: 0 all verified, 2 written but not verified, 1 error, 130 cancelled.
   SIGTERM is honoured only before the write phase; during write/verify/boot it is
   refused (logged as `cancel REFUSED`).
