@@ -92,6 +92,7 @@
 #   mctl jobs-probe                    Machine-readable status of ALL job dirs
 #   mctl jobs-sync                     Mirror every remote job log into ~/.mctl/jobs
 #   mctl jobs-tail <tag> [kind] [n]    Last n lines of one live remote job log
+#   mctl job-tail <job-id> [n]         Last n lines of one run's log (~/.jobs/<id>/log)
 #   mctl jobs-watch [secs]             Stream jobs-probe blocks over one ssh link
 #   mctl cancel <tag> <kind> <pid>     Stop a running job (only if pid still owns it)
 #   mctl term [remote-cmd]             Interactive ssh -tt (portal terminal)
@@ -928,15 +929,16 @@ remote_jobdir() { echo "$(remote_home)/.mctl/jobs/$1"; }
 # ---------------------------------------------------------------------------
 JOBLOG="$MCTL_DIR/joblog.jsonl"
 
-joblog_add() {   # $1=kind $2=local_ws $3=tag $4=cmd $5=pid $6=remote_jobdir
-  python3 - "$JOBLOG" "$T_NAME" "$(sshdest)" "$1" "$2" "$3" "$4" "$5" "$6" "$(_vm_bound_id)" <<'PY' 2>/dev/null || true
+joblog_add() {   # $1=kind $2=local_ws $3=tag $4=cmd $5=pid $6=remote_jobdir [$7=job_id]
+  python3 - "$JOBLOG" "$T_NAME" "$(sshdest)" "$1" "$2" "$3" "$4" "$5" "$6" "$(_vm_bound_id)" "${7:-}" <<'PY' 2>/dev/null || true
 import json, sys, time
-path, target, dest, kind, ws, tag, cmd, pid, jd, inst = sys.argv[1:11]
+path, target, dest, kind, ws, tag, cmd, pid, jd, inst, job_id = sys.argv[1:12]
 rec = {"id": "%d-%s" % (int(time.time() * 1000), kind), "target": target,
        "dest": dest, "kind": kind, "ws": ws, "tag": tag, "cmd": cmd,
        # The EC2 instance behind a VM target: `vm` follows Main, so the name
        # alone does not say which machine ran a historic job.
        **({"instance": inst} if inst else {}),
+       **({"job_id": job_id} if job_id else {}),
        "pid": int(pid) if pid.isdigit() else None, "jobdir": jd,
        "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "state": "running"}
 with open(path, "a", encoding="utf-8") as fh:
@@ -944,8 +946,28 @@ with open(path, "a", encoding="utf-8") as fh:
 PY
 }
 
+# Shared job records (lib/jobs.md). job_where = the id's location part.
+job_where() { local w=${T_NAME//[^A-Za-z0-9._-]/}; echo "${w:-target}"; }
+MCTL_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" 2>/dev/null && pwd || true)"
+
+# Local pointer to a run on a target: a shared record whose host is the target,
+# so readers here list it (status `remote`) before any jobs-sync. Best effort.
+job_pointer() {  # $1=id $2=kind $3=cmd $4=remote_cwd $5=remote_host $6=build_target $7=local_ws
+  [[ -n "$MCTL_LIB" ]] || return 0
+  PYTHONPATH="$MCTL_LIB" python3 - "$@" "$T_NAME" <<'PY' 2>/dev/null || true
+import os, sys
+import jobs
+jid, kind, cmd, cwd, host, build, lws, target = sys.argv[1:9]
+if host == jobs.this_host():
+    sys.exit(0)          # the target shares this home: its own record is already here
+extra = {k: v for k, v in (("local_cwd", lws), ("build_target", build)) if v}
+jobs.create(jid, runner="mctl", kind=kind, cmd=cmd, target=target, cwd=cwd, host=host,
+            label=f"{os.path.basename(lws or cwd)} {kind}", extra=extra)
+PY
+}
+
 # One SSH round trip, every job dir on the target, machine-readable. Columns:
-#   tag  kind  STATE  rc  pid  log_mtime_epoch  lines  errors  cmd  last_line
+#   tag  kind  STATE  rc  pid  log_mtime_epoch  lines  errors  cmd  last_line  job_id
 # Remote status of every job dir, one TSV row per job (see jobs-probe).
 PROBE_SCRIPT='jr=$HOME/.mctl/jobs
 for d in "$jr"/*/; do
@@ -979,9 +1001,10 @@ for d in "$jr"/*/; do
     last=$(grep -v -e __MCTL_DONE__ -e __MCTL_CANCELLED__ "$log" 2>/dev/null | tail -1 \
            | sed "s/\x1b\[[0-9;]*[A-Za-z]//g" | tr -d "\r\t" | cut -c1-160 | (iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat))
     cmd=$(head -1 "$d$k.cmd" 2>/dev/null | tr -d "\r\t" | cut -c1-200 | (iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat))
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$tag" "$k" "$st" "$rc" "$pid" \
+    jid=$(head -1 "$d$k.id" 2>/dev/null | tr -cd "A-Za-z0-9._-")
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$tag" "$k" "$st" "$rc" "$pid" \
       "$(stat -c %Y "$log" 2>/dev/null)" "$(wc -l < "$log" 2>/dev/null)" \
-      "$errs" "$cmd" "$last"
+      "$errs" "$cmd" "$last" "$jid"
   done
 done'
 
@@ -1056,9 +1079,17 @@ cmd_jobs_sync() {
   log "syncing job logs from '$T_NAME' into $into"
   # --backup keeps the previous copy as <name>.log~ when the remote slot was
   # reused, so a reused tag does not silently destroy the older local log.
-  _rsync_from --prune-empty-dirs --backup --suffix='~' \
-    --include='*/' --include='*.log' --include='*.cmd' --include='*.pid' --exclude='*' \
+  # --copy-links: the slot files are symlinks into the target's ~/.jobs records.
+  _rsync_from --copy-links --prune-empty-dirs --backup --suffix='~' \
+    --include='*/' --include='*.log' --include='*.cmd' --include='*.pid' --include='*.id' --exclude='*' \
     "$dest:$rjr/" "$into/" 2>/dev/null || { warn "no job logs pulled from '$T_NAME'"; return 0; }
+  # This target's shared run records (lib/jobs.md) into the local ~/.jobs, so
+  # every run keeps its own log here (unchanged files are skipped, so a target
+  # sharing this home costs nothing).
+  mkdir -p "$HOME/.jobs"
+  _rsync_from --prune-empty-dirs --include="mctl-$(job_where)-*/" \
+    --include="mctl-$(job_where)-*/*" --exclude='*' \
+    "$dest:$(remote_home)/.jobs/" "$HOME/.jobs/" 2>/dev/null || warn "no job records pulled from '$T_NAME'"
   ok "job logs synced ($(find "$into" -name '*.log' 2>/dev/null | wc -l) local)"
 }
 
@@ -1067,6 +1098,16 @@ cmd_jobs_sync() {
 cmd_jobs_tail() {   # $1=tag $2=kind $3=lines
   local tag=${1:?tag required} kind=${2:-build} n=${3:-200}
   rsh "tail -n $n \$HOME/.mctl/jobs/$tag/$kind.log 2>/dev/null \
+       | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr -d '\r'" 2>/dev/null || true
+}
+
+# Last N lines of ONE run's log, by its shared job id: exact even after a later
+# run took the workspace slot over.
+cmd_job_tail() {   # $1=id $2=lines
+  local id=${1:?job id required} n=${2:-200}
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$id" != *..* ]] || die "invalid job id: $id"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "invalid line count: $n"
+  rsh "tail -n $n \$HOME/.jobs/$id/log 2>/dev/null \
        | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr -d '\r'" 2>/dev/null || true
 }
 
@@ -1089,6 +1130,11 @@ while kill -0 "$pid" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); don
 kill -0 "$pid" 2>/dev/null && { kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null; sleep 0.5; }
 grep -q __MCTL_DONE__ "$log" || echo "__MCTL_DONE__ rc=130" >> "$log"
 echo "__MCTL_CANCELLED__ by=$by at=$(date -Is)" >> "$log"
+rec=$(dirname "$(readlink -f "$log")")
+if [ -f "$rec/cmd.sh" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $by" > "$rec/stopped"
+  [ -f "$rec/rc" ] || { echo 130 > "$rec/rc"; date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/finished"; }
+fi
 echo "__MCTL_CANCEL__ CANCELLED"'
 
 cmd_cancel() {   # $1=tag $2=kind $3=pid
@@ -1798,6 +1844,10 @@ cd $qrws && wip ws checkout && wip ws hard-reset --yes" \
 start_job() {   # $1=remote_ws  $2=kind  $3=script  $4=force  $5=jobdir  $6=local_ws  $7=target
   local rws=$1 kind=$2 cmd=$3 force=${4:-0} jd=$5 lws=${6:-} target=${7:-}
   local logf="$jd/$kind.log"
+  # Every run is also a shared job record on the target (~/.jobs/<id>/, see
+  # lib/jobs.md); the slot's <kind>.log/.pid/.cmd are symlinks into it, so the
+  # probe, status, cancel and runs/ archive keep reading the slot paths.
+  local jid; jid="mctl-$(job_where)-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04x' $((RANDOM % 65536)))"
   log "starting detached $kind on '$T_NAME' in $rws: $cmd"
   # setsid+nohup detaches the wrapper; `trap '' HUP` (inherited by the child)
   # keeps the real build/test alive after the login shell exits. CRITICAL: `cd`
@@ -1806,10 +1856,12 @@ start_job() {   # $1=remote_ws  $2=kind  $3=script  $4=force  $5=jobdir  $6=loca
   # the session-leader PID (PID==PGID) is recorded in <kind>.pid.
   # GUARD: build, test and run share ONE working tree, so refuse a second running job
   # (of EITHER kind) unless --force (which kills the old process group first).
-  local out rc=0 encoded qrws qjd qcmd qlog qtarget target_block target_file
+  local out rc=0 encoded qrws qjd qcmd qlog qtarget target_block target_file qslotcmd qrec qtname qlabel
   encoded=$(printf '%s' "$cmd" | base64 | tr -d '\n')
   qrws=$(shell_quote "$rws"); qjd=$(shell_quote "$jd")
-  qcmd=$(shell_quote "$jd/$kind.cmd"); qlog=$(shell_quote "$logf")
+  qslotcmd=$(shell_quote "$jd/$kind.cmd"); qlog=$(shell_quote "$logf")
+  qrec="\$HOME/.jobs/$jid"; qcmd="$qrec/cmd.sh"
+  qtname=$(shell_quote "$T_NAME"); qlabel=$(shell_quote "$(basename "${lws:-$rws}") $kind")
   qtarget=$(shell_quote "$target")
   target_file=$(shell_quote "$jd/$kind.target")
   if [[ -n "$target" ]]; then
@@ -1838,15 +1890,27 @@ if [ -f $qlog ]; then
   opid=\$(cat $qjd/$kind.pid 2>/dev/null || echo 0)
   arc=$qjd/runs/$kind-\$(date -d @\$ots +%Y%m%d-%H%M%S 2>/dev/null || echo \$ots)-\$opid
   mv -f $qlog \$arc.log 2>/dev/null
-  [ -f $qcmd ] && cp -f $qcmd \$arc.cmd 2>/dev/null
+  [ -f $qslotcmd ] && cp -f $qslotcmd \$arc.cmd 2>/dev/null
   ls -1t $qjd/runs/$kind-*.log 2>/dev/null | tail -n +\$((${MCTL_KEEP_RUNS:-30}+1)) | while read -r old; do rm -f \"\$old\" \"\${old%.log}.cmd\"; done
 fi
+rec=$qrec
+mkdir -p \"\$rec\" || exit 1
+find \"\$HOME/.jobs\" -mindepth 1 -maxdepth 1 -name 'mctl-*' -mtime +\${MCTL_KEEP_DAYS:-30} -exec test -e {}/rc \\; -exec rm -rf {} + 2>/dev/null
 printf '%s' '$encoded' | base64 -d > $qcmd || exit 1
+echo mctl > \"\$rec/runner\"; echo $kind > \"\$rec/kind\"; printf '%s\\n' $qtname > \"\$rec/target\"
+printf '%s\\n' $qlabel > \"\$rec/label\"
+printf '%s\\n' $qrws > \"\$rec/cwd\"
+hostname -s 2>/dev/null | tr A-Z a-z > \"\$rec/host\"
+id -un > \"\$rec/user\" 2>/dev/null
+date -u +%Y-%m-%dT%H:%M:%SZ > \"\$rec/started\"
+ln -sfn \"\$rec/log\" $qlog; ln -sfn \"\$rec/pid\" $qjd/$kind.pid; ln -sfn \"\$rec/cmd.sh\" $qslotcmd
+printf '%s\\n' $jid > $qjd/$kind.id
 date +%s > $qjd/$kind.started
 $target_block
-setsid nohup bash -c 'trap \"\" HUP; NO_COLOR=1 TERM=dumb bash \"\$1\" 2>&1 | sed -r \"s/\\x1b\\[[0-9;]*m//g\" > \"\$2\"; rc=\${PIPESTATUS[0]}; printf \"__MCTL_DONE__ rc=%s\\n\" \"\$rc\" >> \"\$2\"; exit \"\$rc\"' mctl-job $qcmd $qlog > /dev/null 2>&1 < /dev/null &
+JOB_ID=$jid setsid nohup bash -c 'trap \"\" HUP; NO_COLOR=1 TERM=dumb bash \"\$1\" 2>&1 | sed -r \"s/\\x1b\\[[0-9;]*m//g\" > \"\$2\"; rc=\${PIPESTATUS[0]}; d=\$(dirname \"\$1\"); date -u +%Y-%m-%dT%H:%M:%SZ > \"\$d/finished\"; echo \"\$rc\" > \"\$d/rc.tmp\" && mv -f \"\$d/rc.tmp\" \"\$d/rc\"; printf \"__MCTL_DONE__ rc=%s\\n\" \"\$rc\" >> \"\$2\"; exit \"\$rc\"' mctl-job $qcmd $qlog > /dev/null 2>&1 < /dev/null &
 p=\$!
-echo \$p > $qjd/$kind.pid
+echo \$p > \"\$rec/pid\"
+printf 'host=%s\\n' \"\$(cat \"\$rec/host\")\"
 disown 2>/dev/null || true
 printf 'launched: %s pid=%s\\n' $qrws \$p") || rc=$?
   if [[ "$out" == *__MCTL_BUSY__* ]]; then
@@ -1855,7 +1919,9 @@ printf 'launched: %s pid=%s\\n' $qrws \$p") || rc=$?
   fi
   [[ $rc -eq 0 ]] || die "failed to launch $kind on '$T_NAME' (rc=$rc)${out:+ — $out}"
   local jpid; jpid=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)
-  [[ -n "$lws" ]] && joblog_add "$kind" "$lws" "$(ws_tag "$lws")" "$cmd" "${jpid:-}" "$jd"
+  local rhost; rhost=$(sed -n 's/^host=//p' <<<"$out" | tail -1)
+  job_pointer "$jid" "$kind" "$cmd" "$rws" "${rhost:-$T_NAME}" "$target" "$lws"
+  [[ -n "$lws" ]] && joblog_add "$kind" "$lws" "$(ws_tag "$lws")" "$cmd" "${jpid:-}" "$jd" "$jid"
   echo "$logf"
 }
 
@@ -2301,6 +2367,7 @@ main() {
     bmc)           cmd_bmc "$@" ;;
     jobs-sync)     cmd_jobs_sync "$@" ;;
     jobs-tail)     cmd_jobs_tail "$@" ;;
+    job-tail)      cmd_job_tail "$@" ;;
     cancel)        cmd_cancel "$@" ;;
     run)           ( cmd_run "$@" ) ;;
     run-status)    cmd_run_status "$@" ;;

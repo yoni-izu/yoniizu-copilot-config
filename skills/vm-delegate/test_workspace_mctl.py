@@ -70,6 +70,50 @@ done
             self.assertRegex(log.name, r"^build-\d{8}-\d{6}-\d+\.log$")
             self.assertTrue(log.with_suffix(".cmd").exists())
         self.assertEqual({x.read_text().splitlines()[0] for x in runs}, {"run2", "run3"})
+        # Every run is a shared job record; the slot files are symlinks into it.
+        import sys
+        sys.path.insert(0, str(MCTL.parents[1] / "lib"))
+        import jobs
+        recs = jobs.list_jobs(runner="mctl", base=self.home / ".jobs")
+        self.assertEqual(len(recs), 4, recs)
+        jid = (jd / "build.id").read_text().strip()
+        self.assertEqual((jd / "build.log").resolve(), self.home / ".jobs" / jid / "log")
+        rec = jobs.get(jid, base=self.home / ".jobs")
+        self.assertEqual((rec["runner"], rec["kind"], rec["target"], rec["status"], rec["rc"]),
+                         ("mctl", "build", "lab", "passed", 0))
+        self.assertEqual(rec["cwd"], str(ws))
+        self.assertIn("run4", (self.home / ".jobs" / jid / "log").read_text())
+
+    def test_cancel_probe_and_pointer_use_the_shared_record(self):
+        import sys
+        sys.path.insert(0, str(MCTL.parents[1] / "lib"))
+        import jobs
+        jd = self.home / ".mctl" / "jobs" / "tag"
+        ws = self.home / "ws"
+        ws.mkdir()
+        q = shlex.quote
+        code = f"""T_NAME=lab; T_KIND=remote
+start_job {q(str(ws))} run "sleep 30" 0 {q(str(jd))} >/dev/null || exit 9
+for _ in $(seq 50); do [ -s {q(str(jd))}/run.pid ] && break; sleep 0.1; done
+pid=$(cat {q(str(jd))}/run.pid)
+bash -s -- tag run "$pid" tester <<<"$CANCEL_SCRIPT"
+bash -c "$PROBE_SCRIPT"
+MCTL_LIB={q(str(MCTL.parents[1] / "lib"))}
+job_pointer mctl-lab-x-0001 build "octl ws build" /r/ws otherbox fw {q(str(ws))}
+"""
+        r = self.shell("rlogin() { bash -c \"$1\"; }\n" + code)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("__MCTL_CANCEL__ CANCELLED", r.stdout)
+        jid = (jd / "run.id").read_text().strip()
+        base = self.home / ".jobs"
+        rec = jobs.get(jid, base=base)
+        self.assertEqual((rec["status"], rec["rc"]), ("cancelled", 130))
+        row = [l.split("\t") for l in r.stdout.splitlines() if l.startswith("tag\trun\t")][0]
+        self.assertEqual((row[2], row[10]), ("CANCELLED", jid))
+        ptr = jobs.get("mctl-lab-x-0001", base=base)
+        self.assertEqual((ptr["host"], ptr["status"], ptr["target"], ptr["cwd"]),
+                         ("otherbox", "remote", "lab", "/r/ws"))
+        self.assertEqual((base / "mctl-lab-x-0001" / "local_cwd").read_text().strip(), str(ws))
 
     def runtime_fixture(self, body):
         runtime = self.home / ".copilot/skills/workspace-manager/workspace_runtime.py"

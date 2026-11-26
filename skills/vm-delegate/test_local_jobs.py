@@ -35,6 +35,7 @@ class LocalJobs(unittest.TestCase):
         self.log: list[dict] = []
         self.patches = [
             mock.patch.object(vd, "LOCAL_DIR", self.tmp / "local"),
+            mock.patch.dict(vd.os.environ, {"JOB_ROOT": str(self.tmp / "jobs")}),
             mock.patch.object(vd, "MCTL_DIR", self.tmp),
             mock.patch.object(vd, "_read_log", side_effect=lambda: list(self.log)),
             mock.patch.object(vd, "_append_log", side_effect=self.log.append),
@@ -129,6 +130,38 @@ class LocalJobs(unittest.TestCase):
                 mock.patch.object(vd, "_tag_to_ws", return_value={}):
             vd.refresh(sync=False, preprobed={"srv22": {}})
         self.assertNotIn(job["id"], state["jobs"])
+
+    def test_new_run_is_a_shared_job_record(self):
+        job = self.start(rc=0)
+        self.wait(job, "passed")
+        rec = vd.joblib.get(job["id"])
+        self.assertEqual((rec["runner"], rec["kind"], rec["target"], rec["status"], rec["rc"]),
+                         ("flash", "flash", "srv22", "passed", 0))
+        self.assertEqual(rec["unstoppable"], ["boot", "verify", "write"])
+        self.assertEqual(vd.local_files(job)["dir"], self.tmp / "jobs" / job["id"])
+        self.assertTrue((self.tmp / "jobs" / job["id"] / "finished").exists())
+
+    def test_cancel_marks_the_shared_record_cancelled(self):
+        job = self.start(phase="upload", hold=30)
+        self.wait(job, "running")
+        time.sleep(0.3)
+        self.assertEqual(vd.cancel(job["id"])["result"], "CANCELLED")
+        self.wait(job, "cancelled")
+        end = time.time() + 5
+        while time.time() < end and vd.joblib.get(job["id"])["status"] == "running":
+            time.sleep(0.05)
+        self.assertEqual(vd.joblib.get(job["id"])["status"], "cancelled")
+
+    def test_legacy_local_dir_is_still_read(self):
+        jid = "flash-srv22-20250101-120000-abcd"
+        d = self.tmp / "local" / jid
+        d.mkdir(parents=True)
+        (d / "flash.log").write_text("old run\n__MCTL_DONE__ rc=3\n")
+        job = {"id": jid, "kind": "flash", "target": "srv22", "runner": "local",
+               "started": "2025-01-01T12:00:00"}
+        self.assertEqual(vd.local_files(job)["log"], d / "flash.log")
+        st = vd.local_status(job)
+        self.assertEqual((st["status"], st["rc"], st["last_line"]), ("failed", 3, "old run"))
 
     def test_unknown_kind_and_target_refused(self):
         self.assertIn("unsupported", vd.start_local_job("srv22", "build", ["true"])["error"])

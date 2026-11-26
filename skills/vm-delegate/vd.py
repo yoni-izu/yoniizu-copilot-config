@@ -59,6 +59,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from delegation_db import Store, EMPTY_STATE
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
+import jobs as joblib  # noqa: E402  (shared ~/.jobs record: lib/jobs.py)
+
 DB = Path(os.environ.get("DELEGATION_DB", "~/tasks/delegation.db")).expanduser()
 MCTL_DIR = Path(os.path.expanduser("~/.mctl"))
 JOBLOG = MCTL_DIR / "joblog.jsonl"
@@ -305,6 +308,7 @@ def parse_probe(text: str) -> dict:
         tag, kind, state, rc, pid, mtime, lines, errors = parts[:8]
         cmd = parts[8] if len(parts) > 8 else ""
         last = parts[9] if len(parts) > 9 else ""
+        jid = parts[10].strip() if len(parts) > 10 else ""
         rows[(tag, kind)] = {
             "state": state,
             "rc": int(rc) if rc.isdigit() else None,
@@ -314,6 +318,7 @@ def parse_probe(text: str) -> dict:
             "errors": int(errors) if errors.isdigit() else 0,
             "cmd": cmd,
             "last_line": last,
+            "job_id": jid if joblib.safe(jid) else "",
         }
     return rows
 
@@ -441,7 +446,9 @@ def owns_slot(job: dict) -> bool:
 # as a dispatched job, but its status is read from the local log + pid, never
 # probed on the target. Each run is a transient systemd user unit
 # (``mctl-<id>.service``) so it survives a portal restart and its output is
-# also in ``journalctl --user -u mctl-<id>``.
+# also in ``journalctl --user -u mctl-<id>``. New runs are shared job records
+# (``~/.jobs/<id>/``, lib/jobs.md); runs from before that stay readable in
+# ``~/.mctl/local/<id>/``.
 # --------------------------------------------------------------------------
 LOCAL_DIR = MCTL_DIR / "local"
 LOCAL_KINDS = {"flash"}
@@ -457,9 +464,14 @@ def is_local(job: dict | None) -> bool:
 
 def local_files(job: dict) -> dict:
     """Paths of a local job, DERIVED from its id (never trusted from the record)."""
-    d = LOCAL_DIR / job["id"]
-    kind = job.get("kind") or "flash"
-    return {"dir": d, "log": d / f"{kind}.log", "pid": d / "pid", "events": d / "events.jsonl"}
+    shared = joblib.job_dir(job["id"]) if joblib.safe(job["id"]) else None
+    if shared is not None and (shared / "cmd.sh").exists():
+        d, log = shared, shared / "log"
+    else:
+        d = LOCAL_DIR / job["id"]
+        log = d / f"{job.get('kind') or 'flash'}.log"
+    return {"dir": d, "log": log, "pid": d / "pid", "events": d / "events.jsonl",
+            "rc": d / "rc", "stopped": d / "stopped"}
 
 
 def _pid_of(job: dict) -> int | None:
@@ -481,10 +493,10 @@ def _pid_runs_job(pid: int | None, job: dict) -> bool:
     if job["id"] in cmd:
         return True
     try:
-        env = Path(f"/proc/{pid}/environ").read_bytes()
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
     except OSError:
         return False
-    return f"MCTL_JOB_ID={job['id']}".encode() in env.split(b"\0")
+    return any(f"{k}={job['id']}".encode() in env for k in ("MCTL_JOB_ID", "JOB_ID"))
 
 
 def local_events(job: dict) -> list[dict]:
@@ -525,16 +537,23 @@ def local_status(job: dict) -> dict:
         return out
     lines = [l for l in data.decode("utf-8", "replace").splitlines() if l.strip()]
     rc = None
+    try:
+        raw = f["rc"].read_text().strip()
+        rc = int(raw) if raw.lstrip("-").isdigit() else None
+    except OSError:
+        pass
     for line in reversed(lines[-5:]):
+        if rc is not None:
+            break
         m = re.match(re.escape(LOCAL_DONE) + r" rc=(\d+)", line)
         if m:
             rc = int(m.group(1))
-            break
-    body = [l for l in lines if not l.startswith(LOCAL_DONE)]
+    body = [l for l in lines if not l.startswith((LOCAL_DONE, "__JOB_DONE__"))]
     out.update(lines=len(body), last_line=_clean(body[-1])[:300] if body else "",
                errors=sum(1 for l in body if re.search(r"\bfailed\b|\berror\b", l, re.I)))
     if rc is not None:
-        out.update(rc=rc, status="passed" if rc == 0 else ("cancelled" if rc == 130 else "failed"))
+        cancelled = rc == 130 or (rc != 0 and f["stopped"].exists())
+        out.update(rc=rc, status="passed" if rc == 0 else ("cancelled" if cancelled else "failed"))
     elif _pid_runs_job(pid, job) or time.time() - st.st_mtime < 5:
         out["status"] = "running"         # alive, or exiting and the sentinel is due
     else:
@@ -561,21 +580,30 @@ def start_local_job(target: str, kind: str, argv: list[str], *, label: str = "",
                 and local_status(j)["status"] == "running"):
             return {"error": f"a {kind} job is already running on {target} ({j['id']})",
                     "job_id": j["id"]}
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    jid = f"{kind}-{target}-{stamp}-{os.urandom(2).hex()}"
+    jid = joblib.new_id(kind, target)
+    d = joblib.job_dir(jid)
+    argv = [a.replace("{events}", str(d / "events.jsonl")).replace("{job}", jid) for a in argv]
+    try:
+        joblib.create(jid, runner=kind, kind=kind, cmd=shlex.join(argv), target=target,
+                      label=label, meta=meta,
+                      extra={"unstoppable": " ".join(sorted(LOCAL_UNSTOPPABLE))})
+    except (OSError, ValueError) as e:
+        return {"error": f"could not create the job record: {e}"}
     rec = {"id": jid, "target": target, "dest": "", "kind": kind, "ws": "", "tag": jid,
            "cmd": label or " ".join(argv), "pid": None, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "state": "dispatched", "runner": "local", "unit": f"mctl-{jid}",
-           "jobdir": str(LOCAL_DIR / jid), **(meta or {})}
+           "jobdir": str(d), **(meta or {})}
     f = local_files(rec)
-    f["dir"].mkdir(parents=True, exist_ok=True)
-    argv = [a.replace("{events}", str(f["events"])).replace("{job}", jid) for a in argv]
-    log, pidf = shlex.quote(str(f["log"])), shlex.quote(str(f["pid"]))
-    # The job's own process writes the pid; the wrapper appends the exit status.
-    # Output goes to the log AND the unit's journal.
-    script = (f"export MCTL_JOB_ID={jid}; {shlex.join(argv)} > >(tee -a {log}) 2>&1 < /dev/null & "
-              f"c=$!; echo $c > {pidf}; wait $c; rc=$?; sleep 0.2; "
-              f'echo "{LOCAL_DONE} rc=$rc" >> {log}; exit $rc')
+    q = {k: shlex.quote(str(d / k)) for k in ("log", "pid", "rc", "finished")}
+    # The job's own process writes the pid; the wrapper records the exit status
+    # (rc is authoritative; the sentinel is for old readers). Output goes to the
+    # log AND the unit's journal.
+    script = (f"export JOB_ID={jid} MCTL_JOB_ID={jid}; "
+              f"{shlex.join(argv)} > >(tee -a {q['log']}) 2>&1 < /dev/null & "
+              f"c=$!; echo $c > {q['pid']}; wait $c; rc=$?; sleep 0.2; "
+              f"date -u +%Y-%m-%dT%H:%M:%SZ > {q['finished']}; "
+              f"echo $rc > {q['rc']}.tmp && mv -f {q['rc']}.tmp {q['rc']}; "
+              f'echo "{LOCAL_DONE} rc=$rc" >> {q["log"]}; exit $rc')
     env, _ = agent_env()
     try:
         if shutil.which("systemd-run"):
@@ -613,6 +641,11 @@ def cancel_local(job: dict) -> dict:
     if not _pid_runs_job(pid, job):
         return {"error": "job has no live process to signal"}
     try:
+        local_files(job)["stopped"].write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                               + " portal\n")
+    except OSError:
+        pass
+    try:
         os.kill(pid, signal.SIGTERM)
     except OSError as e:
         return {"error": str(e)}
@@ -649,6 +682,60 @@ def _mirror_is(job: dict, mirror: dict, next_start: float | None = None) -> bool
     return mirror["mtime"] >= started - 60 and (not next_start or mirror["mtime"] < next_start)
 
 
+def _run_outcome(job: dict) -> dict | None:
+    """Final status of a run from its synced job record, or None when unknown."""
+    jid = run_id(job)
+    rec = joblib.get(jid) if jid else None
+    if not rec or rec.get("rc") is None:
+        return None
+    rc = rec["rc"]
+    status = "passed" if rc == 0 else ("cancelled" if rec.get("stopped") or rc == 130 else "failed")
+    fin = rec.get("finished_ts") or 0
+    return {"status": status, "rc": rc,
+            "finished": datetime.fromtimestamp(fin).strftime("%Y-%m-%dT%H:%M:%S") if fin else ""}
+
+
+def run_id(job: dict | None) -> str:
+    """The shared job-record id of a dispatched run (lib/jobs.md), or ""."""
+    jid = (job or {}).get("job_id") or ""
+    return jid if joblib.safe(jid) and jid.startswith("mctl-") else ""
+
+
+def tail_run(target: str, jid: str, lines: int = 200) -> str:
+    """Last N lines of ONE run's log on the target, by its job id."""
+    if not MCTL.exists() or not (_safe_id(target) and run_id({"job_id": jid})):
+        return ""
+    try:
+        p = subprocess.run([str(MCTL), "-t", target, "job-tail", jid, str(lines)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=TAIL_TIMEOUT, env=agent_env()[0])
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return _clean(p.stdout)
+
+
+def _read_run_copy(job: dict, limit: int) -> dict | None:
+    """The synced copy of a FINISHED run's own record log (jobs-sync), if held."""
+    jid = run_id(job)
+    if not jid:
+        return None
+    d = joblib.job_dir(jid)
+    log = d / "log"
+    if not (log.is_file() and (d / "rc").exists()):
+        return None
+    size = log.stat().st_size
+    with log.open("rb") as fh:
+        if size > limit:
+            fh.seek(size - limit)
+            fh.readline()
+        raw = fh.read()
+    return {"error": "", "path": str(log), "source": "local",
+            "text": _clean(raw.decode("utf-8", "replace")), "bytes": size,
+            "truncated": size > limit, "provenance": "stored copy of this run",
+            "job_pid": job.get("pid"), "log_pid": job.get("pid"),
+            "mtime": datetime.fromtimestamp(log.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")}
+
+
 def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
              job_id: str = "") -> dict:
     """Serve a job's log, never a different run's.
@@ -661,6 +748,9 @@ def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
     job = _job_by_id(job_id) if job_id else None
     if is_local(job):
         return _read_local(job, limit)
+    held = _read_run_copy(job, limit) if job else None
+    if held:
+        return held
     path = local_log(target, tag, kind)
     mirror = mirror_run(target, tag, kind)
 
@@ -668,7 +758,8 @@ def read_log(target: str, tag: str, kind: str, limit: int = LOG_MAX_BYTES,
         mine = _mirror_is(job, mirror)
         newest = owns_slot(job)
         if not mine:
-            text = tail_remote(target, tag, kind, 400) if newest else ""
+            text = (tail_run(target, run_id(job), 400) if run_id(job)
+                    else tail_remote(target, tag, kind, 400) if newest else "")
             if text:
                 return {"error": "", "path": "", "text": text, "bytes": len(text),
                         "truncated": True, "source": "remote",
@@ -792,12 +883,15 @@ def tail(target: str, tag: str, kind: str, lines: int = 200, job_id: str = "") -
         held = _read_local(job)
         return {"error": held["error"], "text": "\n".join(held["text"].splitlines()[-lines:]),
                 "source": "local", "at": time.strftime("%H:%M:%S")}
-    if job and not owns_slot(job):
+    if run_id(job):
+        text = tail_run(target, run_id(job), lines)     # never the slot: it may be a later run's
+    elif job and not owns_slot(job):
         return {"error": f"a newer run in the same workspace ({tag}) now owns "
                          f"{kind}.log on {target} \u2014 this job's live tail ended",
                 "text": "", "source": "none", "at": time.strftime("%H:%M:%S"),
                 "superseded": True}
-    text = tail_remote(target, tag, kind, lines)
+    else:
+        text = tail_remote(target, tag, kind, lines)
     if text:
         return {"error": "", "text": text, "source": "remote",
                 "at": time.strftime("%H:%M:%S")}
@@ -883,7 +977,11 @@ def refresh(only: str | None = None, sync: bool = True,
             cur["unverified_since"] = cur.get("unverified_since") or now
             continue
         if tkey in seen:                  # a newer dispatch owns the remote slot
-            cur.update(status="superseded", checked=now)
+            done = _run_outcome(j)
+            if done:                      # its own record (jobs-sync) still knows the outcome
+                cur.update(checked=now, **done)
+            else:
+                cur.update(status="superseded", checked=now)
             cur.pop("unverified_since", None)
             continue
         seen.add(tkey)
@@ -936,7 +1034,8 @@ def refresh(only: str | None = None, sync: bool = True,
                    "target": t, "dest": "", "kind": kind,
                    "ws": rev.get(tag, ""), "tag": tag,
                    "cmd": row["cmd"], "pid": row["pid"], "jobdir": "",
-                   "started": started, "state": "adopted", "adopted": True}
+                   "started": started, "state": "adopted", "adopted": True,
+                   **({"job_id": row["job_id"]} if row.get("job_id") else {})}
             if rec["id"] in jstate:
                 continue                       # already adopted this very slot
             adopted.append(rec)
@@ -1389,12 +1488,16 @@ def jobs() -> list[dict]:
         # workspace overwrites the first, and serving the leftover as the new
         # job's output is exactly how a fresh job shows a previous run's log.
         mine = _mirror_is(j, mirror, later[0] if later else 0.0)
+        jid = j["id"] if local else run_id(j)
         if local:
             held = local_files(j)["log"]
             mine, owns = held.exists(), True
             mirror = {"pid": st.get("pid"), "at": st.get("finished") or ""}
+        elif jid and (joblib.job_dir(jid) / "rc").exists() and (joblib.job_dir(jid) / "log").is_file():
+            held, mine = joblib.job_dir(jid) / "log", True     # this run's own synced record
         out.append({
             "id": j["id"],
+            "job_id": jid,
             "target": target,
             "dest": j.get("dest") or "",
             "instance": j.get("instance") or "",
@@ -1952,6 +2055,13 @@ def log_view(job_id: str) -> dict:
     pid = int(pid) if str(pid or "").isdigit() else None
     running = st.get("status") == "running"
     title = f"{target}:{tag}/{kind}.log"
+    jid = run_id(job)
+    if jid:
+        follow = "tail -n 300 -F log" if running else f"tail -n {LOG_VIEW_LINES} log"
+        script = (f'cd "$HOME/.jobs/{jid}" 2>/dev/null '
+                  f'|| {{ echo "no job record {jid} on {target}"; exit 3; }}; {follow}')
+        return {"mode": "remote", "target": target, "running": running, "command": script,
+                "title": ("tail -F " if running else "tail ") + f"{target}:{jid}"}
     if owns_slot(job):
         follow = (f"tail -n 300 -F {kind}.log" if running
                   else f"tail -n {LOG_VIEW_LINES} {kind}.log")

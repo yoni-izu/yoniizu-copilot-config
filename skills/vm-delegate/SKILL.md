@@ -401,15 +401,25 @@ The target keeps exactly **one** `build.log`/`test.log` per workspace tag — th
 next run of the same kind overwrites it. So the remote holds *current* state
 and no history at all.
 
-Every dispatch is therefore also appended locally to **`~/.mctl/joblog.jsonl`**
-(target, kind, workspace, tag, command, pid, jobdir, start time). That file is
-the only record that survives the next run.
+Every run is therefore also a **shared job record** `~/.jobs/<job_id>/` on the
+target (format: [`lib/jobs.md`](../../lib/jobs.md); id
+`mctl-<target>-<UTC>-<rand4>`, runner `mctl`, `cwd` = the workspace). The slot
+files `<kind>.log`/`.pid`/`.cmd` are symlinks into the current run's record and
+`<kind>.id` names it, so a re-run no longer destroys the previous run's log.
+Records with an `rc` older than `MCTL_KEEP_DAYS` (default 30) are pruned on the
+next dispatch. When the target is another host, mctl also writes a local pointer
+record (`host` = the target) here.
+
+Every dispatch is also appended locally to **`~/.mctl/joblog.jsonl`**
+(target, kind, workspace, tag, command, pid, jobdir, start time, `job_id`) —
+the dispatch log vd reconciles.
 
 ```bash
 mctl jobs           # every job ever delegated, from the local log
 mctl jobs-probe     # EVERY job dir, including last lines: source-free targets only
 mctl jobs-sync      # EVERY job log: source-free targets only
 mctl jobs-tail <tag> [kind] [n]   # ONE verified source-free software log
+mctl job-tail <job_id> [n]        # ONE run's own record log, even after its slot was reused
 mctl cancel <tag> <kind> <pid>    # stop a running job (TERM, then KILL its process group)
 ```
 
@@ -419,8 +429,8 @@ the one given, so it never kills a newer run. A stopped job's log gains
 `CANCELLED` (resolved status `cancelled`). Docker containers it started may
 survive; check them before re-dispatching.
 
-`jobs-probe` emits `tag kind STATE rc pid log_mtime lines errors cmd last_line`,
-which is what the resolver consumes:
+`jobs-probe` emits `tag kind STATE rc pid log_mtime lines errors cmd last_line job_id`
+(the 11th column is empty for legacy slots), which is what the resolver consumes:
 
 ```bash
 python3 ~/.copilot/skills/vm-delegate/vd.py list       # history + resolved status
@@ -484,7 +494,8 @@ Subject to the mixed/unknown-target restriction above, `refresh()` calls
 `sync_logs()` for every target it reached, which is
 `mctl jobs-sync`: an rsync of `~/.mctl/jobs/*/` on the target into
 `~/.mctl/jobs/<target>/`, keeping the previous copy as `<name>.log~` when a tag
-is re-run. **Without this a log is gone the moment its slot is reused**, which
+is re-run, plus the target's `~/.jobs/mctl-<target>-*/` records into the local
+`~/.jobs/`. **Without this a log is gone the moment its slot is reused**, which
 is why only a mirrored log can be reopened later. `has_log` / `log_bytes` on
 each payload row say whether a local copy is held; the portal's **Log** column
 offers *open* only when one is.
@@ -495,8 +506,10 @@ Jobs that predate this show **not recorded** in the portal rather than a command
 that was never captured.
 
 `vd.py` writes resolved observations to `~/tasks/delegation.db` and binds each
-probe row to the **newest** dispatch for that `(target, tag, kind)` — older
-entries settle as `superseded`, because their log is gone. Jobs found on a
+probe row to the **newest** dispatch for that `(target, tag, kind)`. An older
+run that carries a `job_id` takes its outcome and log from its own synced record
+(`~/.jobs/<job_id>/`), and Log/tail read it by id (`mctl job-tail`), never from
+the slot; only legacy runs without an id settle as `superseded`. Jobs found on a
 target that were never dispatched from here are adopted once (`found on target`).
 
 **`refresh()` probes EVERY registered target, always.** It used to ask only the
