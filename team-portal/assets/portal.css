@@ -864,6 +864,8 @@
   .vm-verline { display:block; margin-top:3px; }
   tr.vm-stale td { background:color-mix(in srgb, var(--warn) 7%, transparent); }
   tr.vm-stale .vm-st { opacity:.65; }
+  .vm-src { margin-left:6px; padding:0 6px; border-radius:var(--r-pill); font-size:9.5px;
+           border:1px solid var(--line); color:var(--muted); }
   .vm-logcell { white-space:normal; }
   .vm-logmeta { display:block; color:var(--muted); font-weight:400; font-size:10px; margin-top:3px; }
   .vm-live .vm-log { margin-top:8px; }

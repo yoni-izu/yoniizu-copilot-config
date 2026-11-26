@@ -209,13 +209,19 @@ test("VM open-only shows running jobs without changing the saved job list", () =
     "vm-livefirst": {checked: true},
   };
   const context = vm.createContext({
-    VMLOG: {jobs}, vmTargets: [],
+    VMLOG: {jobs}, vmTargets: [], vmSources: [],
     document: {getElementById: id => elements[id]},
   });
   vm.runInContext(block("function vmJobs()", "// The elapsed figure"), context);
   assert.deepEqual(Array.from(context.vmJobs(), job => job.id), ["running-1"]);
   elements["vm-openonly"].checked = false;
   assert.deepEqual(Array.from(context.vmJobs(), job => job.id), ["running-1", "passed-1", "failed-1"]);
+  jobs[2].source = "pilot-local";
+  context.vmSources = ["pilot-local"];
+  assert.deepEqual(Array.from(context.vmJobs(), job => job.id), ["failed-1"]);
+  context.vmSources = ["delegated"];
+  assert.deepEqual(Array.from(context.vmJobs(), job => job.id), ["running-1", "passed-1"]);
+  delete jobs[2].source;
   assert.equal(jobs.length, 3);
   assert.match(source, /makeOpenOnly\("vm-openonly"\)/);
   assert.match(source, /id="vm-count"/);
@@ -223,12 +229,19 @@ test("VM open-only shows running jobs without changing the saved job list", () =
 
 test("machine rows offer stop only for a running job that still owns its slot", () => {
   const context = vm.createContext({esc: s => String(s)});
-  vm.runInContext(block("function vmCancelButton(", "async function vmCancel("), context);
+  vm.runInContext(block("function vmIsPilot(", "async function vmCancel("), context);
   const row = {id: "j1", status: "running", pid: 7, kind: "build", tag: "ws", ws_label: "one/fw", target: "lab1"};
   assert.match(context.vmCancelButton(row), /class="vm-cancel" data-id="j1" data-label="build one\/fw on lab1"/);
   for (const off of [{status: "passed"}, {owns_slot: false}, {pid: null}, {kind: "mirror"}])
     assert.equal(context.vmCancelButton({...row, ...off}), "", JSON.stringify(off));
   assert.match(source, /cancelled:"stopped from the portal/);
+  const pj = {id: "pj:L:t", source: "pilot-local", status: "running", kind: "job", tag: "t",
+              target: "srv12", cancellable: true, stop_refusal: "", stale: false};
+  assert.match(context.vmCancelButton(pj), /data-pilot="1" data-id="pj:L:t"/);
+  assert.equal(context.vmCancelButton({...pj, status: "passed"}), "");
+  assert.match(context.vmCancelButton({...pj, cancellable: false, stop_refusal: "flashing"}),
+               /disabled title="flashing"/);
+  assert.match(context.vmCancelButton({...pj, cancellable: false, stale: true}), /disabled title="The BMC reading is unverified/);
 });
 
 function machineMenuHarness() {
@@ -1056,7 +1069,7 @@ test("Flash FW: lab-only button, running badge, last run line, guarded stop", ()
        method: "bmc", image: "iridium/t", oams: [1, 3]},
       {id: "f2", kind: "flash", target: "dsk61", status: "running", started: "2026-01-02T00:00:00"}]}});
   vm.runInContext(block("function vmFlashRunning(", "function flashWindow("), context);
-  vm.runInContext(block("function vmCancelButton(", "function vmFlashProgressBtn("), context);
+  vm.runInContext(block("function vmIsPilot(", "function vmFlashProgressBtn("), context);
   vm.runInContext(block("function vmFlashProgressBtn(", "async function vmCancel("), context);
   assert.equal(context.vmFlashBtn({name: "vm", instance: "i-1"}), "");
   assert.match(context.vmFlashBtn({name: "srv22", instance: ""}), /class="vm-flash" data-target="srv22"/);

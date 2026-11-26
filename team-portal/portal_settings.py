@@ -68,6 +68,13 @@ DEFAULTS: dict[str, Any] = {
         "power_grace_s": 30,
         "power_retry_s": 30,
         "power_retry_limit": 3,
+        # machine-pilot's detached local `job` / BMC `bmcjob` runs in the job view
+        "pilot_jobs": True,
+        "pilot_jobs_days": 14,
+        "pilot_bmc_on_refresh": True,
+        "pilot_poll_s": 5,
+        # finished ~/.jobs records (all runners) older than this are pruned; 0 keeps all
+        "job_retention_days": 30,
     },
     # Machine terminals: where a terminal opens and the console grid's limits.
     "terminals": {
@@ -124,7 +131,10 @@ GROUP_INT_RANGES = {"ai": {"daily_cap": (0, 500), "interactive_daily_cap": (0, 1
                     "machines": {"live_interval_s": (5, 300),
                                  "power_grace_s": (0, 300),
                                  "power_retry_s": (5, 300),
-                                 "power_retry_limit": (0, 10)},
+                                 "power_retry_limit": (0, 10),
+                                 "pilot_jobs_days": (1, 90),
+                                 "pilot_poll_s": (2, 300),
+                                 "job_retention_days": (0, 365)},
                     "terminals": {"max_sessions": (8, 64), "idle_close_min": (0, 480)},
                     "live_updates": {"scan_interval_s": (1, 60), "quiet_ms": (0, 10000),
                                      "replay_events": (50, 2000), "keepalive_s": (5, 40),

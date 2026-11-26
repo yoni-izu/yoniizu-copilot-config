@@ -16,7 +16,7 @@ a single page with a top-level section nav:
 | **Workspaces** | `~/tasks/workspaces.db` | `workspace-manager` | live |
 | **Bugs** | `~/tasks/bugs.db` (bugs, families, phenomena) + `~/.copilot-private/skills/bug-triage/investigations/*.md` | `bug-monitor` + `bug-triage` | live |
 | **PRs** | `~/tasks/prs.db` | `pr-monitor` | live |
-| **Machines** | `~/tasks/delegation.db` (mctl log ingestion for VMs and lab machines) | `vm-delegate` | live |
+| **Machines** | `~/tasks/delegation.db` (mctl log ingestion for VMs and lab machines) + machine-pilot `~/.jobs/` and `~/.pilot/bmcjobs-cache/` | `vm-delegate` + `machine-pilot` | live |
 | **RAID** | `~/tasks/raid.db` | `team-planner` | live |
 | **Team** | `~/tasks/team.db` via `team-manager` | `team-manager` | live: Overview / Plan / Members |
 | **Settings** | `state/portal-settings.json` (server) + browser `localStorage` `team-portal-prefs-v1` | `portal-maintainer` | live; editable only when served |
@@ -57,6 +57,13 @@ Three tiles:
     - retry spacing (5–300 s, default 30 s)
     - additional retries (0–10, default 3; 0 means only the first check)
     - changes apply live on Save; these checks never start, stop or renew a VM
+    - machine-pilot jobs: show on/off (default on), history window (1–90 days,
+      default 14; running jobs always show), read bmcjobs on Refresh (default on)
+      and local job-dir poll interval (2–300 s, default 5); apply on Save
+    - job record retention (0–365 days, default 30; 0 keeps all): finished
+      `~/.jobs/<id>/` records of every runner (pilot, ad-hoc, flash, synced mctl
+      copies) older than this are removed by the `portal-pilot-jobs` thread, at
+      most every 6 h; running and unresolved records are never touched
   - **Terminals** (applies on Save, no restart):
     - default launcher: `windows_terminal` (default) or `browser`; every terminal
       button's `▾` offers the other one
@@ -871,6 +878,27 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   the log gains `__MCTL_DONE__ rc=130` + `__MCTL_CANCELLED__`, the target is
   re-probed and the row shows `cancelled`. A newer run in the slot (pid mismatch)
   is refused. Containers the job started may outlive it.
+- **Shared job records** (`~/.jobs/<id>/`, spec in [`lib/jobs.md`](../../lib/jobs.md)) share the
+  table through one adapter, [`jobs_view.py`](../jobs_view.py) (`pilot_view.py` is a legacy alias).
+  vm-delegate lists runners `mctl` and `flash` (its rows gain `source` `delegated` / `flash` and
+  `runner_name`); [`pilot_jobs.py`](../../skills/machine-pilot/scripts/pilot_jobs.py) owns every
+  other runner (`pilot`, ad-hoc `job run --runner NAME`) plus legacy bmcjob dirs, and
+  `jobs_view.py` maps those onto the row shape and merges them into `/api/vm-jobs` (counts,
+  running, stale, per-target `target_state`, nav badge, pulse). Local-record rows carry
+  `source` `pilot-local`, id `job:<record id>` and `job_id`; `pj:L:<id>` is still accepted.
+  Legacy BMC rows are `pilot-bmc`, ids `pj:B:<target>:<tag>`. The Kind cell shows the runner
+  name, and the **Source** multi-select filters Delegated / Flash / Local job / bmcjob. The target is the `job run -T <target>` record, else a
+  known name guessed from the command/host/tag, else `(unattributed)` (muted; it never scopes Refresh).
+  Local rows are read from `~/.jobs` (a `portal-pilot-jobs` thread polls them for start/finish
+  notifications). bmcjob rows come from a per-target cache that **Refresh status** fills through
+  `mctl bmc` on targets with a BMC (read-only; a failed read keeps the old rows and shows the error
+  in the header; a rejected login is not retried by Refresh for 6 h). A BMC reading older than
+  10 min is unverified and cannot be stopped. **Log** opens the owner's `log_view` (local `tail`,
+  or `mctl bmc tail` on the BMC). **■ stop** (confirm) queues the same `vm-cancel` action, which
+  calls `pilot_jobs.stop`: the pid must still be this job's wrapper, then its process group gets
+  TERM and a `stopped` marker makes the row `cancelled`. Commands that flash, power-cycle, reset or
+  switch muxes are refused (disabled button with the reason); the portal never forces. `pilot run
+  --detach` host jobs are not listed.
 - **Refresh status** (`POST /api/vm-refresh`) is a **background job**, polled through
   `/api/align/<id>` like the PR scan, and it streams one row per target into the align banner.
   It is not inline for a reason: one unreachable target costs a 90 s ssh timeout and `octl vm

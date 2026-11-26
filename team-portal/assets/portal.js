@@ -4573,10 +4573,11 @@ function vmStaleTitle(j){
     : "not reconfirmed since "+formatPortalDate(j.checked||"?");
   return was+(j.note?" \u2014 "+j.note:"");
 }
-let vmTarget="", vmTargets=[];   // vmTarget = the single picked target (scopes refresh)
+let vmTarget="", vmTargets=[], vmSources=[];   // vmTarget = the single picked target (scopes refresh)
 function vmJobs(){
   let js=(VMLOG.jobs||[]).slice();
   if(vmTargets.length) js=js.filter(j=>vmTargets.includes(j.target));
+  if(vmSources.length) js=js.filter(j=>vmSources.includes(j.source||"delegated"));
   if(document.getElementById("vm-openonly").checked) js=js.filter(j=>j.status==="running");
   const live=document.getElementById("vm-livefirst");
   if(!live||live.checked){
@@ -4604,7 +4605,7 @@ function vmLiveCard(j){
     : vmElapsedText(j.duration||0);
   return '<div class="vm-live"><div class="vm-live-l">'
     +'<div class="vm-live-t"><span class="spin">\u21bb</span> Running now \u00b7 '+esc(j.target)
-    +' \u00b7 '+esc(j.kind)+'</div>'
+    +' \u00b7 '+esc(j.kind)+(vmIsPilot(j)?' \u00b7 machine-pilot':"")+'</div>'
     +'<h4>'+esc(j.ws_label||j.tag)+'</h4>'
     +(j.cmd?'<code>'+esc(j.cmd)+'</code>':"")
     +'<div class="vm-live-m">started '+esc(formatPortalDate(j.started))
@@ -4644,8 +4645,13 @@ function renderVmlog(){
   // day-old verdicts as current.
   const stale=VMLOG.stale_n||0, unreach=VMLOG.unreachable||[];
   const attemptLate=VMLOG.last_attempt&&VMLOG.last_attempt>VMLOG.last_refresh;
+  const pil=VMLOG.pilot||{}, nPilot=all.filter(vmIsPilot).length;
+  const bmcBad=Object.entries(pil.bmc||{}).filter(([,b])=>b&&b.error).map(([t])=>t);
   document.getElementById("vm-asof").innerHTML=
-    all.length+" delegated job"+(all.length===1?"":"s")+" \u00b7 "+running.length+" running \u00b7 "
+    all.length+" machine job"+(all.length===1?"":"s")
+    +(nPilot?' <span title="machine-pilot job / bmcjob runs in the last '
+      +esc(String(pil.days||""))+' day(s)">('+nPilot+" pilot)</span>":"")
+    +" \u00b7 "+running.length+" running \u00b7 "
     +(VMLOG.last_refresh
       ? "verified <b>"+esc(VMLOG.last_refresh)+"</b>"
         +(VMLOG.refresh_age_h?' <span class="vm-age'+(vmStale(VMLOG.refresh_age_h)?" old":"")
@@ -4658,7 +4664,10 @@ function renderVmlog(){
     +(unreach.length?' \u00b7 <span class="vm-unver">unreachable: '+esc(unreach.join(", "))
       +'</span>':"")
     +" \u00b7 "+(VMLOG.logs_held||0)+" log(s) held locally"
-    +(VMLOG.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(VMLOG.error)+'</span>':"");
+    +(VMLOG.error?' \u00b7 <span style="color:'+PBI.red+'">'+esc(VMLOG.error)+'</span>':"")
+    +(pil.error?' \u00b7 <span class="vm-unver">'+esc(pil.error)+'</span>':"")
+    +(bmcBad.length?' \u00b7 <span class="vm-unver" title="'+esc(bmcBad.map(t=>t+": "+pil.bmc[t].error).join("\n"))
+      +'">bmcjob read failed: '+esc(bmcBad.join(", "))+'</span>':"");
 
   renderVmMachines();
 
@@ -4670,7 +4679,7 @@ function renderVmlog(){
 
   document.getElementById("vm-kpis").innerHTML=[
     kpi({c:running.length?PBI.blue:PBI.grey, label:"Running", n:running.length,
-         sub:"of "+all.length+" delegated"}),
+         sub:"of "+all.length+" jobs"}),
     kpi({c:PBI.green, label:"Passed", n:n("passed"), sub:"rc=0"}),
     kpi({c:n("failed")?PBI.red:PBI.grey, label:"Failed", n:n("failed"), sub:"non-zero rc"}),
     kpi({c:n("died")?PBI.orange:PBI.grey, label:"Died", n:n("died"),
@@ -4681,11 +4690,12 @@ function renderVmlog(){
 
   const js=vmJobs();
   document.getElementById("vm-count").textContent=
-    js.length+" of "+all.length+" delegated job"+(all.length===1?"":"s")+" shown";
+    js.length+" of "+all.length+" machine job"+(all.length===1?"":"s")+" shown";
   document.getElementById("vm-body").innerHTML=js.length
     ? js.map(vmRow).join("")
-    : '<tr><td colspan="8"><div class="empty">No delegated jobs recorded yet. '
-      +'Every <code>mctl build</code> / <code>mctl test</code> lands here.</div></td></tr>';
+    : '<tr><td colspan="8"><div class="empty">No machine jobs recorded yet. '
+      +'Every <code>mctl build</code> / <code>mctl test</code> and machine-pilot '
+      +'<code>job run -T &lt;target&gt;</code> / <code>bmcjob</code> run lands here.</div></td></tr>';
   vmBindLogs();
   vmTimersSync();
   applyTableStandards(document.getElementById("sec-vm"));
@@ -4779,7 +4789,7 @@ function vmBindLogs(){
     vmLogOpen(b.dataset.target, b.dataset.tag, b.dataset.kind, b.dataset.live==="1",
               b.dataset.id||"")));
   document.querySelectorAll(".vm-cancel").forEach(b=>b.addEventListener("click",()=>
-    vmCancel(b.dataset.id,b.dataset.label)));
+    vmCancel(b.dataset.id,b.dataset.label,b.dataset.pilot==="1")));
   vmBindFlashOpen(document);
 }
 // A reading older than an hour is history, not status. Saying so is the whole
@@ -5704,8 +5714,12 @@ function vmRow(j){
   const title=(VM_STATUS_TITLE[j.status]||"")+(j.note?" \u2014 "+j.note:"")
     +(j.stale?" \u2014 "+vmStaleTitle(j):"");
   return '<tr class="task'+(j.status==="running"?" on":"")+(j.stale?" vm-stale":"")+'">'
-    +'<td title="'+esc([j.dest,j.instance].filter(Boolean).join(" \u00b7 "))+'">'+esc(j.target)+'</td>'
-    +'<td>'+esc(j.kind)+'</td>'
+    +'<td title="'+esc([j.dest,j.instance,j.attributed===false?"no machine recorded for this job; launch with job run -T <target>":""].filter(Boolean).join(" \u00b7 "))+'"'
+      +(j.attributed===false?' class="muted"':"")+'>'+esc(j.target)+'</td>'
+    +'<td>'+esc(j.kind)+(vmIsPilot(j)?'<span class="vm-src" title="'
+      +(j.source==="pilot-bmc"?"machine-pilot bmcjob on the BMC (read on Refresh)"
+        :"job runner on this workstation"+(j.job_id?" \u00b7 record "+esc(j.job_id):""))+'">'
+      +esc(j.runner_name||"pilot")+'</span>':"")+'</td>'
     +'<td class="vm-ws"><b>'+esc(j.ws_label||j.tag)+'</b>'
       +(j.adopted?'<span>found on target \u00b7 not dispatched from here</span>':"")+'</td>'
     +'<td class="vm-cmd">'+(j.cmd?'<code>'+esc(j.cmd)+'</code>'
@@ -5725,7 +5739,17 @@ function vmRow(j){
 }
 // Only a run that still owns its workspace slot can be stopped: mctl kills the
 // pid recorded in that slot and refuses when a newer run has taken it over.
+function vmIsPilot(j){ return j.source==="pilot-local"||j.source==="pilot-bmc"; }
 function vmCancelButton(j){
+  if(vmIsPilot(j)){
+    if(j.status!=="running") return "";
+    const why=j.stop_refusal||(j.stale?"The BMC reading is unverified \u2014 refresh this machine before stopping":"");
+    if(why||!j.cancellable)
+      return '<button class="vm-cancel" disabled title="'+esc(why||"Cannot be stopped from here")+'">\u25a0 stop</button>';
+    return '<button class="vm-cancel" data-pilot="1" data-id="'+esc(j.id)+'" data-label="'
+      +esc(j.kind+" "+j.tag+" ("+j.target+")")+'"'
+      +' title="TERM this job\u2019s process group (queued as a portal action)">\u25a0 stop</button>';
+  }
   if(j.kind==="flash"&&j.status==="running"&&!j.cancellable)
     return '<button class="vm-cancel" disabled title="Writing flash ('+esc(j.phase||"")+') \u2014 cannot be stopped safely">\u25a0 stop</button>';
   if(j.status!=="running"||j.owns_slot===false||!j.pid||!["build","test","run","flash"].includes(j.kind))
@@ -5739,11 +5763,15 @@ function vmFlashProgressBtn(j){
   return '<button class="vm-flash-open" data-id="'+esc(j.id)+'" title="Open the flash progress window (per-OAM state, phases, result)">'
     +'\u26a1 progress</button>';
 }
-async function vmCancel(id,label){
+async function vmCancel(id,label,pilot){
   const note=document.getElementById("vm-refresh-note");
   if(!SERVED){ note.textContent="Serve the portal to stop a job"; return; }
-  if(!confirm("Stop "+label+"? The process group is terminated on the machine; "
-    +"containers it started may need manual cleanup.")) return;
+  if(!confirm(pilot
+    ? "Stop "+label+"? Its whole process group gets SIGTERM"
+      +(id.startsWith("pj:B:")?" on the BMC":" on this workstation")
+      +"; the pid is verified to still be this job first. Anything it was doing to a machine stops mid-way."
+    : "Stop "+label+"? The process group is terminated on the machine; "
+      +"containers it started may need manual cleanup.")) return;
   note.textContent="stopping "+label+"\u2026";
   try{
     const r=await fetch("/api/vm-cancel",{method:"POST",
@@ -5782,7 +5810,11 @@ function vmLogLink(j){
     return '<span class="muted" title="'+esc(lost)+'">'+(meta||"\u2014")+'</span>';
   }
   // Not yet probed but still the slot's owner: the remote log IS this run's.
-  const what=live?"Open a terminal tailing this log live on "+j.target
+  const what=vmIsPilot(j)
+    ? (j.source==="pilot-bmc"
+        ? (live?"Tail this bmcjob\u2019s log live on the BMC of ":"Open this bmcjob\u2019s log on the BMC of ")+j.target+" (mctl bmc)"
+        : (live?"Tail this job\u2019s log live":"Open this job\u2019s log")+" from ~/.jobs on this workstation")
+    : live?"Open a terminal tailing this log live on "+j.target
     :(j.has_log?"Open this run\u2019s stored log in a terminal pager ("+Math.round((j.log_bytes||0)/1024)+" KB"
         +(j.log_at?", mirrored "+j.log_at:"")+")"
       :(j.owns_slot===false?"Look up this run\u2019s archived log on "+j.target
@@ -6114,7 +6146,13 @@ document.getElementById("vm-vms").addEventListener("click",checkVms);
 document.getElementById("vm-console")?.addEventListener("click",()=>consoleDialog());
 document.getElementById("vm-add")?.addEventListener("click",()=>vmAddDialog());
 document.getElementById("vm-target").addEventListener("change",e=>{
-  vmTargets=msVals(e.target); vmTarget=vmTargets.length===1?vmTargets[0]:""; renderVmlog();
+  vmTargets=msVals(e.target);
+  // Only a registered target scopes Refresh; "(unattributed)" pilot jobs are not one.
+  vmTarget=vmTargets.length===1&&(VMLOG.targets||[]).includes(vmTargets[0])?vmTargets[0]:"";
+  renderVmlog();
+});
+document.getElementById("vm-source").addEventListener("change",e=>{
+  vmSources=msVals(e.target); renderVmlog();
 });
 document.getElementById("vm-livefirst").addEventListener("change",renderVmlog);
 document.getElementById("vm-openonly").addEventListener("change",renderVmlog);
@@ -7248,7 +7286,12 @@ const SETTING_GROUPS=[
     ["power_checks","Check power at expected transitions","EC2 read only at lease end or during a pending transition; no SSH probes or power actions"],
     ["power_grace_s","Lease-end grace","seconds after expected lease end before checking power"],
     ["power_retry_s","Power-check retry spacing","seconds between bounded follow-up checks"],
-    ["power_retry_limit","Power-check retries","additional attempts after the first check; 0 disables retries"]]],
+    ["power_retry_limit","Power-check retries","additional attempts after the first check; 0 disables retries"],
+    ["pilot_jobs","Show machine-pilot jobs","list local job and BMC bmcjob runs in the Machines job view"],
+    ["pilot_jobs_days","Machine-pilot history","days of finished pilot jobs to list; running ones always show"],
+    ["job_retention_days","Job record retention","days to keep finished ~/.jobs records of every runner (pilot, flash, mctl copies); 0 keeps all"],
+    ["pilot_bmc_on_refresh","Read bmcjobs on Refresh","Refresh status also lists bmcjob dirs on targets with an mctl BMC (read-only; a rejected login is not retried for 6 h)"],
+    ["pilot_poll_s","Pilot job poll interval","seconds between reads of the local job dirs for start/finish notices"]]],
   ["terminals","Terminals",[
     ["launcher","Default launcher","where \u201c>_ Terminal\u201d, BMC and log buttons open; every button\u2019s \u25be offers the other",
       [["windows_terminal","Windows Terminal window"],["browser","Browser pop-up"]]],

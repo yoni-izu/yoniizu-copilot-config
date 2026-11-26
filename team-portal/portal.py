@@ -59,6 +59,7 @@ import domain_watch  # noqa: E402
 import power_schedule  # noqa: E402
 import live_status  # noqa: E402
 import ai  # noqa: E402
+import jobs_view  # noqa: E402
 
 # bug-monitor owns the HSI bug store. The portal dashboard renders its Bugs
 # section from it; the portal never touches ~/tasks/bugs.json directly.
@@ -515,6 +516,13 @@ __STYLES__
       </div>
       <div class="slicer">
         <select id="vm-target" data-filter><option value="">All targets</option></select>
+        <select id="vm-source" data-filter title="Which runner wrote the job record: mctl delegation, the local fw-flash runner, the local job runner (pilot or ad-hoc), or bmcjob on a BMC">
+          <option value="">All sources</option>
+          <option value="delegated">Delegated (mctl)</option>
+          <option value="flash">Flash (local runner)</option>
+          <option value="pilot-local">Local job (pilot / ad-hoc)</option>
+          <option value="pilot-bmc">Pilot bmcjob (BMC)</option>
+        </select>
         <label class="chip"><input type="checkbox" id="vm-livefirst" checked> Live on top</label>
         <button id="vm-add" class="btn">+ Add machine</button>
         <button id="vm-console" class="btn" title="Open several machine shells, BMCs and UART consoles at once: Windows Terminal split panes or a browser grid with shared input (broadcast).">&#8862; Console</button>
@@ -766,6 +774,7 @@ def vmlog_payload() -> dict:
     except Exception as e:
         return {"jobs": [], "running": [], "counts": {}, "targets": [], "machines": [],
                 "machines_checked": "", "last_refresh": "", "log": "", "error": str(e)}
+    jobs_view.merge(body, portal_settings.load()["machines"])
     body["terminal_targets"] = list(vd.targets())
     body["live"] = live_payload()["links"]
     body["power_schedule"] = POWER_SCHEDULE.snapshot() if POWER_SCHEDULE else {
@@ -974,9 +983,14 @@ def term_spec(data: dict) -> dict:
         return terminal.uart_spec(target, str(data.get("console") or ""),
                                   uart_consoles(target)["consoles"])
     if kind == "log":
+        ident = str(data.get("job") or "")
+        if jobs_view.is_pilot_id(ident):
+            if jobs_view.pilot_jobs is None:
+                raise terminal.TermError("machine-pilot is not installed")
+            return terminal.log_spec(jobs_view.pilot_jobs.log_view(jobs_view.pilot_id(ident)))
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
-        return terminal.log_spec(vd.log_view(str(data.get("job") or "")))
+        return terminal.log_spec(vd.log_view(ident))
     if kind == "provision":
         if vd is None:
             raise terminal.TermError("vm-delegate is not installed")
@@ -1566,6 +1580,8 @@ def _execute_action(job: dict, store_lock=None) -> None:
         VM_REFRESH_LOCK.acquire()
         return run_vm_refresh(job)
     if kind == "vm-cancel":
+        if jobs_view.is_pilot_id(job.get("vm_job")):
+            return run_pilot_stop(job)
         with VM_REFRESH_LOCK:
             return run_vm_cancel(job)
     if kind == "ai":
@@ -2363,6 +2379,33 @@ def start_pr_scan_job(only=None, jira: bool = True) -> str:
     return enqueue_action(job)
 
 
+def refresh_pilot_bmc(job: dict, names: list) -> None:
+    """Read machine-pilot's bmcjob dirs on the refreshed targets that have a BMC."""
+    cfg = portal_settings.load()["machines"]
+    if not (cfg["pilot_jobs"] and cfg["pilot_bmc_on_refresh"]) or jobs_view.pilot_jobs is None:
+        return
+    try:
+        bmcs = [t for t in jobs_view.pilot_jobs.bmc_targets() if t in names]
+    except Exception:                                          # noqa: BLE001
+        return
+    for t in bmcs:
+        with ALIGN_LOCK:
+            job["current"] = f"reading bmcjobs on {t}"
+            job["total"] = job.get("total", 0) + 1
+        try:
+            res = jobs_view.pilot_jobs.refresh_bmc(t, auto=True)
+        except Exception as e:                                 # noqa: BLE001
+            res = {"error": str(e)}
+        bad = res.get("error")
+        with ALIGN_LOCK:
+            job["repos"].append({
+                "name": f"{t} BMC", "action": "skipped" if res.get("skipped") else
+                ("unreachable" if bad else "read"), "icon": "\u26a0" if bad else "\u2713",
+                "tone": "warn" if bad else "ok",
+                "detail": bad or f"{res.get('jobs', 0)} bmcjob(s) read"})
+    observe_pilot_jobs()
+
+
 def run_vm_refresh(job: dict) -> None:
     """Probe target(s), mirror their logs, re-read EC2 — on a worker thread.
 
@@ -2401,6 +2444,7 @@ def run_vm_refresh(job: dict) -> None:
                     "detail": bad or "job dirs read \u00b7 logs mirrored locally",
                 })
             job["current"] = "octl vm list"
+        refresh_pilot_bmc(job, names)
         # Scoped to a bare-metal target there is no instance to ask about, and
         # `octl vm list` costs an SSO revalidation — skip it.
         want_ec2 = True
@@ -2540,6 +2584,49 @@ def notify_machine_job(ident: str, row: dict) -> None:
 
 
 MACHINE_NOTIFICATIONS = events.JobTransitions(machine_notification_snapshot, notify_machine_job)
+
+
+def pilot_notification_snapshot() -> dict:
+    return {ident: {"status": r["status"], "kind": r["kind"], "target": r["target"],
+                    "ws": r["tag"], "rc": r["rc"], "last_line": r["last_line"]}
+            for ident, r in jobs_view.snapshot(portal_settings.load()["machines"]).items()}
+
+
+PILOT_CHANGED = threading.Event()
+
+
+def notify_pilot_job(ident: str, row: dict) -> None:
+    PILOT_CHANGED.set()
+    notify_machine_job(ident, row)
+
+
+PILOT_NOTIFICATIONS = events.JobTransitions(pilot_notification_snapshot, notify_pilot_job)
+
+
+def observe_pilot_jobs() -> bool:
+    """Observe machine-pilot job transitions; True when any status changed."""
+    PILOT_CHANGED.clear()
+    try:
+        PILOT_NOTIFICATIONS.observe()
+    except Exception:
+        logging.exception("Portal machine-pilot observation failed")
+    return PILOT_CHANGED.is_set()
+
+
+def run_pilot_watch(stop: threading.Event) -> None:
+    """Poll machine-pilot's local job dirs so starts/finishes show without a click."""
+    observe_pilot_jobs()
+    while True:
+        cfg = portal_settings.load()["machines"]
+        try:
+            jobs_view.prune(cfg)
+        except Exception:                                        # noqa: BLE001
+            logging.exception("Portal job record retention failed")
+        if stop.wait(cfg["pilot_poll_s"]):
+            return
+        if cfg["pilot_jobs"] and observe_pilot_jobs():
+            LIVE_STATE["changed"] = time.time()
+            EVENTS.publish_domains(["delegation"])
 
 
 def observe_machine_jobs() -> None:
@@ -3872,7 +3959,9 @@ def execute_and_notify(job: dict, store_lock=None) -> None:
 
 
 def start_vm_cancel_job(job_id: str) -> str:
-    """Queue stopping one running delegated machine job (through vm-delegate)."""
+    """Queue stopping one running machine job (vm-delegate or machine-pilot)."""
+    if jobs_view.is_pilot_id(job_id):
+        return start_pilot_stop_job(job_id)
     rows = {j.get("id"): j for j in vd.jobs()}
     rec = rows.get(job_id)
     if rec is None:
@@ -3885,6 +3974,39 @@ def start_vm_cancel_job(job_id: str) -> str:
     return enqueue_action({"kind": "vm-cancel", "slot": slot, "title": slot,
                            "vm_job": job_id, "target": target,
                            "current": None, "total": 1, "message": "", "repos": []})
+
+
+def start_pilot_stop_job(job_id: str) -> str:
+    """Queue stopping one running machine-pilot job; refused commands never queue."""
+    if jobs_view.pilot_jobs is None:
+        raise LookupError("machine-pilot is not installed")
+    rec = jobs_view.pilot_jobs.find(jobs_view.pilot_id(job_id))
+    if rec is None:
+        raise LookupError("unknown machine job")
+    if rec["status"] != "running":
+        raise ValueError(f"machine job is not running (status: {rec['status']})")
+    if rec["stale"]:
+        raise ValueError("the BMC reading is unverified; refresh the machine before stopping")
+    if rec["stop_refusal"]:
+        raise ValueError(rec["stop_refusal"])
+    target = rec["target"] or jobs_view.UNATTRIBUTED
+    slot = f"Stop {rec['source']} job {rec['tag']} \u00b7 {target}"
+    return enqueue_action({"kind": "vm-cancel", "slot": slot, "title": slot,
+                           "vm_job": job_id, "target": target,
+                           "current": None, "total": 1, "message": "", "repos": []})
+
+
+def run_pilot_stop(job: dict) -> None:
+    """TERM a machine-pilot job through its owner API (verifies the pid first)."""
+    with ALIGN_LOCK:
+        job["current"] = f"stopping {job['vm_job'].split(':')[-1]}"
+    res = jobs_view.pilot_jobs.stop(jobs_view.pilot_id(job["vm_job"]))
+    observe_pilot_jobs()
+    EVENTS.publish_domains(["delegation"])
+    with ALIGN_LOCK:
+        job.update(current=None, result={k: res[k] for k in ("result", "error") if res.get(k)},
+                   status="error" if res.get("error") else "done",
+                   message=res.get("error") or res.get("result", "").lower().replace("_", " "))
 
 
 def run_vm_cancel(job: dict) -> None:
@@ -5137,11 +5259,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 origin = self.headers.get("Origin")
                 if origin and origin != f"http://{self.headers.get('Host')}":
                     return self._send(403, json.dumps({"error": "cross-origin request rejected"}))
-                if vd is None:
-                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
                 ident = payload.get("id")
                 if set(payload) != {"id"} or not isinstance(ident, str) or not ident:
                     return self._send(400, json.dumps({"error": "id of a machine job is required"}))
+                if vd is None and not jobs_view.is_pilot_id(ident):
+                    return self._send(503, json.dumps({"error": "vm-delegate not installed"}))
                 try:
                     jid = start_vm_cancel_job(ident)
                 except LookupError as e:
@@ -5525,6 +5647,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except Exception as error:                                   # noqa: BLE001
         print(f"[portal/review-chat] recovery failed: {error}", file=sys.stderr)
     threading.Thread(target=run_review_chat_sweeper, args=(stop,), daemon=True).start()
+    if jobs_view.pilot_jobs is not None:
+        threading.Thread(target=run_pilot_watch, args=(stop,), daemon=True,
+                         name="portal-pilot-jobs").start()
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     print(f"[tm] serving editable dashboard at http://127.0.0.1:{args.port} (Ctrl-C to stop)")
