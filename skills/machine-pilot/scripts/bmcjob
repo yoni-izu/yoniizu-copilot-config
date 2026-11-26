@@ -14,6 +14,8 @@
 # reaped out from under long-lived jobs).
 set -uo pipefail
 
+[ "${1:-}" = run ] && echo "bmcjob: deprecated - no job state lives on the BMC any more. Run BMC work as a local job: job run --kind bmc -T <target> -- mctl -t <target> bmc '<cmd>' (skills/machine-pilot/references/detached-ops.md)" >&2
+
 ROOT=/var/lib/bmcjobs
 
 is_running() {

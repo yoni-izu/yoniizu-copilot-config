@@ -14,6 +14,7 @@ FILES=(
 	"bin/setup_machine.sh:setup_machine.sh"
 	"bin/lsctl:lsctl"
 	"bin/bmcjob:bmcjob"
+	"bin/job:job"
 	"bin/fw-deploy:fw-deploy"
 	"bin/sat:sat"
 	"bin/cli-local-config.sh:cli-local-config.sh"

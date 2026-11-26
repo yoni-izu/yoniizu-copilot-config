@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# job — run commands DETACHED in the shared job record (~/.jobs/<id>/) so they
+# survive SSH hangups, VPN drops, terminal timeouts and agent restarts.
+# Format: ~/.copilot/lib/jobs.md (Python twin: ~/.copilot/lib/jobs.py).
+#
+#   job run [opts] [--] '<cmd>'   launch detached, print the job id (returns at once)
+#       -t|--id ID        job id (default <runner>-<host>-<UTC>-<rand>)
+#       -T|--target NAME  machine the job is about (default $PILOT_TARGET)
+#       --runner NAME     pilot (default) | mctl | flash
+#       --kind NAME       job (default) | build | test | run | bmc | ...
+#       --cwd DIR         run in DIR (also the busy-guard key)
+#       --label TEXT      free-text label
+#       --plain           NO_COLOR=1 TERM=dumb, strip ANSI from the log
+#       --unstoppable P   space-separated phases 'job kill' refuses
+#   job status [ID]          RUNNING / DONE rc=N / CANCELLED / DIED / REMOTE
+#   job log ID [N]           last N lines (default 40)
+#   job wait ID [SECS]       poll until done (default 60s), then print tail
+#   job list [--tsv] [--host H] [--since DAYS] [--runner R]
+#   job busy --cwd DIR       ids holding DIR; exit 3 if busy
+#   job kill ID [--wait S]   mark stopped, TERM the group, KILL after S (10)
+#   job clean [DAYS]         drop finished local jobs older than DAYS (default 30)
+set -uo pipefail
+
+JOBS_ROOT="${JOB_ROOT:-$HOME/.jobs}"
+HOST=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
+REMOTE_BUSY_TTL=$((6 * 3600))
+
+die() { echo "job: $*" >&2; exit 1; }
+safe() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && "$1" != *..* ]]; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+field() { [[ -f "$1/$2" ]] && head -c 1024 "$1/$2" 2>/dev/null | head -n 1; }
+epoch() { [[ -n "$1" ]] && date -u -d "$1" +%s 2>/dev/null || echo 0; }
+
+is_local() { local h; h=$(field "$1" host); [[ -z "$h" || "${h,,}" == "$HOST" ]]; }
+
+# Alive AND still this job: argv carries the dir, or the env carries JOB_ID.
+pid_runs() {
+	local jd=$1 pid=$2
+	[[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]] || return 1
+	kill -0 "$pid" 2>/dev/null || [[ -d /proc/$pid ]] || return 1
+	# A reaped pid vanishes from /proc after kill -0; only trust kill -0 without /proc.
+	[[ -d /proc/$pid ]] || { [[ -d /proc/self ]] && return 1; return 0; }
+	tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "${jd%/}" && return 0
+	tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qxF -- "JOB_ID=$(basename "$jd")"
+}
+
+rc_of() {
+	local jd=$1 rc
+	rc=$(field "$jd" rc)
+	if [[ ! "$rc" =~ ^-?[0-9]+$ && -f "$jd/log" ]]; then
+		rc=$(tail -c 8192 "$jd/log" 2>/dev/null | grep -aoE '__((BMC|MCTL)?JOB|MCTL)_DONE__ rc=-?[0-9]+' | tail -1 | sed 's/.*rc=//')
+	fi
+	[[ "$rc" =~ ^-?[0-9]+$ ]] && echo "$rc"
+}
+
+# running | passed | failed | cancelled | died | remote  (mirrors jobs.status)
+state_of() {
+	local jd=$1 rc pid started
+	is_local "$jd" || { echo remote; return; }
+	rc=$(rc_of "$jd")
+	pid=$(field "$jd" pid)
+	if [[ -z "$rc" ]] && pid_runs "$jd" "$pid"; then echo running; return; fi
+	[[ -n "$rc" ]] || rc=$(rc_of "$jd") # it may have finished since rc was read
+	if [[ -f "$jd/stopped" && "$rc" != 0 ]]; then echo cancelled; return; fi
+	if [[ -z "$rc" ]]; then
+		started=$(epoch "$(field "$jd" started)")
+		if [[ -z "$pid" ]] && (($(date +%s) - started < 15)); then echo running; else echo died; fi
+		return
+	fi
+	[[ "$rc" == 0 ]] && echo passed || echo failed
+}
+
+last_phase() {
+	[[ -f "$1/events.jsonl" ]] || return 0
+	grep -o '"phase": *"[^"]*"' "$1/events.jsonl" 2>/dev/null | tail -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+cmd_run() {
+	local id="" target=${PILOT_TARGET:-} runner=pilot kind=job cwd="" label="" plain="" unstop=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		-t | --tag | --id) id=${2:-}; shift 2 ;;
+		-T | --target) target=${2:-}; shift 2 ;;
+		--runner) runner=${2:-}; shift 2 ;;
+		--kind) kind=${2:-}; shift 2 ;;
+		--cwd) cwd=${2:-}; shift 2 ;;
+		--label) label=${2:-}; shift 2 ;;
+		--plain) plain=1; shift ;;
+		--unstoppable) unstop=${2:-}; shift 2 ;;
+		--) shift; break ;;
+		*) break ;;
+		esac
+	done
+	[[ $# -gt 0 ]] || die "run needs a command"
+	safe "$runner" || die "bad runner: $runner"
+	safe "$kind" || die "bad kind: $kind"
+	[[ -z "$target" ]] || safe "$target" || die "bad target: $target"
+	[[ -n "$id" ]] || id="$runner-${target:-$HOST}-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04x' $((RANDOM % 65536)))"
+	safe "$id" || die "bad job id: $id"
+	[[ -z "$cwd" || -d "$cwd" ]] || die "no such directory: $cwd"
+	local jd="$JOBS_ROOT/$id"
+
+	if [[ -d "$jd" ]]; then
+		[[ "$(state_of "$jd")" == running ]] && die "'$id' is already RUNNING (pid $(field "$jd" pid)) — poll it, 'job kill $id', or pick another id"
+		is_local "$jd" || die "'$id' belongs to host $(field "$jd" host)"
+		rm -f "$jd"/{rc,finished,stopped,pid,log,events.jsonl,meta.json,target,cwd,label,unstoppable}
+	fi
+	mkdir -p "$jd" || die "cannot create $jd"
+	printf '%s\n' "$*" >"$jd/cmd.sh"
+	printf '%s\n' "$runner" >"$jd/runner"
+	printf '%s\n' "$kind" >"$jd/kind"
+	printf '%s\n' "$HOST" >"$jd/host"
+	printf '%s\n' "${USER:-$(id -un)}" >"$jd/user"
+	[[ -z "$target" ]] || printf '%s\n' "$target" >"$jd/target"
+	[[ -z "$cwd" ]] || printf '%s\n' "$cwd" >"$jd/cwd"
+	[[ -z "$label" ]] || printf '%s\n' "${label//$'\n'/ }" >"$jd/label"
+	[[ -z "$unstop" ]] || printf '%s\n' "$unstop" >"$jd/unstoppable"
+	now_iso >"$jd/started"
+
+	# setsid+nohup: a session leader detached from this terminal; `trap "" HUP`
+	# is inherited. stdin is /dev/null so a prompt can never block it. The
+	# command is read from a file, which sidesteps nested-quoting hazards. rc is
+	# written last and atomically: its presence means "finished".
+	JOB_ID="$id" setsid nohup bash -c '
+		trap "" HUP
+		jd=$0
+		if [ -n "$1" ] && ! cd "$1"; then rc=127
+		elif [ -n "$2" ]; then
+			NO_COLOR=1 TERM=dumb bash "$jd/cmd.sh" 2>&1 | sed -u -r "s/\x1b\[[0-9;?]*[A-Za-z]//g"
+			rc=${PIPESTATUS[0]}
+		else bash "$jd/cmd.sh"; rc=$?; fi
+		date -u +%Y-%m-%dT%H:%M:%SZ >"$jd/finished"
+		printf "%s\n" "$rc" >"$jd/.rc.tmp" && mv -f "$jd/.rc.tmp" "$jd/rc"
+		echo "__JOB_DONE__ rc=$rc"' "$jd" "$cwd" "$plain" >"$jd/log" 2>&1 </dev/null &
+	local pid=$! i
+	# Publish the pid only once the child has exec'd and carries the job dir;
+	# before that pid_runs cannot identify it and a reader would see "died".
+	for ((i = 0; i < 100; i++)); do
+		[[ -d /proc/$pid ]] || break
+		tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$jd" && break
+		sleep 0.02
+	done
+	echo "$pid" >"$jd/pid"
+	disown 2>/dev/null || true
+	echo "$id"
+}
+
+jobdir() {
+	local id=${1:-}
+	[[ -n "$id" ]] || die "missing job id"
+	safe "$id" || die "bad job id: $id"
+	[[ -d "$JOBS_ROOT/$id" ]] || die "no such job: $id"
+	echo "$JOBS_ROOT/$id"
+}
+
+line_of() {
+	local jd=$1 id st extra=""
+	id=$(basename "$jd")
+	st=$(state_of "$jd")
+	case "$st" in
+	running) extra="pid=$(field "$jd" pid)" ;;
+	passed | failed) extra="rc=$(rc_of "$jd")" ;;
+	cancelled) extra="(stopped $(field "$jd" stopped))" ;;
+	died) extra="(no exit code recorded — killed or host rebooted)" ;;
+	remote) extra="host=$(field "$jd" host)" ;;
+	esac
+	local word=${st^^}
+	[[ "$st" == passed || "$st" == failed ]] && word=DONE
+	echo "$id $word $extra since=$(field "$jd" started) log=$(wc -c <"$jd/log" 2>/dev/null || echo 0)B"
+}
+
+cmd_status() {
+	[[ -n "${1:-}" ]] || { cmd_list; return; }
+	line_of "$(jobdir "$1")"
+}
+
+cmd_log() {
+	local jd; jd=$(jobdir "${1:-}")
+	[[ -f "$jd/log" ]] || die "no log for: $1"
+	tail -n "${2:-40}" "$jd/log"
+}
+
+cmd_wait() {
+	local jd; jd=$(jobdir "${1:-}")
+	local secs=${2:-60} i=0
+	while ((i < secs)); do
+		[[ "$(state_of "$jd")" == running ]] || break
+		sleep 2
+		i=$((i + 2))
+	done
+	line_of "$jd"
+	echo "--- log tail ---"
+	tail -n 40 "$jd/log" 2>/dev/null
+	# Non-zero exit only means "still running", so callers can loop.
+	[[ "$(state_of "$jd")" == running ]] && return 2
+	return 0
+}
+
+tsv_clean() { tr '\t\r\n' '   ' | cut -c1-"${1:-240}"; }
+
+# id runner kind host target status rc pid started finished log_bytes phase cwd last_line
+tsv_of() {
+	local jd=$1 last
+	last=$(tail -c 8192 "$jd/log" 2>/dev/null | grep -av -e '__\(\(BMC\|MCTL\)\?JOB\|MCTL\)_DONE__' -e __MCTL_CANCELLED__ |
+		sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' | grep -av '^[[:space:]]*$' | tail -1)
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$(basename "$jd")" "$(field "$jd" runner || true)" "$(field "$jd" kind || true)" \
+		"$(field "$jd" host || true)" "$(field "$jd" target || true)" "$(state_of "$jd")" \
+		"$(rc_of "$jd" || true)" "$(field "$jd" pid || true)" "$(field "$jd" started || true)" \
+		"$(field "$jd" finished || true)" "$(wc -c <"$jd/log" 2>/dev/null || echo 0)" \
+		"$(last_phase "$jd")" "$(field "$jd" cwd | tsv_clean 1024)" "$(printf '%s' "$last" | tsv_clean)"
+}
+
+cmd_list() {
+	local tsv="" host="" since="" runner=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--tsv) tsv=1; shift ;;
+		--host) host=${2,,}; shift 2 ;;
+		--since) since=${2:-}; shift 2 ;;
+		--runner) runner=${2:-}; shift 2 ;;
+		*) die "unknown list option: $1" ;;
+		esac
+	done
+	[[ -d "$JOBS_ROOT" ]] || { [[ -n "$tsv" ]] || echo "(no jobs)"; return; }
+	local jd name h cutoff=0
+	[[ -z "$since" ]] || cutoff=$(($(date +%s) - ${since%.*} * 86400))
+	for jd in $(ls -1dt "$JOBS_ROOT"/*/ 2>/dev/null); do
+		jd=${jd%/}
+		name=$(basename "$jd")
+		safe "$name" || continue
+		if [[ -n "$host" ]]; then
+			h=$(field "$jd" host)
+			[[ "${h,,}" == "$host" || (-z "$h" && "$host" == "$HOST") ]] || continue
+		fi
+		if [[ -n "$runner" ]]; then
+			[[ "$(field "$jd" runner || echo pilot)" == "$runner" ]] || continue
+		fi
+		if ((cutoff)) && (($(stat -c %Y "$jd") < cutoff)) && [[ "$(state_of "$jd")" != running ]]; then
+			continue
+		fi
+		if [[ -n "$tsv" ]]; then tsv_of "$jd"; else line_of "$jd"; fi
+	done
+}
+
+cmd_busy() {
+	local cwd=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--cwd) cwd=${2:-}; shift 2 ;;
+		*) die "unknown busy option: $1" ;;
+		esac
+	done
+	[[ -n "$cwd" ]] || die "busy needs --cwd DIR"
+	[[ -d "$JOBS_ROOT" ]] || return 0
+	local jd st n=0 now
+	now=$(date +%s)
+	for jd in "$JOBS_ROOT"/*/; do
+		jd=${jd%/}
+		[[ -d "$jd" && "$(field "$jd" cwd)" == "$cwd" ]] || continue
+		st=$(state_of "$jd")
+		if [[ "$st" == remote ]]; then
+			[[ -z "$(rc_of "$jd")" && ! -f "$jd/stopped" ]] || continue
+			((now - $(epoch "$(field "$jd" started)") < REMOTE_BUSY_TTL)) || continue
+		elif [[ "$st" != running ]]; then
+			continue
+		fi
+		echo "$(basename "$jd") $st pid=$(field "$jd" pid) host=$(field "$jd" host)"
+		n=$((n + 1))
+	done
+	((n == 0)) || return 3
+}
+
+# Prints one '__JOB_KILL__ <RESULT>' line: STOPPED | FINISHED rc=N | DIED |
+# REFUSED <phase> | REMOTE <host> | STOP-PENDING.
+cmd_kill() {
+	local jd; jd=$(jobdir "${1:-}")
+	shift
+	local wait=10
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--wait) wait=${2:-10}; shift 2 ;;
+		*) die "unknown kill option: $1" ;;
+		esac
+	done
+	local st pid phase
+	st=$(state_of "$jd")
+	case "$st" in
+	remote) echo "__JOB_KILL__ REMOTE $(field "$jd" host)"; return 1 ;;
+	passed | failed) echo "__JOB_KILL__ FINISHED rc=$(rc_of "$jd")"; return 0 ;;
+	cancelled | died) echo "__JOB_KILL__ DIED"; return 0 ;;
+	esac
+	phase=$(last_phase "$jd")
+	if [[ -n "$phase" && " $(field "$jd" unstoppable) " == *" $phase "* ]]; then
+		echo "__JOB_KILL__ REFUSED $phase"
+		return 1
+	fi
+	pid=$(field "$jd" pid)
+	pid_runs "$jd" "$pid" || { echo "__JOB_KILL__ DIED"; return 0; }
+	# Marks the job cancelled: the TERM also kills the wrapper before it writes rc.
+	echo "$(now_iso) ${USER:-}" >"$jd/stopped"
+	# Negative PID targets the whole process group (setsid made it a leader).
+	kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+	local i=0
+	while ((i < wait * 10)) && pid_runs "$jd" "$pid"; do sleep 0.1; i=$((i + 1)); done
+	if pid_runs "$jd" "$pid"; then
+		kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+		sleep 0.5
+	fi
+	echo "[job] cancelled $(now_iso) by ${USER:-?}" >>"$jd/log"
+	if pid_runs "$jd" "$pid"; then echo "__JOB_KILL__ STOP-PENDING"; return 1; fi
+	echo "__JOB_KILL__ STOPPED"
+}
+
+cmd_clean() {
+	local days=${1:-30} jd st
+	[[ "$days" =~ ^[0-9]+$ ]] || die "DAYS must be a whole number"
+	[[ -d "$JOBS_ROOT" ]] || return 0
+	for jd in "$JOBS_ROOT"/*/; do
+		jd=${jd%/}
+		[[ -d "$jd" ]] && safe "$(basename "$jd")" || continue
+		st=$(state_of "$jd")
+		[[ "$st" == running || "$st" == remote ]] && continue
+		if [[ -z $(find "$jd" -maxdepth 0 -mtime -"$days" 2>/dev/null) ]]; then
+			rm -rf "$jd" && echo "removed $(basename "$jd")"
+		fi
+	done
+}
+
+case "${1:-}" in
+run | status | log | wait | list | busy | kill | clean)
+	c=$1
+	shift
+	"cmd_$c" "$@"
+	;;
+*)
+	sed -n '2,25p' "$0" | sed 's/^# \?//'
+	exit 1
+	;;
+esac

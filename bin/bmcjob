@@ -16,6 +16,8 @@
 # Password: ~/.pilot/bmc.pw (all lab BMCs share one credential), via $SSHPASS.
 set -uo pipefail
 
+[[ " $* " == *" run "* ]] && echo "bmcjob: deprecated - no job state lives on the BMC any more. Run BMC work as a local job: job run --kind bmc -T <target> -- mctl -t <target> bmc '<cmd>' (skills/machine-pilot/references/detached-ops.md)" >&2
+
 source "$(dirname "$(readlink -f "$0")")/cli-local-config.sh" || exit 1
 
 BMC_HOST_DEFAULT=$(cli_local_default lab-bmc-host "") || exit 1
