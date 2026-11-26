@@ -34,7 +34,7 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
    (taxonomy/detection), `~/.copilot-private/skills/machine-pilot/references/host-ops.md`,
    `~/.copilot-private/skills/machine-pilot/references/uart.md`,
    `~/.copilot-private/skills/machine-pilot/references/bmc.md`,
-   [detached-ops.md](./references/detached-ops.md) (`job`/`bmcjob` — read before running anything long).
+   [detached-ops.md](./references/detached-ops.md) (`job` and the shared `~/.jobs` record — read before running anything long).
 
 ## Hard Rules
 
@@ -53,8 +53,11 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
   hangups, terminal timeouts and VS Code reloads — and a command you cannot poll is
   a command you have to re-run blind (dangerous for resets/flashes). So **never run a
   lab operation in the foreground**: launch it with a job runner that returns a TAG
-  immediately, then poll. Same model everywhere — `job` (local), `bmcjob` (on the BMC),
-  `mctl` (VMs/remote hosts). See [detached-ops.md](./references/detached-ops.md).
+  immediately, then poll. One record everywhere (`~/.jobs/<id>/`): `job` (local),
+  `job run --kind bmc -- mctl -t <t> bmc '<cmd>'` (BMC; no state on the BMC; `bmcjob`
+  is deprecated), `mctl` (VMs/remote hosts). See [detached-ops.md](./references/detached-ops.md).
+  - Launch local jobs as `job run -T <target> …` so the Team Portal's Machines job
+    view files them under that machine (`scripts/pilot_jobs.py` is the data API).
   - A timeout on *your* poll means "not finished yet", **never** "it failed" — the work
     is still running on the far side. Re-poll; do not relaunch.
   - This is how `bmccli device reset` (can exceed 120 s) and any flash must be run.
