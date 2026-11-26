@@ -125,5 +125,5 @@ echo "out: $OUT"
 if [[ ${#silent[@]} -gt 0 ]]; then
 	echo "silent: ${silent[*]}"
 	echo "hint: reset them by EXPLICIT index (-d all skips non-READY devices):"
-	printf '      bmcjob run rst%s "bmccli device reset -d %s"\n' "${silent[0]}" "${silent[0]}"
+	printf "      job run --kind bmc -T <target> -- mctl -t <target> bmc 'bmccli device reset -d %s'\n" "${silent[0]}"
 fi

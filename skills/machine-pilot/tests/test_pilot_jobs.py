@@ -193,5 +193,16 @@ class Bmc(Base):
         self.assertTrue(rows[0]["stopped"])
 
 
+
+class BmcSideBmcjobRetired(unittest.TestCase):
+    def test_every_command_refused_without_touching_state(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "bmcjob"
+        for args in (["run", "t1", "touch /tmp/should-not-exist"], ["list"], []):
+            res = subprocess.run(["sh", str(script), *args], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("retired", res.stderr)
+            self.assertEqual(res.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()

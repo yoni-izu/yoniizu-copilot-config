@@ -58,7 +58,7 @@ Three tiles:
     - additional retries (0–10, default 3; 0 means only the first check)
     - changes apply live on Save; these checks never start, stop or renew a VM
     - machine-pilot jobs: show on/off (default on), history window (1–90 days,
-      default 14; running jobs always show), read bmcjobs on Refresh (default on)
+      default 14; running jobs always show), read leftover bmcjobs on Refresh (default on)
       and local job-dir poll interval (2–300 s, default 5); apply on Save
     - job record retention (0–365 days, default 30; 0 keeps all): finished
       `~/.jobs/<id>/` records of every runner (pilot, ad-hoc, flash, synced mctl
@@ -882,12 +882,13 @@ navigation badge continues to count confirmed running delegated jobs; the separa
   table through one adapter, [`jobs_view.py`](../jobs_view.py) (`pilot_view.py` is a legacy alias).
   vm-delegate lists runners `mctl` and `flash` (its rows gain `source` `delegated` / `flash` and
   `runner_name`); [`pilot_jobs.py`](../../skills/machine-pilot/scripts/pilot_jobs.py) owns every
-  other runner (`pilot`, ad-hoc `job run --runner NAME`) plus legacy bmcjob dirs, and
+  other runner (`pilot`, ad-hoc `job run --runner NAME`) plus the dirs left on BMCs by the retired
+  `bmcjob` (its `run` is refused; BMC work is a local `job run --kind bmc`), and
   `jobs_view.py` maps those onto the row shape and merges them into `/api/vm-jobs` (counts,
   running, stale, per-target `target_state`, nav badge, pulse). Local-record rows carry
   `source` `pilot-local`, id `job:<record id>` and `job_id`; `pj:L:<id>` is still accepted.
   Legacy BMC rows are `pilot-bmc`, ids `pj:B:<target>:<tag>`. The Kind cell shows the runner
-  name, and the **Source** multi-select filters Delegated / Flash / Local job / bmcjob. The target is the `job run -T <target>` record, else a
+  name, and the **Source** multi-select filters Delegated / Flash / Local job / Legacy bmcjob. The target is the `job run -T <target>` record, else a
   known name guessed from the command/host/tag, else `(unattributed)` (muted; it never scopes Refresh).
   Local rows are read from `~/.jobs` (a `portal-pilot-jobs` thread polls them for start/finish
   notifications). bmcjob rows come from a per-target cache that **Refresh status** fills through

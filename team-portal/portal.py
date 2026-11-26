@@ -516,12 +516,12 @@ __STYLES__
       </div>
       <div class="slicer">
         <select id="vm-target" data-filter><option value="">All targets</option></select>
-        <select id="vm-source" data-filter title="Which runner wrote the job record: mctl delegation, the local fw-flash runner, the local job runner (pilot or ad-hoc), or bmcjob on a BMC">
+        <select id="vm-source" data-filter title="Which runner wrote the job record: mctl delegation, the local fw-flash runner, the local job runner (pilot or ad-hoc), or a job left on a BMC by the retired bmcjob">
           <option value="">All sources</option>
           <option value="delegated">Delegated (mctl)</option>
           <option value="flash">Flash (local runner)</option>
           <option value="pilot-local">Local job (pilot / ad-hoc)</option>
-          <option value="pilot-bmc">Pilot bmcjob (BMC)</option>
+          <option value="pilot-bmc">Legacy bmcjob (BMC)</option>
         </select>
         <label class="chip"><input type="checkbox" id="vm-livefirst" checked> Live on top</label>
         <button id="vm-add" class="btn">+ Add machine</button>

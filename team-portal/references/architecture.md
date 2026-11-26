@@ -17,7 +17,7 @@ NFS or share them between machines without a supported database service.
 | Local PLDM tracking (not surfaced in the portal; the job queue lives in the company PLDM portal) | `pldm-job-queue/pjq.py` | `~/tasks/pldm.db` |
 | Delegation observations/history | `vm-delegate/vd.py` | `~/tasks/delegation.db` |
 | Shared job record format (all runners), `job` CLI | `lib/jobs.py`, `bin/job` (spec `lib/jobs.md`) | `~/.jobs/<id>/` |
-| machine-pilot local jobs (runner `pilot` + ad-hoc) and bmcjob cache (Machines view, read + stop) | `machine-pilot/scripts/pilot_jobs.py` | `~/.jobs/<id>/`, `~/.pilot/bmcjobs-cache/<target>.json` |
+| machine-pilot local jobs (runner `pilot` + ad-hoc) and the cache of jobs left by the retired bmcjob (Machines view, read + stop) | `machine-pilot/scripts/pilot_jobs.py` | `~/.jobs/<id>/`, `~/.pilot/bmcjobs-cache/<target>.json` |
 | Website maintenance actions | `../team-portal/maintenance.py` | `~/.copilot-private/team-portal/state/portal-maintenance.db` |
 | Portal action scheduling | `../team-portal/action_queue.py`, `portal.py` | `~/.copilot-private/team-portal/state/action-queue.db` |
 | Daily maintenance brief (derived) | `../team-portal/routine.py` | `~/.copilot-private/team-portal/state/morning-brief.json` |

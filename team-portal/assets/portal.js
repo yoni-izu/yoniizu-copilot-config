@@ -4649,7 +4649,7 @@ function renderVmlog(){
   const bmcBad=Object.entries(pil.bmc||{}).filter(([,b])=>b&&b.error).map(([t])=>t);
   document.getElementById("vm-asof").innerHTML=
     all.length+" machine job"+(all.length===1?"":"s")
-    +(nPilot?' <span title="machine-pilot job / bmcjob runs in the last '
+    +(nPilot?' <span title="machine-pilot jobs (and leftover bmcjob runs) in the last '
       +esc(String(pil.days||""))+' day(s)">('+nPilot+" pilot)</span>":"")
     +" \u00b7 "+running.length+" running \u00b7 "
     +(VMLOG.last_refresh
@@ -4695,7 +4695,7 @@ function renderVmlog(){
     ? js.map(vmRow).join("")
     : '<tr><td colspan="8"><div class="empty">No machine jobs recorded yet. '
       +'Every <code>mctl build</code> / <code>mctl test</code> and machine-pilot '
-      +'<code>job run -T &lt;target&gt;</code> / <code>bmcjob</code> run lands here.</div></td></tr>';
+      +'<code>job run -T &lt;target&gt;</code> lands here.</div></td></tr>';
   vmBindLogs();
   vmTimersSync();
   applyTableStandards(document.getElementById("sec-vm"));
@@ -7287,10 +7287,10 @@ const SETTING_GROUPS=[
     ["power_grace_s","Lease-end grace","seconds after expected lease end before checking power"],
     ["power_retry_s","Power-check retry spacing","seconds between bounded follow-up checks"],
     ["power_retry_limit","Power-check retries","additional attempts after the first check; 0 disables retries"],
-    ["pilot_jobs","Show machine-pilot jobs","list local job and BMC bmcjob runs in the Machines job view"],
+    ["pilot_jobs","Show machine-pilot jobs","list local job runs (and leftover jobs of the retired BMC bmcjob) in the Machines job view"],
     ["pilot_jobs_days","Machine-pilot history","days of finished pilot jobs to list; running ones always show"],
     ["job_retention_days","Job record retention","days to keep finished ~/.jobs records of every runner (pilot, flash, mctl copies); 0 keeps all"],
-    ["pilot_bmc_on_refresh","Read bmcjobs on Refresh","Refresh status also lists bmcjob dirs on targets with an mctl BMC (read-only; a rejected login is not retried for 6 h)"],
+    ["pilot_bmc_on_refresh","Read leftover bmcjobs on Refresh","Refresh status also lists jobs left on BMCs by the retired bmcjob, on targets with an mctl BMC (read-only; a rejected login is not retried for 6 h)"],
     ["pilot_poll_s","Pilot job poll interval","seconds between reads of the local job dirs for start/finish notices"]]],
   ["terminals","Terminals",[
     ["launcher","Default launcher","where \u201c>_ Terminal\u201d, BMC and log buttons open; every button\u2019s \u25be offers the other",

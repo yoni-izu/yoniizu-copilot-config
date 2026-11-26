@@ -11,13 +11,14 @@ is unclear.
 | `wip`, `wip-deploy` | Multi-repo workspace operations and remote installation |
 | `mctl`, `vmctl`, `setup_machine.sh` | Machine delegation and compatibility helpers |
 | `job` | Detached jobs in the shared `~/.jobs/<id>/` record (format: `lib/jobs.md`); also installed on mctl targets |
-| `lsctl`, `bmcjob` | Local lab console; `bmcjob` is deprecated (use `job run --kind bmc -- mctl -t <t> bmc '<cmd>'`) |
+| `lsctl`, `bmcjob` | Local lab console; `bmcjob` is retired: `run` is refused (use `job run --kind bmc -T <t> -- mctl -t <t> bmc '<cmd>'`), the rest only drains old BMC jobs |
 | `sat` | Read-only client for SAT inventory, allocation, workflow and power status APIs |
 | `fw-deploy` | Launcher for `skills/fw-deploy/scripts/fw_deploy.py` |
 
 The local `bmcjob` client is different from the BMC-side script in
-`skills/machine-pilot/scripts/bmcjob`. Both are deprecated: BMC work now runs
-as a local `job` that talks to the BMC, so no job state lives on the BMC.
+`skills/machine-pilot/scripts/bmcjob`. Both are retired: BMC work now runs
+as a local `job` that talks to the BMC, so no job state lives on the BMC. The
+BMC-side source is a stub that refuses every command.
 `skills/machine-pilot/scripts/job` is a compatibility link to `bin/job`.
 
 ## Install

@@ -114,6 +114,11 @@ class CliInstallTests(unittest.TestCase):
         result = self.run_command(BIN / "bmcjob", "-H", "explicit-host", "list", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("root@explicit-host", result.stdout)
+        result = self.run_command(BIN / "bmcjob", "-H", "explicit-host", "run", "t1", "true", env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("retired", result.stderr)
+        self.assertIn("job run --kind bmc", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_fw_deploy_launcher_uses_repository_implementation(self):
         (self.home / ".copilot").symlink_to(REPO, target_is_directory=True)

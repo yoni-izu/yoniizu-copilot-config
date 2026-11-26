@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# bmcjob — run commands on a lab BMC DETACHED, so they survive VPN/SSH drops.
+# bmcjob — RETIRED launcher for detached jobs on a lab BMC.
 #
-# Mirrors mctl's model: the work runs under `setsid nohup` on the BMC with a
-# pid/log/rc triplet under /tmp/pilot-jobs/<tag>/. No persistent SSH session is
-# needed — poll later from a fresh connection with `status`.
+# No job state lives on the BMC any more: run BMC work as a local job that
+# talks to the BMC, so the record is ~/.jobs/<id>/ on this workstation:
+#   job run --kind bmc -T <target> -- mctl -t <target> bmc '<cmd>'
+# `run` is refused. The other commands only drain jobs launched before the
+# retirement (state under /tmp/pilot-jobs/<tag>/ on the BMC):
 #
-#   bmcjob run <tag> '<cmd>'    start detached, return immediately
 #   bmcjob status <tag> [-n N]  RUNNING/DONE + exit code + last N log lines
 #   bmcjob log <tag> [-n N]     just the log tail
 #   bmcjob wait <tag> [-T secs] poll until DONE (default 600s), then print status
-#   bmcjob list                 all jobs and their states
-#   bmcjob clean <tag>|--all    remove job dirs
+#   bmcjob list                 all leftover jobs and their states
+#   bmcjob clean <tag>|--all    remove leftover job dirs
 #
 # Host: -H <ip|name>, else $BMC_HOST, else the private lab-bmc-host setting.
 # Password: ~/.pilot/bmc.pw (all lab BMCs share one credential), via $SSHPASS.
 set -uo pipefail
-
-[[ " $* " == *" run "* ]] && echo "bmcjob: deprecated - no job state lives on the BMC any more. Run BMC work as a local job: job run --kind bmc -T <target> -- mctl -t <target> bmc '<cmd>' (skills/machine-pilot/references/detached-ops.md)" >&2
 
 source "$(dirname "$(readlink -f "$0")")/cli-local-config.sh" || exit 1
 
@@ -41,6 +40,13 @@ set -- "${args[@]:-}"
 
 die() { echo "bmcjob: $*" >&2; exit 1; }
 
+if [[ "${1:-}" == run ]]; then
+	echo "bmcjob: retired - no job state lives on the BMC. Run BMC work as a local job:" >&2
+	echo "  job run --kind bmc -T <target> -- mctl -t <target> bmc '<cmd>'" >&2
+	echo "(skills/machine-pilot/references/detached-ops.md)" >&2
+	exit 2
+fi
+
 [[ -n "$host" ]] || die "set BMC_HOST, -H, or configure lab-bmc-host"
 [[ -r "$PWFILE" ]] || die "no password file at $PWFILE (all BMCs share one credential)"
 command -v sshpass >/dev/null || die "sshpass not installed"
@@ -55,13 +61,6 @@ bmc_ssh() {
 		"root@$host" "$@"
 }
 
-bmc_put() { # stdin -> remote file
-	timeout 60 sshpass -e ssh \
-		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		-o LogLevel=ERROR -o ConnectTimeout=10 \
-		"root@$host" "cat > $1"
-}
-
 ck_tag() {
 	[[ -n "${1:-}" ]] || die "missing <tag>"
 	[[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "tag must be [A-Za-z0-9._-]+"
@@ -70,20 +69,6 @@ ck_tag() {
 sub="${1:-}"; shift || true
 
 case "$sub" in
-run)
-	tag="${1:-}"; ck_tag "$tag"; shift || true
-	cmd="${1:-}"
-	[[ -n "$cmd" ]] || die "missing '<cmd>'"
-	d="$JOBROOT/$tag"
-	bmc_ssh "mkdir -p $d && rm -f $d/rc $d/pid $d/log" >/dev/null || die "cannot create $d on $host"
-	printf '%s\n' "$cmd" | bmc_put "$d/cmd.sh" || die "failed to stage cmd.sh"
-	# setsid+nohup detaches from the ssh session; rc is written after the body exits.
-	bmc_ssh "cd $d && date -u +%Y-%m-%dT%H:%M:%SZ > started && \
-		setsid nohup sh -c 'sh $d/cmd.sh > $d/log 2>&1; echo \$? > $d/rc' \
-		>/dev/null 2>&1 </dev/null & echo \$! > $d/pid; cat $d/pid" >/dev/null
-	echo "detached tag=$tag host=$host log=$d/log"
-	echo "poll: bmcjob status $tag"
-	;;
 status)
 	tag="${1:-}"; ck_tag "$tag"
 	d="$JOBROOT/$tag"
@@ -127,7 +112,7 @@ clean)
 	fi
 	;;
 *)
-	sed -n '2,22p' "$0" | sed 's/^# \?//'
+	sed -n '2,17p' "$0" | sed 's/^# \?//'
 	exit 1
 	;;
 esac

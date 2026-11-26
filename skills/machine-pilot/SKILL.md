@@ -55,7 +55,7 @@ Never paste a full dmesg or lspci into chat; save it with `evidence` and quote l
   lab operation in the foreground**: launch it with a job runner that returns a TAG
   immediately, then poll. One record everywhere (`~/.jobs/<id>/`): `job` (local),
   `job run --kind bmc -- mctl -t <t> bmc '<cmd>'` (BMC; no state on the BMC; `bmcjob`
-  is deprecated), `mctl` (VMs/remote hosts). See [detached-ops.md](./references/detached-ops.md).
+  is retired and refuses `run`), `mctl` (VMs/remote hosts). See [detached-ops.md](./references/detached-ops.md).
   - Launch local jobs as `job run -T <target> …` so the Team Portal's Machines job
     view files them under that machine (`scripts/pilot_jobs.py` is the data API).
   - A timeout on *your* poll means "not finished yet", **never** "it failed" — the work

@@ -33,9 +33,11 @@ judged on its own `host`) and cannot be killed from here.
 holds the `mctl … bmc` session open. If that link drops mid-command the remote
 command may be killed with it and the result is **unknown**: read the device
 state before re-running anything. Flash, power and reset stay with
-`fw-flasher`'s own path. `bmcjob` (both the local client and the BMC-side
-script) is deprecated: it still works and warns on `run`; the portal still
-lists and can stop old BMC jobs.
+`fw-flasher`'s own path. `bmcjob` is **retired**: `bmcjob run` is refused by
+both the local client and the BMC-side script, so nothing new is written on a
+BMC. The local client keeps `status`/`log`/`wait`/`list`/`clean` only to drain
+jobs launched before the retirement, and the portal still lists (and can stop)
+those leftovers through `pilot_jobs.py refresh-bmc`.
 
 **Always name the machine: `job run -T <target> …`** (or export `PILOT_TARGET`).
 It writes `<id>/target`, which the Team Portal's Machines job view uses to put
@@ -102,10 +104,12 @@ disown
 
 ## BMC specifics (legacy `bmcjob`)
 
-`bmcjob` is deprecated (see above); these notes apply only to reading old jobs.
-It lives in **`/usr/local/bin`** with state in `/var/lib/bmcjobs/` (not `/tmp`,
-which is tmpfs), and non-interactive SSH needs the absolute path
-`/usr/local/bin/bmcjob`.
+`bmcjob` is retired (see above); these notes apply only to reading old jobs.
+The BMC-side copy was installed in **`/usr/local/bin`** with state in
+`/var/lib/bmcjobs/`; the source in `scripts/bmcjob` is now a stub that refuses
+every command. Copies already installed on a BMC are not touched from here:
+replacing or removing them is a write on a shared BMC and needs its own approval.
+Read leftovers with `pilot_jobs.py refresh-bmc <target>`, not the BMC copy.
 
 ## Driving OAM consoles
 
